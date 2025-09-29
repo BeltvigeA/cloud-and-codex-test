@@ -296,6 +296,41 @@ def test_uploadAcceptsUppercaseExtension(appModule):
     assert createdBucket.createdBlobs[-1].uploadCallCount == 1
 
 
+def test_uploadAcceptsDoubleEncodedJson(appModule):
+    doubleEncodedValue = json.dumps(json.dumps({'info': 'value'}))
+    buildRequest(
+        appModule,
+        DummyFileStorage(b'gcode data', 'print_job.gcode'),
+        {
+            'unencrypted_data': doubleEncodedValue,
+            'encrypted_data_payload': doubleEncodedValue,
+            'recipient_id': 'recipient123',
+        },
+    )
+
+    payload, statusCode = extractResponse(appModule.uploadFile())
+
+    assert statusCode == 200
+    assert payload['message'] == 'File uploaded successfully'
+
+
+def test_uploadRejectsNonObjectJsonMetadata(appModule):
+    buildRequest(
+        appModule,
+        DummyFileStorage(b'gcode data', 'print_job.gcode'),
+        {
+            'unencrypted_data': '[]',
+            'encrypted_data_payload': '{}',
+            'recipient_id': 'recipient123',
+        },
+    )
+
+    payload, statusCode = extractResponse(appModule.uploadFile())
+
+    assert statusCode == 400
+    assert payload['error'] == 'Invalid JSON format for associated data'
+
+
 def test_uploadRejectsExtensionBeforeUpload(appModule):
     buildRequest(
         appModule,
