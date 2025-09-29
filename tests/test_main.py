@@ -174,37 +174,50 @@ class MockDocument:
 
 
 class MockQuery:
-    def __init__(self, documentSnapshot):
-        self.documentSnapshot = documentSnapshot
+    def __init__(self, documentSnapshots):
+        if documentSnapshots is None:
+            self.documentSnapshots = []
+        elif isinstance(documentSnapshots, list):
+            self.documentSnapshots = documentSnapshots
+        else:
+            self.documentSnapshots = [documentSnapshots]
+
+    def where(self, *_args, **_kwargs):  # pylint: disable=unused-argument
+        return self
 
     def limit(self, _count):
         return self
 
     def stream(self):
-        return [self.documentSnapshot]
+        return self.documentSnapshots
 
 
 class MockCollection:
-    def __init__(self, documentSnapshot, updateRecorder):
-        self.documentSnapshot = documentSnapshot
+    def __init__(self, documentSnapshots, updateRecorder):
+        self.documentSnapshots = documentSnapshots
         self.updateRecorder = updateRecorder
 
     def document(self, _docId):
         return MockDocument(self.updateRecorder)
 
     def where(self, _field, _operator, _value):
-        return MockQuery(self.documentSnapshot)
+        return MockQuery(self.documentSnapshots)
 
 
 class MockFirestoreClient:
-    def __init__(self, documentSnapshot=None, updateRecorder=None):
-        self.documentSnapshot = documentSnapshot
+    def __init__(self, documentSnapshot=None, documentSnapshots=None, updateRecorder=None):
+        if documentSnapshots is not None:
+            self.documentSnapshots = documentSnapshots
+        elif documentSnapshot is not None:
+            self.documentSnapshots = [documentSnapshot]
+        else:
+            self.documentSnapshots = []
         self.updateRecorder = updateRecorder or {'set': None, 'update': []}
 
     def collection(self, _name):
-        if self.documentSnapshot is None:
-            return MockCollection(None, self.updateRecorder)
-        return MockCollection(self.documentSnapshot, self.updateRecorder)
+        if not self.documentSnapshots:
+            return MockCollection([], self.updateRecorder)
+        return MockCollection(self.documentSnapshots, self.updateRecorder)
 
 
 class MockDocumentSnapshot:
@@ -359,6 +372,47 @@ def testFetchFileRejectsExpiredToken(monkeypatch):
     assert statusCode == 410
     assert 'expired' in responseBody['error']
     assert not updateRecorder['update'], 'Update should not be called for expired tokens'
+
+
+def testListPendingFilesReturnsActiveEntries(monkeypatch):
+    activeMetadata = {
+        'originalFilename': 'file.gcode',
+        'fetchToken': 'token-active',
+        'fetchTokenExpiry': datetime.now(timezone.utc) + timedelta(minutes=5),
+        'fetchTokenConsumed': False,
+        'status': 'uploaded',
+        'timestamp': datetime.now(timezone.utc),
+    }
+    expiredMetadata = {
+        'originalFilename': 'old-file.gcode',
+        'fetchToken': 'token-expired',
+        'fetchTokenExpiry': datetime.now(timezone.utc) - timedelta(minutes=1),
+        'fetchTokenConsumed': False,
+        'status': 'uploaded',
+        'timestamp': datetime.now(timezone.utc),
+    }
+    documentSnapshots = [
+        MockDocumentSnapshot('doc-active', activeMetadata),
+        MockDocumentSnapshot('doc-expired', expiredMetadata),
+    ]
+    mockClients = main.ClientBundle(
+        storageClient=MockStorageClient(),
+        firestoreClient=MockFirestoreClient(documentSnapshots=documentSnapshots),
+        kmsClient=MockEncryptClient({'sensitive': 'value'}),
+        kmsKeyPath='projects/test/locations/test/keyRings/test/cryptoKeys/test',
+        gcsBucketName='test-bucket',
+    )
+    monkeypatch.setattr(main, 'getClients', lambda: mockClients)
+
+    responseBody, statusCode = main.listPendingFiles('recipient123')
+
+    assert statusCode == 200
+    assert responseBody['recipientId'] == 'recipient123'
+    pendingFiles = responseBody['pendingFiles']
+    assert len(pendingFiles) == 1
+    assert pendingFiles[0]['fileId'] == 'doc-active'
+    assert pendingFiles[0]['fetchToken'] == 'token-active'
+    assert responseBody['skippedFiles'] == ['doc-expired']
 
 
 def testUploadFileReportsMissingEnvironment(monkeypatch):
