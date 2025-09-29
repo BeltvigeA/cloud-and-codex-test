@@ -9,6 +9,8 @@ from types import ModuleType, SimpleNamespace
 import pytest
 
 fakeFlaskModule = ModuleType('flask')
+fakeWerkzeugModule = ModuleType('werkzeug')
+fakeWerkzeugUtilsModule = ModuleType('werkzeug.utils')
 
 
 class DummyFlask:
@@ -30,7 +32,21 @@ fakeRequest = SimpleNamespace(files={}, form={})
 fakeFlaskModule.Flask = DummyFlask
 fakeFlaskModule.jsonify = dummyJsonify
 fakeFlaskModule.request = fakeRequest
+fakeWerkzeugModule.utils = fakeWerkzeugUtilsModule
+
+
+def secureFilename(value):
+    return ''.join(
+        character
+        for character in value
+        if character.isalnum() or character in {'.', '_', '-'}
+    ).strip(' .')
+
+
+fakeWerkzeugUtilsModule.secure_filename = secureFilename
 sys.modules['flask'] = fakeFlaskModule
+sys.modules['werkzeug'] = fakeWerkzeugModule
+sys.modules['werkzeug.utils'] = fakeWerkzeugUtilsModule
 
 googleModule = ModuleType('google')
 cloudModule = ModuleType('google.cloud')
@@ -121,6 +137,7 @@ class MockUploadFile:
     def __init__(self, data, filename):
         self.stream = BytesIO(data)
         self.filename = filename
+        self.mimetype = 'application/octet-stream'
 
     def read(self, *_args, **_kwargs):
         return self.stream.read(*_args, **_kwargs)
@@ -216,7 +233,7 @@ def testUploadFileStoresExpiryMetadata(monkeypatch):
     monkeypatch.setattr(main, 'firestoreClient', MockFirestoreClient(updateRecorder=metadataRecorder))
     monkeypatch.setattr(main, 'generateFetchToken', lambda: 'testFetchToken')
 
-    fakeRequest.files = {'file': MockUploadFile(b'file-contents', 'test.txt')}
+    fakeRequest.files = {'file': MockUploadFile(b'file-contents', 'test.gcode')}
     fakeRequest.form = {
         'unencrypted_data': json.dumps({'visible': 'info'}),
         'encrypted_data_payload': json.dumps({'secure': 'payload'}),
