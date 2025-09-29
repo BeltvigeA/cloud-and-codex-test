@@ -62,6 +62,58 @@ class ClientBundle:
 cachedClients: Optional[ClientBundle] = None
 
 
+def parseJsonObjectField(rawValue: str, fieldName: str) -> Tuple[Optional[dict], Optional[Tuple[dict, int]]]:
+    """Parse a JSON object field that may arrive with varying quoting/escaping."""
+
+    if rawValue is None:
+        logging.warning('Missing JSON payload for field %s.', fieldName)
+        return None, ({'error': 'Invalid JSON format for associated data'}, 400)
+
+    candidates = []
+    trimmedValue = rawValue.strip()
+    candidates.append(rawValue)
+    if trimmedValue != rawValue:
+        candidates.append(trimmedValue)
+
+    if trimmedValue and trimmedValue[0] == trimmedValue[-1] and trimmedValue[0] in {"'", '"'}:
+        candidates.append(trimmedValue[1:-1])
+
+    if '\\' in rawValue:
+        try:
+            unescapedValue = bytes(rawValue, 'utf-8').decode('unicode_escape')
+            if unescapedValue != rawValue:
+                candidates.append(unescapedValue)
+        except UnicodeDecodeError:
+            logging.debug('Failed to unicode-unescape field %s. Proceeding with originals.', fieldName)
+
+    lastErrorMessage = None
+    for candidate in candidates:
+        valueToParse = candidate
+        for _ in range(3):
+            try:
+                parsedValue = json.loads(valueToParse)
+            except json.JSONDecodeError as error:
+                lastErrorMessage = error.msg
+                break
+
+            if isinstance(parsedValue, dict):
+                return parsedValue, None
+
+            if isinstance(parsedValue, str):
+                valueToParse = parsedValue.strip()
+                continue
+
+            logging.warning('JSON payload for %s must be an object, received %s.', fieldName, type(parsedValue).__name__)
+            return None, ({'error': 'Invalid JSON format for associated data'}, 400)
+
+    if lastErrorMessage:
+        logging.warning('Invalid JSON for field %s: %s', fieldName, lastErrorMessage)
+    else:
+        logging.warning('Invalid JSON for field %s.', fieldName)
+
+    return None, ({'error': 'Invalid JSON format for associated data'}, 400)
+
+
 def getClients() -> ClientBundle:
     global cachedClients  # pylint: disable=global-statement
 
@@ -176,12 +228,15 @@ def uploadFile():
             logging.warning('Recipient ID is missing.')
             return jsonify({'error': 'Recipient ID is required'}), 400
 
-        try:
-            unencryptedData = json.loads(unencryptedDataRaw)
-            encryptedDataPayload = json.loads(encryptedDataPayloadRaw)
-        except json.JSONDecodeError:
-            logging.warning('Invalid JSON for unencrypted_data or encrypted_data_payload.')
-            return jsonify({'error': 'Invalid JSON format for associated data'}), 400
+        unencryptedData, errorResponse = parseJsonObjectField(unencryptedDataRaw, 'unencrypted_data')
+        if errorResponse:
+            return jsonify(errorResponse[0]), errorResponse[1]
+
+        encryptedDataPayload, errorResponse = parseJsonObjectField(
+            encryptedDataPayloadRaw, 'encrypted_data_payload'
+        )
+        if errorResponse:
+            return jsonify(errorResponse[0]), errorResponse[1]
 
         fileId = str(uuid.uuid4())
         normalizedFilename = secure_filename(upload.filename)
