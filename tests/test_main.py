@@ -9,9 +9,8 @@ from types import ModuleType, SimpleNamespace
 import pytest
 
 fakeFlaskModule = ModuleType('flask')
-werkzeugModule = ModuleType('werkzeug')
-werkzeugUtilsModule = ModuleType('werkzeug.utils')
-
+fakeWerkzeugModule = ModuleType('werkzeug')
+fakeWerkzeugUtilsModule = ModuleType('werkzeug.utils')
 
 
 class DummyFlask:
@@ -29,27 +28,6 @@ def dummyJsonify(payload):
     return payload
 
 
-fakeRequest = SimpleNamespace(files={}, form={})
-fakeFlaskModule.Flask = DummyFlask
-fakeFlaskModule.jsonify = dummyJsonify
-fakeFlaskModule.request = fakeRequest
-fakeWerkzeugModule.utils = fakeWerkzeugUtilsModule
-
-
-def secureFilename(value):
-    return ''.join(
-        character
-        for character in value
-        if character.isalnum() or character in {'.', '_', '-'}
-    ).strip(' .')
-
-
-fakeWerkzeugUtilsModule.secure_filename = secureFilename
-sys.modules['flask'] = fakeFlaskModule
-sys.modules['werkzeug'] = fakeWerkzeugModule
-sys.modules['werkzeug.utils'] = fakeWerkzeugUtilsModule
-
-
 def secureFilename(value):
     sanitized = ''.join(
         character for character in value if character.isalnum() or character in {'.', '_', '-'}
@@ -57,11 +35,15 @@ def secureFilename(value):
     return sanitized.strip(' .')
 
 
-werkzeugUtilsModule.secure_filename = secureFilename
-
-werkzeugModule.utils = werkzeugUtilsModule
-sys.modules['werkzeug'] = werkzeugModule
-sys.modules['werkzeug.utils'] = werkzeugUtilsModule
+fakeRequest = SimpleNamespace(files={}, form={})
+fakeFlaskModule.Flask = DummyFlask
+fakeFlaskModule.jsonify = dummyJsonify
+fakeFlaskModule.request = fakeRequest
+fakeWerkzeugModule.utils = fakeWerkzeugUtilsModule
+fakeWerkzeugUtilsModule.secure_filename = secureFilename
+sys.modules['flask'] = fakeFlaskModule
+sys.modules['werkzeug'] = fakeWerkzeugModule
+sys.modules['werkzeug.utils'] = fakeWerkzeugUtilsModule
 
 googleModule = ModuleType('google')
 cloudModule = ModuleType('google.cloud')
