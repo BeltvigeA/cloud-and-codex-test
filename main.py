@@ -9,11 +9,21 @@ from flask import Flask, jsonify, request
 from google.api_core.exceptions import GoogleAPICallError
 from google.cloud import firestore, kms_v1, storage
 from google.cloud.firestore_v1 import DELETE_FIELD
+from werkzeug.utils import secure_filename
 
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 app = Flask(__name__)
+
+
+allowedUploadExtensions = {'.3mf', '.gcode', '.gco'}
+allowedUploadMimeTypes = {
+    'application/octet-stream',
+    'application/x-gcode',
+    'text/plain',
+    'model/3mf',
+}
 
 
 gcpProjectId = os.environ.get('GCP_PROJECT_ID')
@@ -93,13 +103,51 @@ def uploadFile():
             return jsonify({'error': 'Invalid JSON format for associated data'}), 400
 
         fileId = str(uuid.uuid4())
-        originalFilename = upload.filename
-        gcsObjectName = f"{recipientId}/{fileId}_{originalFilename}"
+        normalizedFilename = secure_filename(upload.filename)
+        if not normalizedFilename:
+            logging.warning('Invalid or empty filename provided.')
+            return jsonify({'error': 'Invalid filename'}), 400
+
+        _, fileExtension = os.path.splitext(normalizedFilename)
+        fileExtension = fileExtension.lower()
+        if fileExtension not in allowedUploadExtensions:
+            logging.warning('Rejected file with unsupported extension: %s', fileExtension)
+            return (
+                jsonify(
+                    {
+                        'error': (
+                            'Unsupported file type. Allowed extensions: '
+                            + ', '.join(sorted(allowedUploadExtensions))
+                        )
+                    }
+                ),
+                400,
+            )
+
+        if upload.mimetype and upload.mimetype not in allowedUploadMimeTypes:
+            logging.warning(
+                'Rejected file due to unsupported MIME type: %s', upload.mimetype
+            )
+            return (
+                jsonify(
+                    {
+                        'error': (
+                            'Unsupported MIME type. Allowed types: '
+                            + ', '.join(sorted(allowedUploadMimeTypes))
+                        )
+                    }
+                ),
+                400,
+            )
+
+        gcsObjectName = f"{recipientId}/{fileId}_{normalizedFilename}"
         bucket = storageClient.bucket(gcsBucketName)
         blob = bucket.blob(gcsObjectName)
 
         blob.upload_from_file(upload)
-        logging.info('File %s uploaded to gs://%s/%s', originalFilename, gcsBucketName, gcsObjectName)
+        logging.info(
+            'File %s uploaded to gs://%s/%s', normalizedFilename, gcsBucketName, gcsObjectName
+        )
 
         try:
             encryptResponse = kmsClient.encrypt(
@@ -117,7 +165,7 @@ def uploadFile():
         fetchToken = generateFetchToken()
         metadata = {
             'fileId': fileId,
-            'originalFilename': originalFilename,
+            'originalFilename': normalizedFilename,
             'gcsPath': gcsObjectName,
             'encryptedData': encryptedDataCipherText,
             'unencryptedData': unencryptedData,
