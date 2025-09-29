@@ -133,13 +133,20 @@ def tryParseKeyValueObject(rawValue: str) -> Optional[dict]:
             return None
 
         rawKey = segment[:separatorIndex].strip().strip("\"'")
-        rawValuePart = segment[separatorIndex + 1 :].strip()
+        rawValuePortion = segment[separatorIndex + 1 :]
+        rawValuePart = rawValuePortion.strip()
 
         if not rawKey:
             return None
 
-        if rawValuePart and rawValuePart[0] in {'"', "'"} and rawValuePart[-1] == rawValuePart[0]:
-            rawValuePart = rawValuePart[1:-1]
+        if rawValuePart:
+            quoteCharacters = {'"', "'"}
+            if rawValuePart[0] in quoteCharacters and rawValuePart[-1] == rawValuePart[0]:
+                rawValuePart = rawValuePart[1:-1]
+            elif rawValuePart[-1] in quoteCharacters:
+                strippedPortion = rawValuePortion.strip()
+                if strippedPortion and strippedPortion[0] == rawValuePart[-1]:
+                    rawValuePart = rawValuePart[:-1]
 
         try:
             normalizedValue = bytes(rawValuePart, 'utf-8').decode('unicode_escape')
@@ -176,6 +183,7 @@ def parseJsonObjectField(rawValue: str, fieldName: str) -> Tuple[Optional[dict],
             logging.debug('Failed to unicode-unescape field %s. Proceeding with originals.', fieldName)
 
     lastErrorMessage = None
+    attemptedFallbackCandidates = set()
     for candidate in candidates:
         valueToParse = candidate
         for _ in range(3):
@@ -194,6 +202,13 @@ def parseJsonObjectField(rawValue: str, fieldName: str) -> Tuple[Optional[dict],
 
             logging.warning('JSON payload for %s must be an object, received %s.', fieldName, type(parsedValue).__name__)
             return None, ({'error': 'Invalid JSON format for associated data'}, 400)
+
+        if candidate != rawValue and candidate not in attemptedFallbackCandidates:
+            attemptedFallbackCandidates.add(candidate)
+            fallbackParsed = tryParseKeyValueObject(candidate)
+            if fallbackParsed is not None:
+                logging.info('Parsed field %s using key/value fallback.', fieldName)
+                return fallbackParsed, None
 
     fallbackParsed = tryParseKeyValueObject(rawValue)
     if fallbackParsed is not None:

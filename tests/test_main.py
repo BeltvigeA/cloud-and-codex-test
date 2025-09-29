@@ -399,3 +399,10 @@ def testParseJsonObjectFieldParsesEqualsFallback():
 
     assert errorResponse is None
     assert parsedValue == {'secret': '1234'}
+
+
+def testParseJsonObjectFieldParsesQuotedEqualsFallback():
+    parsedValue, errorResponse = main.parseJsonObjectField('"secret=1234"', 'encrypted_data_payload')
+
+    assert errorResponse is None
+    assert parsedValue == {'secret': '1234'}
