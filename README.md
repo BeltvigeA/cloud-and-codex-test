@@ -21,3 +21,10 @@ curl.exe -X POST "https://printer-backend-934564650450.europe-west1.run.app/uplo
   --form-string recipient_id=user-123 `
   --form-string 'unencrypted_data={"printJob":"demo"}' `
   --form-string 'encrypted_data_payload={"secret":"1234"}'
+
+  curl.exe -X POST "https://printer-backend-934564650450.europe-west1.run.app/upload" `
+  -F "file=@C:\Users\508484\Downloads\googleting.gcode.3mf" `
+  --form-string recipient_id=user-123 `
+  --form-string 'unencrypted_data={"printJob":"demo"}' `
+  --form-string 'encrypted_data_payload={"secret":"1234"}'
+
