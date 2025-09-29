@@ -312,6 +312,52 @@ def testFetchFileFirstUseSuccess(monkeypatch):
     assert updatePayload['fetchTokenConsumed'] is True
 
 
+def testFetchFileReturnsLegacyUnencryptedMetadata(monkeypatch):
+    metadata = {
+        'unencryptedData': {'legacy': 'info'},
+        'gcsPath': 'recipient123/file.gcode',
+        'fetchTokenExpiry': datetime.now(timezone.utc) + timedelta(minutes=5),
+        'fetchTokenConsumed': False,
+    }
+    documentSnapshot = MockDocumentSnapshot('doc123', metadata)
+    updateRecorder = {'set': None, 'update': []}
+
+    class SpyKmsClient(MockEncryptClient):
+        def __init__(self):
+            super().__init__()
+            self.decryptCalled = False
+
+        def decrypt(self, **kwargs):  # pylint: disable=unused-argument
+            self.decryptCalled = True
+            return super().decrypt(**kwargs)
+
+    spyKmsClient = SpyKmsClient()
+    mockClients = main.ClientBundle(
+        storageClient=MockStorageClient(),
+        firestoreClient=MockFirestoreClient(
+            documentSnapshot=documentSnapshot, updateRecorder=updateRecorder
+        ),
+        kmsClient=spyKmsClient,
+        kmsKeyPath='projects/test/locations/test/keyRings/test/cryptoKeys/test',
+        gcsBucketName='test-bucket',
+    )
+    monkeypatch.setattr(main, 'getClients', lambda: mockClients)
+
+    fakeRequest.files = {}
+    fakeRequest.form = {}
+
+    responseBody, statusCode = main.fetchFile('testFetchToken')
+
+    assert statusCode == 200
+    assert responseBody['decryptedData'] == {'legacy': 'info'}
+    assert responseBody['unencryptedData'] == {'legacy': 'info'}
+    assert spyKmsClient.decryptCalled is False
+
+    assert updateRecorder['update'], 'Expected Firestore update to be recorded'
+    updatePayload = updateRecorder['update'][0]
+    assert updatePayload['fetchTokenConsumed'] is True
+
+
 def testFetchFileRejectsConsumedToken(monkeypatch):
     metadata = {
         'encryptedData': '7b7d',
