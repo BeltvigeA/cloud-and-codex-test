@@ -3,11 +3,12 @@
 import argparse
 import json
 import logging
+import shutil
 import sys
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import requests
 
@@ -30,8 +31,22 @@ def parseArguments() -> argparse.Namespace:
         "fetch",
         help="Fetch a file and metadata using a fetch token.",
     )
-    fetchParser.add_argument("--baseUrl", required=True, help="Base URL of the Cloud Run service.")
-    fetchParser.add_argument("--fetchToken", required=True, help="Fetch token provided by the web app.")
+    fetchParser.add_argument(
+        "--mode",
+        choices={"remote", "offline"},
+        default="remote",
+        help="Select remote HTTP backend or offline file-based backend.",
+    )
+    fetchParser.add_argument("--baseUrl", help="Base URL of the Cloud Run service.")
+    fetchParser.add_argument("--fetchToken", help="Fetch token provided by the web app.")
+    fetchParser.add_argument(
+        "--metadataFile",
+        help="Path to JSON metadata when using offline mode.",
+    )
+    fetchParser.add_argument(
+        "--dataFile",
+        help="Path to the local file contents when using offline mode.",
+    )
     fetchParser.add_argument(
         "--outputDir",
         required=True,
@@ -62,11 +77,20 @@ def parseArguments() -> argparse.Namespace:
         "listen",
         help="Continuously poll for files assigned to a recipient and download them.",
     )
-    listenParser.add_argument("--baseUrl", required=True, help="Base URL of the Cloud Run service.")
+    listenParser.add_argument(
+        "--mode",
+        choices={"remote", "offline"},
+        default="remote",
+        help="Select remote HTTP backend or offline file-based backend.",
+    )
+    listenParser.add_argument("--baseUrl", help="Base URL of the Cloud Run service.")
     listenParser.add_argument(
         "--recipientId",
-        required=True,
         help="Recipient identifier to filter pending files.",
+    )
+    listenParser.add_argument(
+        "--offlineDataset",
+        help="Path to JSON dataset describing files for offline mode.",
     )
     listenParser.add_argument(
         "--outputDir",
@@ -113,6 +137,162 @@ def ensureOutputDirectory(outputDir: str) -> Path:
     outputPath = Path(outputDir).expanduser().resolve()
     outputPath.mkdir(parents=True, exist_ok=True)
     return outputPath
+
+
+def loadOfflineMetadata(metadataSource: Union[str, Path, Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if isinstance(metadataSource, dict):
+        metadata = metadataSource
+    else:
+        if not metadataSource:
+            logging.error("Offline metadata source must be provided.")
+            return None
+        metadataPath = Path(metadataSource).expanduser().resolve()
+        try:
+            metadataText = metadataPath.read_text(encoding="utf-8")
+        except OSError as error:
+            logging.error("Unable to read offline metadata file %s: %s", metadataPath, error)
+            return None
+        try:
+            metadata = json.loads(metadataText)
+        except json.JSONDecodeError as error:
+            logging.error("Offline metadata file %s is not valid JSON: %s", metadataPath, error)
+            return None
+
+    if not isinstance(metadata, dict):
+        logging.error("Offline metadata must be a JSON object, received %s", type(metadata).__name__)
+        return None
+
+    if "unencryptedData" not in metadata:
+        metadata["unencryptedData"] = {}
+    if "decryptedData" not in metadata:
+        metadata["decryptedData"] = {}
+
+    return metadata
+
+
+def copyOfflineFile(dataFile: str, outputPath: Path, preferredName: Optional[str]) -> Optional[Path]:
+    if not dataFile:
+        logging.error("Offline file path must be provided when using offline mode.")
+        return None
+
+    sourcePath = Path(dataFile).expanduser().resolve()
+    if not sourcePath.is_file():
+        logging.error("Offline data file %s does not exist or is not a file.", sourcePath)
+        return None
+
+    filename = preferredName.strip() if isinstance(preferredName, str) else ""
+    if not filename:
+        filename = sourcePath.name
+
+    destinationPath = outputPath / filename
+    try:
+        shutil.copy2(sourcePath, destinationPath)
+    except OSError as error:
+        logging.error("Failed to copy offline file from %s to %s: %s", sourcePath, destinationPath, error)
+        return None
+
+    logging.info("Saved offline file to %s", destinationPath)
+    return destinationPath
+
+
+def performOfflineFetch(
+    metadataSource: Union[str, Path, Dict[str, Any]],
+    dataFile: Optional[str],
+    outputDir: str,
+) -> Optional[Path]:
+    metadata = loadOfflineMetadata(metadataSource)
+    if metadata is None:
+        return None
+
+    outputPath = ensureOutputDirectory(outputDir)
+    preferredName = metadata.get("originalFilename") or metadata.get("fileName")
+    savedFile = copyOfflineFile(dataFile, outputPath, preferredName)
+    if savedFile is None:
+        return None
+
+    logging.info("Unencrypted data:\n%s", json.dumps(metadata.get("unencryptedData"), indent=2))
+    logging.info("Decrypted data:\n%s", json.dumps(metadata.get("decryptedData"), indent=2))
+    return savedFile
+
+
+def loadOfflineDataset(datasetPath: str) -> Optional[List[Dict[str, Any]]]:
+    if not datasetPath:
+        logging.error("Offline dataset path must be provided when using offline listen mode.")
+        return None
+
+    resolvedPath = Path(datasetPath).expanduser().resolve()
+    try:
+        datasetText = resolvedPath.read_text(encoding="utf-8")
+    except OSError as error:
+        logging.error("Unable to read offline dataset file %s: %s", resolvedPath, error)
+        return None
+
+    try:
+        loadedDataset = json.loads(datasetText)
+    except json.JSONDecodeError as error:
+        logging.error("Offline dataset file %s is not valid JSON: %s", resolvedPath, error)
+        return None
+
+    if isinstance(loadedDataset, dict):
+        pendingEntries = loadedDataset.get("pendingFiles")
+        if pendingEntries is None:
+            pendingEntries = loadedDataset.get("files")
+        if pendingEntries is None:
+            pendingEntries = [loadedDataset]
+    else:
+        pendingEntries = loadedDataset
+
+    if not isinstance(pendingEntries, list):
+        logging.error(
+            "Offline dataset must be a list or object containing a list of pending files. Received %s.",
+            type(pendingEntries).__name__,
+        )
+        return None
+
+    normalizedEntries: List[Dict[str, Any]] = []
+    for entry in pendingEntries:
+        if isinstance(entry, dict):
+            normalizedEntries.append(entry)
+        else:
+            logging.warning(
+                "Skipping offline dataset entry because it is not an object: %r", entry
+            )
+
+    return normalizedEntries
+
+
+def listenOffline(datasetPath: str, outputDir: str) -> None:
+    entries = loadOfflineDataset(datasetPath)
+    if entries is None:
+        return
+
+    if not entries:
+        logging.info("No offline files to process; dataset is empty.")
+        return
+
+    processedCount = 0
+    for entry in entries:
+        dataFile = entry.get("dataFile")
+        if not dataFile:
+            logging.warning("Skipping offline entry without dataFile: %s", entry)
+            continue
+
+        if entry.get("metadataFile"):
+            metadataSource: Union[str, Path, Dict[str, Any]] = entry["metadataFile"]
+        elif isinstance(entry.get("metadata"), dict):
+            metadataSource = entry["metadata"]
+        else:
+            metadataSource = {
+                key: value
+                for key, value in entry.items()
+                if key not in {"dataFile", "metadataFile"}
+            }
+
+        savedFile = performOfflineFetch(metadataSource, dataFile, outputDir)
+        if savedFile is not None:
+            processedCount += 1
+
+    logging.info("Offline processing complete. Files saved: %d", processedCount)
 
 
 def determineFilename(response: requests.Response, fallbackName: str = "downloaded_file.bin") -> str:
@@ -327,12 +507,70 @@ def performStatusUpdates(
         time.sleep(intervalSeconds)
 
 
+def validateRemoteFetchArguments(arguments: argparse.Namespace) -> bool:
+    missingOptions = []
+    if not arguments.baseUrl:
+        missingOptions.append("--baseUrl")
+    if not arguments.fetchToken:
+        missingOptions.append("--fetchToken")
+
+    if missingOptions:
+        logging.error(
+            "Missing required options for remote fetch: %s",
+            ", ".join(missingOptions),
+        )
+        return False
+
+    return True
+
+
+def validateRemoteListenArguments(arguments: argparse.Namespace) -> bool:
+    missingOptions = []
+    if not arguments.baseUrl:
+        missingOptions.append("--baseUrl")
+    if not arguments.recipientId:
+        missingOptions.append("--recipientId")
+
+    if missingOptions:
+        logging.error(
+            "Missing required options for remote listen: %s",
+            ", ".join(missingOptions),
+        )
+        return False
+
+    return True
+
+
 def main() -> None:
     configureLogging()
     arguments = parseArguments()
 
     if arguments.command == "fetch":
-        performFetch(arguments.baseUrl, arguments.fetchToken, arguments.outputDir)
+        if arguments.mode == "offline":
+            if not arguments.dataFile:
+                logging.error("Offline fetch requires --dataFile to specify the local file to copy.")
+                return
+            if not arguments.metadataFile:
+                logging.info(
+                    "Offline fetch without metadata file will proceed with default metadata."
+                )
+            metadataSource: Union[str, Path, Dict[str, Any]]
+            if arguments.metadataFile:
+                metadataSource = arguments.metadataFile
+            else:
+                metadataSource = {
+                    "fetchToken": arguments.fetchToken,
+                    "unencryptedData": {},
+                    "decryptedData": {},
+                }
+
+            savedFile = performOfflineFetch(metadataSource, arguments.dataFile, arguments.outputDir)
+            if savedFile is None:
+                logging.error("Offline fetch failed.")
+        else:
+            if not validateRemoteFetchArguments(arguments):
+                return
+            performFetch(arguments.baseUrl, arguments.fetchToken, arguments.outputDir)
     elif arguments.command == "status":
         performStatusUpdates(
             arguments.baseUrl,
@@ -342,13 +580,23 @@ def main() -> None:
             arguments.numUpdates,
         )
     elif arguments.command == "listen":
-        listenForFiles(
-            arguments.baseUrl,
-            arguments.recipientId,
-            arguments.outputDir,
-            arguments.pollInterval,
-            arguments.maxIterations,
-        )
+        if arguments.mode == "offline":
+            if not arguments.offlineDataset:
+                logging.error(
+                    "Offline listen requires --offlineDataset to reference a JSON description of files."
+                )
+                return
+            listenOffline(arguments.offlineDataset, arguments.outputDir)
+        else:
+            if not validateRemoteListenArguments(arguments):
+                return
+            listenForFiles(
+                arguments.baseUrl,
+                arguments.recipientId,
+                arguments.outputDir,
+                arguments.pollInterval,
+                arguments.maxIterations,
+            )
     else:
         logging.error("Unknown command: %s", arguments.command)
 
