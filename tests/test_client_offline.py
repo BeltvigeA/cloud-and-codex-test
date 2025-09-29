@@ -117,3 +117,50 @@ def test_listenOffline_processes_dataset_entries(tmp_path: Path, caplog: pytest.
     ]
 
     assert any("Offline processing complete" in message for message in caplog.messages)
+
+
+def test_listenOffline_supports_relative_paths(tmp_path: Path) -> None:
+    datasetDirectory = tmp_path / "datasetBundle"
+    datasetDirectory.mkdir()
+    dataDirectory = datasetDirectory / "data"
+    dataDirectory.mkdir()
+    metadataDirectory = datasetDirectory / "metadata"
+    metadataDirectory.mkdir()
+
+    relativeMetadataPath = metadataDirectory / "relativeMetadata.json"
+    relativeMetadataPath.write_text(
+        json.dumps(
+            {
+                "originalFilename": "relativeFile.gcode",
+                "unencryptedData": {"job": "relative"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (dataDirectory / "relativeData.gcode").write_bytes(b"relative-bytes")
+    (dataDirectory / "inlineData.gcode").write_bytes(b"inline-bytes")
+
+    dataset = {
+        "pendingFiles": [
+            {
+                "dataFile": "data/relativeData.gcode",
+                "metadataFile": "metadata/relativeMetadata.json",
+            },
+            {
+                "dataFile": "data/inlineData.gcode",
+                "metadata": {
+                    "originalFilename": "inlineRelative.gcode",
+                    "decryptedData": {"job": "inline-relative"},
+                },
+            },
+        ]
+    }
+
+    datasetPath = datasetDirectory / "dataset.json"
+    datasetPath.write_text(json.dumps(dataset), encoding="utf-8")
+
+    outputDirectory = tmp_path / "relativeOutput"
+    client.listenOffline(str(datasetPath), str(outputDirectory))
+
+    savedFiles = sorted(path.name for path in outputDirectory.iterdir())
+    assert savedFiles == ["inlineRelative.gcode", "relativeFile.gcode"]

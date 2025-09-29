@@ -299,12 +299,18 @@ def listenOffline(datasetPath: str, outputDir: str) -> None:
         logging.info("No offline files to process; dataset is empty.")
         return
 
+    datasetDirectory = Path(datasetPath).expanduser().resolve().parent
+
     processedCount = 0
     for entry in entries:
         dataFile = entry.get("dataFile")
         if not dataFile:
             logging.warning("Skipping offline entry without dataFile: %s", entry)
             continue
+
+        dataFilePath = Path(dataFile).expanduser()
+        if not dataFilePath.is_absolute():
+            dataFilePath = (datasetDirectory / dataFilePath).resolve()
 
         if entry.get("metadataFile"):
             metadataSource: Union[str, Path, Dict[str, Any]] = entry["metadataFile"]
@@ -317,7 +323,13 @@ def listenOffline(datasetPath: str, outputDir: str) -> None:
                 if key not in {"dataFile", "metadataFile"}
             }
 
-        savedFile = performOfflineFetch(metadataSource, dataFile, outputDir)
+        if isinstance(metadataSource, (str, Path)):
+            metadataPath = Path(metadataSource).expanduser()
+            if not metadataPath.is_absolute():
+                metadataPath = (datasetDirectory / metadataPath).resolve()
+            metadataSource = str(metadataPath)
+
+        savedFile = performOfflineFetch(metadataSource, str(dataFilePath), outputDir)
         if savedFile is not None:
             processedCount += 1
 
