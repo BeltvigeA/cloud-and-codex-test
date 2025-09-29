@@ -199,12 +199,14 @@ def loadOfflineMetadata(metadataSource: Union[str, Path, Dict[str, Any]]) -> Opt
     return metadata
 
 
-def copyOfflineFile(dataFile: str, outputPath: Path, preferredName: Optional[str]) -> Optional[Path]:
+def copyOfflineFile(
+    dataFile: Union[str, Path], outputPath: Path, preferredName: Optional[str]
+) -> Optional[Path]:
     if not dataFile:
         logging.error("Offline file path must be provided when using offline mode.")
         return None
 
-    sourcePath = Path(dataFile).expanduser().resolve()
+    sourcePath = Path(dataFile).expanduser()
     if not sourcePath.is_file():
         logging.error("Offline data file %s does not exist or is not a file.", sourcePath)
         return None
