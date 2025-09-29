@@ -475,16 +475,44 @@ def fetchFile(fetchToken: str):
             logging.warning('Fetch token expired for file %s', documentSnapshot.id)
             return jsonify({'error': 'Fetch token expired'}), 410
 
-        encryptedDataCipherText = bytes.fromhex(fileMetadata['encryptedData'])
-        try:
-            decryptResponse = kmsClient.decrypt(
-                request={'name': kmsKeyPath, 'ciphertext': encryptedDataCipherText}
+        unencryptedData = fileMetadata.get('unencryptedData')
+        encryptedDataHex = fileMetadata.get('encryptedData')
+        decryptedData = {}
+
+        if encryptedDataHex:
+            try:
+                encryptedDataCipherText = bytes.fromhex(encryptedDataHex)
+            except ValueError:
+                logging.warning(
+                    'Invalid encryptedData stored for file %s', documentSnapshot.id
+                )
+                return (
+                    jsonify({'error': 'Stored encrypted data is invalid'}),
+                    422,
+                )
+
+            try:
+                decryptResponse = kmsClient.decrypt(
+                    request={'name': kmsKeyPath, 'ciphertext': encryptedDataCipherText}
+                )
+                decryptedData = json.loads(decryptResponse.plaintext.decode('utf-8'))
+                logging.info('Sensitive data decrypted with KMS.')
+            except GoogleAPICallError as error:
+                logging.error('KMS decryption failed: %s', error)
+                return jsonify({'error': f'KMS decryption failed: {error.message}'}), 500
+        else:
+            if unencryptedData is None:
+                logging.warning(
+                    'Missing encrypted and unencrypted data for file %s',
+                    documentSnapshot.id,
+                )
+                return jsonify({'error': 'File metadata is incomplete'}), 422
+
+            decryptedData = unencryptedData
+            logging.info(
+                'No encrypted data found for file %s; using stored unencrypted metadata.',
+                documentSnapshot.id,
             )
-            decryptedData = json.loads(decryptResponse.plaintext.decode('utf-8'))
-            logging.info('Sensitive data decrypted with KMS.')
-        except GoogleAPICallError as error:
-            logging.error('KMS decryption failed: %s', error)
-            return jsonify({'error': f'KMS decryption failed: {error.message}'}), 500
 
         bucket = storageClient.bucket(gcsBucketName)
         blob = bucket.blob(fileMetadata['gcsPath'])
@@ -512,7 +540,7 @@ def fetchFile(fetchToken: str):
             {
                 'message': 'File and data retrieved successfully',
                 'signedUrl': signedUrl,
-                'unencryptedData': fileMetadata.get('unencryptedData', {}),
+                'unencryptedData': unencryptedData if isinstance(unencryptedData, dict) else unencryptedData or {},
                 'decryptedData': decryptedData,
             }
         ), 200
