@@ -3,11 +3,12 @@
 import argparse
 import json
 import logging
+import os
 import sys
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
@@ -30,7 +31,14 @@ def parseArguments() -> argparse.Namespace:
         "fetch",
         help="Fetch a file and metadata using a fetch token.",
     )
-    fetchParser.add_argument("--baseUrl", required=True, help="Base URL of the Cloud Run service.")
+    fetchParser.add_argument(
+        "--baseUrl",
+        required=False,
+        help=(
+            "Base URL of the Cloud Run service. If omitted, the CLIENT_BASE_URL "
+            "environment variable will be used."
+        ),
+    )
     fetchParser.add_argument("--fetchToken", required=True, help="Fetch token provided by the web app.")
     fetchParser.add_argument(
         "--outputDir",
@@ -42,9 +50,23 @@ def parseArguments() -> argparse.Namespace:
         "status",
         help="Send printer status updates to the Cloud Run service.",
     )
-    statusParser.add_argument("--baseUrl", required=True, help="Base URL of the Cloud Run service.")
-    statusParser.add_argument("--apiKey", required=True, help="API key for authenticating with the server.")
-    statusParser.add_argument("--printerSerial", required=True, help="Unique printer serial number.")
+    statusParser.add_argument(
+        "--baseUrl",
+        required=False,
+        help=(
+            "Base URL of the Cloud Run service. Defaults to CLIENT_BASE_URL environment variable if unset."
+        ),
+    )
+    statusParser.add_argument(
+        "--apiKey",
+        required=False,
+        help="API key for authenticating with the server (or set CLIENT_API_KEY).",
+    )
+    statusParser.add_argument(
+        "--printerSerial",
+        required=False,
+        help="Unique printer serial number (or set CLIENT_PRINTER_SERIAL).",
+    )
     statusParser.add_argument(
         "--interval",
         type=int,
@@ -58,6 +80,43 @@ def parseArguments() -> argparse.Namespace:
         help="Number of updates to send (0 for indefinite).",
     )
 
+    listenParser = subparsers.add_parser(
+        "listen",
+        help="Continuously poll for files assigned to a recipient and download them.",
+    )
+    listenParser.add_argument(
+        "--baseUrl",
+        required=False,
+        help=(
+            "Base URL of the Cloud Run service. Defaults to CLIENT_BASE_URL environment variable if unset."
+        ),
+    )
+    listenParser.add_argument(
+        "--recipientId",
+        required=False,
+        help=(
+            "Recipient identifier to filter pending files. Provide via flag, the "
+            "CLIENT_RECIPIENT_ID environment variable, or interactively when prompted."
+        ),
+    )
+    listenParser.add_argument(
+        "--outputDir",
+        required=True,
+        help="Directory path to save downloaded files.",
+    )
+    listenParser.add_argument(
+        "--pollInterval",
+        type=int,
+        default=30,
+        help="Seconds to wait between polling attempts (default: 30).",
+    )
+    listenParser.add_argument(
+        "--maxIterations",
+        type=int,
+        default=0,
+        help="Maximum number of polling iterations (0 for indefinite).",
+    )
+
     return parser.parse_args()
 
 
@@ -68,9 +127,65 @@ def buildBaseUrl(baseUrl: str) -> str:
     return sanitized
 
 
+def resolveBaseUrl(argumentValue: Optional[str]) -> str:
+    candidate = argumentValue or os.environ.get("CLIENT_BASE_URL")
+    if not candidate:
+        raise ValueError(
+            "A base URL is required. Provide --baseUrl or set the CLIENT_BASE_URL environment variable."
+        )
+    return buildBaseUrl(candidate)
+
+
+def resolveApiKey(argumentValue: Optional[str]) -> str:
+    candidate = argumentValue or os.environ.get("CLIENT_API_KEY")
+    if not candidate:
+        raise ValueError(
+            "An API key is required. Provide --apiKey or set the CLIENT_API_KEY environment variable."
+        )
+    return candidate
+
+
+def resolvePrinterSerial(argumentValue: Optional[str]) -> str:
+    candidate = argumentValue or os.environ.get("CLIENT_PRINTER_SERIAL")
+    if not candidate:
+        raise ValueError(
+            "A printer serial is required. Provide --printerSerial or set the CLIENT_PRINTER_SERIAL environment variable."
+        )
+    return candidate
+
+
+def resolveRecipientId(argumentValue: Optional[str]) -> str:
+    candidate = argumentValue or os.environ.get("CLIENT_RECIPIENT_ID")
+    if candidate:
+        sanitized = candidate.strip()
+        if sanitized:
+            return sanitized
+
+    if sys.stdin.isatty():
+        while True:
+            try:
+                userInput = input("Enter recipient ID to monitor: ").strip()
+            except EOFError as error:
+                raise ValueError("recipientId is required but was not provided.") from error
+            if userInput:
+                return userInput
+
+    raise ValueError(
+        "A recipient ID is required. Provide --recipientId, set CLIENT_RECIPIENT_ID, or run interactively to input it."
+    )
+
+
 def buildFetchUrl(baseUrl: str, fetchToken: str) -> str:
     sanitizedBase = buildBaseUrl(baseUrl)
     return f"{sanitizedBase}/fetch/{fetchToken}"
+
+
+def buildPendingUrl(baseUrl: str, recipientId: str) -> str:
+    sanitizedBase = buildBaseUrl(baseUrl)
+    sanitizedRecipient = recipientId.strip()
+    if not sanitizedRecipient:
+        raise ValueError("recipientId must not be empty")
+    return f"{sanitizedBase}/recipients/{sanitizedRecipient}/pending"
 
 
 def ensureOutputDirectory(outputDir: str) -> Path:
@@ -149,6 +264,30 @@ def performFetch(baseUrl: str, fetchToken: str, outputDir: str) -> None:
     logging.info("Fetch completed successfully. File saved at %s", savedFile)
 
 
+def fetchPendingFiles(baseUrl: str, recipientId: str) -> Optional[List[Dict[str, Any]]]:
+    pendingUrl = buildPendingUrl(baseUrl, recipientId)
+    logging.info("Checking for pending files for recipient %s", recipientId)
+    try:
+        response = requests.get(pendingUrl, timeout=30)
+        response.raise_for_status()
+    except requests.RequestException as error:
+        logging.error("Failed to fetch pending files: %s", error)
+        return None
+
+    try:
+        payload = response.json()
+    except json.JSONDecodeError as error:
+        logging.error("Invalid JSON response when listing pending files: %s", error)
+        return None
+
+    pendingFiles = payload.get("pendingFiles")
+    if not isinstance(pendingFiles, list):
+        logging.error("Unexpected response format when listing pending files: %s", payload)
+        return None
+
+    return pendingFiles
+
+
 def generateStatusPayload(
     printerSerial: str,
     iteration: int,
@@ -200,6 +339,43 @@ def generateStatusPayload(
     return payload, nextJobId
 
 
+def listenForFiles(
+    baseUrl: str,
+    recipientId: str,
+    outputDir: str,
+    pollInterval: int,
+    maxIterations: int,
+) -> None:
+    iteration = 0
+    while True:
+        pendingFiles = fetchPendingFiles(baseUrl, recipientId)
+        if pendingFiles is None:
+            logging.warning("Unable to retrieve pending files; will retry after delay.")
+        elif not pendingFiles:
+            logging.info("No pending files for recipient %s.", recipientId)
+        else:
+            logging.info("Found %d pending file(s) for recipient %s.", len(pendingFiles), recipientId)
+            for pendingFile in pendingFiles:
+                fetchToken = pendingFile.get("fetchToken")
+                if not fetchToken:
+                    logging.warning("Skipping pending entry without fetchToken: %s", pendingFile)
+                    continue
+
+                filename = pendingFile.get("originalFilename") or pendingFile.get("fileId")
+                logging.info(
+                    "Fetching pending file %s with token %s.",
+                    filename,
+                    fetchToken,
+                )
+                performFetch(baseUrl, fetchToken, outputDir)
+
+        iteration += 1
+        if maxIterations and iteration >= maxIterations:
+            break
+
+        time.sleep(pollInterval)
+
+
 def performStatusUpdates(
     baseUrl: str,
     apiKey: str,
@@ -234,18 +410,36 @@ def main() -> None:
     configureLogging()
     arguments = parseArguments()
 
-    if arguments.command == "fetch":
-        performFetch(arguments.baseUrl, arguments.fetchToken, arguments.outputDir)
-    elif arguments.command == "status":
-        performStatusUpdates(
-            arguments.baseUrl,
-            arguments.apiKey,
-            arguments.printerSerial,
-            arguments.interval,
-            arguments.numUpdates,
-        )
-    else:
-        logging.error("Unknown command: %s", arguments.command)
+    try:
+        if arguments.command == "fetch":
+            baseUrl = resolveBaseUrl(arguments.baseUrl)
+            performFetch(baseUrl, arguments.fetchToken, arguments.outputDir)
+        elif arguments.command == "status":
+            baseUrl = resolveBaseUrl(arguments.baseUrl)
+            apiKey = resolveApiKey(arguments.apiKey)
+            printerSerial = resolvePrinterSerial(arguments.printerSerial)
+            performStatusUpdates(
+                baseUrl,
+                apiKey,
+                printerSerial,
+                arguments.interval,
+                arguments.numUpdates,
+            )
+        elif arguments.command == "listen":
+            baseUrl = resolveBaseUrl(arguments.baseUrl)
+            recipientId = resolveRecipientId(arguments.recipientId)
+            listenForFiles(
+                baseUrl,
+                recipientId,
+                arguments.outputDir,
+                arguments.pollInterval,
+                arguments.maxIterations,
+            )
+        else:
+            logging.error("Unknown command: %s", arguments.command)
+    except ValueError as error:
+        logging.error("%s", error)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
