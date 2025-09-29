@@ -9,8 +9,9 @@ from types import ModuleType, SimpleNamespace
 import pytest
 
 fakeFlaskModule = ModuleType('flask')
-fakeWerkzeugModule = ModuleType('werkzeug')
-fakeWerkzeugUtilsModule = ModuleType('werkzeug.utils')
+werkzeugModule = ModuleType('werkzeug')
+werkzeugUtilsModule = ModuleType('werkzeug.utils')
+
 
 
 class DummyFlask:
@@ -48,9 +49,16 @@ sys.modules['flask'] = fakeFlaskModule
 sys.modules['werkzeug'] = fakeWerkzeugModule
 sys.modules['werkzeug.utils'] = fakeWerkzeugUtilsModule
 
-werkzeugModule = ModuleType('werkzeug')
-werkzeugUtilsModule = ModuleType('werkzeug.utils')
-werkzeugUtilsModule.secure_filename = lambda value: value  # noqa: E731
+
+def secureFilename(value):
+    sanitized = ''.join(
+        character for character in value if character.isalnum() or character in {'.', '_', '-'}
+    )
+    return sanitized.strip(' .')
+
+
+werkzeugUtilsModule.secure_filename = secureFilename
+
 werkzeugModule.utils = werkzeugUtilsModule
 sys.modules['werkzeug'] = werkzeugModule
 sys.modules['werkzeug.utils'] = werkzeugUtilsModule
@@ -141,10 +149,10 @@ class MockBlob:
 
 
 class MockUploadFile:
-    def __init__(self, data, filename):
+    def __init__(self, data, filename, mimetype='application/octet-stream'):
         self.stream = BytesIO(data)
         self.filename = filename
-        self.mimetype = 'application/octet-stream'
+        self.mimetype = mimetype
 
     def read(self, *_args, **_kwargs):
         return self.stream.read(*_args, **_kwargs)
@@ -276,7 +284,7 @@ def testFetchFileFirstUseSuccess(monkeypatch):
     metadata = {
         'encryptedData': '7b7d',
         'unencryptedData': {'visible': 'info'},
-        'gcsPath': 'recipient123/file.txt',
+        'gcsPath': 'recipient123/file.gcode',
         'fetchTokenExpiry': datetime.now(timezone.utc) + timedelta(minutes=5),
         'fetchTokenConsumed': False,
     }
@@ -313,7 +321,7 @@ def testFetchFileRejectsConsumedToken(monkeypatch):
     metadata = {
         'encryptedData': '7b7d',
         'unencryptedData': {'visible': 'info'},
-        'gcsPath': 'recipient123/file.txt',
+        'gcsPath': 'recipient123/file.gcode',
         'fetchTokenExpiry': datetime.now(timezone.utc) + timedelta(minutes=5),
         'fetchTokenConsumed': True,
     }
@@ -344,7 +352,7 @@ def testFetchFileRejectsExpiredToken(monkeypatch):
     metadata = {
         'encryptedData': '7b7d',
         'unencryptedData': {'visible': 'info'},
-        'gcsPath': 'recipient123/file.txt',
+        'gcsPath': 'recipient123/file.gcode',
         'fetchTokenExpiry': datetime.now(timezone.utc) - timedelta(minutes=1),
         'fetchTokenConsumed': False,
     }
