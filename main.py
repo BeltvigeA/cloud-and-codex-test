@@ -3,11 +3,12 @@ import logging
 import os
 import secrets
 import uuid
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 from flask import Flask, jsonify, request
 from google.api_core.exceptions import GoogleAPICallError
 from google.cloud import firestore, kms_v1, storage
+from google.cloud.firestore_v1 import DELETE_FIELD
 
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -25,6 +26,7 @@ firestoreCollectionPrinterStatus = os.environ.get('FIRESTORE_COLLECTION_PRINTER_
 apiKeysPrinterStatusStr = os.environ.get('API_KEYS_PRINTER_STATUS', '')
 validPrinterApiKeys = {apiKey.strip() for apiKey in apiKeysPrinterStatusStr.split(',') if apiKey.strip()}
 port = int(os.environ.get('PORT', '8080'))
+fetchTokenTtlMinutes = int(os.environ.get('FETCH_TOKEN_TTL_MINUTES', '15'))
 
 missingConfig = [
     configName
@@ -121,6 +123,8 @@ def uploadFile():
             'unencryptedData': unencryptedData,
             'recipientId': recipientId,
             'fetchToken': fetchToken,
+            'fetchTokenExpiry': datetime.now(timezone.utc) + timedelta(minutes=fetchTokenTtlMinutes),
+            'fetchTokenConsumed': False,
             'status': 'uploaded',
             'timestamp': firestore.SERVER_TIMESTAMP,
         }
@@ -163,6 +167,16 @@ def fetchFile(fetchToken: str):
         documentSnapshot = fileDocuments[0]
         fileMetadata = documentSnapshot.to_dict() or {}
 
+        if fileMetadata.get('fetchTokenConsumed'):
+            logging.warning('Fetch token already consumed for file %s', documentSnapshot.id)
+            return jsonify({'error': 'Fetch token already used'}), 410
+
+        fetchTokenExpiry = fileMetadata.get('fetchTokenExpiry')
+        currentTime = datetime.now(timezone.utc)
+        if fetchTokenExpiry and fetchTokenExpiry < currentTime:
+            logging.warning('Fetch token expired for file %s', documentSnapshot.id)
+            return jsonify({'error': 'Fetch token expired'}), 410
+
         encryptedDataCipherText = bytes.fromhex(fileMetadata['encryptedData'])
         try:
             decryptResponse = kmsClient.decrypt(
@@ -185,7 +199,14 @@ def fetchFile(fetchToken: str):
         logging.info('Generated signed URL for gs://%s/%s', gcsBucketName, fileMetadata['gcsPath'])
 
         firestoreClient.collection(firestoreCollectionFiles).document(documentSnapshot.id).update(
-            {'status': 'fetched', 'fetchedTimestamp': firestore.SERVER_TIMESTAMP}
+            {
+                'status': 'fetched',
+                'fetchedTimestamp': firestore.SERVER_TIMESTAMP,
+                'fetchToken': DELETE_FIELD,
+                'fetchTokenExpiry': DELETE_FIELD,
+                'fetchTokenConsumed': True,
+                'fetchTokenConsumedTimestamp': firestore.SERVER_TIMESTAMP,
+            }
         )
         logging.info('Updated status for file %s to fetched.', documentSnapshot.id)
 
