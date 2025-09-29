@@ -5,7 +5,7 @@ import secrets
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from flask import Flask, jsonify, request
 from google.api_core.exceptions import GoogleAPICallError
@@ -291,6 +291,16 @@ def generateFetchToken() -> str:
     return secrets.token_urlsafe(32)
 
 
+def normalizeTimestamp(value: Optional[datetime]) -> Optional[str]:
+    if not value or not isinstance(value, datetime):
+        return None
+
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+
+    return value.astimezone(timezone.utc).isoformat()
+
+
 @app.route('/upload', methods=['POST'])
 def uploadFile():
     logging.info('Received request to /upload')
@@ -509,6 +519,77 @@ def fetchFile(fetchToken: str):
 
     except Exception:  # pylint: disable=broad-except
         logging.exception('An unexpected error occurred during file fetch.')
+        return jsonify({'error': 'Internal server error'}), 500
+
+
+def buildPendingFileList(
+    firestoreClient: firestore.Client, recipientId: str
+) -> Tuple[List[Dict[str, Optional[str]]], List[str]]:
+    pendingFiles: List[Dict[str, Optional[str]]] = []
+    skippedFiles: List[str] = []
+    currentTime = datetime.now(timezone.utc)
+
+    fileQuery = (
+        firestoreClient.collection(firestoreCollectionFiles)
+        .where('recipientId', '==', recipientId)
+        .where('fetchTokenConsumed', '==', False)
+    )
+
+    for documentSnapshot in fileQuery.stream():
+        metadata = documentSnapshot.to_dict() or {}
+        fetchToken = metadata.get('fetchToken')
+        if not fetchToken:
+            skippedFiles.append(documentSnapshot.id)
+            continue
+
+        fetchTokenExpiry = metadata.get('fetchTokenExpiry')
+        if isinstance(fetchTokenExpiry, datetime) and fetchTokenExpiry < currentTime:
+            skippedFiles.append(documentSnapshot.id)
+            continue
+
+        pendingFiles.append(
+            {
+                'fileId': documentSnapshot.id,
+                'originalFilename': metadata.get('originalFilename'),
+                'fetchToken': fetchToken,
+                'fetchTokenExpiry': normalizeTimestamp(fetchTokenExpiry),
+                'status': metadata.get('status'),
+                'uploadedAt': normalizeTimestamp(metadata.get('timestamp')),
+            }
+        )
+
+    pendingFiles.sort(key=lambda item: item.get('uploadedAt') or '')
+
+    return pendingFiles, skippedFiles
+
+
+@app.route('/recipients/<recipientId>/pending', methods=['GET'])
+def listPendingFiles(recipientId: str):
+    logging.info('Received request to /recipients/%s/pending', recipientId)
+    try:
+        clients, errorResponse = fetchClientsOrResponse()
+        if errorResponse:
+            return jsonify(errorResponse[0]), errorResponse[1]
+
+        firestoreClient = clients.firestoreClient
+
+        if not recipientId:
+            logging.warning('Recipient ID is missing when listing pending files.')
+            return jsonify({'error': 'Recipient ID is required'}), 400
+
+        pendingFiles, skippedFiles = buildPendingFileList(firestoreClient, recipientId)
+
+        responsePayload = {
+            'recipientId': recipientId,
+            'pendingFiles': pendingFiles,
+        }
+        if skippedFiles:
+            responsePayload['skippedFiles'] = skippedFiles
+
+        return jsonify(responsePayload), 200
+
+    except Exception:  # pylint: disable=broad-except
+        logging.exception('An unexpected error occurred while listing pending files.')
         return jsonify({'error': 'Internal server error'}), 500
 
 

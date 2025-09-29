@@ -7,7 +7,7 @@ import sys
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
@@ -58,6 +58,34 @@ def parseArguments() -> argparse.Namespace:
         help="Number of updates to send (0 for indefinite).",
     )
 
+    listenParser = subparsers.add_parser(
+        "listen",
+        help="Continuously poll for files assigned to a recipient and download them.",
+    )
+    listenParser.add_argument("--baseUrl", required=True, help="Base URL of the Cloud Run service.")
+    listenParser.add_argument(
+        "--recipientId",
+        required=True,
+        help="Recipient identifier to filter pending files.",
+    )
+    listenParser.add_argument(
+        "--outputDir",
+        required=True,
+        help="Directory path to save downloaded files.",
+    )
+    listenParser.add_argument(
+        "--pollInterval",
+        type=int,
+        default=30,
+        help="Seconds to wait between polling attempts (default: 30).",
+    )
+    listenParser.add_argument(
+        "--maxIterations",
+        type=int,
+        default=0,
+        help="Maximum number of polling iterations (0 for indefinite).",
+    )
+
     return parser.parse_args()
 
 
@@ -71,6 +99,14 @@ def buildBaseUrl(baseUrl: str) -> str:
 def buildFetchUrl(baseUrl: str, fetchToken: str) -> str:
     sanitizedBase = buildBaseUrl(baseUrl)
     return f"{sanitizedBase}/fetch/{fetchToken}"
+
+
+def buildPendingUrl(baseUrl: str, recipientId: str) -> str:
+    sanitizedBase = buildBaseUrl(baseUrl)
+    sanitizedRecipient = recipientId.strip()
+    if not sanitizedRecipient:
+        raise ValueError("recipientId must not be empty")
+    return f"{sanitizedBase}/recipients/{sanitizedRecipient}/pending"
 
 
 def ensureOutputDirectory(outputDir: str) -> Path:
@@ -149,6 +185,30 @@ def performFetch(baseUrl: str, fetchToken: str, outputDir: str) -> None:
     logging.info("Fetch completed successfully. File saved at %s", savedFile)
 
 
+def fetchPendingFiles(baseUrl: str, recipientId: str) -> Optional[List[Dict[str, Any]]]:
+    pendingUrl = buildPendingUrl(baseUrl, recipientId)
+    logging.info("Checking for pending files for recipient %s", recipientId)
+    try:
+        response = requests.get(pendingUrl, timeout=30)
+        response.raise_for_status()
+    except requests.RequestException as error:
+        logging.error("Failed to fetch pending files: %s", error)
+        return None
+
+    try:
+        payload = response.json()
+    except json.JSONDecodeError as error:
+        logging.error("Invalid JSON response when listing pending files: %s", error)
+        return None
+
+    pendingFiles = payload.get("pendingFiles")
+    if not isinstance(pendingFiles, list):
+        logging.error("Unexpected response format when listing pending files: %s", payload)
+        return None
+
+    return pendingFiles
+
+
 def generateStatusPayload(
     printerSerial: str,
     iteration: int,
@@ -200,6 +260,43 @@ def generateStatusPayload(
     return payload, nextJobId
 
 
+def listenForFiles(
+    baseUrl: str,
+    recipientId: str,
+    outputDir: str,
+    pollInterval: int,
+    maxIterations: int,
+) -> None:
+    iteration = 0
+    while True:
+        pendingFiles = fetchPendingFiles(baseUrl, recipientId)
+        if pendingFiles is None:
+            logging.warning("Unable to retrieve pending files; will retry after delay.")
+        elif not pendingFiles:
+            logging.info("No pending files for recipient %s.", recipientId)
+        else:
+            logging.info("Found %d pending file(s) for recipient %s.", len(pendingFiles), recipientId)
+            for pendingFile in pendingFiles:
+                fetchToken = pendingFile.get("fetchToken")
+                if not fetchToken:
+                    logging.warning("Skipping pending entry without fetchToken: %s", pendingFile)
+                    continue
+
+                filename = pendingFile.get("originalFilename") or pendingFile.get("fileId")
+                logging.info(
+                    "Fetching pending file %s with token %s.",
+                    filename,
+                    fetchToken,
+                )
+                performFetch(baseUrl, fetchToken, outputDir)
+
+        iteration += 1
+        if maxIterations and iteration >= maxIterations:
+            break
+
+        time.sleep(pollInterval)
+
+
 def performStatusUpdates(
     baseUrl: str,
     apiKey: str,
@@ -243,6 +340,14 @@ def main() -> None:
             arguments.printerSerial,
             arguments.interval,
             arguments.numUpdates,
+        )
+    elif arguments.command == "listen":
+        listenForFiles(
+            arguments.baseUrl,
+            arguments.recipientId,
+            arguments.outputDir,
+            arguments.pollInterval,
+            arguments.maxIterations,
         )
     else:
         logging.error("Unknown command: %s", arguments.command)
