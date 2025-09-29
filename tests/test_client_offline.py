@@ -164,3 +164,50 @@ def test_listenOffline_supports_relative_paths(tmp_path: Path) -> None:
 
     savedFiles = sorted(path.name for path in outputDirectory.iterdir())
     assert savedFiles == ["inlineRelative.gcode", "relativeFile.gcode"]
+
+
+def test_listenOffline_relative_paths_from_different_working_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    datasetDirectory = tmp_path / "offlineDataset"
+    datasetDirectory.mkdir()
+
+    dataDirectory = datasetDirectory / "data"
+    metadataDirectory = datasetDirectory / "metadata"
+    dataDirectory.mkdir()
+    metadataDirectory.mkdir()
+
+    (dataDirectory / "jobData.gcode").write_bytes(b"job-data")
+    metadataPath = metadataDirectory / "jobMetadata.json"
+    metadataPath.write_text(
+        json.dumps(
+            {
+                "originalFilename": "jobData.gcode",
+                "unencryptedData": {"job": "relative-from-alt-cwd"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    dataset = {
+        "pendingFiles": [
+            {
+                "dataFile": "data/jobData.gcode",
+                "metadataFile": "metadata/jobMetadata.json",
+            }
+        ]
+    }
+
+    datasetPath = datasetDirectory / "dataset.json"
+    datasetPath.write_text(json.dumps(dataset), encoding="utf-8")
+
+    alternateWorkingDirectory = tmp_path / "alternateCwd"
+    alternateWorkingDirectory.mkdir()
+
+    outputDirectory = tmp_path / "offlineOutput"
+
+    monkeypatch.chdir(alternateWorkingDirectory)
+    client.listenOffline(str(datasetPath), str(outputDirectory))
+
+    savedFiles = sorted(path.name for path in outputDirectory.iterdir())
+    assert savedFiles == ["jobData.gcode"]
