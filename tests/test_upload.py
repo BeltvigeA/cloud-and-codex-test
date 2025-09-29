@@ -209,10 +209,9 @@ def appModule(monkeypatch):
 
 
 def buildRequest(module, fileStorage, formValues):
-    if hasattr(module, 'storageClient') and hasattr(
-        module.storageClient, 'bucketInstances'
-    ):
-        module.storageClient.bucketInstances.clear()
+    cachedClients = getattr(module, 'cachedClients', None)
+    if cachedClients and hasattr(cachedClients.storageClient, 'bucketInstances'):
+        cachedClients.storageClient.bucketInstances.clear()
     module.request.files = {'file': fileStorage}
     module.request.form = formValues
 
@@ -289,8 +288,10 @@ def test_uploadAcceptsUppercaseExtension(appModule):
     assert statusCode == 200
     assert payload['message'] == 'File uploaded successfully'
 
-    assert appModule.storageClient.bucketInstances
-    createdBucket = appModule.storageClient.bucketInstances[-1]
+    cachedClients = appModule.cachedClients
+    assert cachedClients is not None
+    assert cachedClients.storageClient.bucketInstances
+    createdBucket = cachedClients.storageClient.bucketInstances[-1]
     assert createdBucket.createdBlobs
     assert createdBucket.createdBlobs[-1].uploadCallCount == 1
 
@@ -310,4 +311,6 @@ def test_uploadRejectsExtensionBeforeUpload(appModule):
 
     assert statusCode == 400
     assert 'Unsupported file type' in payload['error']
-    assert appModule.storageClient.bucketInstances == []
+    cachedClients = appModule.cachedClients
+    assert cachedClients is not None
+    assert cachedClients.storageClient.bucketInstances == []
