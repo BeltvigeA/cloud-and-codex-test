@@ -13,6 +13,7 @@ werkzeugModule = ModuleType('werkzeug')
 werkzeugUtilsModule = ModuleType('werkzeug.utils')
 
 
+
 class DummyFlask:
     def __init__(self, _name):
         self.name = _name
@@ -32,7 +33,21 @@ fakeRequest = SimpleNamespace(files={}, form={})
 fakeFlaskModule.Flask = DummyFlask
 fakeFlaskModule.jsonify = dummyJsonify
 fakeFlaskModule.request = fakeRequest
+fakeWerkzeugModule.utils = fakeWerkzeugUtilsModule
+
+
+def secureFilename(value):
+    return ''.join(
+        character
+        for character in value
+        if character.isalnum() or character in {'.', '_', '-'}
+    ).strip(' .')
+
+
+fakeWerkzeugUtilsModule.secure_filename = secureFilename
 sys.modules['flask'] = fakeFlaskModule
+sys.modules['werkzeug'] = fakeWerkzeugModule
+sys.modules['werkzeug.utils'] = fakeWerkzeugUtilsModule
 
 
 def secureFilename(value):
