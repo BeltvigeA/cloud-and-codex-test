@@ -62,6 +62,95 @@ class ClientBundle:
 cachedClients: Optional[ClientBundle] = None
 
 
+def tryParseKeyValueObject(rawValue: str) -> Optional[dict]:
+    sanitizedValue = rawValue.strip()
+    if not sanitizedValue:
+        return None
+
+    if sanitizedValue[0] == '{' and sanitizedValue[-1] == '}':
+        sanitizedValue = sanitizedValue[1:-1].strip()
+
+    if not sanitizedValue:
+        return {}
+
+    segments = []
+    currentSegment = []
+    insideQuotes = False
+    quoteCharacter = ''
+    escapeNext = False
+    nestingDepth = 0
+
+    for character in sanitizedValue:
+        if escapeNext:
+            currentSegment.append(character)
+            escapeNext = False
+            continue
+
+        if character == '\\':
+            currentSegment.append(character)
+            escapeNext = True
+            continue
+
+        if character in {'"', "'"}:
+            if insideQuotes and character == quoteCharacter:
+                insideQuotes = False
+            elif not insideQuotes:
+                insideQuotes = True
+                quoteCharacter = character
+            currentSegment.append(character)
+            continue
+
+        if character in {'{', '['} and not insideQuotes:
+            nestingDepth += 1
+        elif character in {'}', ']'} and not insideQuotes and nestingDepth > 0:
+            nestingDepth -= 1
+
+        if character in {',', ';', '&'} and not insideQuotes and nestingDepth == 0:
+            segment = ''.join(currentSegment).strip()
+            if segment:
+                segments.append(segment)
+            currentSegment = []
+            continue
+
+        currentSegment.append(character)
+
+    finalSegment = ''.join(currentSegment).strip()
+    if finalSegment:
+        segments.append(finalSegment)
+
+    if not segments:
+        return None
+
+    parsedObject = {}
+    for segment in segments:
+        separatorIndex = -1
+        for separator in (':', '='):
+            if separator in segment:
+                separatorIndex = segment.find(separator)
+                break
+
+        if separatorIndex == -1:
+            return None
+
+        rawKey = segment[:separatorIndex].strip().strip("\"'")
+        rawValuePart = segment[separatorIndex + 1 :].strip()
+
+        if not rawKey:
+            return None
+
+        if rawValuePart and rawValuePart[0] in {'"', "'"} and rawValuePart[-1] == rawValuePart[0]:
+            rawValuePart = rawValuePart[1:-1]
+
+        try:
+            normalizedValue = bytes(rawValuePart, 'utf-8').decode('unicode_escape')
+        except UnicodeDecodeError:
+            normalizedValue = rawValuePart
+
+        parsedObject[rawKey] = normalizedValue
+
+    return parsedObject if parsedObject else None
+
+
 def parseJsonObjectField(rawValue: str, fieldName: str) -> Tuple[Optional[dict], Optional[Tuple[dict, int]]]:
     """Parse a JSON object field that may arrive with varying quoting/escaping."""
 
@@ -105,6 +194,11 @@ def parseJsonObjectField(rawValue: str, fieldName: str) -> Tuple[Optional[dict],
 
             logging.warning('JSON payload for %s must be an object, received %s.', fieldName, type(parsedValue).__name__)
             return None, ({'error': 'Invalid JSON format for associated data'}, 400)
+
+    fallbackParsed = tryParseKeyValueObject(rawValue)
+    if fallbackParsed is not None:
+        logging.info('Parsed field %s using key/value fallback.', fieldName)
+        return fallbackParsed, None
 
     if lastErrorMessage:
         logging.warning('Invalid JSON for field %s: %s', fieldName, lastErrorMessage)

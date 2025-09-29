@@ -385,3 +385,17 @@ def testUploadFileReportsPermissionFailure(monkeypatch):
     assert statusCode == 500
     assert responseBody['error'] == 'Failed to initialize Google Cloud clients'
     assert responseBody['detail'] == 'Permission denied'
+
+
+def testParseJsonObjectFieldParsesKeyValueFallback():
+    parsedValue, errorResponse = main.parseJsonObjectField('{printJob:demo}', 'unencrypted_data')
+
+    assert errorResponse is None
+    assert parsedValue == {'printJob': 'demo'}
+
+
+def testParseJsonObjectFieldParsesEqualsFallback():
+    parsedValue, errorResponse = main.parseJsonObjectField('secret=1234', 'encrypted_data_payload')
+
+    assert errorResponse is None
+    assert parsedValue == {'secret': '1234'}
