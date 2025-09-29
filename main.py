@@ -3,7 +3,9 @@ import logging
 import os
 import secrets
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from typing import List, Optional, Tuple
 
 from flask import Flask, jsonify, request
 from google.api_core.exceptions import GoogleAPICallError
@@ -26,11 +28,6 @@ allowedUploadMimeTypes = {
 }
 
 
-gcpProjectId = os.environ.get('GCP_PROJECT_ID')
-gcsBucketName = os.environ.get('GCS_BUCKET_NAME')
-kmsKeyRing = os.environ.get('KMS_KEY_RING')
-kmsKeyName = os.environ.get('KMS_KEY_NAME')
-kmsLocation = os.environ.get('KMS_LOCATION')
 firestoreCollectionFiles = os.environ.get('FIRESTORE_COLLECTION_FILES', 'files')
 firestoreCollectionPrinterStatus = os.environ.get('FIRESTORE_COLLECTION_PRINTER_STATUS', 'printer_status_updates')
 apiKeysPrinterStatusStr = os.environ.get('API_KEYS_PRINTER_STATUS', '')
@@ -38,36 +35,110 @@ validPrinterApiKeys = {apiKey.strip() for apiKey in apiKeysPrinterStatusStr.spli
 port = int(os.environ.get('PORT', '8080'))
 fetchTokenTtlMinutes = int(os.environ.get('FETCH_TOKEN_TTL_MINUTES', '15'))
 
-missingConfig = [
-    configName
-    for configName, configValue in [
-        ('GCP_PROJECT_ID', gcpProjectId),
-        ('GCS_BUCKET_NAME', gcsBucketName),
-        ('KMS_KEY_RING', kmsKeyRing),
-        ('KMS_KEY_NAME', kmsKeyName),
-        ('KMS_LOCATION', kmsLocation),
+
+class MissingEnvironmentError(RuntimeError):
+    def __init__(self, missingVariables: List[str]):
+        self.missingVariables = missingVariables
+        message = ', '.join(sorted(missingVariables))
+        super().__init__(f'Missing environment variables: {message}')
+
+
+class ClientInitializationError(RuntimeError):
+    def __init__(self, component: str, error: Exception):
+        self.component = component
+        self.detail = str(error)
+        super().__init__(f'Failed to initialize {component}: {error}')
+
+
+@dataclass(frozen=True)
+class ClientBundle:
+    storageClient: storage.Client
+    firestoreClient: firestore.Client
+    kmsClient: kms_v1.KeyManagementServiceClient
+    kmsKeyPath: str
+    gcsBucketName: str
+
+
+cachedClients: Optional[ClientBundle] = None
+
+
+def getClients() -> ClientBundle:
+    global cachedClients  # pylint: disable=global-statement
+
+    if cachedClients is not None:
+        return cachedClients
+
+    gcpProjectId = os.environ.get('GCP_PROJECT_ID')
+    gcsBucketName = os.environ.get('GCS_BUCKET_NAME')
+    kmsKeyRing = os.environ.get('KMS_KEY_RING')
+    kmsKeyName = os.environ.get('KMS_KEY_NAME')
+    kmsLocation = os.environ.get('KMS_LOCATION')
+
+    missingConfig = [
+        configName
+        for configName, configValue in [
+            ('GCP_PROJECT_ID', gcpProjectId),
+            ('GCS_BUCKET_NAME', gcsBucketName),
+            ('KMS_KEY_RING', kmsKeyRing),
+            ('KMS_KEY_NAME', kmsKeyName),
+            ('KMS_LOCATION', kmsLocation),
+        ]
+        if not configValue
     ]
-    if not configValue
-]
 
-if missingConfig:
-    logging.error(
-        "Missing one or more essential environment variables: %s",
-        ', '.join(missingConfig),
+    if missingConfig:
+        raise MissingEnvironmentError(missingConfig)
+
+    try:
+        storageClient = storage.Client(project=gcpProjectId)
+        firestoreClient = firestore.Client(project=gcpProjectId)
+        kmsClient = kms_v1.KeyManagementServiceClient()
+        kmsKeyPath = kmsClient.crypto_key_path(gcpProjectId, kmsLocation, kmsKeyRing, kmsKeyName)
+    except Exception as error:  # pylint: disable=broad-except
+        raise ClientInitializationError('Google Cloud clients', error) from error
+
+    cachedClients = ClientBundle(
+        storageClient=storageClient,
+        firestoreClient=firestoreClient,
+        kmsClient=kmsClient,
+        kmsKeyPath=kmsKeyPath,
+        gcsBucketName=gcsBucketName,
     )
-    raise RuntimeError('Missing essential environment configuration')
 
-storageClient = storage.Client(project=gcpProjectId)
-firestoreClient = firestore.Client(project=gcpProjectId)
-kmsClient = kms_v1.KeyManagementServiceClient()
-kmsKeyPath = kmsClient.crypto_key_path(gcpProjectId, kmsLocation, kmsKeyRing, kmsKeyName)
+    logging.info(
+        "Initialized Google Cloud clients with Project: %s, Bucket: %s, KMS Key: %s",
+        gcpProjectId,
+        gcsBucketName,
+        kmsKeyPath,
+    )
 
-logging.info(
-    "Initialized Google Cloud clients with Project: %s, Bucket: %s, KMS Key: %s",
-    gcpProjectId,
-    gcsBucketName,
-    kmsKeyPath,
-)
+    return cachedClients
+
+
+def fetchClientsOrResponse() -> Tuple[Optional[ClientBundle], Optional[Tuple[dict, int]]]:
+    try:
+        return getClients(), None
+    except MissingEnvironmentError as error:
+        logging.error(
+            "Missing one or more essential environment variables: %s",
+            ', '.join(sorted(error.missingVariables)),
+        )
+        return None, (
+            {
+                'error': 'Missing environment configuration',
+                'missingVariables': sorted(error.missingVariables),
+            },
+            503,
+        )
+    except ClientInitializationError as error:
+        logging.error('Failed to initialize Google Cloud clients: %s', error.detail)
+        return None, (
+            {
+                'error': 'Failed to initialize Google Cloud clients',
+                'detail': error.detail,
+            },
+            500,
+        )
 
 
 def generateFetchToken() -> str:
@@ -78,6 +149,16 @@ def generateFetchToken() -> str:
 def uploadFile():
     logging.info('Received request to /upload')
     try:
+        clients, errorResponse = fetchClientsOrResponse()
+        if errorResponse:
+            return jsonify(errorResponse[0]), errorResponse[1]
+
+        storageClient = clients.storageClient
+        firestoreClient = clients.firestoreClient
+        kmsClient = clients.kmsClient
+        kmsKeyPath = clients.kmsKeyPath
+        gcsBucketName = clients.gcsBucketName
+
         if 'file' not in request.files:
             logging.warning('No file part in the request.')
             return jsonify({'error': 'No file part'}), 400
@@ -197,6 +278,16 @@ def uploadFile():
 def fetchFile(fetchToken: str):
     logging.info('Received request to /fetch/%s', fetchToken)
     try:
+        clients, errorResponse = fetchClientsOrResponse()
+        if errorResponse:
+            return jsonify(errorResponse[0]), errorResponse[1]
+
+        storageClient = clients.storageClient
+        firestoreClient = clients.firestoreClient
+        kmsClient = clients.kmsClient
+        kmsKeyPath = clients.kmsKeyPath
+        gcsBucketName = clients.gcsBucketName
+
         if not fetchToken:
             logging.warning('Fetch token is missing.')
             return jsonify({'error': 'Fetch token is required'}), 400
@@ -276,6 +367,12 @@ def fetchFile(fetchToken: str):
 def printerStatusUpdate():
     logging.info('Received request to /printer-status')
     try:
+        clients, errorResponse = fetchClientsOrResponse()
+        if errorResponse:
+            return jsonify(errorResponse[0]), errorResponse[1]
+
+        firestoreClient = clients.firestoreClient
+
         apiKey = request.headers.get('X-API-Key')
         if not apiKey or apiKey not in validPrinterApiKeys:
             logging.warning('Unauthorized access attempt to /printer-status with API Key: %s', apiKey)

@@ -48,6 +48,13 @@ sys.modules['flask'] = fakeFlaskModule
 sys.modules['werkzeug'] = fakeWerkzeugModule
 sys.modules['werkzeug.utils'] = fakeWerkzeugUtilsModule
 
+werkzeugModule = ModuleType('werkzeug')
+werkzeugUtilsModule = ModuleType('werkzeug.utils')
+werkzeugUtilsModule.secure_filename = lambda value: value  # noqa: E731
+werkzeugModule.utils = werkzeugUtilsModule
+sys.modules['werkzeug'] = werkzeugModule
+sys.modules['werkzeug.utils'] = werkzeugUtilsModule
+
 googleModule = ModuleType('google')
 cloudModule = ModuleType('google.cloud')
 firestoreModule = ModuleType('google.cloud.firestore')
@@ -221,8 +228,16 @@ class MockDocumentSnapshot:
 
 @pytest.fixture(autouse=True)
 def resetClients(monkeypatch):
-    monkeypatch.setattr(main, 'storageClient', MockStorageClient())
-    monkeypatch.setattr(main, 'kmsClient', MockEncryptClient({'sensitive': 'value'}))
+    monkeypatch.setattr(main, 'cachedClients', None)
+    defaultBundle = main.ClientBundle(
+        storageClient=MockStorageClient(),
+        firestoreClient=MockFirestoreClient(),
+        kmsClient=MockEncryptClient({'sensitive': 'value'}),
+        kmsKeyPath='projects/test/locations/test/keyRings/test/cryptoKeys/test',
+        gcsBucketName='test-bucket',
+    )
+
+    monkeypatch.setattr(main, 'getClients', lambda: defaultBundle)
     fakeRequest.files = {}
     fakeRequest.form = {}
     yield
@@ -230,7 +245,14 @@ def resetClients(monkeypatch):
 
 def testUploadFileStoresExpiryMetadata(monkeypatch):
     metadataRecorder = {'set': None, 'update': []}
-    monkeypatch.setattr(main, 'firestoreClient', MockFirestoreClient(updateRecorder=metadataRecorder))
+    mockClients = main.ClientBundle(
+        storageClient=MockStorageClient(),
+        firestoreClient=MockFirestoreClient(updateRecorder=metadataRecorder),
+        kmsClient=MockEncryptClient({'sensitive': 'value'}),
+        kmsKeyPath='projects/test/locations/test/keyRings/test/cryptoKeys/test',
+        gcsBucketName='test-bucket',
+    )
+    monkeypatch.setattr(main, 'getClients', lambda: mockClients)
     monkeypatch.setattr(main, 'generateFetchToken', lambda: 'testFetchToken')
 
     fakeRequest.files = {'file': MockUploadFile(b'file-contents', 'test.gcode')}
@@ -260,11 +282,16 @@ def testFetchFileFirstUseSuccess(monkeypatch):
     }
     documentSnapshot = MockDocumentSnapshot('doc123', metadata)
     updateRecorder = {'set': None, 'update': []}
-    monkeypatch.setattr(
-        main,
-        'firestoreClient',
-        MockFirestoreClient(documentSnapshot=documentSnapshot, updateRecorder=updateRecorder),
+    mockClients = main.ClientBundle(
+        storageClient=MockStorageClient(),
+        firestoreClient=MockFirestoreClient(
+            documentSnapshot=documentSnapshot, updateRecorder=updateRecorder
+        ),
+        kmsClient=MockEncryptClient({'sensitive': 'value'}),
+        kmsKeyPath='projects/test/locations/test/keyRings/test/cryptoKeys/test',
+        gcsBucketName='test-bucket',
     )
+    monkeypatch.setattr(main, 'getClients', lambda: mockClients)
 
     fakeRequest.files = {}
     fakeRequest.form = {}
@@ -292,11 +319,16 @@ def testFetchFileRejectsConsumedToken(monkeypatch):
     }
     documentSnapshot = MockDocumentSnapshot('doc123', metadata)
     updateRecorder = {'set': None, 'update': []}
-    monkeypatch.setattr(
-        main,
-        'firestoreClient',
-        MockFirestoreClient(documentSnapshot=documentSnapshot, updateRecorder=updateRecorder),
+    mockClients = main.ClientBundle(
+        storageClient=MockStorageClient(),
+        firestoreClient=MockFirestoreClient(
+            documentSnapshot=documentSnapshot, updateRecorder=updateRecorder
+        ),
+        kmsClient=MockEncryptClient({'sensitive': 'value'}),
+        kmsKeyPath='projects/test/locations/test/keyRings/test/cryptoKeys/test',
+        gcsBucketName='test-bucket',
     )
+    monkeypatch.setattr(main, 'getClients', lambda: mockClients)
 
     fakeRequest.files = {}
     fakeRequest.form = {}
@@ -318,11 +350,16 @@ def testFetchFileRejectsExpiredToken(monkeypatch):
     }
     documentSnapshot = MockDocumentSnapshot('doc123', metadata)
     updateRecorder = {'set': None, 'update': []}
-    monkeypatch.setattr(
-        main,
-        'firestoreClient',
-        MockFirestoreClient(documentSnapshot=documentSnapshot, updateRecorder=updateRecorder),
+    mockClients = main.ClientBundle(
+        storageClient=MockStorageClient(),
+        firestoreClient=MockFirestoreClient(
+            documentSnapshot=documentSnapshot, updateRecorder=updateRecorder
+        ),
+        kmsClient=MockEncryptClient({'sensitive': 'value'}),
+        kmsKeyPath='projects/test/locations/test/keyRings/test/cryptoKeys/test',
+        gcsBucketName='test-bucket',
     )
+    monkeypatch.setattr(main, 'getClients', lambda: mockClients)
 
     fakeRequest.files = {}
     fakeRequest.form = {}
@@ -332,3 +369,29 @@ def testFetchFileRejectsExpiredToken(monkeypatch):
     assert statusCode == 410
     assert 'expired' in responseBody['error']
     assert not updateRecorder['update'], 'Update should not be called for expired tokens'
+
+
+def testUploadFileReportsMissingEnvironment(monkeypatch):
+    def raiseMissing():
+        raise main.MissingEnvironmentError(['GCP_PROJECT_ID'])
+
+    monkeypatch.setattr(main, 'getClients', raiseMissing)
+
+    responseBody, statusCode = main.uploadFile()
+
+    assert statusCode == 503
+    assert responseBody['error'] == 'Missing environment configuration'
+    assert responseBody['missingVariables'] == ['GCP_PROJECT_ID']
+
+
+def testUploadFileReportsPermissionFailure(monkeypatch):
+    def raisePermission():
+        raise main.ClientInitializationError('Google Cloud clients', Exception('Permission denied'))
+
+    monkeypatch.setattr(main, 'getClients', raisePermission)
+
+    responseBody, statusCode = main.uploadFile()
+
+    assert statusCode == 500
+    assert responseBody['error'] == 'Failed to initialize Google Cloud clients'
+    assert responseBody['detail'] == 'Permission denied'
