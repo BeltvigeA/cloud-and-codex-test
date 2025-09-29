@@ -13,6 +13,9 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import requests
 
 
+defaultBaseUrl = "https://printer-backend-934564650450.europe-west1.run.app"
+
+
 def configureLogging() -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -37,7 +40,11 @@ def parseArguments() -> argparse.Namespace:
         default="remote",
         help="Select remote HTTP backend or offline file-based backend.",
     )
-    fetchParser.add_argument("--baseUrl", help="Base URL of the Cloud Run service.")
+    fetchParser.add_argument(
+        "--baseUrl",
+        default=defaultBaseUrl,
+        help="Base URL of the Cloud Run service.",
+    )
     fetchParser.add_argument("--fetchToken", help="Fetch token provided by the web app.")
     fetchParser.add_argument(
         "--metadataFile",
@@ -57,7 +64,11 @@ def parseArguments() -> argparse.Namespace:
         "status",
         help="Send printer status updates to the Cloud Run service.",
     )
-    statusParser.add_argument("--baseUrl", required=True, help="Base URL of the Cloud Run service.")
+    statusParser.add_argument(
+        "--baseUrl",
+        default=defaultBaseUrl,
+        help="Base URL of the Cloud Run service.",
+    )
     statusParser.add_argument("--apiKey", required=True, help="API key for authenticating with the server.")
     statusParser.add_argument("--printerSerial", required=True, help="Unique printer serial number.")
     statusParser.add_argument(
@@ -83,7 +94,11 @@ def parseArguments() -> argparse.Namespace:
         default="remote",
         help="Select remote HTTP backend or offline file-based backend.",
     )
-    listenParser.add_argument("--baseUrl", help="Base URL of the Cloud Run service.")
+    listenParser.add_argument(
+        "--baseUrl",
+        default=defaultBaseUrl,
+        help="Base URL of the Cloud Run service.",
+    )
     listenParser.add_argument(
         "--recipientId",
         help="Recipient identifier to filter pending files.",
@@ -131,6 +146,20 @@ def buildPendingUrl(baseUrl: str, recipientId: str) -> str:
     if not sanitizedRecipient:
         raise ValueError("recipientId must not be empty")
     return f"{sanitizedBase}/recipients/{sanitizedRecipient}/pending"
+
+
+def validateBaseUrlArgument(baseUrl: Optional[str], commandName: str) -> bool:
+    if not isinstance(baseUrl, str) or not baseUrl.strip():
+        logging.error("Missing required options for remote %s: --baseUrl", commandName)
+        return False
+
+    try:
+        buildBaseUrl(baseUrl)
+    except ValueError as error:
+        logging.error("Invalid --baseUrl for remote %s: %s", commandName, error)
+        return False
+
+    return True
 
 
 def ensureOutputDirectory(outputDir: str) -> Path:
@@ -508,34 +537,22 @@ def performStatusUpdates(
 
 
 def validateRemoteFetchArguments(arguments: argparse.Namespace) -> bool:
-    missingOptions = []
-    if not arguments.baseUrl:
-        missingOptions.append("--baseUrl")
-    if not arguments.fetchToken:
-        missingOptions.append("--fetchToken")
+    if not validateBaseUrlArgument(arguments.baseUrl, "fetch"):
+        return False
 
-    if missingOptions:
-        logging.error(
-            "Missing required options for remote fetch: %s",
-            ", ".join(missingOptions),
-        )
+    if not arguments.fetchToken:
+        logging.error("Missing required options for remote fetch: --fetchToken")
         return False
 
     return True
 
 
 def validateRemoteListenArguments(arguments: argparse.Namespace) -> bool:
-    missingOptions = []
-    if not arguments.baseUrl:
-        missingOptions.append("--baseUrl")
-    if not arguments.recipientId:
-        missingOptions.append("--recipientId")
+    if not validateBaseUrlArgument(arguments.baseUrl, "listen"):
+        return False
 
-    if missingOptions:
-        logging.error(
-            "Missing required options for remote listen: %s",
-            ", ".join(missingOptions),
-        )
+    if not arguments.recipientId:
+        logging.error("Missing required options for remote listen: --recipientId")
         return False
 
     return True
