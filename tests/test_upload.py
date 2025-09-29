@@ -11,9 +11,11 @@ import pytest
 class DummyBlob:
     def __init__(self):
         self.uploadedPayloads = []
+        self.uploadCallCount = 0
 
     def upload_from_file(self, fileHandle):
         # Read the file to simulate upload and store content for assertions if needed.
+        self.uploadCallCount += 1
         self.uploadedPayloads.append(fileHandle.read())
         fileHandle.seek(0)
 
@@ -22,16 +24,24 @@ class DummyBlob:
 
 
 class DummyBucket:
+    def __init__(self):
+        self.createdBlobs = []
+
     def blob(self, _name):
-        return DummyBlob()
+        blob = DummyBlob()
+        self.createdBlobs.append(blob)
+        return blob
 
 
 class DummyStorageClient:
     def __init__(self, project=None):
         self.project = project
+        self.bucketInstances = []
 
     def bucket(self, _name):
-        return DummyBucket()
+        bucket = DummyBucket()
+        self.bucketInstances.append(bucket)
+        return bucket
 
 
 class DummyCollection:
@@ -199,6 +209,10 @@ def appModule(monkeypatch):
 
 
 def buildRequest(module, fileStorage, formValues):
+    if hasattr(module, 'storageClient') and hasattr(
+        module.storageClient, 'bucketInstances'
+    ):
+        module.storageClient.bucketInstances.clear()
     module.request.files = {'file': fileStorage}
     module.request.form = formValues
 
@@ -208,7 +222,7 @@ def extractResponse(result):
     return response.get_json(), statusCode
 
 
-def test_upload_accepts_allowed_extension(appModule):
+def test_uploadAcceptsAllowedExtension(appModule):
     buildRequest(
         appModule,
         DummyFileStorage(b'gcode data', 'print_job.gcode'),
@@ -225,7 +239,7 @@ def test_upload_accepts_allowed_extension(appModule):
     assert payload['message'] == 'File uploaded successfully'
 
 
-def test_upload_rejects_disallowed_extension(appModule):
+def test_uploadRejectsDisallowedExtension(appModule):
     buildRequest(
         appModule,
         DummyFileStorage(b'invalid data', 'notes.txt'),
@@ -242,7 +256,7 @@ def test_upload_rejects_disallowed_extension(appModule):
     assert 'Unsupported file type' in payload['error']
 
 
-def test_upload_rejects_disallowed_mime_type(appModule):
+def test_uploadRejectsDisallowedMimeType(appModule):
     buildRequest(
         appModule,
         DummyFileStorage(b'gcode data', 'build.gcode', mimetype='image/png'),
@@ -257,3 +271,43 @@ def test_upload_rejects_disallowed_mime_type(appModule):
 
     assert statusCode == 400
     assert 'Unsupported MIME type' in payload['error']
+
+
+def test_uploadAcceptsUppercaseExtension(appModule):
+    buildRequest(
+        appModule,
+        DummyFileStorage(b'gcode data', 'MODEL.GCO'),
+        {
+            'unencrypted_data': json.dumps({'info': 'value'}),
+            'encrypted_data_payload': json.dumps({'secret': 'value'}),
+            'recipient_id': 'recipient123',
+        },
+    )
+
+    payload, statusCode = extractResponse(appModule.uploadFile())
+
+    assert statusCode == 200
+    assert payload['message'] == 'File uploaded successfully'
+
+    assert appModule.storageClient.bucketInstances
+    createdBucket = appModule.storageClient.bucketInstances[-1]
+    assert createdBucket.createdBlobs
+    assert createdBucket.createdBlobs[-1].uploadCallCount == 1
+
+
+def test_uploadRejectsExtensionBeforeUpload(appModule):
+    buildRequest(
+        appModule,
+        DummyFileStorage(b'invalid data', '../../escape.exe'),
+        {
+            'unencrypted_data': '{}',
+            'encrypted_data_payload': '{}',
+            'recipient_id': 'recipient123',
+        },
+    )
+
+    payload, statusCode = extractResponse(appModule.uploadFile())
+
+    assert statusCode == 400
+    assert 'Unsupported file type' in payload['error']
+    assert appModule.storageClient.bucketInstances == []

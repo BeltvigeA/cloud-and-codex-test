@@ -9,6 +9,8 @@ from types import ModuleType, SimpleNamespace
 import pytest
 
 fakeFlaskModule = ModuleType('flask')
+werkzeugModule = ModuleType('werkzeug')
+werkzeugUtilsModule = ModuleType('werkzeug.utils')
 
 
 class DummyFlask:
@@ -31,6 +33,19 @@ fakeFlaskModule.Flask = DummyFlask
 fakeFlaskModule.jsonify = dummyJsonify
 fakeFlaskModule.request = fakeRequest
 sys.modules['flask'] = fakeFlaskModule
+
+
+def secureFilename(value):
+    sanitized = ''.join(
+        character for character in value if character.isalnum() or character in {'.', '_', '-'}
+    )
+    return sanitized.strip(' .')
+
+
+werkzeugUtilsModule.secure_filename = secureFilename
+werkzeugModule.utils = werkzeugUtilsModule
+sys.modules['werkzeug'] = werkzeugModule
+sys.modules['werkzeug.utils'] = werkzeugUtilsModule
 
 googleModule = ModuleType('google')
 cloudModule = ModuleType('google.cloud')
@@ -118,9 +133,10 @@ class MockBlob:
 
 
 class MockUploadFile:
-    def __init__(self, data, filename):
+    def __init__(self, data, filename, mimetype='application/octet-stream'):
         self.stream = BytesIO(data)
         self.filename = filename
+        self.mimetype = mimetype
 
     def read(self, *_args, **_kwargs):
         return self.stream.read(*_args, **_kwargs)
@@ -216,7 +232,7 @@ def testUploadFileStoresExpiryMetadata(monkeypatch):
     monkeypatch.setattr(main, 'firestoreClient', MockFirestoreClient(updateRecorder=metadataRecorder))
     monkeypatch.setattr(main, 'generateFetchToken', lambda: 'testFetchToken')
 
-    fakeRequest.files = {'file': MockUploadFile(b'file-contents', 'test.txt')}
+    fakeRequest.files = {'file': MockUploadFile(b'file-contents', 'test.gcode')}
     fakeRequest.form = {
         'unencrypted_data': json.dumps({'visible': 'info'}),
         'encrypted_data_payload': json.dumps({'secure': 'payload'}),
@@ -237,7 +253,7 @@ def testFetchFileFirstUseSuccess(monkeypatch):
     metadata = {
         'encryptedData': '7b7d',
         'unencryptedData': {'visible': 'info'},
-        'gcsPath': 'recipient123/file.txt',
+        'gcsPath': 'recipient123/file.gcode',
         'fetchTokenExpiry': datetime.now(timezone.utc) + timedelta(minutes=5),
         'fetchTokenConsumed': False,
     }
@@ -269,7 +285,7 @@ def testFetchFileRejectsConsumedToken(monkeypatch):
     metadata = {
         'encryptedData': '7b7d',
         'unencryptedData': {'visible': 'info'},
-        'gcsPath': 'recipient123/file.txt',
+        'gcsPath': 'recipient123/file.gcode',
         'fetchTokenExpiry': datetime.now(timezone.utc) + timedelta(minutes=5),
         'fetchTokenConsumed': True,
     }
@@ -295,7 +311,7 @@ def testFetchFileRejectsExpiredToken(monkeypatch):
     metadata = {
         'encryptedData': '7b7d',
         'unencryptedData': {'visible': 'info'},
-        'gcsPath': 'recipient123/file.txt',
+        'gcsPath': 'recipient123/file.gcode',
         'fetchTokenExpiry': datetime.now(timezone.utc) - timedelta(minutes=1),
         'fetchTokenConsumed': False,
     }
