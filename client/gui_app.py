@@ -31,6 +31,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QSizePolicy,
+    QScrollArea,
     QStackedWidget,
     QVBoxLayout,
     QWidget,
@@ -94,10 +95,11 @@ class NavigationList(QListWidget):
         self.setSpacing(6)
         self.setFrameShape(QFrame.NoFrame)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.setFocusPolicy(Qt.NoFocus)
         self.setSelectionMode(QListWidget.SingleSelection)
         self.setFixedWidth(200)
+        self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
         self.setSizeAdjustPolicy(QAbstractScrollArea.AdjustToContents)
 
     def addDestination(self, label: str) -> None:
@@ -113,7 +115,8 @@ class NavigationList(QListWidget):
         for index in range(self.count()):
             totalHeight += self.sizeHintForRow(index)
         totalHeight += max(0, self.count() - 1) * self.spacing()
-        self.setFixedHeight(totalHeight)
+        availableHeight = max(self.viewport().sizeHint().height(), 0)
+        self.setMinimumHeight(min(totalHeight, availableHeight or totalHeight))
 
 
 class PrinterDashboardWindow(QMainWindow):
@@ -123,9 +126,9 @@ class PrinterDashboardWindow(QMainWindow):
         self.resize(1280, 830)
 
         self.printers = self.samplePrinters()
-        self.jobs = self.sampleJobs()
-        self.sampleJobsList = list(self.jobs)
-        self.manualJobs = list(self.jobs)
+        self.jobs: List[JobInfo] = []
+        self.sampleJobsList: List[JobInfo] = []
+        self.manualJobs: List[JobInfo] = []
         self.remoteJobsList: List[JobInfo] = []
         self.currentRemoteJobIds: set[str] = set()
         self.remoteJobsSignature: tuple[str, ...] | None = None
@@ -179,8 +182,22 @@ class PrinterDashboardWindow(QMainWindow):
 
         logoWrapper = self.createLogoHeader()
         navigationWrapper.addWidget(logoWrapper)
-        navigationWrapper.addWidget(self.navigationList)
-        navigationWrapper.addStretch(1)
+
+        navigationScrollContent = QWidget()
+        navigationScrollLayout = QVBoxLayout(navigationScrollContent)
+        navigationScrollLayout.setContentsMargins(0, 0, 0, 0)
+        navigationScrollLayout.setSpacing(0)
+        navigationScrollLayout.addWidget(self.navigationList)
+        navigationScrollLayout.addStretch(1)
+
+        navigationScrollArea = QScrollArea()
+        navigationScrollArea.setWidgetResizable(True)
+        navigationScrollArea.setFrameShape(QFrame.NoFrame)
+        navigationScrollArea.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        navigationScrollArea.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        navigationScrollArea.setWidget(navigationScrollContent)
+
+        navigationWrapper.addWidget(navigationScrollArea, 1)
         navigationWrapperWidget = QWidget()
         navigationWrapperWidget.setLayout(navigationWrapper)
         navigationWrapperWidget.setFixedWidth(220)
@@ -216,6 +233,7 @@ class PrinterDashboardWindow(QMainWindow):
         self.refreshEventsList()
         self.updateListenerStatus()
         self.navigationList.setCurrentRow(0)
+        self.pollPendingJobs(force=True)
 
     def applyTheme(self) -> None:
         baseColor = "#101827"
@@ -1001,11 +1019,48 @@ class PrinterDashboardWindow(QMainWindow):
             layout.addWidget(label)
 
         layout.addStretch(1)
+        detailsButton = QPushButton("Details")
+        detailsButton.clicked.connect(partial(self.showJobDetails, job))
+        layout.addWidget(detailsButton)
         removeButton = QPushButton("Remove")
         removeButton.clicked.connect(partial(self.removeJob, job))
         layout.addWidget(removeButton)
 
         return row
+
+    def showJobDetails(self, job: JobInfo) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Job Details")
+        dialogLayout = QVBoxLayout(dialog)
+        dialogLayout.setSpacing(16)
+
+        infoLayout = QFormLayout()
+        infoLayout.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        infoLayout.setFormAlignment(Qt.AlignLeft | Qt.AlignTop)
+
+        def addInfoRow(label: str, value: str | None) -> None:
+            valueLabel = QLabel(value or "-")
+            valueLabel.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            infoLayout.addRow(label, valueLabel)
+
+        addInfoRow("Job Number", job.jobNumber or "-")
+        addInfoRow("Filename", job.filename)
+        addInfoRow("Target Printer", job.targetPrinter)
+        addInfoRow("Status", job.status)
+        addInfoRow("Material", job.material)
+        addInfoRow("Duration", job.duration)
+        addInfoRow("Job ID", job.jobId or "-")
+        addInfoRow("Uploaded", job.uploadedAt or "-")
+
+        dialogLayout.addLayout(infoLayout)
+
+        buttonBox = QDialogButtonBox(QDialogButtonBox.Close)
+        buttonBox.rejected.connect(dialog.reject)
+        buttonBox.accepted.connect(dialog.accept)
+        dialogLayout.addWidget(buttonBox)
+
+        buttonBox.button(QDialogButtonBox.Close).setText("Close")
+        dialog.exec()
 
     def refreshJobsTable(self) -> None:
         if self.jobsContainerLayout is None:
@@ -1253,7 +1308,7 @@ class PrinterDashboardWindow(QMainWindow):
         )
         if self.isListening:
             self.listenerPollTimer.start()
-            self.pollPendingJobs()
+            self.pollPendingJobs(force=True)
         else:
             self.listenerPollTimer.stop()
             self.listenerLastError = None
@@ -1268,8 +1323,8 @@ class PrinterDashboardWindow(QMainWindow):
             )
         )
 
-    def pollPendingJobs(self) -> None:
-        if not self.isListening:
+    def pollPendingJobs(self, force: bool = False) -> None:
+        if not force and not self.isListening:
             return
         try:
             pendingUrl = buildPendingUrl(self.backendBaseUrl, self.listenerChannel)
