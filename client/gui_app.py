@@ -5,7 +5,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from functools import partial
 from datetime import datetime
+from pathlib import Path
 from typing import List
+
+import sys
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QFont
@@ -36,7 +39,15 @@ from PySide6.QtWidgets import (
 import requests
 from requests import RequestException
 
-from .client import buildPendingUrl, defaultBaseUrl
+if __package__ in {None, ""}:
+    currentFilePath = Path(__file__).resolve()
+    projectRootPath = currentFilePath.parent.parent
+    projectRootString = str(projectRootPath)
+    if projectRootString not in sys.path:
+        sys.path.append(projectRootString)
+    from client.client import buildPendingUrl, defaultBaseUrl
+else:
+    from .client import buildPendingUrl, defaultBaseUrl
 
 
 @dataclass
