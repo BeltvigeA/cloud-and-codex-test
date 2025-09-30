@@ -356,6 +356,7 @@ class PrinterDashboardWindow(QMainWindow):
         self.jobs = [*self.remoteJobsList, *self.manualJobs]
 
 
+
     def updateManualJobCounter(self) -> None:
         highestNumber = 0
         for job in self.manualJobs:
@@ -1513,6 +1514,7 @@ class PrinterDashboardWindow(QMainWindow):
         logEventOnSuccess: bool = True,
     ) -> Optional[RemoteJobMetadata]:
         cacheKey = self.getJobCacheKey(job)
+
         if not job.fetchToken:
             if not silent:
                 QMessageBox.warning(
@@ -2273,6 +2275,23 @@ class PrinterDashboardWindow(QMainWindow):
             self.cacheRemoteJobSnapshot(job, payload)
 
         remoteJobs = [job for job, _ in remoteJobEntries]
+
+        for job in remoteJobs:
+            self.database.upsertJob(
+                StoredJob(
+                    jobId=job.jobId or f"remote-{uuid.uuid4().hex}",
+                    source="remote",
+                    jobNumber=job.jobNumber,
+                    filename=job.filename,
+                    targetPrinter=job.targetPrinter,
+                    status=job.status,
+                    material=job.material,
+                    duration=job.duration,
+                    uploadedAt=job.uploadedAt,
+                    fetchToken=job.fetchToken,
+                )
+            )
+        self.database.pruneJobs("remote", (job.jobId for job in remoteJobs if job.jobId))
 
         for job in remoteJobs:
             self.database.upsertJob(
