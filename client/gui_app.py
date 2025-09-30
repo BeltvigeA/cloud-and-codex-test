@@ -7,9 +7,10 @@ from functools import partial
 from datetime import datetime
 from typing import List
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
+    QAbstractScrollArea,
     QApplication,
     QComboBox,
     QDialog,
@@ -32,6 +33,11 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+import requests
+from requests import RequestException
+
+from .client import buildPendingUrl, defaultBaseUrl
+
 
 @dataclass
 class PrinterInfo:
@@ -52,6 +58,8 @@ class JobInfo:
     status: str
     material: str
     duration: str
+    jobId: str | None = None
+    uploadedAt: str | None = None
 
 
 @dataclass
@@ -79,6 +87,7 @@ class NavigationList(QListWidget):
         self.setFocusPolicy(Qt.NoFocus)
         self.setSelectionMode(QListWidget.SingleSelection)
         self.setFixedWidth(200)
+        self.setSizeAdjustPolicy(QAbstractScrollArea.AdjustToContents)
 
     def addDestination(self, label: str) -> None:
         item = QListWidgetItem(label)
@@ -86,6 +95,14 @@ class NavigationList(QListWidget):
         sizeHint.setHeight(sizeHint.height() + 8)
         item.setSizeHint(sizeHint)
         self.addItem(item)
+        self.updateListHeight()
+
+    def updateListHeight(self) -> None:
+        totalHeight = self.frameWidth() * 2
+        for index in range(self.count()):
+            totalHeight += self.sizeHintForRow(index)
+        totalHeight += max(0, self.count() - 1) * self.spacing()
+        self.setFixedHeight(totalHeight)
 
 
 class PrinterDashboardWindow(QMainWindow):
@@ -96,6 +113,11 @@ class PrinterDashboardWindow(QMainWindow):
 
         self.printers = self.samplePrinters()
         self.jobs = self.sampleJobs()
+        self.sampleJobsList = list(self.jobs)
+        self.manualJobs = list(self.jobs)
+        self.remoteJobsList: List[JobInfo] = []
+        self.currentRemoteJobIds: set[str] = set()
+        self.remoteJobsSignature: tuple[str, ...] | None = None
         self.events = self.sampleEvents()
         self.keys: List[KeyInfo] = []
         self.listenerChannel = "user-123"
@@ -103,6 +125,12 @@ class PrinterDashboardWindow(QMainWindow):
         self.jobCounter = (
             max((int(job.jobNumber.lstrip("#")) for job in self.jobs), default=0) + 1
         )
+        self.backendBaseUrl = defaultBaseUrl
+        self.listenerPollIntervalMs = 15000
+        self.listenerPollTimer = QTimer(self)
+        self.listenerPollTimer.setInterval(self.listenerPollIntervalMs)
+        self.listenerPollTimer.timeout.connect(self.pollPendingJobs)
+        self.listenerLastError: str | None = None
 
         self.metricValueLabels: dict[str, QLabel] = {}
         self.dashboardPrinterStatusLayout: QVBoxLayout | None = None
@@ -913,10 +941,9 @@ class PrinterDashboardWindow(QMainWindow):
                 status=status,
                 material=material,
                 duration=duration,
+                jobId=self.generateManualJobId(),
             )
-            self.jobs.append(job)
-            self.refreshJobsTable()
-            self.refreshDashboard()
+            self.addManualJob(job)
             self.logEvent(
                 ActivityEvent(
                     level="SUCCESS",
@@ -936,6 +963,9 @@ class PrinterDashboardWindow(QMainWindow):
         jobNumber = f"#{self.jobCounter}"
         self.jobCounter += 1
         return jobNumber
+
+    def generateManualJobId(self) -> str:
+        return f"manual-{max(0, self.jobCounter - 1)}"
 
     def createJobRow(self, job: JobInfo) -> QWidget:
         row = QFrame()
@@ -978,20 +1008,64 @@ class PrinterDashboardWindow(QMainWindow):
         for job in reversed(self.jobs):
             self.jobsContainerLayout.addWidget(self.createJobRow(job))
 
+    def addManualJob(self, job: JobInfo) -> None:
+        self.manualJobs.insert(0, job)
+        self.updateCombinedJobs()
+
+    def updateCombinedJobs(self, remoteJobs: List[JobInfo] | None = None) -> None:
+        if remoteJobs is not None:
+            self.remoteJobsList = remoteJobs
+        combinedJobs: List[JobInfo] = []
+        combinedJobs.extend(self.remoteJobsList)
+        combinedJobs.extend(self.manualJobs)
+        self.jobs = combinedJobs
+        self.refreshJobsTable()
+        self.refreshDashboard()
+
     def removeJob(self, job: JobInfo) -> None:
-        if job in self.jobs:
-            self.jobs.remove(job)
-            self.refreshJobsTable()
-            self.refreshDashboard()
-            self.logEvent(
-                ActivityEvent(
-                    level="WARNING",
-                    timestamp=datetime.now().strftime("%H:%M"),
-                    message=f"Removed job '{job.filename}'",
-                    category="jobs",
-                    color=self.getEventColor("WARNING"),
-                )
+        if job.jobId and job.jobId in self.currentRemoteJobIds:
+            QMessageBox.information(
+                self,
+                "Remote job",
+                "Cloud-managed jobs can only be cleared from the server dashboard.",
             )
+            return
+        if job in self.manualJobs:
+            self.manualJobs.remove(job)
+        elif job in self.jobs:
+            self.jobs.remove(job)
+        else:
+            return
+        self.updateCombinedJobs()
+        self.logEvent(
+            ActivityEvent(
+                level="WARNING",
+                timestamp=datetime.now().strftime("%H:%M"),
+                message=f"Removed job '{job.filename}'",
+                category="jobs",
+                color=self.getEventColor("WARNING"),
+            )
+        )
+
+    def formatJobDuration(self, rawDuration: object) -> str:
+        if rawDuration in (None, ""):
+            return "-"
+        if isinstance(rawDuration, (int, float)):
+            totalMinutes = int(rawDuration)
+            if totalMinutes <= 0:
+                return "-"
+            hours, minutes = divmod(totalMinutes, 60)
+            if hours:
+                return f"{hours}h {minutes:02d}m"
+            return f"{minutes}m"
+        return str(rawDuration)
+
+    def normalizeTimestamp(self, rawTimestamp: object) -> str | None:
+        if isinstance(rawTimestamp, str):
+            return rawTimestamp
+        if isinstance(rawTimestamp, datetime):
+            return rawTimestamp.strftime("%H:%M")
+        return None
 
     def showAddKeyDialog(self) -> None:
         dialog = QDialog(self)
@@ -1166,6 +1240,12 @@ class PrinterDashboardWindow(QMainWindow):
             if self.isListening
             else "Stopped listening for jobs"
         )
+        if self.isListening:
+            self.listenerPollTimer.start()
+            self.pollPendingJobs()
+        else:
+            self.listenerPollTimer.stop()
+            self.listenerLastError = None
         self.updateListenerStatus()
         self.logEvent(
             ActivityEvent(
@@ -1176,6 +1256,133 @@ class PrinterDashboardWindow(QMainWindow):
                 color=self.getEventColor(statusLevel),
             )
         )
+
+    def pollPendingJobs(self) -> None:
+        if not self.isListening:
+            return
+        try:
+            pendingUrl = buildPendingUrl(self.backendBaseUrl, self.listenerChannel)
+        except ValueError as error:
+            self.listenerPollTimer.stop()
+            self.isListening = False
+            self.updateListenerStatus()
+            errorMessage = f"Invalid backend address: {error}"
+            if self.listenerLastError != errorMessage:
+                self.listenerLastError = errorMessage
+                self.logEvent(
+                    ActivityEvent(
+                        level="ERROR",
+                        timestamp=datetime.now().strftime("%H:%M"),
+                        message=errorMessage,
+                        category="listener",
+                        color=self.getEventColor("ERROR"),
+                    )
+                )
+            QMessageBox.warning(self, "Invalid backend URL", errorMessage)
+            return
+
+        try:
+            response = requests.get(pendingUrl, timeout=10)
+            response.raise_for_status()
+        except RequestException as error:
+            warningMessage = f"Unable to reach cloud queue: {error}".rstrip(".")
+            if self.listenerLastError != warningMessage:
+                self.listenerLastError = warningMessage
+                self.logEvent(
+                    ActivityEvent(
+                        level="WARNING",
+                        timestamp=datetime.now().strftime("%H:%M"),
+                        message=warningMessage,
+                        category="listener",
+                        color=self.getEventColor("WARNING"),
+                    )
+                )
+            return
+
+        try:
+            payload = response.json()
+        except ValueError:
+            errorMessage = "Received invalid response from cloud queue"
+            if self.listenerLastError != errorMessage:
+                self.listenerLastError = errorMessage
+                self.logEvent(
+                    ActivityEvent(
+                        level="ERROR",
+                        timestamp=datetime.now().strftime("%H:%M"),
+                        message=errorMessage,
+                        category="listener",
+                        color=self.getEventColor("ERROR"),
+                    )
+                )
+            return
+
+        self.listenerLastError = None
+
+        pendingFiles = payload.get("pendingFiles")
+        if not isinstance(pendingFiles, list):
+            pendingFiles = []
+
+        remoteJobs: List[JobInfo] = []
+        for rawIndex, pending in enumerate(pendingFiles, start=1):
+            if not isinstance(pending, dict):
+                continue
+            jobIdSource = pending.get("fileId") or pending.get("fetchToken") or rawIndex
+            jobId = str(jobIdSource)
+            filename = pending.get("originalFilename") or pending.get("fileId") or f"Job {rawIndex}"
+            statusRaw = pending.get("status")
+            statusText = statusRaw.strip() if isinstance(statusRaw, str) else "Pending"
+            statusDisplay = statusText.replace("_", " ").title() if statusText else "Pending"
+            materialValue = pending.get("material") or pending.get("materialType") or "-"
+            targetPrinter = (
+                pending.get("targetPrinter")
+                or pending.get("printerSerial")
+                or pending.get("recipientId")
+                or "-"
+            )
+            durationValue = pending.get("duration") or pending.get("estimatedDuration")
+            uploadedAt = self.normalizeTimestamp(pending.get("uploadedAt"))
+            remoteJobs.append(
+                JobInfo(
+                    jobNumber="",
+                    filename=str(filename),
+                    targetPrinter=str(targetPrinter),
+                    status=statusDisplay,
+                    material=str(materialValue),
+                    duration=self.formatJobDuration(durationValue),
+                    jobId=jobId,
+                    uploadedAt=uploadedAt,
+                )
+            )
+
+        remoteJobs.sort(key=lambda job: job.uploadedAt or "", reverse=True)
+        for index, job in enumerate(remoteJobs, start=1):
+            job.jobNumber = f"#{index}"
+
+        self.currentRemoteJobIds = {job.jobId for job in remoteJobs if job.jobId}
+
+        if self.sampleJobsList:
+            self.manualJobs = [job for job in self.manualJobs if job not in self.sampleJobsList]
+            self.sampleJobsList = []
+
+        newSignature = tuple(sorted(f"{job.jobId}:{job.status}" for job in remoteJobs if job.jobId))
+        if self.remoteJobsSignature != newSignature:
+            self.remoteJobsSignature = newSignature
+            message = (
+                f"Cloud queue updated - {len(remoteJobs)} pending job(s)"
+                if remoteJobs
+                else "Cloud queue updated - no pending jobs"
+            )
+            self.logEvent(
+                ActivityEvent(
+                    level="INFO",
+                    timestamp=datetime.now().strftime("%H:%M"),
+                    message=message,
+                    category="jobs",
+                    color=self.getEventColor("INFO"),
+                )
+            )
+
+        self.updateCombinedJobs(remoteJobs)
 
     def saveListenerChannel(self) -> None:
         if self.listenerInput is None:
@@ -1267,6 +1474,8 @@ class PrinterDashboardWindow(QMainWindow):
                 status="Queued",
                 material="ABS",
                 duration="90m",
+                jobId=None,
+                uploadedAt="09:25",
             ),
             JobInfo(
                 jobNumber="#2",
@@ -1275,6 +1484,8 @@ class PrinterDashboardWindow(QMainWindow):
                 status="Queued",
                 material="PLA",
                 duration="120m",
+                jobId=None,
+                uploadedAt="08:54",
             ),
             JobInfo(
                 jobNumber="#1",
@@ -1283,6 +1494,8 @@ class PrinterDashboardWindow(QMainWindow):
                 status="Printing",
                 material="PETG",
                 duration="240m",
+                jobId=None,
+                uploadedAt="08:12",
             ),
         ]
 
