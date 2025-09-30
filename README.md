@@ -88,6 +88,17 @@ pyinstaller --name PrintMasterDashboard --windowed --noconfirm --collect-all PyS
 
 Dette oppretter en mappe `dist/PrintMasterDashboard` som inneholder `PrintMasterDashboard.exe`. Distribuer hele mappen for å sikre at alle nødvendige Qt-ressurser følger med.
 
+##### Bygge klienten for distribusjon
+
+1. Sørg for at du har installert prosjektavhengighetene (se avsnittet "Lokal PC-klient" over) i samme virtuelle miljø.
+2. Kjør kommandoen nedenfor fra prosjektroten for å rydde bort eventuelle tidligere byggartefakter:
+
+   ```bash
+   pyinstaller --clean --name PrintMasterDashboard --windowed --noconfirm --collect-all PySide6 --add-data "client:client" client/gui_app.py
+   ```
+
+3. Etter at kommandoen er ferdig, finner du den ferdige bygde klienten i `dist/PrintMasterDashboard/`. Pakk og distribuer hele mappen slik at alle nødvendige filer følger med.
+
 Tilgjengelige kommandoer:
 
 - **Hente én fil via token**:
