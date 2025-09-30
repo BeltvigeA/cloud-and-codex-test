@@ -3,19 +3,28 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import partial
+from datetime import datetime
 from typing import List
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QApplication,
+    QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QFormLayout,
     QFrame,
     QGridLayout,
     QHBoxLayout,
+    QLayout,
     QLabel,
+    QLineEdit,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QMessageBox,
     QPushButton,
     QSizePolicy,
     QStackedWidget,
@@ -54,6 +63,12 @@ class ActivityEvent:
     color: str
 
 
+@dataclass
+class KeyInfo:
+    keyLabel: str
+    keyValue: str
+
+
 class NavigationList(QListWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -79,6 +94,29 @@ class PrinterDashboardWindow(QMainWindow):
         self.setWindowTitle("PrintMaster Dashboard")
         self.resize(1280, 830)
 
+        self.printers = self.samplePrinters()
+        self.jobs = self.sampleJobs()
+        self.events = self.sampleEvents()
+        self.keys: List[KeyInfo] = []
+        self.listenerChannel = "user-123"
+        self.isListening = False
+        self.jobCounter = (
+            max((int(job.jobNumber.lstrip("#")) for job in self.jobs), default=0) + 1
+        )
+
+        self.metricValueLabels: dict[str, QLabel] = {}
+        self.dashboardPrinterStatusLayout: QVBoxLayout | None = None
+        self.dashboardActivityLayout: QVBoxLayout | None = None
+        self.printerGridLayout: QGridLayout | None = None
+        self.jobsLayout: QVBoxLayout | None = None
+        self.jobsContainerLayout: QVBoxLayout | None = None
+        self.keysLayout: QVBoxLayout | None = None
+        self.eventsLayout: QVBoxLayout | None = None
+        self.listenerStatusLabel: QLabel | None = None
+        self.listenerStatusIndicator: QLabel | None = None
+        self.listenerInput: QLineEdit | None = None
+        self.listenerToggleButton: QPushButton | None = None
+
         self.mainWidget = QWidget()
         self.setCentralWidget(self.mainWidget)
 
@@ -90,6 +128,7 @@ class PrinterDashboardWindow(QMainWindow):
         self.navigationList.addDestination("Dashboard")
         self.navigationList.addDestination("Printers")
         self.navigationList.addDestination("Job Queue")
+        self.navigationList.addDestination("Listener")
         self.navigationList.addDestination("Keys")
         self.navigationList.addDestination("Events")
 
@@ -113,6 +152,7 @@ class PrinterDashboardWindow(QMainWindow):
         self.dashboardPage = self.createDashboardPage()
         self.printersPage = self.createPrintersPage()
         self.jobQueuePage = self.createJobQueuePage()
+        self.listenerPage = self.createListenerPage()
         self.keysPage = self.createKeysPage()
         self.eventsPage = self.createEventsPage()
 
@@ -120,6 +160,7 @@ class PrinterDashboardWindow(QMainWindow):
             self.dashboardPage,
             self.printersPage,
             self.jobQueuePage,
+            self.listenerPage,
             self.keysPage,
             self.eventsPage,
         ]:
@@ -129,6 +170,12 @@ class PrinterDashboardWindow(QMainWindow):
         rootLayout.addWidget(self.pageStack, 1)
 
         self.applyTheme()
+        self.refreshDashboard()
+        self.refreshPrintersGrid()
+        self.refreshJobsTable()
+        self.refreshKeysList()
+        self.refreshEventsList()
+        self.updateListenerStatus()
         self.navigationList.setCurrentRow(0)
 
     def applyTheme(self) -> None:
@@ -252,13 +299,14 @@ class PrinterDashboardWindow(QMainWindow):
         metricLayout = QHBoxLayout(metricCard)
         metricLayout.setSpacing(32)
 
-        for title, value in [
-            ("Total Printers", "3"),
-            ("Active Jobs", "3"),
-            ("Queued Jobs", "2"),
-            ("Online Printers", "3"),
+        self.metricValueLabels.clear()
+        for title in [
+            "Total Printers",
+            "Active Jobs",
+            "Queued Jobs",
+            "Online Printers",
         ]:
-            card = self.createMetricWidget(title, value)
+            card = self.createMetricWidget(title)
             metricLayout.addWidget(card)
 
         printerStatusCard = QFrame()
@@ -270,10 +318,9 @@ class PrinterDashboardWindow(QMainWindow):
         printerStatusTitle.setProperty("class", "sectionTitle")
         printerStatusLayout.addWidget(printerStatusTitle)
 
-        for printer in self.samplePrinters():
-            statusRow = self.createPrinterStatusRow(printer)
-            printerStatusLayout.addWidget(statusRow)
-
+        self.dashboardPrinterStatusLayout = QVBoxLayout()
+        self.dashboardPrinterStatusLayout.setSpacing(12)
+        printerStatusLayout.addLayout(self.dashboardPrinterStatusLayout)
         printerStatusLayout.addStretch(1)
 
         recentActivityCard = QFrame()
@@ -285,10 +332,9 @@ class PrinterDashboardWindow(QMainWindow):
         recentActivityTitle.setProperty("class", "sectionTitle")
         recentActivityLayout.addWidget(recentActivityTitle)
 
-        for event in self.sampleEvents():
-            eventWidget = self.createActivityRow(event)
-            recentActivityLayout.addWidget(eventWidget)
-
+        self.dashboardActivityLayout = QVBoxLayout()
+        self.dashboardActivityLayout.setSpacing(12)
+        recentActivityLayout.addLayout(self.dashboardActivityLayout)
         recentActivityLayout.addStretch(1)
 
         lowerLayout = QHBoxLayout()
@@ -313,22 +359,16 @@ class PrinterDashboardWindow(QMainWindow):
         addButton.setObjectName("addPrinterButton")
         addButton.setProperty("class", "primaryButton")
         addButton.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        addButton.clicked.connect(self.showAddPrinterDialog)
         headerRow.addWidget(title)
         headerRow.addStretch(1)
         headerRow.addWidget(addButton)
 
         layout.addLayout(headerRow)
 
-        grid = QGridLayout()
-        grid.setSpacing(20)
-
-        for index, printer in enumerate(self.samplePrinters()):
-            printerCard = self.createPrinterCard(printer)
-            row = index // 2
-            column = index % 2
-            grid.addWidget(printerCard, row, column)
-
-        layout.addLayout(grid)
+        self.printerGridLayout = QGridLayout()
+        self.printerGridLayout.setSpacing(20)
+        layout.addLayout(self.printerGridLayout)
         layout.addStretch(1)
 
         return page
@@ -343,6 +383,7 @@ class PrinterDashboardWindow(QMainWindow):
         title.setProperty("class", "sectionTitle")
         addButton = QPushButton("Add Job")
         addButton.setProperty("class", "primaryButton")
+        addButton.clicked.connect(self.showAddJobDialog)
         headerRow.addWidget(title)
         headerRow.addStretch(1)
         headerRow.addWidget(addButton)
@@ -351,28 +392,74 @@ class PrinterDashboardWindow(QMainWindow):
 
         jobsCard = QFrame()
         jobsCard.setProperty("class", "card")
-        jobsLayout = QVBoxLayout(jobsCard)
-        jobsLayout.setSpacing(12)
+        self.jobsLayout = QVBoxLayout(jobsCard)
+        self.jobsLayout.setSpacing(12)
 
-        headerLabels = ["#", "Filename", "Target Printer", "Status", "Material", "Duration"]
+        headerLabels = [
+            "#",
+            "Filename",
+            "Target Printer",
+            "Status",
+            "Material",
+            "Duration",
+            "Actions",
+        ]
         headerRowWidget = self.createTableRow(headerLabels, header=True)
-        jobsLayout.addWidget(headerRowWidget)
+        self.jobsLayout.addWidget(headerRowWidget)
 
-        for job in self.sampleJobs():
-            jobsLayout.addWidget(
-                self.createTableRow(
-                    [
-                        job.jobNumber,
-                        job.filename,
-                        job.targetPrinter,
-                        job.status,
-                        job.material,
-                        job.duration,
-                    ]
-                )
-            )
+        self.jobsContainerLayout = QVBoxLayout()
+        self.jobsContainerLayout.setSpacing(8)
+        self.jobsLayout.addLayout(self.jobsContainerLayout)
 
         layout.addWidget(jobsCard)
+        layout.addStretch(1)
+
+        return page
+
+    def createListenerPage(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setSpacing(20)
+
+        title = QLabel("Listener Settings")
+        title.setProperty("class", "sectionTitle")
+        layout.addWidget(title)
+
+        listenerCard = QFrame()
+        listenerCard.setProperty("class", "card")
+        cardLayout = QVBoxLayout(listenerCard)
+        cardLayout.setSpacing(16)
+
+        statusRow = QHBoxLayout()
+        statusRow.setSpacing(8)
+        self.listenerStatusIndicator = QLabel("●")
+        self.listenerStatusIndicator.setFont(QFont("Segoe UI", 18, QFont.Bold))
+        self.listenerStatusLabel = QLabel("")
+        statusRow.addWidget(self.listenerStatusIndicator)
+        statusRow.addWidget(self.listenerStatusLabel)
+        statusRow.addStretch(1)
+        cardLayout.addLayout(statusRow)
+
+        formLayout = QFormLayout()
+        formLayout.setLabelAlignment(Qt.AlignLeft)
+        self.listenerInput = QLineEdit(self.listenerChannel)
+        formLayout.addRow("Recipient / Channel", self.listenerInput)
+        cardLayout.addLayout(formLayout)
+
+        buttonRow = QHBoxLayout()
+        buttonRow.setSpacing(12)
+        saveButton = QPushButton("Save Channel")
+        saveButton.setProperty("class", "primaryButton")
+        saveButton.clicked.connect(self.saveListenerChannel)
+        self.listenerToggleButton = QPushButton("Start Listening")
+        self.listenerToggleButton.setProperty("class", "primaryButton")
+        self.listenerToggleButton.clicked.connect(self.toggleListening)
+        buttonRow.addWidget(saveButton)
+        buttonRow.addWidget(self.listenerToggleButton)
+        buttonRow.addStretch(1)
+        cardLayout.addLayout(buttonRow)
+
+        layout.addWidget(listenerCard)
         layout.addStretch(1)
 
         return page
@@ -387,32 +474,19 @@ class PrinterDashboardWindow(QMainWindow):
         title.setProperty("class", "sectionTitle")
         addButton = QPushButton("Add Key")
         addButton.setProperty("class", "primaryButton")
+        addButton.clicked.connect(self.showAddKeyDialog)
         headerRow.addWidget(title)
         headerRow.addStretch(1)
         headerRow.addWidget(addButton)
 
         layout.addLayout(headerRow)
 
-        emptyCard = QFrame()
-        emptyCard.setProperty("class", "card")
-        emptyLayout = QVBoxLayout(emptyCard)
-        emptyLayout.setSpacing(12)
-        emptyLayout.setAlignment(Qt.AlignCenter)
+        keysCard = QFrame()
+        keysCard.setProperty("class", "card")
+        self.keysLayout = QVBoxLayout(keysCard)
+        self.keysLayout.setSpacing(12)
 
-        iconLabel = QLabel("🔑")
-        iconLabel.setAlignment(Qt.AlignCenter)
-        iconLabel.setFont(QFont("Segoe UI Emoji", 40))
-        messageLabel = QLabel("No public keys configured yet")
-        messageLabel.setAlignment(Qt.AlignCenter)
-        messageLabel.setStyleSheet("color: #7B8AA5; font-size: 16px;")
-        ctaButton = QPushButton("Add Your First Key")
-        ctaButton.setProperty("class", "primaryButton")
-
-        emptyLayout.addWidget(iconLabel)
-        emptyLayout.addWidget(messageLabel)
-        emptyLayout.addWidget(ctaButton)
-
-        layout.addWidget(emptyCard, alignment=Qt.AlignCenter)
+        layout.addWidget(keysCard)
         layout.addStretch(1)
 
         return page
@@ -425,25 +499,31 @@ class PrinterDashboardWindow(QMainWindow):
         headerRow = QHBoxLayout()
         title = QLabel("System Events")
         title.setProperty("class", "sectionTitle")
-        refreshButton = QPushButton("Refresh")
-        refreshButton.setProperty("class", "primaryButton")
+        addEventButton = QPushButton("Add Event")
+        addEventButton.setProperty("class", "primaryButton")
+        addEventButton.clicked.connect(self.showAddEventDialog)
+        clearButton = QPushButton("Clear Events")
+        clearButton.setProperty("class", "primaryButton")
+        clearButton.clicked.connect(self.clearEvents)
         headerRow.addWidget(title)
         headerRow.addStretch(1)
-        headerRow.addWidget(refreshButton)
+        headerRow.addWidget(addEventButton)
+        headerRow.addWidget(clearButton)
 
         layout.addLayout(headerRow)
 
         eventsCard = QFrame()
         eventsCard.setProperty("class", "card")
-        eventsLayout = QVBoxLayout(eventsCard)
-        eventsLayout.setSpacing(12)
+        cardLayout = QVBoxLayout(eventsCard)
+        cardLayout.setSpacing(12)
 
         logTitle = QLabel("Event Log")
         logTitle.setProperty("class", "sectionTitle")
-        eventsLayout.addWidget(logTitle)
+        cardLayout.addWidget(logTitle)
 
-        for event in self.sampleEvents():
-            eventsLayout.addWidget(self.createEventLogRow(event))
+        self.eventsLayout = QVBoxLayout()
+        self.eventsLayout.setSpacing(8)
+        cardLayout.addLayout(self.eventsLayout)
 
         layout.addWidget(eventsCard)
         layout.addStretch(1)
@@ -453,7 +533,7 @@ class PrinterDashboardWindow(QMainWindow):
     def changePage(self, index: int) -> None:
         self.pageStack.setCurrentIndex(index)
 
-    def createMetricWidget(self, title: str, value: str) -> QWidget:
+    def createMetricWidget(self, title: str) -> QWidget:
         widget = QWidget()
         layout = QVBoxLayout(widget)
         layout.setSpacing(6)
@@ -461,8 +541,10 @@ class PrinterDashboardWindow(QMainWindow):
 
         titleLabel = QLabel(title)
         titleLabel.setProperty("class", "metricTitle")
-        valueLabel = QLabel(value)
+        valueLabel = QLabel("0")
         valueLabel.setProperty("class", "metricValue")
+
+        self.metricValueLabels[title] = valueLabel
 
         layout.addWidget(titleLabel)
         layout.addWidget(valueLabel)
@@ -558,6 +640,14 @@ class PrinterDashboardWindow(QMainWindow):
         layout.addWidget(QLabel(f"Serial\n{printer.serialNumber}"))
         layout.addWidget(QLabel(f"Current Job\n{printer.statusDetail}"))
 
+        buttonRow = QHBoxLayout()
+        buttonRow.setSpacing(8)
+        removeButton = QPushButton("Remove")
+        removeButton.clicked.connect(partial(self.removePrinter, printer))
+        buttonRow.addWidget(removeButton)
+        buttonRow.addStretch(1)
+        layout.addLayout(buttonRow)
+
         return card
 
     def createTableRow(self, values: List[str], header: bool = False) -> QWidget:
@@ -609,8 +699,533 @@ class PrinterDashboardWindow(QMainWindow):
 
         layout.addWidget(statusBadge)
         layout.addLayout(messageLayout, 1)
+        removeButton = QPushButton("Remove")
+        removeButton.clicked.connect(partial(self.removeEvent, event))
+        layout.addWidget(removeButton)
 
         return row
+
+    def clearLayout(self, layout: QLayout | None) -> None:
+        if layout is None:
+            return
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(None)
+            else:
+                childLayout = item.layout()
+                if childLayout is not None:
+                    self.clearLayout(childLayout)
+
+    def refreshDashboard(self) -> None:
+        self.updateMetricValues()
+        self.populateDashboardPrinters()
+        self.populateDashboardActivity()
+
+    def updateMetricValues(self) -> None:
+        activeJobs = sum(
+            1 for job in self.jobs if job.status.lower() in {"printing", "in progress"}
+        )
+        queuedJobs = sum(1 for job in self.jobs if job.status.lower() == "queued")
+        onlinePrinters = sum(1 for printer in self.printers if printer.statusColor == "success")
+        metrics = {
+            "Total Printers": len(self.printers),
+            "Active Jobs": activeJobs,
+            "Queued Jobs": queuedJobs,
+            "Online Printers": onlinePrinters,
+        }
+        for title, value in metrics.items():
+            label = self.metricValueLabels.get(title)
+            if label is not None:
+                label.setText(str(value))
+
+    def populateDashboardPrinters(self) -> None:
+        if self.dashboardPrinterStatusLayout is None:
+            return
+        self.clearLayout(self.dashboardPrinterStatusLayout)
+        if not self.printers:
+            emptyLabel = QLabel("No printers registered yet")
+            emptyLabel.setStyleSheet("color: #7B8AA5;")
+            self.dashboardPrinterStatusLayout.addWidget(emptyLabel)
+            return
+        for printer in self.printers:
+            statusRow = self.createPrinterStatusRow(printer)
+            self.dashboardPrinterStatusLayout.addWidget(statusRow)
+
+    def populateDashboardActivity(self) -> None:
+        if self.dashboardActivityLayout is None:
+            return
+        self.clearLayout(self.dashboardActivityLayout)
+        if not self.events:
+            emptyLabel = QLabel("No recent activity yet")
+            emptyLabel.setStyleSheet("color: #7B8AA5;")
+            self.dashboardActivityLayout.addWidget(emptyLabel)
+            return
+        for event in reversed(self.events[-4:]):
+            eventWidget = self.createActivityRow(event)
+            self.dashboardActivityLayout.addWidget(eventWidget)
+
+    def refreshPrintersGrid(self) -> None:
+        if self.printerGridLayout is None:
+            return
+        self.clearLayout(self.printerGridLayout)
+        if not self.printers:
+            placeholder = QLabel("Add your first printer to get started")
+            placeholder.setStyleSheet("color: #7B8AA5;")
+            self.printerGridLayout.addWidget(placeholder, 0, 0)
+            return
+        for index, printer in enumerate(self.printers):
+            card = self.createPrinterCard(printer)
+            row = index // 2
+            column = index % 2
+            self.printerGridLayout.addWidget(card, row, column)
+
+    def showAddPrinterDialog(self) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Add Printer")
+        formLayout = QFormLayout(dialog)
+
+        nameInput = QLineEdit()
+        modelInput = QLineEdit()
+        ipInput = QLineEdit()
+        serialInput = QLineEdit()
+        detailInput = QLineEdit("Ready for next job")
+        statusCombo = QComboBox()
+        statusCombo.addItems(["Printing", "Idle", "Error"])
+
+        formLayout.addRow("Printer Name", nameInput)
+        formLayout.addRow("Model", modelInput)
+        formLayout.addRow("IP Address", ipInput)
+        formLayout.addRow("Serial Number", serialInput)
+        formLayout.addRow("Current Job", detailInput)
+        formLayout.addRow("Status", statusCombo)
+
+        buttonBox = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        formLayout.addWidget(buttonBox)
+
+        def submit() -> None:
+            printerName = nameInput.text().strip()
+            modelName = modelInput.text().strip() or "Unknown"
+            ipAddress = ipInput.text().strip()
+            serialNumber = serialInput.text().strip()
+            statusDetail = detailInput.text().strip() or "Ready for next job"
+            if not printerName or not ipAddress or not serialNumber:
+                QMessageBox.warning(
+                    self,
+                    "Missing information",
+                    "Printer name, IP address, and serial number are required.",
+                )
+                return
+            statusText = statusCombo.currentText()
+            statusColor = {
+                "Printing": "success",
+                "Idle": "warning",
+                "Error": "error",
+            }.get(statusText, "success")
+            printer = PrinterInfo(
+                printerName=printerName,
+                modelName=modelName,
+                ipAddress=ipAddress,
+                serialNumber=serialNumber,
+                status=statusText.lower(),
+                statusDetail=statusDetail,
+                statusColor=statusColor,
+            )
+            self.printers.append(printer)
+            self.refreshPrintersGrid()
+            self.refreshDashboard()
+            self.logEvent(
+                ActivityEvent(
+                    level="INFO",
+                    timestamp=datetime.now().strftime("%H:%M"),
+                    message=f"Added printer '{printer.printerName}'",
+                    category="printers",
+                    color=self.getEventColor("INFO"),
+                )
+            )
+            dialog.accept()
+
+        buttonBox.accepted.connect(submit)
+        buttonBox.rejected.connect(dialog.reject)
+        dialog.exec()
+
+    def removePrinter(self, printer: PrinterInfo) -> None:
+        if printer in self.printers:
+            self.printers.remove(printer)
+            self.refreshPrintersGrid()
+            self.refreshDashboard()
+            self.logEvent(
+                ActivityEvent(
+                    level="WARNING",
+                    timestamp=datetime.now().strftime("%H:%M"),
+                    message=f"Removed printer '{printer.printerName}'",
+                    category="printers",
+                    color=self.getEventColor("WARNING"),
+                )
+            )
+
+    def showAddJobDialog(self) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Send Print Job")
+        formLayout = QFormLayout(dialog)
+
+        filenameInput = QLineEdit()
+        targetCombo = QComboBox()
+        targetCombo.setEditable(True)
+        for printer in self.printers:
+            targetCombo.addItem(
+                f"{printer.printerName} ({printer.ipAddress})", printer.ipAddress
+            )
+        statusCombo = QComboBox()
+        statusCombo.addItems(["Queued", "Printing", "Completed"])
+        materialInput = QLineEdit("PLA")
+        durationInput = QLineEdit("60m")
+
+        formLayout.addRow("Filename", filenameInput)
+        formLayout.addRow("Target Printer", targetCombo)
+        formLayout.addRow("Status", statusCombo)
+        formLayout.addRow("Material", materialInput)
+        formLayout.addRow("Duration", durationInput)
+
+        buttonBox = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        formLayout.addWidget(buttonBox)
+
+        def submit() -> None:
+            filename = filenameInput.text().strip()
+            targetPrinter = targetCombo.currentData()
+            if not targetPrinter:
+                targetPrinter = targetCombo.currentText().strip()
+            status = statusCombo.currentText()
+            material = materialInput.text().strip() or "PLA"
+            duration = durationInput.text().strip() or "60m"
+            if not filename or not targetPrinter:
+                QMessageBox.warning(
+                    self,
+                    "Missing information",
+                    "Filename and target printer are required to create a job.",
+                )
+                return
+            job = JobInfo(
+                jobNumber=self.generateJobNumber(),
+                filename=filename,
+                targetPrinter=targetPrinter,
+                status=status,
+                material=material,
+                duration=duration,
+            )
+            self.jobs.append(job)
+            self.refreshJobsTable()
+            self.refreshDashboard()
+            self.logEvent(
+                ActivityEvent(
+                    level="SUCCESS",
+                    timestamp=datetime.now().strftime("%H:%M"),
+                    message=f"Received new job '{job.filename}'",
+                    category="jobs",
+                    color=self.getEventColor("SUCCESS"),
+                )
+            )
+            dialog.accept()
+
+        buttonBox.accepted.connect(submit)
+        buttonBox.rejected.connect(dialog.reject)
+        dialog.exec()
+
+    def generateJobNumber(self) -> str:
+        jobNumber = f"#{self.jobCounter}"
+        self.jobCounter += 1
+        return jobNumber
+
+    def createJobRow(self, job: JobInfo) -> QWidget:
+        row = QFrame()
+        row.setStyleSheet(
+            "background-color: rgba(255, 255, 255, 0.04); border-radius: 12px; padding: 10px;"
+        )
+        layout = QHBoxLayout(row)
+        layout.setSpacing(12)
+        layout.setContentsMargins(8, 8, 8, 8)
+
+        for value in [
+            job.jobNumber,
+            job.filename,
+            job.targetPrinter,
+            job.status,
+            job.material,
+            job.duration,
+        ]:
+            label = QLabel(value)
+            label.setStyleSheet("color: #CBD5F5;")
+            label.setMinimumWidth(100)
+            layout.addWidget(label)
+
+        layout.addStretch(1)
+        removeButton = QPushButton("Remove")
+        removeButton.clicked.connect(partial(self.removeJob, job))
+        layout.addWidget(removeButton)
+
+        return row
+
+    def refreshJobsTable(self) -> None:
+        if self.jobsContainerLayout is None:
+            return
+        self.clearLayout(self.jobsContainerLayout)
+        if not self.jobs:
+            placeholder = QLabel("No jobs in the queue yet")
+            placeholder.setStyleSheet("color: #7B8AA5;")
+            self.jobsContainerLayout.addWidget(placeholder)
+            return
+        for job in reversed(self.jobs):
+            self.jobsContainerLayout.addWidget(self.createJobRow(job))
+
+    def removeJob(self, job: JobInfo) -> None:
+        if job in self.jobs:
+            self.jobs.remove(job)
+            self.refreshJobsTable()
+            self.refreshDashboard()
+            self.logEvent(
+                ActivityEvent(
+                    level="WARNING",
+                    timestamp=datetime.now().strftime("%H:%M"),
+                    message=f"Removed job '{job.filename}'",
+                    category="jobs",
+                    color=self.getEventColor("WARNING"),
+                )
+            )
+
+    def showAddKeyDialog(self) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Add API Key")
+        formLayout = QFormLayout(dialog)
+
+        labelInput = QLineEdit()
+        valueInput = QLineEdit()
+
+        formLayout.addRow("Key Label", labelInput)
+        formLayout.addRow("Key Value", valueInput)
+
+        buttonBox = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        formLayout.addWidget(buttonBox)
+
+        def submit() -> None:
+            keyLabel = labelInput.text().strip()
+            keyValue = valueInput.text().strip()
+            if not keyLabel or not keyValue:
+                QMessageBox.warning(
+                    self,
+                    "Missing information",
+                    "Both key label and key value are required.",
+                )
+                return
+            key = KeyInfo(keyLabel=keyLabel, keyValue=keyValue)
+            self.keys.append(key)
+            self.refreshKeysList()
+            self.logEvent(
+                ActivityEvent(
+                    level="INFO",
+                    timestamp=datetime.now().strftime("%H:%M"),
+                    message=f"Added key '{key.keyLabel}'",
+                    category="security",
+                    color=self.getEventColor("INFO"),
+                )
+            )
+            dialog.accept()
+
+        buttonBox.accepted.connect(submit)
+        buttonBox.rejected.connect(dialog.reject)
+        dialog.exec()
+
+    def createKeyRow(self, key: KeyInfo) -> QWidget:
+        row = QFrame()
+        row.setStyleSheet(
+            "background-color: rgba(255, 255, 255, 0.04); border-radius: 12px; padding: 12px;"
+        )
+        layout = QHBoxLayout(row)
+        layout.setSpacing(12)
+
+        label = QLabel(key.keyLabel)
+        label.setStyleSheet("font-weight: 600; color: #E5EDFF;")
+        valueLabel = QLabel(key.keyValue)
+        valueLabel.setStyleSheet(
+            "color: #CBD5F5; font-family: 'JetBrains Mono', 'Fira Code', monospace;"
+        )
+
+        layout.addWidget(label)
+        layout.addWidget(valueLabel, 1)
+
+        removeButton = QPushButton("Remove")
+        removeButton.clicked.connect(partial(self.removeKey, key))
+        layout.addWidget(removeButton)
+
+        return row
+
+    def refreshKeysList(self) -> None:
+        if self.keysLayout is None:
+            return
+        self.clearLayout(self.keysLayout)
+        if not self.keys:
+            placeholder = QLabel("No public keys configured yet")
+            placeholder.setAlignment(Qt.AlignCenter)
+            placeholder.setStyleSheet("color: #7B8AA5; font-size: 16px;")
+            self.keysLayout.addWidget(placeholder)
+            return
+        for key in self.keys:
+            self.keysLayout.addWidget(self.createKeyRow(key))
+
+    def removeKey(self, key: KeyInfo) -> None:
+        if key in self.keys:
+            self.keys.remove(key)
+            self.refreshKeysList()
+            self.logEvent(
+                ActivityEvent(
+                    level="WARNING",
+                    timestamp=datetime.now().strftime("%H:%M"),
+                    message=f"Removed key '{key.keyLabel}'",
+                    category="security",
+                    color=self.getEventColor("WARNING"),
+                )
+            )
+
+    def showAddEventDialog(self) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Log Event")
+        formLayout = QFormLayout(dialog)
+
+        levelCombo = QComboBox()
+        levelCombo.addItems(["INFO", "SUCCESS", "WARNING", "ERROR"])
+        messageInput = QLineEdit()
+        categoryInput = QLineEdit("system")
+
+        formLayout.addRow("Level", levelCombo)
+        formLayout.addRow("Message", messageInput)
+        formLayout.addRow("Category", categoryInput)
+
+        buttonBox = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        formLayout.addWidget(buttonBox)
+
+        def submit() -> None:
+            level = levelCombo.currentText()
+            message = messageInput.text().strip()
+            category = categoryInput.text().strip() or "system"
+            if not message:
+                QMessageBox.warning(
+                    self,
+                    "Missing information",
+                    "Event message cannot be empty.",
+                )
+                return
+            event = ActivityEvent(
+                level=level,
+                timestamp=datetime.now().strftime("%H:%M"),
+                message=message,
+                category=category,
+                color=self.getEventColor(level),
+            )
+            self.logEvent(event)
+            dialog.accept()
+
+        buttonBox.accepted.connect(submit)
+        buttonBox.rejected.connect(dialog.reject)
+        dialog.exec()
+
+    def logEvent(self, event: ActivityEvent) -> None:
+        self.events.append(event)
+        self.refreshEventsList()
+        self.populateDashboardActivity()
+
+    def refreshEventsList(self) -> None:
+        if self.eventsLayout is None:
+            return
+        self.clearLayout(self.eventsLayout)
+        if not self.events:
+            placeholder = QLabel("No events logged yet")
+            placeholder.setStyleSheet("color: #7B8AA5;")
+            self.eventsLayout.addWidget(placeholder)
+            return
+        for event in reversed(self.events):
+            self.eventsLayout.addWidget(self.createEventLogRow(event))
+
+    def removeEvent(self, event: ActivityEvent) -> None:
+        if event in self.events:
+            self.events.remove(event)
+            self.refreshEventsList()
+            self.populateDashboardActivity()
+
+    def clearEvents(self) -> None:
+        if not self.events:
+            return
+        self.events.clear()
+        self.refreshEventsList()
+        self.populateDashboardActivity()
+
+    def toggleListening(self) -> None:
+        self.isListening = not self.isListening
+        statusLevel = "SUCCESS" if self.isListening else "INFO"
+        statusMessage = (
+            f"Started listening on channel '{self.listenerChannel}'"
+            if self.isListening
+            else "Stopped listening for jobs"
+        )
+        self.updateListenerStatus()
+        self.logEvent(
+            ActivityEvent(
+                level=statusLevel,
+                timestamp=datetime.now().strftime("%H:%M"),
+                message=statusMessage,
+                category="listener",
+                color=self.getEventColor(statusLevel),
+            )
+        )
+
+    def saveListenerChannel(self) -> None:
+        if self.listenerInput is None:
+            return
+        channel = self.listenerInput.text().strip()
+        if not channel:
+            QMessageBox.warning(
+                self,
+                "Invalid channel",
+                "Channel cannot be empty.",
+            )
+            return
+        if channel != self.listenerChannel:
+            self.listenerChannel = channel
+            self.updateListenerStatus()
+            self.logEvent(
+                ActivityEvent(
+                    level="INFO",
+                    timestamp=datetime.now().strftime("%H:%M"),
+                    message=f"Listening channel set to '{self.listenerChannel}'",
+                    category="listener",
+                    color=self.getEventColor("INFO"),
+                )
+            )
+
+    def updateListenerStatus(self) -> None:
+        if not (
+            self.listenerStatusIndicator
+            and self.listenerStatusLabel
+            and self.listenerToggleButton
+        ):
+            return
+        if self.isListening:
+            self.listenerStatusIndicator.setStyleSheet("color: #34D399;")
+            self.listenerStatusLabel.setText(
+                f"Listening on {self.listenerChannel}"
+            )
+            self.listenerToggleButton.setText("Stop Listening")
+        else:
+            self.listenerStatusIndicator.setStyleSheet("color: #F87171;")
+            self.listenerStatusLabel.setText("Not listening for jobs")
+            self.listenerToggleButton.setText("Start Listening")
+
+    def getEventColor(self, level: str) -> str:
+        return {
+            "INFO": "59, 130, 246",
+            "SUCCESS": "52, 211, 153",
+            "WARNING": "245, 158, 11",
+            "ERROR": "248, 113, 113",
+        }.get(level.upper(), "59, 130, 246")
 
     def samplePrinters(self) -> List[PrinterInfo]:
         return [
