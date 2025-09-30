@@ -1410,6 +1410,7 @@ class PrinterDashboardWindow(QMainWindow):
             )
             return None
 
+
         unencryptedData = self.normalizeDataDict(payload.get("unencryptedData"))
         decryptedData = self.normalizeDataDict(payload.get("decryptedData"))
         signedUrl = payload.get("signedUrl")
