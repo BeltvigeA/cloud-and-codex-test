@@ -1402,6 +1402,15 @@ class PrinterDashboardWindow(QMainWindow):
             )
             return None
 
+        if not isinstance(payload, dict):
+            QMessageBox.warning(
+                self,
+                "Unexpected response",
+                "The server returned data in an unexpected structure.",
+            )
+            return None
+
+
         unencryptedData = self.normalizeDataDict(payload.get("unencryptedData"))
         decryptedData = self.normalizeDataDict(payload.get("decryptedData"))
         signedUrl = payload.get("signedUrl")
