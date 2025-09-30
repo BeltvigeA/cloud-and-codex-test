@@ -2,3 +2,5 @@ __pycache__/
 *.pyc
 build/
 dist/
+node_modules/
+client/web/dist/
