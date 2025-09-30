@@ -9,6 +9,7 @@ import io
 import json
 import re
 import sys
+import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from functools import partial
@@ -59,8 +60,10 @@ if __package__ in {None, ""}:
         defaultBaseUrl,
         determineFilename,
     )
+    from client.database import LocalDatabase, StoredJob, StoredJobMetadata
 else:
     from .client import buildFetchUrl, buildPendingUrl, defaultBaseUrl, determineFilename
+    from .database import LocalDatabase, StoredJob, StoredJobMetadata
 
 
 @dataclass
@@ -152,7 +155,9 @@ class PrinterDashboardWindow(QMainWindow):
         self.setWindowTitle("PrintMaster Dashboard")
         self.resize(1280, 830)
 
-        self.printers = self.samplePrinters()
+        self.database = LocalDatabase()
+
+        self.printers: List[PrinterInfo] = []
         self.jobs: List[JobInfo] = []
         self.sampleJobsList: List[JobInfo] = []
         self.manualJobs: List[JobInfo] = []
@@ -165,15 +170,15 @@ class PrinterDashboardWindow(QMainWindow):
         self.listenerChannel = "user-123"
         self.knownListenerChannels = ["user-123", "production-queue", "lab-testing"]
         self.isListening = False
-        self.jobCounter = (
-            max((int(job.jobNumber.lstrip("#")) for job in self.jobs), default=0) + 1
-        )
+        self.jobCounter = 1
         self.backendBaseUrl = defaultBaseUrl
         self.listenerPollIntervalMs = 15000
         self.listenerPollTimer = QTimer(self)
         self.listenerPollTimer.setInterval(self.listenerPollIntervalMs)
         self.listenerPollTimer.timeout.connect(self.pollPendingJobs)
         self.listenerLastError: str | None = None
+
+        self.loadPersistedState()
 
         self.metricValueLabels: dict[str, QLabel] = {}
         self.dashboardPrinterStatusLayout: QVBoxLayout | None = None
@@ -272,6 +277,93 @@ class PrinterDashboardWindow(QMainWindow):
         self.navigationList.setCurrentRow(0)
         self.pollPendingJobs(force=True)
         self.ensureNavigationFits()
+
+
+    def loadPersistedState(self) -> None:
+        storedPrinters = self.database.loadPrinters()
+        if storedPrinters:
+            self.printers = [
+                PrinterInfo(
+                    printerName=printer["printerName"],
+                    modelName=printer["modelName"],
+                    ipAddress=printer["ipAddress"],
+                    serialNumber=printer["serialNumber"],
+                    status=printer["status"],
+                    statusDetail=printer["statusDetail"],
+                    statusColor=printer["statusColor"],
+                )
+                for printer in storedPrinters
+            ]
+        else:
+            self.printers = self.samplePrinters()
+            for printer in self.printers:
+                self.database.upsertPrinter(
+                    serialNumber=printer.serialNumber,
+                    printerName=printer.printerName,
+                    modelName=printer.modelName,
+                    ipAddress=printer.ipAddress,
+                    status=printer.status,
+                    statusDetail=printer.statusDetail,
+                    statusColor=printer.statusColor,
+                )
+
+        storedJobs = self.database.loadJobs()
+        self.manualJobs = []
+        self.remoteJobsList = []
+        for storedJob in storedJobs:
+            job = JobInfo(
+                jobNumber=storedJob.jobNumber,
+                filename=storedJob.filename,
+                targetPrinter=storedJob.targetPrinter,
+                status=storedJob.status,
+                material=storedJob.material,
+                duration=storedJob.duration,
+                jobId=storedJob.jobId,
+                uploadedAt=storedJob.uploadedAt,
+                fetchToken=storedJob.fetchToken,
+            )
+            if storedJob.source == "remote":
+                self.remoteJobsList.append(job)
+            else:
+                self.manualJobs.append(job)
+
+        if not storedJobs:
+            self.sampleJobsList = self.sampleJobs()
+            for job in self.sampleJobsList:
+                if not job.jobId:
+                    job.jobId = f"sample-{uuid.uuid4().hex}"
+                if not job.jobNumber:
+                    job.jobNumber = self.generateJobNumber()
+                self.database.upsertJob(
+                    StoredJob(
+                        jobId=job.jobId,
+                        source="sample",
+                        jobNumber=job.jobNumber,
+                        filename=job.filename,
+                        targetPrinter=job.targetPrinter,
+                        status=job.status,
+                        material=job.material,
+                        duration=job.duration,
+                        uploadedAt=job.uploadedAt,
+                        fetchToken=job.fetchToken,
+                    )
+                )
+            self.manualJobs = list(self.sampleJobsList)
+
+        self.currentRemoteJobIds = {job.jobId for job in self.remoteJobsList if job.jobId}
+        self.updateManualJobCounter()
+        self.updateCombinedJobs(self.remoteJobsList)
+
+
+    def updateManualJobCounter(self) -> None:
+        highestNumber = 0
+        for job in self.manualJobs:
+            if job.jobNumber and job.jobNumber.startswith("#"):
+                try:
+                    highestNumber = max(highestNumber, int(job.jobNumber.lstrip("#")))
+                except ValueError:
+                    continue
+        self.jobCounter = highestNumber + 1 if highestNumber else max(self.jobCounter, 1)
 
 
     def applyTheme(self) -> None:
@@ -699,9 +791,20 @@ class PrinterDashboardWindow(QMainWindow):
         logTitle.setProperty("class", "sectionTitle")
         cardLayout.addWidget(logTitle)
 
-        self.eventsLayout = QVBoxLayout()
-        self.eventsLayout.setSpacing(8)
-        cardLayout.addLayout(self.eventsLayout)
+        eventsScrollArea = QScrollArea()
+        eventsScrollArea.setWidgetResizable(True)
+        eventsScrollArea.setFrameShape(QFrame.NoFrame)
+        eventsScrollArea.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
+        eventsContainer = QWidget()
+        eventsContainerLayout = QVBoxLayout(eventsContainer)
+        eventsContainerLayout.setSpacing(8)
+        eventsContainerLayout.setContentsMargins(0, 0, 0, 0)
+
+        eventsScrollArea.setWidget(eventsContainer)
+
+        self.eventsLayout = eventsContainerLayout
+        cardLayout.addWidget(eventsScrollArea)
 
         layout.addWidget(eventsCard)
         layout.addStretch(1)
@@ -1011,6 +1114,15 @@ class PrinterDashboardWindow(QMainWindow):
                 statusColor=statusColor,
             )
             self.printers.append(printer)
+            self.database.upsertPrinter(
+                serialNumber=printer.serialNumber,
+                printerName=printer.printerName,
+                modelName=printer.modelName,
+                ipAddress=printer.ipAddress,
+                status=printer.status,
+                statusDetail=printer.statusDetail,
+                statusColor=printer.statusColor,
+            )
             self.refreshPrintersGrid()
             self.refreshDashboard()
             self.logEvent(
@@ -1031,6 +1143,7 @@ class PrinterDashboardWindow(QMainWindow):
     def removePrinter(self, printer: PrinterInfo) -> None:
         if printer in self.printers:
             self.printers.remove(printer)
+            self.database.deletePrinter(printer.serialNumber)
             self.refreshPrintersGrid()
             self.refreshDashboard()
             self.logEvent(
@@ -1115,7 +1228,7 @@ class PrinterDashboardWindow(QMainWindow):
         return jobNumber
 
     def generateManualJobId(self) -> str:
-        return f"manual-{max(0, self.jobCounter - 1)}"
+        return f"manual-{uuid.uuid4().hex}"
 
     def createJobRow(self, job: JobInfo) -> QWidget:
         row = QFrame()
@@ -1331,6 +1444,15 @@ class PrinterDashboardWindow(QMainWindow):
 
         metadata.downloadedFilePath = downloadPath
         self.remoteJobDetails[cacheKey] = metadata
+        if job.jobId:
+            self.database.saveJobMetadata(
+                jobId=job.jobId,
+                fetchToken=metadata.fetchToken,
+                unencryptedData=metadata.unencryptedData,
+                decryptedData=metadata.decryptedData,
+                signedUrl=metadata.signedUrl,
+                downloadedFilePath=str(downloadPath),
+            )
 
         self.logEvent(
             ActivityEvent(
@@ -1364,6 +1486,22 @@ class PrinterDashboardWindow(QMainWindow):
         cached = self.remoteJobDetails.get(cacheKey)
         if cached is not None:
             return cached
+        storedMetadata = self.database.loadJobMetadata(job.jobId, job.fetchToken)
+        if storedMetadata is not None:
+            storedPath = (
+                Path(storedMetadata.downloadedFilePath)
+                if storedMetadata.downloadedFilePath
+                else None
+            )
+            metadata = RemoteJobMetadata(
+                fetchToken=storedMetadata.fetchToken or job.fetchToken or "",
+                unencryptedData=storedMetadata.unencryptedData,
+                decryptedData=storedMetadata.decryptedData,
+                signedUrl=storedMetadata.signedUrl,
+                downloadedFilePath=storedPath,
+            )
+            self.remoteJobDetails[cacheKey] = metadata
+            return metadata
         if not job.fetchToken:
             QMessageBox.warning(
                 self,
@@ -1423,6 +1561,14 @@ class PrinterDashboardWindow(QMainWindow):
             signedUrl=signedUrlValue,
         )
         self.remoteJobDetails[cacheKey] = metadata
+        if job.jobId:
+            self.database.saveJobMetadata(
+                jobId=job.jobId,
+                fetchToken=job.fetchToken,
+                unencryptedData=unencryptedData,
+                decryptedData=decryptedData,
+                signedUrl=signedUrlValue,
+            )
 
         self.logEvent(
             ActivityEvent(
@@ -1598,7 +1744,29 @@ class PrinterDashboardWindow(QMainWindow):
         return targetPath
 
     def addManualJob(self, job: JobInfo) -> None:
+        if not job.jobId:
+            job.jobId = self.generateManualJobId()
+        if not job.jobNumber:
+            job.jobNumber = self.generateJobNumber()
+        if not job.uploadedAt:
+            job.uploadedAt = datetime.now().strftime("%H:%M")
+        self.manualJobs = [existing for existing in self.manualJobs if existing.jobId != job.jobId]
         self.manualJobs.insert(0, job)
+        self.database.upsertJob(
+            StoredJob(
+                jobId=job.jobId,
+                source="manual",
+                jobNumber=job.jobNumber,
+                filename=job.filename,
+                targetPrinter=job.targetPrinter,
+                status=job.status,
+                material=job.material,
+                duration=job.duration,
+                uploadedAt=job.uploadedAt,
+                fetchToken=job.fetchToken,
+            )
+        )
+        self.updateManualJobCounter()
         self.updateCombinedJobs()
 
     def updateCombinedJobs(self, remoteJobs: List[JobInfo] | None = None) -> None:
@@ -1621,8 +1789,12 @@ class PrinterDashboardWindow(QMainWindow):
             return
         if job in self.manualJobs:
             self.manualJobs.remove(job)
+            if job.jobId:
+                self.database.deleteJob(job.jobId)
         elif job in self.jobs:
             self.jobs.remove(job)
+            if job.jobId:
+                self.database.deleteJob(job.jobId)
         else:
             return
         self.updateCombinedJobs()
@@ -1807,6 +1979,7 @@ class PrinterDashboardWindow(QMainWindow):
             return
         for event in reversed(self.events):
             self.eventsLayout.addWidget(self.createEventLogRow(event))
+        self.eventsLayout.addStretch(1)
 
     def removeEvent(self, event: ActivityEvent) -> None:
         if event in self.events:
@@ -1963,9 +2136,29 @@ class PrinterDashboardWindow(QMainWindow):
         for index, job in enumerate(remoteJobs, start=1):
             job.jobNumber = f"#{index}"
 
+        for job in remoteJobs:
+            self.database.upsertJob(
+                StoredJob(
+                    jobId=job.jobId or f"remote-{uuid.uuid4().hex}",
+                    source="remote",
+                    jobNumber=job.jobNumber,
+                    filename=job.filename,
+                    targetPrinter=job.targetPrinter,
+                    status=job.status,
+                    material=job.material,
+                    duration=job.duration,
+                    uploadedAt=job.uploadedAt,
+                    fetchToken=job.fetchToken,
+                )
+            )
+        self.database.pruneJobs("remote", (job.jobId for job in remoteJobs if job.jobId))
+
         self.currentRemoteJobIds = {job.jobId for job in remoteJobs if job.jobId}
 
         if self.sampleJobsList:
+            for sampleJob in self.sampleJobsList:
+                if sampleJob.jobId:
+                    self.database.deleteJob(sampleJob.jobId)
             self.manualJobs = [job for job in self.manualJobs if job not in self.sampleJobsList]
             self.sampleJobsList = []
 
