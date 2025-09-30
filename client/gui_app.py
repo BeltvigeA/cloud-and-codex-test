@@ -352,7 +352,8 @@ class PrinterDashboardWindow(QMainWindow):
 
         self.currentRemoteJobIds = {job.jobId for job in self.remoteJobsList if job.jobId}
         self.updateManualJobCounter()
-        self.updateCombinedJobs(self.remoteJobsList)
+        self.jobs = [*self.remoteJobsList, *self.manualJobs]
+
 
 
     def updateManualJobCounter(self) -> None:
