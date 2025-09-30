@@ -68,24 +68,33 @@ Installer klientavhengigheter (bruk gjerne det samme virtuelle miljøet):
 pip install -r requirements.txt
 ```
 
-### Webdashbord (React)
+### Skrivebordsklient (Tkinter)
 
-Den tidligere skrivebordsklienten er erstattet av en lett React-applikasjon som kjører i nettleseren. Løsningen etterligner lytter-funksjonen fra GUI-et og viser både kryptert og ukryptert metadata for eksempeldata.
+Det følger nå en enkel Python-basert GUI-klient som lar deg skrive inn metadata for utskriftsjobber og eksportere dem til JSON.
 
-1. Installer Node-avhengigheter i `client/web`:
-
-   ```bash
-   cd client/web
-   npm install
-   ```
-
-2. Start utviklingsserveren:
+1. Installer prosjektavhengighetene dersom du ikke allerede har gjort det:
 
    ```bash
-   npm run dev
+   pip install -r requirements.txt
    ```
 
-3. Åpne nettleseren på adressen som vises i terminalen (som regel http://localhost:5173) for å se dashboardet. Skriv inn en kanal-ID (for eksempel `user-123`) og trykk «Start listening» for å vise demo-dataene.
+2. Start GUI-en lokalt:
+
+   ```bash
+   python -m client.gui
+   ```
+
+   Skjemaet lar deg fylle ut de viktigste feltene for en utskriftsjobb, lese inn eksisterende JSON-filer og lagre et nytt metadata-dokument.
+
+#### Bygg GUI-en som en Windows `.exe`
+
+Prosjektet inkluderer PyInstaller i `requirements.txt` slik at du kan generere en frittstående kjørbar fil:
+
+```bash
+pyinstaller --name PrintMetadataGUI --windowed --onefile client/gui.py
+```
+
+Den ferdige `.exe`-filen finner du i `dist/PrintMetadataGUI.exe`. Kopier hele `dist`-mappen til målmaskinen og kjør programmet derfra.
 
 Tilgjengelige kommandoer:
 
