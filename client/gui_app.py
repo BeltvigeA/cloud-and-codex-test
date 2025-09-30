@@ -356,6 +356,7 @@ class PrinterDashboardWindow(QMainWindow):
         self.jobs = [*self.remoteJobsList, *self.manualJobs]
 
 
+
     def updateManualJobCounter(self) -> None:
         highestNumber = 0
         for job in self.manualJobs:
@@ -1513,6 +1514,7 @@ class PrinterDashboardWindow(QMainWindow):
         logEventOnSuccess: bool = True,
     ) -> Optional[RemoteJobMetadata]:
         cacheKey = self.getJobCacheKey(job)
+
         if not job.fetchToken:
             if not silent:
                 QMessageBox.warning(
@@ -1588,6 +1590,7 @@ class PrinterDashboardWindow(QMainWindow):
                 signedUrl=signedUrlValue,
             )
         self.metadataFetchFailures.pop(cacheKey, None)
+
 
         if logEventOnSuccess:
             self.logEvent(
