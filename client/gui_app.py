@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from functools import partial
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QFont, QImage, QPixmap
@@ -1591,7 +1591,6 @@ class PrinterDashboardWindow(QMainWindow):
             )
         self.metadataFetchFailures.pop(cacheKey, None)
 
-
         if logEventOnSuccess:
             self.logEvent(
                 ActivityEvent(
@@ -1751,6 +1750,18 @@ class PrinterDashboardWindow(QMainWindow):
         return QPixmap.fromImage(image)
 
     def buildRelevantFieldPairs(self, data: Dict[str, Any]) -> List[tuple[str, str]]:
+        if not data:
+            return []
+        if data.get("__snapshot__"):
+            summaryPairs = self.buildPairsFromMapping(data.get("jobSummary"))
+            if summaryPairs:
+                return summaryPairs
+            return self.buildPairsFromMapping(data.get("cloudPayload"))
+        return self.buildPairsFromMapping(data)
+
+    def buildPairsFromMapping(self, mapping: Any) -> List[tuple[str, str]]:
+        if not isinstance(mapping, dict):
+            return []
         preferredFields = [
             ("productName", "Produkt"),
             ("objectName", "Objekt"),
@@ -1764,12 +1775,12 @@ class PrinterDashboardWindow(QMainWindow):
         ]
         pairs: List[tuple[str, str]] = []
         for key, label in preferredFields:
-            if key in data:
-                pairs.append((label, self.formatDisplayValue(data.get(key))))
+            if key in mapping:
+                pairs.append((label, self.formatDisplayValue(mapping.get(key))))
         if pairs:
             return pairs
         fallbackPairs: List[tuple[str, str]] = []
-        for index, (key, value) in enumerate(data.items()):
+        for index, (key, value) in enumerate(mapping.items()):
             if index >= 6:
                 break
             if isinstance(value, (str, int, float, bool)):
@@ -1809,6 +1820,66 @@ class PrinterDashboardWindow(QMainWindow):
             targetPath = directory / f"{stem}_{counter}{suffix}"
             counter += 1
         return targetPath
+
+    def buildJobSummary(self, job: JobInfo) -> Dict[str, Any]:
+        return {
+            "jobNumber": job.jobNumber,
+            "filename": job.filename,
+            "targetPrinter": job.targetPrinter,
+            "status": job.status,
+            "material": job.material,
+            "duration": job.duration,
+            "uploadedAt": job.uploadedAt,
+            "jobId": job.jobId,
+            "fetchToken": job.fetchToken,
+        }
+
+    def sanitizeForJson(self, value: Any) -> Any:
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        if isinstance(value, datetime):
+            return value.isoformat()
+        if isinstance(value, Path):
+            return str(value)
+        if isinstance(value, dict):
+            return {str(key): self.sanitizeForJson(val) for key, val in value.items()}
+        if isinstance(value, (list, tuple, set)):
+            return [self.sanitizeForJson(item) for item in value]
+        return str(value)
+
+    def cacheRemoteJobSnapshot(self, job: JobInfo, payload: Any) -> None:
+        if not isinstance(payload, dict) or not job.jobId:
+            return
+        existingMetadata = self.loadRemoteJobMetadataFromCache(job)
+        if existingMetadata is not None and not existingMetadata.unencryptedData.get("__snapshot__", False):
+            return
+        sanitizedPayload = self.sanitizeForJson(payload)
+        if not isinstance(sanitizedPayload, dict):
+            sanitizedPayload = {"value": sanitizedPayload}
+        summaryData = self.sanitizeForJson(self.buildJobSummary(job))
+        summaryDict = summaryData if isinstance(summaryData, dict) else {}
+        combinedData: Dict[str, Any] = {
+            "__snapshot__": True,
+            "jobSummary": summaryDict,
+            "cloudPayload": sanitizedPayload,
+        }
+        metadata = RemoteJobMetadata(
+            fetchToken=job.fetchToken or "",
+            unencryptedData=combinedData,
+            decryptedData={},
+            signedUrl=None,
+            downloadedFilePath=None,
+        )
+        cacheKey = self.getJobCacheKey(job)
+        self.remoteJobDetails[cacheKey] = metadata
+        self.database.saveJobMetadata(
+            jobId=job.jobId,
+            fetchToken=job.fetchToken,
+            unencryptedData=combinedData,
+            decryptedData={},
+            signedUrl=None,
+            downloadedFilePath=None,
+        )
 
     def addManualJob(self, job: JobInfo) -> None:
         if not job.jobId:
@@ -2165,7 +2236,7 @@ class PrinterDashboardWindow(QMainWindow):
         if not isinstance(pendingFiles, list):
             pendingFiles = []
 
-        remoteJobs: List[JobInfo] = []
+        remoteJobEntries: List[Tuple[JobInfo, Dict[str, Any]]] = []
         for rawIndex, pending in enumerate(pendingFiles, start=1):
             if not isinstance(pending, dict):
                 continue
@@ -2185,23 +2256,42 @@ class PrinterDashboardWindow(QMainWindow):
             )
             durationValue = pending.get("duration") or pending.get("estimatedDuration")
             uploadedAt = self.normalizeTimestamp(pending.get("uploadedAt"))
-            remoteJobs.append(
-                JobInfo(
-                    jobNumber="",
-                    filename=str(filename),
-                    targetPrinter=str(targetPrinter),
-                    status=statusDisplay,
-                    material=str(materialValue),
-                    duration=self.formatJobDuration(durationValue),
-                    jobId=jobId,
-                    uploadedAt=uploadedAt,
-                    fetchToken=str(fetchToken) if isinstance(fetchToken, str) else None,
+            jobInfo = JobInfo(
+                jobNumber="",
+                filename=str(filename),
+                targetPrinter=str(targetPrinter),
+                status=statusDisplay,
+                material=str(materialValue),
+                duration=self.formatJobDuration(durationValue),
+                jobId=jobId,
+                uploadedAt=uploadedAt,
+                fetchToken=str(fetchToken) if isinstance(fetchToken, str) else None,
+            )
+            remoteJobEntries.append((jobInfo, pending))
+
+        remoteJobEntries.sort(key=lambda entry: entry[0].uploadedAt or "", reverse=True)
+        for index, (job, payload) in enumerate(remoteJobEntries, start=1):
+            job.jobNumber = f"#{index}"
+            self.cacheRemoteJobSnapshot(job, payload)
+
+        remoteJobs = [job for job, _ in remoteJobEntries]
+
+        for job in remoteJobs:
+            self.database.upsertJob(
+                StoredJob(
+                    jobId=job.jobId or f"remote-{uuid.uuid4().hex}",
+                    source="remote",
+                    jobNumber=job.jobNumber,
+                    filename=job.filename,
+                    targetPrinter=job.targetPrinter,
+                    status=job.status,
+                    material=job.material,
+                    duration=job.duration,
+                    uploadedAt=job.uploadedAt,
+                    fetchToken=job.fetchToken,
                 )
             )
-
-        remoteJobs.sort(key=lambda job: job.uploadedAt or "", reverse=True)
-        for index, job in enumerate(remoteJobs, start=1):
-            job.jobNumber = f"#{index}"
+        self.database.pruneJobs("remote", (job.jobId for job in remoteJobs if job.jobId))
 
         for job in remoteJobs:
             self.database.upsertJob(
