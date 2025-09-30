@@ -355,6 +355,7 @@ class PrinterDashboardWindow(QMainWindow):
         self.jobs = [*self.remoteJobsList, *self.manualJobs]
 
 
+
     def updateManualJobCounter(self) -> None:
         highestNumber = 0
         for job in self.manualJobs:
