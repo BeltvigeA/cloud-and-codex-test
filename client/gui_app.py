@@ -11,7 +11,7 @@ import re
 import sys
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from functools import partial
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -165,6 +165,7 @@ class PrinterDashboardWindow(QMainWindow):
         self.currentRemoteJobIds: set[str] = set()
         self.remoteJobsSignature: tuple[str, ...] | None = None
         self.remoteJobDetails: Dict[str, RemoteJobMetadata] = {}
+        self.metadataFetchFailures: Dict[str, datetime] = {}
         self.events = self.sampleEvents()
         self.keys: List[KeyInfo] = []
         self.listenerChannel = "user-123"
@@ -1308,7 +1309,7 @@ class PrinterDashboardWindow(QMainWindow):
         dialog.exec()
 
     def showRemoteJobData(self, job: JobInfo) -> None:
-        metadata = self.fetchRemoteJobData(job)
+        metadata = self.fetchRemoteJobData(job, triggerRefresh=True)
         if metadata is None:
             return
 
@@ -1390,7 +1391,7 @@ class PrinterDashboardWindow(QMainWindow):
         dialog.exec()
 
     def downloadRemoteJobFile(self, job: JobInfo) -> None:
-        metadata = self.fetchRemoteJobData(job)
+        metadata = self.fetchRemoteJobData(job, triggerRefresh=True)
         if metadata is None:
             return
         if metadata.signedUrl is None:
@@ -1482,73 +1483,91 @@ class PrinterDashboardWindow(QMainWindow):
         for job in reversed(self.jobs):
             self.jobsContainerLayout.addWidget(self.createJobRow(job))
 
-    def fetchRemoteJobData(self, job: JobInfo) -> Optional[RemoteJobMetadata]:
+    def loadRemoteJobMetadataFromCache(self, job: JobInfo) -> Optional[RemoteJobMetadata]:
         cacheKey = self.getJobCacheKey(job)
         cached = self.remoteJobDetails.get(cacheKey)
         if cached is not None:
             return cached
         storedMetadata = self.database.loadJobMetadata(job.jobId, job.fetchToken)
-        if storedMetadata is not None:
-            storedPath = (
-                Path(storedMetadata.downloadedFilePath)
-                if storedMetadata.downloadedFilePath
-                else None
-            )
-            metadata = RemoteJobMetadata(
-                fetchToken=storedMetadata.fetchToken or job.fetchToken or "",
-                unencryptedData=storedMetadata.unencryptedData,
-                decryptedData=storedMetadata.decryptedData,
-                signedUrl=storedMetadata.signedUrl,
-                downloadedFilePath=storedPath,
-            )
-            self.remoteJobDetails[cacheKey] = metadata
-            return metadata
+        if storedMetadata is None:
+            return None
+        storedPath = (
+            Path(storedMetadata.downloadedFilePath)
+            if storedMetadata.downloadedFilePath
+            else None
+        )
+        metadata = RemoteJobMetadata(
+            fetchToken=storedMetadata.fetchToken or job.fetchToken or "",
+            unencryptedData=storedMetadata.unencryptedData,
+            decryptedData=storedMetadata.decryptedData,
+            signedUrl=storedMetadata.signedUrl,
+            downloadedFilePath=storedPath,
+        )
+        self.remoteJobDetails[cacheKey] = metadata
+        return metadata
+
+    def requestRemoteJobMetadata(
+        self,
+        job: JobInfo,
+        *,
+        silent: bool = False,
+        logEventOnSuccess: bool = True,
+    ) -> Optional[RemoteJobMetadata]:
+        cacheKey = self.getJobCacheKey(job)
+
         if not job.fetchToken:
-            QMessageBox.warning(
-                self,
-                "Missing token",
-                "This job does not include a fetch token and cannot be retrieved.",
-            )
+            if not silent:
+                QMessageBox.warning(
+                    self,
+                    "Missing token",
+                    "This job does not include a fetch token and cannot be retrieved.",
+                )
             return None
         try:
             fetchUrl = buildFetchUrl(self.backendBaseUrl, job.fetchToken)
         except ValueError as error:
-            QMessageBox.warning(
-                self,
-                "Invalid configuration",
-                f"Unable to build fetch URL: {error}",
-            )
+            if not silent:
+                QMessageBox.warning(
+                    self,
+                    "Invalid configuration",
+                    f"Unable to build fetch URL: {error}",
+                )
             return None
 
         try:
             response = requests.get(fetchUrl, timeout=30)
             response.raise_for_status()
         except RequestException as error:
-            QMessageBox.warning(
-                self,
-                "Fetch failed",
-                f"Unable to retrieve job metadata: {error}",
-            )
+            if not silent:
+                QMessageBox.warning(
+                    self,
+                    "Fetch failed",
+                    f"Unable to retrieve job metadata: {error}",
+                )
+            self.metadataFetchFailures[cacheKey] = datetime.utcnow()
             return None
 
         try:
             payload = response.json()
         except ValueError:
-            QMessageBox.warning(
-                self,
-                "Unexpected response",
-                "The server returned data in an unexpected format.",
-            )
+            if not silent:
+                QMessageBox.warning(
+                    self,
+                    "Unexpected response",
+                    "The server returned data in an unexpected format.",
+                )
+            self.metadataFetchFailures[cacheKey] = datetime.utcnow()
             return None
 
         if not isinstance(payload, dict):
-            QMessageBox.warning(
-                self,
-                "Unexpected response",
-                "The server returned data in an unexpected structure.",
-            )
+            if not silent:
+                QMessageBox.warning(
+                    self,
+                    "Unexpected response",
+                    "The server returned data in an unexpected structure.",
+                )
+            self.metadataFetchFailures[cacheKey] = datetime.utcnow()
             return None
-
 
         unencryptedData = self.normalizeDataDict(payload.get("unencryptedData"))
         decryptedData = self.normalizeDataDict(payload.get("decryptedData"))
@@ -1570,17 +1589,39 @@ class PrinterDashboardWindow(QMainWindow):
                 decryptedData=decryptedData,
                 signedUrl=signedUrlValue,
             )
+        self.metadataFetchFailures.pop(cacheKey, None)
 
-        self.logEvent(
-            ActivityEvent(
-                level="INFO",
-                timestamp=datetime.now().strftime("%H:%M"),
-                message=f"Fetched metadata for '{job.filename}'",
-                category="jobs",
-                color=self.getEventColor("INFO"),
+
+        if logEventOnSuccess:
+            self.logEvent(
+                ActivityEvent(
+                    level="INFO",
+                    timestamp=datetime.now().strftime("%H:%M"),
+                    message=f"Fetched metadata for '{job.filename}'",
+                    category="jobs",
+                    color=self.getEventColor("INFO"),
+                )
             )
+        return metadata
+
+    def fetchRemoteJobData(
+        self,
+        job: JobInfo,
+        *,
+        silent: bool = False,
+        logEventOnSuccess: bool = True,
+        triggerRefresh: bool = False,
+    ) -> Optional[RemoteJobMetadata]:
+        metadata = self.loadRemoteJobMetadataFromCache(job)
+        if metadata is not None:
+            return metadata
+        metadata = self.requestRemoteJobMetadata(
+            job,
+            silent=silent,
+            logEventOnSuccess=logEventOnSuccess,
         )
-        self.pollPendingJobs(force=True)
+        if metadata is not None and triggerRefresh:
+            self.pollPendingJobs(force=True)
         return metadata
 
     def getJobCacheKey(self, job: JobInfo) -> str:
@@ -1589,6 +1630,31 @@ class PrinterDashboardWindow(QMainWindow):
         if job.jobId:
             return job.jobId
         return job.filename
+
+    def preloadRemoteJobMetadata(self, remoteJobs: List[JobInfo]) -> None:
+        if not remoteJobs:
+            return
+        now = datetime.utcnow()
+        retryDelay = timedelta(minutes=5)
+        for job in remoteJobs:
+            cacheKey = self.getJobCacheKey(job)
+            if not job.fetchToken:
+                continue
+            if self.loadRemoteJobMetadataFromCache(job) is not None:
+                continue
+            lastFailure = self.metadataFetchFailures.get(cacheKey)
+            if lastFailure and now - lastFailure < retryDelay:
+                continue
+            metadata = self.fetchRemoteJobData(
+                job,
+                silent=True,
+                logEventOnSuccess=False,
+                triggerRefresh=False,
+            )
+            if metadata is None:
+                self.metadataFetchFailures[cacheKey] = now
+            else:
+                self.metadataFetchFailures.pop(cacheKey, None)
 
     def normalizeDataDict(self, rawData: object) -> Dict[str, Any]:
         if isinstance(rawData, dict):
@@ -2181,6 +2247,7 @@ class PrinterDashboardWindow(QMainWindow):
                 )
             )
 
+        self.preloadRemoteJobMetadata(remoteJobs)
         self.updateCombinedJobs(remoteJobs)
 
     def saveListenerChannel(self) -> None:
