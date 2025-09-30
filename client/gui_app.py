@@ -101,6 +101,7 @@ class NavigationList(QListWidget):
         self.setFixedWidth(200)
         self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
         self.setSizeAdjustPolicy(QAbstractScrollArea.AdjustToContents)
+        self._contentHeight = 0
 
     def addDestination(self, label: str) -> None:
         item = QListWidgetItem(label)
@@ -115,8 +116,12 @@ class NavigationList(QListWidget):
         for index in range(self.count()):
             totalHeight += self.sizeHintForRow(index)
         totalHeight += max(0, self.count() - 1) * self.spacing()
-        availableHeight = max(self.viewport().sizeHint().height(), 0)
-        self.setMinimumHeight(min(totalHeight, availableHeight or totalHeight))
+        self._contentHeight = totalHeight
+        self.setFixedHeight(totalHeight)
+
+
+    def contentHeight(self) -> int:
+        return self._contentHeight
 
 
 class PrinterDashboardWindow(QMainWindow):
@@ -154,6 +159,10 @@ class PrinterDashboardWindow(QMainWindow):
         self.jobsContainerLayout: QVBoxLayout | None = None
         self.keysLayout: QVBoxLayout | None = None
         self.eventsLayout: QVBoxLayout | None = None
+        self.navigationWrapperLayout: QVBoxLayout | None = None
+        self.navigationLogoWidget: QWidget | None = None
+        self.rootLayout: QHBoxLayout | None = None
+        self.navigationWrapperWidget: QWidget | None = None
         self.listenerStatusLabel: QLabel | None = None
         self.listenerStatusIndicator: QLabel | None = None
         self.listenerInput: QLineEdit | None = None
@@ -165,6 +174,7 @@ class PrinterDashboardWindow(QMainWindow):
         rootLayout = QHBoxLayout(self.mainWidget)
         rootLayout.setContentsMargins(24, 24, 24, 24)
         rootLayout.setSpacing(24)
+        self.rootLayout = rootLayout
 
         self.navigationList = NavigationList()
         self.navigationList.addDestination("Dashboard")
@@ -179,8 +189,10 @@ class PrinterDashboardWindow(QMainWindow):
         navigationWrapper = QVBoxLayout()
         navigationWrapper.setContentsMargins(0, 0, 0, 0)
         navigationWrapper.setSpacing(16)
+        self.navigationWrapperLayout = navigationWrapper
 
         logoWrapper = self.createLogoHeader()
+        self.navigationLogoWidget = logoWrapper
         navigationWrapper.addWidget(logoWrapper)
 
         navigationScrollContent = QWidget()
@@ -202,6 +214,7 @@ class PrinterDashboardWindow(QMainWindow):
         navigationWrapperWidget.setLayout(navigationWrapper)
         navigationWrapperWidget.setFixedWidth(220)
         navigationWrapperWidget.setObjectName("navigationPanel")
+        self.navigationWrapperWidget = navigationWrapperWidget
 
         self.pageStack = QStackedWidget()
 
@@ -234,6 +247,8 @@ class PrinterDashboardWindow(QMainWindow):
         self.updateListenerStatus()
         self.navigationList.setCurrentRow(0)
         self.pollPendingJobs(force=True)
+        self.ensureNavigationFits()
+
 
     def applyTheme(self) -> None:
         baseColor = "#101827"
@@ -344,6 +359,37 @@ class PrinterDashboardWindow(QMainWindow):
         logoWidget = QWidget()
         logoWidget.setLayout(logoLayout)
         return logoWidget
+
+    def ensureNavigationFits(self) -> None:
+        if (
+            not hasattr(self, "navigationWrapperLayout")
+            or self.navigationWrapperLayout is None
+            or self.rootLayout is None
+        ):
+            return
+
+        navigationWidget = getattr(self, "navigationWrapperWidget", None)
+        if navigationWidget is not None:
+            navigationHeight = navigationWidget.sizeHint().height()
+        else:
+            navHeight = self.navigationList.contentHeight()
+            margins = self.navigationWrapperLayout.getContentsMargins()
+            _, layoutTop, _, layoutBottom = margins
+            spacing = self.navigationWrapperLayout.spacing()
+            headerHeight = (
+                self.navigationLogoWidget.sizeHint().height()
+                if self.navigationLogoWidget is not None
+                else 0
+            )
+            navigationHeight = layoutTop + headerHeight + spacing + navHeight + layoutBottom
+
+        rootMargins = self.rootLayout.contentsMargins()
+        totalHeight = navigationHeight + rootMargins.top() + rootMargins.bottom()
+
+        if totalHeight > self.minimumHeight():
+            self.setMinimumHeight(totalHeight)
+        if self.height() < totalHeight:
+            self.resize(self.width(), totalHeight)
 
     def createDashboardPage(self) -> QWidget:
         page = QWidget()
