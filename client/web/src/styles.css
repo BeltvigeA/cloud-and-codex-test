@@ -1,0 +1,212 @@
+:root {
+  color-scheme: light dark;
+  font-family: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  background-color: #101322;
+  color: #f6f7fb;
+  line-height: 1.5;
+}
+
+body {
+  margin: 0;
+  background: linear-gradient(160deg, #1c2333 0%, #0f1624 100%);
+  min-height: 100vh;
+}
+
+#root {
+  min-height: 100vh;
+}
+
+.appContainer {
+  max-width: 960px;
+  margin: 0 auto;
+  padding: 48px 24px 64px;
+  display: flex;
+  flex-direction: column;
+  gap: 32px;
+}
+
+.headerSection {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.headerTitle {
+  font-size: 2.75rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  margin: 0;
+}
+
+.headerSubtitle {
+  color: #bac3e5;
+  margin: 0;
+  max-width: 640px;
+}
+
+.listenerCard {
+  background: rgba(20, 26, 45, 0.85);
+  border-radius: 18px;
+  padding: 28px;
+  box-shadow: 0 32px 60px rgba(10, 12, 24, 0.55);
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  border: 1px solid rgba(115, 131, 190, 0.15);
+}
+
+.listenerCard h2 {
+  margin: 0;
+  font-size: 1.5rem;
+}
+
+.listenerForm {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: center;
+}
+
+.listenerForm label {
+  display: flex;
+  flex-direction: column;
+  font-weight: 600;
+  color: #c3cff6;
+  gap: 6px;
+}
+
+.listenerInput {
+  background: rgba(12, 19, 37, 0.9);
+  border: 1px solid rgba(115, 131, 190, 0.3);
+  border-radius: 10px;
+  padding: 12px 16px;
+  color: #f6f7fb;
+  min-width: 220px;
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+.listenerInput:focus {
+  border-color: #6ca8ff;
+  box-shadow: 0 0 0 3px rgba(108, 168, 255, 0.2);
+  outline: none;
+}
+
+.listenerButton {
+  background: linear-gradient(135deg, #5a7bff 0%, #7f9cff 100%);
+  color: #0c1120;
+  border: none;
+  border-radius: 10px;
+  padding: 12px 22px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  cursor: pointer;
+  transition: transform 0.18s ease, box-shadow 0.18s ease;
+}
+
+.listenerButton:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.listenerButton:not(:disabled):hover {
+  transform: translateY(-1px);
+  box-shadow: 0 18px 32px rgba(90, 123, 255, 0.35);
+}
+
+.statusBadge {
+  align-self: flex-start;
+  padding: 6px 12px;
+  border-radius: 999px;
+  font-size: 0.85rem;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.statusIdle {
+  background: rgba(115, 131, 190, 0.25);
+  color: #d3dcff;
+}
+
+.statusListening {
+  background: rgba(255, 195, 85, 0.25);
+  color: #ffe2a6;
+}
+
+.statusReceived {
+  background: rgba(108, 255, 179, 0.25);
+  color: #c4ffe6;
+}
+
+.statusError {
+  background: rgba(255, 133, 133, 0.25);
+  color: #ffd6d6;
+}
+
+.dataGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 18px;
+}
+
+.dataSection {
+  background: rgba(14, 19, 36, 0.9);
+  border: 1px solid rgba(115, 131, 190, 0.2);
+  border-radius: 16px;
+  padding: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.dataSection h3 {
+  margin: 0;
+  font-size: 1.1rem;
+  color: #d7e2ff;
+}
+
+.dataList {
+  display: grid;
+  gap: 10px;
+}
+
+.dataRow {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.dataLabel {
+  color: #8f9fce;
+  font-size: 0.9rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.dataValue {
+  color: #f5f7ff;
+  font-size: 1rem;
+  word-break: break-word;
+}
+
+.emptyState {
+  color: #9ba7d4;
+  font-style: italic;
+}
+
+.errorMessage {
+  background: rgba(255, 133, 133, 0.2);
+  border: 1px solid rgba(255, 133, 133, 0.4);
+  border-radius: 12px;
+  padding: 12px 16px;
+  color: #ffdede;
+}
+
+@media (max-width: 600px) {
+  .listenerForm {
+    align-items: stretch;
+  }
+
+  .listenerButton {
+    width: 100%;
+  }
+}

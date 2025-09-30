@@ -68,25 +68,24 @@ Installer klientavhengigheter (bruk gjerne det samme virtuelle miljøet):
 pip install -r requirements.txt
 ```
 
-#### Grafisk PrintMaster-klient
+### Webdashbord (React)
 
-Den nye skrivebordsklienten gir et brukergrensesnitt som samsvarer med designet i skjermbildene. Start appen lokalt med:
+Den tidligere skrivebordsklienten er erstattet av en lett React-applikasjon som kjører i nettleseren. Løsningen etterligner lytter-funksjonen fra GUI-et og viser både kryptert og ukryptert metadata for eksempeldata.
 
-```bash
-python -m client.gui_app
-```
+1. Installer Node-avhengigheter i `client/web`:
 
-Applikasjonen viser en navigasjonsmeny med oversikt over dashbord, skrivere, jobbkø, nøkler og hendelser. Dummy-data gir et realistisk inntrykk av statuskortene, og brukergrensesnittet er optimalisert for et mørkt tema.
+   ```bash
+   cd client/web
+   npm install
+   ```
 
-##### Pakke til Windows `.exe`
+2. Start utviklingsserveren:
 
-Det følger med PyInstaller-oppsett slik at klienten kan pakkes til en kjørbar fil. Kjør følgende kommando på Windows etter at avhengighetene er installert:
+   ```bash
+   npm run dev
+   ```
 
-```bash
-pyinstaller --name PrintMasterDashboard --windowed --noconfirm --collect-all PySide6 --add-data "client:client" client/gui_app.py
-```
-
-Dette oppretter en mappe `dist/PrintMasterDashboard` som inneholder `PrintMasterDashboard.exe`. Distribuer hele mappen for å sikre at alle nødvendige Qt-ressurser følger med.
+3. Åpne nettleseren på adressen som vises i terminalen (som regel http://localhost:5173) for å se dashboardet. Skriv inn en kanal-ID (for eksempel `user-123`) og trykk «Start listening» for å vise demo-dataene.
 
 Tilgjengelige kommandoer:
 
