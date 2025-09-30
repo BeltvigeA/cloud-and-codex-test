@@ -2,22 +2,28 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from functools import partial
-from datetime import datetime
-from pathlib import Path
-from typing import List
-
+import base64
+import binascii
+import gzip
+import io
+import json
+import re
 import sys
+from dataclasses import dataclass
+from datetime import datetime
+from functools import partial
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QFont
+from PySide6.QtGui import QFont, QImage, QPixmap
 from PySide6.QtWidgets import (
     QAbstractScrollArea,
     QApplication,
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QFileDialog,
     QFormLayout,
     QFrame,
     QGridLayout,
@@ -29,6 +35,7 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QMainWindow,
     QMessageBox,
+    QPlainTextEdit,
     QPushButton,
     QSizePolicy,
     QScrollArea,
@@ -46,9 +53,14 @@ if __package__ in {None, ""}:
     projectRootString = str(projectRootPath)
     if projectRootString not in sys.path:
         sys.path.append(projectRootString)
-    from client.client import buildPendingUrl, defaultBaseUrl
+    from client.client import (
+        buildFetchUrl,
+        buildPendingUrl,
+        defaultBaseUrl,
+        determineFilename,
+    )
 else:
-    from .client import buildPendingUrl, defaultBaseUrl
+    from .client import buildFetchUrl, buildPendingUrl, defaultBaseUrl, determineFilename
 
 
 @dataclass
@@ -72,6 +84,16 @@ class JobInfo:
     duration: str
     jobId: str | None = None
     uploadedAt: str | None = None
+    fetchToken: str | None = None
+
+
+@dataclass
+class RemoteJobMetadata:
+    fetchToken: str
+    unencryptedData: Dict[str, Any]
+    decryptedData: Dict[str, Any]
+    signedUrl: Optional[str]
+    downloadedFilePath: Optional[Path] = None
 
 
 @dataclass
@@ -137,9 +159,11 @@ class PrinterDashboardWindow(QMainWindow):
         self.remoteJobsList: List[JobInfo] = []
         self.currentRemoteJobIds: set[str] = set()
         self.remoteJobsSignature: tuple[str, ...] | None = None
+        self.remoteJobDetails: Dict[str, RemoteJobMetadata] = {}
         self.events = self.sampleEvents()
         self.keys: List[KeyInfo] = []
         self.listenerChannel = "user-123"
+        self.knownListenerChannels = ["user-123", "production-queue", "lab-testing"]
         self.isListening = False
         self.jobCounter = (
             max((int(job.jobNumber.lstrip("#")) for job in self.jobs), default=0) + 1
@@ -165,7 +189,7 @@ class PrinterDashboardWindow(QMainWindow):
         self.navigationWrapperWidget: QWidget | None = None
         self.listenerStatusLabel: QLabel | None = None
         self.listenerStatusIndicator: QLabel | None = None
-        self.listenerInput: QLineEdit | None = None
+        self.listenerChannelCombo: QComboBox | None = None
         self.listenerToggleButton: QPushButton | None = None
 
         self.mainWidget = QWidget()
@@ -251,27 +275,30 @@ class PrinterDashboardWindow(QMainWindow):
 
 
     def applyTheme(self) -> None:
-        baseColor = "#101827"
-        cardColor = "#111C33"
-        accentColor = "#3B82F6"
-        successColor = "#34D399"
-        warningColor = "#F59E0B"
-        errorColor = "#F87171"
+        baseColor = "#F5F7FA"
+        cardColor = "#FFFFFF"
+        accentColor = "#2563EB"
+        textColor = "#1F2937"
+        mutedColor = "#6B7280"
+        successColor = "#047857"
+        warningColor = "#B45309"
+        errorColor = "#B91C1C"
 
         self.setStyleSheet(
             f"""
             QWidget {{
                 background-color: {baseColor};
-                color: #E5EDFF;
+                color: {textColor};
                 font-family: 'Inter', 'Segoe UI', sans-serif;
                 font-size: 14px;
             }}
             QLabel#logoTitle {{
                 font-size: 20px;
                 font-weight: 600;
+                color: {textColor};
             }}
             QLabel#logoSubtitle {{
-                color: #7B8AA5;
+                color: {mutedColor};
                 font-size: 13px;
             }}
             QListWidget {{
@@ -280,37 +307,41 @@ class PrinterDashboardWindow(QMainWindow):
             QListWidget::item {{
                 padding: 10px 14px;
                 border-radius: 8px;
-                color: #93A5CE;
+                color: {mutedColor};
             }}
             QListWidget::item:selected {{
                 background-color: {accentColor};
-                color: white;
+                color: #FFFFFF;
             }}
             QListWidget::item:hover {{
-                background-color: rgba(59, 130, 246, 0.25);
+                background-color: rgba(37, 99, 235, 0.12);
             }}
             QWidget#navigationPanel {{
                 background-color: {cardColor};
-                border-radius: 16px;
+                border-radius: 12px;
                 padding: 24px 12px;
+                border: 1px solid #E2E8F0;
             }}
             QFrame.card {{
                 background-color: {cardColor};
-                border-radius: 18px;
-                padding: 22px;
+                border-radius: 12px;
+                padding: 20px;
+                border: 1px solid #E2E8F0;
             }}
             QLabel.sectionTitle {{
                 font-size: 18px;
                 font-weight: 600;
-                margin-bottom: 16px;
+                margin-bottom: 12px;
+                color: {textColor};
             }}
             QLabel.metricTitle {{
-                color: #7B8AA5;
-                font-size: 14px;
+                color: {mutedColor};
+                font-size: 13px;
             }}
             QLabel.metricValue {{
-                font-size: 32px;
-                font-weight: 700;
+                font-size: 30px;
+                font-weight: 600;
+                color: {textColor};
             }}
             QLabel.statusBadge {{
                 font-size: 12px;
@@ -319,28 +350,65 @@ class PrinterDashboardWindow(QMainWindow):
                 border-radius: 12px;
             }}
             QLabel.statusSuccess {{
-                background-color: rgba(52, 211, 153, 0.15);
+                background-color: rgba(4, 120, 87, 0.12);
                 color: {successColor};
             }}
             QLabel.statusWarning {{
-                background-color: rgba(245, 158, 11, 0.15);
+                background-color: rgba(180, 83, 9, 0.12);
                 color: {warningColor};
             }}
             QLabel.statusError {{
-                background-color: rgba(248, 113, 113, 0.15);
+                background-color: rgba(185, 28, 28, 0.12);
                 color: {errorColor};
             }}
             QPushButton.primaryButton {{
                 background-color: {accentColor};
-                color: white;
-                border-radius: 12px;
-                padding: 10px 18px;
+                color: #FFFFFF;
+                border-radius: 10px;
+                padding: 8px 16px;
                 font-weight: 600;
             }}
             QPushButton.primaryButton:hover {{
-                background-color: #2563EB;
+                background-color: #1D4ED8;
             }}
-        """
+            QPushButton.primaryButton:pressed {{
+                background-color: #1E40AF;
+            }}
+            QPushButton {{
+                border-radius: 8px;
+                padding: 6px 14px;
+                background-color: #E5E7EB;
+                color: {textColor};
+                border: 1px solid transparent;
+            }}
+            QPushButton:hover {{
+                background-color: #D1D5DB;
+            }}
+            QPushButton:pressed {{
+                background-color: #CBD5E1;
+            }}
+            QLineEdit, QComboBox, QPlainTextEdit {{
+                background-color: #FFFFFF;
+                border: 1px solid #CBD5E1;
+                border-radius: 8px;
+                padding: 6px 10px;
+                color: {textColor};
+            }}
+            QComboBox::drop-down {{
+                border: none;
+            }}
+            QScrollBar:vertical {{
+                width: 10px;
+                background: transparent;
+            }}
+            QScrollBar::handle:vertical {{
+                background: #CBD5E1;
+                border-radius: 5px;
+            }}
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
+                height: 0;
+            }}
+            """
         )
 
     def createLogoHeader(self) -> QWidget:
@@ -505,6 +573,7 @@ class PrinterDashboardWindow(QMainWindow):
             "Status",
             "Material",
             "Duration",
+            "Uploaded",
             "Actions",
         ]
         headerRowWidget = self.createTableRow(headerLabels, header=True)
@@ -545,8 +614,14 @@ class PrinterDashboardWindow(QMainWindow):
 
         formLayout = QFormLayout()
         formLayout.setLabelAlignment(Qt.AlignLeft)
-        self.listenerInput = QLineEdit(self.listenerChannel)
-        formLayout.addRow("Recipient / Channel", self.listenerInput)
+        self.listenerChannelCombo = QComboBox()
+        self.listenerChannelCombo.setEditable(True)
+        for channel in self.knownListenerChannels:
+            self.listenerChannelCombo.addItem(channel)
+        if self.listenerChannel not in self.knownListenerChannels:
+            self.listenerChannelCombo.addItem(self.listenerChannel)
+        self.listenerChannelCombo.setCurrentText(self.listenerChannel)
+        formLayout.addRow("Recipient / Channel", self.listenerChannelCombo)
         cardLayout.addLayout(formLayout)
 
         buttonRow = QHBoxLayout()
@@ -680,7 +755,7 @@ class PrinterDashboardWindow(QMainWindow):
         layout.addLayout(headerLayout)
 
         detailLabel = QLabel(printer.statusDetail)
-        detailLabel.setStyleSheet("color: #7B8AA5;")
+        detailLabel.setStyleSheet("color: #6B7280;")
         layout.addWidget(detailLabel)
 
         return row
@@ -705,7 +780,7 @@ class PrinterDashboardWindow(QMainWindow):
         messageLabel = QLabel(event.message)
         messageLabel.setWordWrap(True)
         metaLabel = QLabel(f"{event.timestamp} • {event.category}")
-        metaLabel.setStyleSheet("color: #7B8AA5;")
+        metaLabel.setStyleSheet("color: #6B7280;")
 
         messageLayout.addWidget(messageLabel)
         messageLayout.addWidget(metaLabel)
@@ -762,9 +837,9 @@ class PrinterDashboardWindow(QMainWindow):
         for value in values:
             label = QLabel(value)
             label.setStyleSheet(
-                "font-weight: 600; color: #E5EDFF;"
+                "font-weight: 600; color: #1F2937;"
                 if header
-                else "color: #CBD5F5;"
+                else "color: #4B5563;"
             )
             label.setMinimumWidth(100)
             layout.addWidget(label)
@@ -776,7 +851,7 @@ class PrinterDashboardWindow(QMainWindow):
         row = QFrame()
         row.setFrameShape(QFrame.StyledPanel)
         row.setStyleSheet(
-            "background-color: rgba(255, 255, 255, 0.04); border-radius: 12px; padding: 12px;"
+            "background-color: rgba(148, 163, 184, 0.12); border: 1px solid #E2E8F0; border-radius: 12px; padding: 12px;"
         )
         layout = QHBoxLayout(row)
         layout.setSpacing(12)
@@ -793,9 +868,9 @@ class PrinterDashboardWindow(QMainWindow):
         messageLayout.setSpacing(4)
 
         messageLabel = QLabel(event.message)
-        messageLabel.setStyleSheet("color: #E5EDFF;")
+        messageLabel.setStyleSheet("color: #1F2937;")
         detailsLabel = QLabel(f"{event.timestamp} • {event.category}")
-        detailsLabel.setStyleSheet("color: #7B8AA5;")
+        detailsLabel.setStyleSheet("color: #6B7280;")
 
         messageLayout.addWidget(messageLabel)
         messageLayout.addWidget(detailsLabel)
@@ -849,7 +924,7 @@ class PrinterDashboardWindow(QMainWindow):
         self.clearLayout(self.dashboardPrinterStatusLayout)
         if not self.printers:
             emptyLabel = QLabel("No printers registered yet")
-            emptyLabel.setStyleSheet("color: #7B8AA5;")
+            emptyLabel.setStyleSheet("color: #6B7280;")
             self.dashboardPrinterStatusLayout.addWidget(emptyLabel)
             return
         for printer in self.printers:
@@ -862,7 +937,7 @@ class PrinterDashboardWindow(QMainWindow):
         self.clearLayout(self.dashboardActivityLayout)
         if not self.events:
             emptyLabel = QLabel("No recent activity yet")
-            emptyLabel.setStyleSheet("color: #7B8AA5;")
+            emptyLabel.setStyleSheet("color: #6B7280;")
             self.dashboardActivityLayout.addWidget(emptyLabel)
             return
         for event in reversed(self.events[-4:]):
@@ -875,7 +950,7 @@ class PrinterDashboardWindow(QMainWindow):
         self.clearLayout(self.printerGridLayout)
         if not self.printers:
             placeholder = QLabel("Add your first printer to get started")
-            placeholder.setStyleSheet("color: #7B8AA5;")
+            placeholder.setStyleSheet("color: #6B7280;")
             self.printerGridLayout.addWidget(placeholder, 0, 0)
             return
         for index, printer in enumerate(self.printers):
@@ -1045,7 +1120,7 @@ class PrinterDashboardWindow(QMainWindow):
     def createJobRow(self, job: JobInfo) -> QWidget:
         row = QFrame()
         row.setStyleSheet(
-            "background-color: rgba(255, 255, 255, 0.04); border-radius: 12px; padding: 10px;"
+            "background-color: rgba(148, 163, 184, 0.12); border: 1px solid #E2E8F0; border-radius: 12px; padding: 10px;"
         )
         layout = QHBoxLayout(row)
         layout.setSpacing(12)
@@ -1058,16 +1133,26 @@ class PrinterDashboardWindow(QMainWindow):
             job.status,
             job.material,
             job.duration,
+            job.uploadedAt or "-",
         ]:
             label = QLabel(value)
-            label.setStyleSheet("color: #CBD5F5;")
+            label.setStyleSheet("color: #1F2937;")
             label.setMinimumWidth(100)
             layout.addWidget(label)
 
         layout.addStretch(1)
-        detailsButton = QPushButton("Details")
-        detailsButton.clicked.connect(partial(self.showJobDetails, job))
-        layout.addWidget(detailsButton)
+        if job.fetchToken:
+            dataButton = QPushButton("View Data")
+            dataButton.clicked.connect(partial(self.showRemoteJobData, job))
+            layout.addWidget(dataButton)
+            downloadButton = QPushButton("Download")
+            downloadButton.clicked.connect(partial(self.downloadRemoteJobFile, job))
+            layout.addWidget(downloadButton)
+        else:
+            detailsButton = QPushButton("Details")
+            detailsButton.clicked.connect(partial(self.showJobDetails, job))
+            layout.addWidget(detailsButton)
+
         removeButton = QPushButton("Remove")
         removeButton.clicked.connect(partial(self.removeJob, job))
         layout.addWidget(removeButton)
@@ -1108,17 +1193,408 @@ class PrinterDashboardWindow(QMainWindow):
         buttonBox.button(QDialogButtonBox.Close).setText("Close")
         dialog.exec()
 
+    def showRemoteJobData(self, job: JobInfo) -> None:
+        metadata = self.fetchRemoteJobData(job)
+        if metadata is None:
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Incoming File Details")
+        dialog.setMinimumWidth(520)
+        dialogLayout = QVBoxLayout(dialog)
+        dialogLayout.setSpacing(16)
+
+        headerForm = QFormLayout()
+        headerForm.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        headerForm.addRow("Filename", QLabel(job.filename))
+        headerForm.addRow("Uploaded", QLabel(job.uploadedAt or "-"))
+        headerForm.addRow("Printer", QLabel(job.targetPrinter or "-"))
+        headerForm.addRow("Status", QLabel(job.status or "Pending"))
+        dialogLayout.addLayout(headerForm)
+
+        relevantPairs = self.buildRelevantFieldPairs(metadata.unencryptedData)
+        if relevantPairs:
+            relevantFrame = QFrame()
+            relevantFrame.setFrameShape(QFrame.NoFrame)
+            relevantLayout = QFormLayout(relevantFrame)
+            relevantLayout.setLabelAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+            for labelText, valueText in relevantPairs:
+                valueLabel = QLabel(valueText)
+                valueLabel.setTextInteractionFlags(Qt.TextSelectableByMouse)
+                relevantLayout.addRow(labelText, valueLabel)
+            dialogLayout.addWidget(relevantFrame)
+
+        imageBase64 = self.extractBase64Image(metadata.unencryptedData)
+        if imageBase64:
+            imagePixmap = self.decodeBase64Image(imageBase64)
+            if imagePixmap is not None:
+                imageLabel = QLabel()
+                imageLabel.setAlignment(Qt.AlignCenter)
+                imageLabel.setPixmap(
+                    imagePixmap.scaledToWidth(320, Qt.SmoothTransformation)
+                )
+                dialogLayout.addWidget(imageLabel)
+
+        sensitivePairs = self.decodeSensitiveData(metadata.decryptedData)
+        sensitiveFrame = QFrame()
+        sensitiveFrame.setFrameShape(QFrame.NoFrame)
+        sensitiveLayout = QFormLayout(sensitiveFrame)
+        sensitiveLayout.setLabelAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        sensitiveTitle = QLabel("Sensitive data")
+        sensitiveTitle.setStyleSheet("font-weight: 600; margin-bottom: 4px;")
+        dialogLayout.addWidget(sensitiveTitle)
+        for labelText, valueText in sensitivePairs:
+            valueLabel = QLabel(valueText)
+            valueLabel.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            sensitiveLayout.addRow(labelText, valueLabel)
+        dialogLayout.addWidget(sensitiveFrame)
+
+        toggleButton = QPushButton("Show All Data")
+        dialogLayout.addWidget(toggleButton)
+        allDataView = QPlainTextEdit()
+        allDataView.setReadOnly(True)
+        allDataView.setPlainText(self.formatJsonForDisplay(metadata))
+        allDataView.hide()
+        dialogLayout.addWidget(allDataView)
+
+        def toggleFullData() -> None:
+            if allDataView.isVisible():
+                allDataView.hide()
+                toggleButton.setText("Show All Data")
+            else:
+                allDataView.show()
+                toggleButton.setText("Hide All Data")
+
+        toggleButton.clicked.connect(toggleFullData)
+
+        buttonBox = QDialogButtonBox(QDialogButtonBox.Close)
+        buttonBox.rejected.connect(dialog.reject)
+        buttonBox.accepted.connect(dialog.accept)
+        buttonBox.button(QDialogButtonBox.Close).setText("Close")
+        dialogLayout.addWidget(buttonBox)
+
+        dialog.exec()
+
+    def downloadRemoteJobFile(self, job: JobInfo) -> None:
+        metadata = self.fetchRemoteJobData(job)
+        if metadata is None:
+            return
+        if metadata.signedUrl is None:
+            QMessageBox.warning(
+                self,
+                "Download unavailable",
+                "The server did not provide a download link for this file.",
+            )
+            return
+
+        cacheKey = self.getJobCacheKey(job)
+        defaultDirectory = Path.home() / "Downloads"
+        if not defaultDirectory.exists():
+            defaultDirectory = Path.home()
+        selectedDirectory = QFileDialog.getExistingDirectory(
+            self,
+            "Choose download folder",
+            str(defaultDirectory),
+        )
+        if not selectedDirectory:
+            return
+
+        targetDirectory = Path(selectedDirectory)
+        try:
+            response = requests.get(metadata.signedUrl, stream=True, timeout=60)
+            response.raise_for_status()
+        except RequestException as error:
+            QMessageBox.warning(
+                self,
+                "Download failed",
+                f"Unable to download the file: {error}",
+            )
+            return
+
+        fallbackName = Path(job.filename).name if job.filename else "downloaded_file.bin"
+        filename = determineFilename(response, fallbackName=fallbackName)
+        filename = Path(filename).name or fallbackName
+        downloadPath = self.createUniqueDownloadPath(targetDirectory, filename)
+
+        try:
+            with open(downloadPath, "wb") as fileHandle:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        fileHandle.write(chunk)
+        except OSError as error:
+            QMessageBox.warning(
+                self,
+                "Unable to save file",
+                f"Could not save the downloaded file: {error}",
+            )
+            return
+
+        metadata.downloadedFilePath = downloadPath
+        self.remoteJobDetails[cacheKey] = metadata
+
+        self.logEvent(
+            ActivityEvent(
+                level="SUCCESS",
+                timestamp=datetime.now().strftime("%H:%M"),
+                message=f"Downloaded '{filename}'",
+                category="downloads",
+                color=self.getEventColor("SUCCESS"),
+            )
+        )
+        QMessageBox.information(
+            self,
+            "Download complete",
+            f"File saved to {downloadPath}",
+        )
+
     def refreshJobsTable(self) -> None:
         if self.jobsContainerLayout is None:
             return
         self.clearLayout(self.jobsContainerLayout)
         if not self.jobs:
             placeholder = QLabel("No jobs in the queue yet")
-            placeholder.setStyleSheet("color: #7B8AA5;")
+            placeholder.setStyleSheet("color: #6B7280;")
             self.jobsContainerLayout.addWidget(placeholder)
             return
         for job in reversed(self.jobs):
             self.jobsContainerLayout.addWidget(self.createJobRow(job))
+
+    def fetchRemoteJobData(self, job: JobInfo) -> Optional[RemoteJobMetadata]:
+        cacheKey = self.getJobCacheKey(job)
+        cached = self.remoteJobDetails.get(cacheKey)
+        if cached is not None:
+            return cached
+        if not job.fetchToken:
+            QMessageBox.warning(
+                self,
+                "Missing token",
+                "This job does not include a fetch token and cannot be retrieved.",
+            )
+            return None
+        try:
+            fetchUrl = buildFetchUrl(self.backendBaseUrl, job.fetchToken)
+        except ValueError as error:
+            QMessageBox.warning(
+                self,
+                "Invalid configuration",
+                f"Unable to build fetch URL: {error}",
+            )
+            return None
+
+        try:
+            response = requests.get(fetchUrl, timeout=30)
+            response.raise_for_status()
+        except RequestException as error:
+            QMessageBox.warning(
+                self,
+                "Fetch failed",
+                f"Unable to retrieve job metadata: {error}",
+            )
+            return None
+
+        try:
+            payload = response.json()
+        except ValueError:
+            QMessageBox.warning(
+                self,
+                "Unexpected response",
+                "The server returned data in an unexpected format.",
+            )
+            return None
+
+        if not isinstance(payload, dict):
+            QMessageBox.warning(
+                self,
+                "Unexpected response",
+                "The server returned data in an unexpected structure.",
+            )
+            return None
+
+        unencryptedData = self.normalizeDataDict(payload.get("unencryptedData"))
+        decryptedData = self.normalizeDataDict(payload.get("decryptedData"))
+        signedUrl = payload.get("signedUrl")
+        signedUrlValue = signedUrl if isinstance(signedUrl, str) and signedUrl else None
+
+        metadata = RemoteJobMetadata(
+            fetchToken=job.fetchToken,
+            unencryptedData=unencryptedData,
+            decryptedData=decryptedData,
+            signedUrl=signedUrlValue,
+        )
+        self.remoteJobDetails[cacheKey] = metadata
+
+        self.logEvent(
+            ActivityEvent(
+                level="INFO",
+                timestamp=datetime.now().strftime("%H:%M"),
+                message=f"Fetched metadata for '{job.filename}'",
+                category="jobs",
+                color=self.getEventColor("INFO"),
+            )
+        )
+        self.pollPendingJobs(force=True)
+        return metadata
+
+    def getJobCacheKey(self, job: JobInfo) -> str:
+        if job.fetchToken:
+            return job.fetchToken
+        if job.jobId:
+            return job.jobId
+        return job.filename
+
+    def normalizeDataDict(self, rawData: object) -> Dict[str, Any]:
+        if isinstance(rawData, dict):
+            return rawData
+        if isinstance(rawData, str):
+            try:
+                parsed = json.loads(rawData)
+            except json.JSONDecodeError:
+                return {}
+            if isinstance(parsed, dict):
+                return parsed
+        return {}
+
+    def decodeSensitiveData(self, rawData: Dict[str, Any]) -> List[tuple[str, str]]:
+        unpacked = self.unpackSensitiveData(rawData)
+        fieldOrder = [
+            ("printerAccessCode", "Tilgangskode"),
+            ("printerSerialNumber", "Serienummer"),
+            ("printerIpAddress", "IP-adresse"),
+            ("useAms", "AMS-bruk"),
+        ]
+        values: List[tuple[str, str]] = []
+        for key, label in fieldOrder:
+            displayValue = self.formatDisplayValue(unpacked.get(key))
+            values.append((label, displayValue))
+        return values
+
+    def unpackSensitiveData(self, rawData: Dict[str, Any]) -> Dict[str, Any]:
+        if not rawData:
+            return {}
+        data = dict(rawData)
+        encodedCandidates = [
+            data.get("base64Gzipped"),
+            data.get("base64Compressed"),
+            data.get("encodedPayload"),
+        ]
+        for candidate in encodedCandidates:
+            if isinstance(candidate, str) and candidate.strip():
+                decoded = self.decodeBase64GzipJson(candidate)
+                if decoded is not None:
+                    data.update(decoded)
+        nested = data.get("sensitiveData")
+        if isinstance(nested, dict):
+            data.update(nested)
+        return data
+
+    def decodeBase64GzipJson(self, encoded: str) -> Optional[Dict[str, Any]]:
+        try:
+            binary = base64.b64decode(encoded)
+        except binascii.Error:
+            return None
+        try:
+            with gzip.GzipFile(fileobj=io.BytesIO(binary)) as gzipFile:
+                decodedBytes = gzipFile.read()
+        except OSError:
+            return None
+        try:
+            decodedText = decodedBytes.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+        try:
+            parsed = json.loads(decodedText)
+        except json.JSONDecodeError:
+            return None
+        return parsed if isinstance(parsed, dict) else None
+
+    def extractBase64Image(self, unencryptedData: Dict[str, Any]) -> Optional[str]:
+        imageKeys = [
+            "base64GatedImage",
+            "base64PreviewImage",
+            "previewImageBase64",
+            "imageBase64",
+        ]
+        for key in imageKeys:
+            value = unencryptedData.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        for key, value in unencryptedData.items():
+            if not isinstance(value, str):
+                continue
+            lowerKey = key.lower()
+            if "image" in lowerKey and "base64" in lowerKey and value.strip():
+                return value.strip()
+        return None
+
+    def decodeBase64Image(self, encoded: str) -> Optional[QPixmap]:
+        try:
+            imageBytes = base64.b64decode(encoded)
+        except binascii.Error:
+            return None
+        image = QImage.fromData(imageBytes)
+        if image.isNull():
+            return None
+        return QPixmap.fromImage(image)
+
+    def buildRelevantFieldPairs(self, data: Dict[str, Any]) -> List[tuple[str, str]]:
+        preferredFields = [
+            ("productName", "Produkt"),
+            ("objectName", "Objekt"),
+            ("priority", "Prioritet"),
+            ("quantity", "Antall"),
+            ("filamentType", "Filamenttype"),
+            ("filamentColor", "Filamentfarge"),
+            ("filamentUsedGrams", "Filament (gram)"),
+            ("layerHeight", "Lagtykkelse"),
+            ("nozzleSize", "Dysetykkelse"),
+        ]
+        pairs: List[tuple[str, str]] = []
+        for key, label in preferredFields:
+            if key in data:
+                pairs.append((label, self.formatDisplayValue(data.get(key))))
+        if pairs:
+            return pairs
+        fallbackPairs: List[tuple[str, str]] = []
+        for index, (key, value) in enumerate(data.items()):
+            if index >= 6:
+                break
+            if isinstance(value, (str, int, float, bool)):
+                fallbackPairs.append((self.humanizeKey(key), self.formatDisplayValue(value)))
+        return fallbackPairs
+
+    def humanizeKey(self, key: str) -> str:
+        spaced = re.sub(r"([A-Z])", r" \1", key)
+        spaced = spaced.replace("_", " ").strip()
+        if not spaced:
+            return key
+        return spaced[0].upper() + spaced[1:]
+
+    def formatDisplayValue(self, value: Any) -> str:
+        if isinstance(value, bool):
+            return "Ja" if value else "Nei"
+        if isinstance(value, float):
+            return f"{value:.2f}".rstrip("0").rstrip(".")
+        if value in (None, ""):
+            return "-"
+        return str(value)
+
+    def formatJsonForDisplay(self, metadata: RemoteJobMetadata) -> str:
+        combined = {
+            "unencryptedData": metadata.unencryptedData,
+            "decryptedData": metadata.decryptedData,
+        }
+        return json.dumps(combined, indent=2, ensure_ascii=False)
+
+    def createUniqueDownloadPath(self, directory: Path, filename: str) -> Path:
+        sanitizedName = filename or "downloaded_file.bin"
+        targetPath = directory / sanitizedName
+        counter = 1
+        while targetPath.exists():
+            stem = targetPath.stem
+            suffix = targetPath.suffix
+            targetPath = directory / f"{stem}_{counter}{suffix}"
+            counter += 1
+        return targetPath
 
     def addManualJob(self, job: JobInfo) -> None:
         self.manualJobs.insert(0, job)
@@ -1224,16 +1700,16 @@ class PrinterDashboardWindow(QMainWindow):
     def createKeyRow(self, key: KeyInfo) -> QWidget:
         row = QFrame()
         row.setStyleSheet(
-            "background-color: rgba(255, 255, 255, 0.04); border-radius: 12px; padding: 12px;"
+            "background-color: rgba(148, 163, 184, 0.12); border: 1px solid #E2E8F0; border-radius: 12px; padding: 12px;"
         )
         layout = QHBoxLayout(row)
         layout.setSpacing(12)
 
         label = QLabel(key.keyLabel)
-        label.setStyleSheet("font-weight: 600; color: #E5EDFF;")
+        label.setStyleSheet("font-weight: 600; color: #1F2937;")
         valueLabel = QLabel(key.keyValue)
         valueLabel.setStyleSheet(
-            "color: #CBD5F5; font-family: 'JetBrains Mono', 'Fira Code', monospace;"
+            "color: #1F2937; font-family: 'JetBrains Mono', 'Fira Code', monospace;"
         )
 
         layout.addWidget(label)
@@ -1252,7 +1728,7 @@ class PrinterDashboardWindow(QMainWindow):
         if not self.keys:
             placeholder = QLabel("No public keys configured yet")
             placeholder.setAlignment(Qt.AlignCenter)
-            placeholder.setStyleSheet("color: #7B8AA5; font-size: 16px;")
+            placeholder.setStyleSheet("color: #6B7280; font-size: 16px;")
             self.keysLayout.addWidget(placeholder)
             return
         for key in self.keys:
@@ -1325,7 +1801,7 @@ class PrinterDashboardWindow(QMainWindow):
         self.clearLayout(self.eventsLayout)
         if not self.events:
             placeholder = QLabel("No events logged yet")
-            placeholder.setStyleSheet("color: #7B8AA5;")
+            placeholder.setStyleSheet("color: #6B7280;")
             self.eventsLayout.addWidget(placeholder)
             return
         for event in reversed(self.events):
@@ -1345,6 +1821,20 @@ class PrinterDashboardWindow(QMainWindow):
         self.populateDashboardActivity()
 
     def toggleListening(self) -> None:
+        if self.listenerChannelCombo is not None:
+            selectedChannel = self.listenerChannelCombo.currentText().strip()
+            if not selectedChannel:
+                QMessageBox.warning(
+                    self,
+                    "Invalid channel",
+                    "Channel cannot be empty when starting the listener.",
+                )
+                return
+            if selectedChannel != self.listenerChannel:
+                self.listenerChannel = selectedChannel
+                if selectedChannel not in self.knownListenerChannels:
+                    self.knownListenerChannels.append(selectedChannel)
+                    self.listenerChannelCombo.addItem(selectedChannel)
         self.isListening = not self.isListening
         statusLevel = "SUCCESS" if self.isListening else "INFO"
         statusMessage = (
@@ -1440,6 +1930,7 @@ class PrinterDashboardWindow(QMainWindow):
                 continue
             jobIdSource = pending.get("fileId") or pending.get("fetchToken") or rawIndex
             jobId = str(jobIdSource)
+            fetchToken = pending.get("fetchToken")
             filename = pending.get("originalFilename") or pending.get("fileId") or f"Job {rawIndex}"
             statusRaw = pending.get("status")
             statusText = statusRaw.strip() if isinstance(statusRaw, str) else "Pending"
@@ -1463,6 +1954,7 @@ class PrinterDashboardWindow(QMainWindow):
                     duration=self.formatJobDuration(durationValue),
                     jobId=jobId,
                     uploadedAt=uploadedAt,
+                    fetchToken=str(fetchToken) if isinstance(fetchToken, str) else None,
                 )
             )
 
@@ -1497,9 +1989,9 @@ class PrinterDashboardWindow(QMainWindow):
         self.updateCombinedJobs(remoteJobs)
 
     def saveListenerChannel(self) -> None:
-        if self.listenerInput is None:
+        if self.listenerChannelCombo is None:
             return
-        channel = self.listenerInput.text().strip()
+        channel = self.listenerChannelCombo.currentText().strip()
         if not channel:
             QMessageBox.warning(
                 self,
@@ -1509,6 +2001,10 @@ class PrinterDashboardWindow(QMainWindow):
             return
         if channel != self.listenerChannel:
             self.listenerChannel = channel
+            if channel not in self.knownListenerChannels:
+                self.knownListenerChannels.append(channel)
+                if self.listenerChannelCombo is not None:
+                    self.listenerChannelCombo.addItem(channel)
             self.updateListenerStatus()
             self.logEvent(
                 ActivityEvent(
