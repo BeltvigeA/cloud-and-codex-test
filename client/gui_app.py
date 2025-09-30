@@ -31,6 +31,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QSizePolicy,
+    QScrollArea,
     QStackedWidget,
     QVBoxLayout,
     QWidget,
@@ -94,10 +95,11 @@ class NavigationList(QListWidget):
         self.setSpacing(6)
         self.setFrameShape(QFrame.NoFrame)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.setFocusPolicy(Qt.NoFocus)
         self.setSelectionMode(QListWidget.SingleSelection)
         self.setFixedWidth(200)
+        self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
         self.setSizeAdjustPolicy(QAbstractScrollArea.AdjustToContents)
         self._contentHeight = 0
 
@@ -116,6 +118,7 @@ class NavigationList(QListWidget):
         totalHeight += max(0, self.count() - 1) * self.spacing()
         self._contentHeight = totalHeight
         self.setFixedHeight(totalHeight)
+
 
     def contentHeight(self) -> int:
         return self._contentHeight
@@ -191,8 +194,22 @@ class PrinterDashboardWindow(QMainWindow):
         logoWrapper = self.createLogoHeader()
         self.navigationLogoWidget = logoWrapper
         navigationWrapper.addWidget(logoWrapper)
-        navigationWrapper.addWidget(self.navigationList)
-        navigationWrapper.addStretch(1)
+
+        navigationScrollContent = QWidget()
+        navigationScrollLayout = QVBoxLayout(navigationScrollContent)
+        navigationScrollLayout.setContentsMargins(0, 0, 0, 0)
+        navigationScrollLayout.setSpacing(0)
+        navigationScrollLayout.addWidget(self.navigationList)
+        navigationScrollLayout.addStretch(1)
+
+        navigationScrollArea = QScrollArea()
+        navigationScrollArea.setWidgetResizable(True)
+        navigationScrollArea.setFrameShape(QFrame.NoFrame)
+        navigationScrollArea.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        navigationScrollArea.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        navigationScrollArea.setWidget(navigationScrollContent)
+
+        navigationWrapper.addWidget(navigationScrollArea, 1)
         navigationWrapperWidget = QWidget()
         navigationWrapperWidget.setLayout(navigationWrapper)
         navigationWrapperWidget.setFixedWidth(220)
@@ -231,6 +248,7 @@ class PrinterDashboardWindow(QMainWindow):
         self.navigationList.setCurrentRow(0)
         self.pollPendingJobs(force=True)
         self.ensureNavigationFits()
+
 
     def applyTheme(self) -> None:
         baseColor = "#101827"
