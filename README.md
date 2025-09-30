@@ -68,6 +68,26 @@ Installer klientavhengigheter (bruk gjerne det samme virtuelle miljøet):
 pip install -r requirements.txt
 ```
 
+#### Grafisk PrintMaster-klient
+
+Den nye skrivebordsklienten gir et brukergrensesnitt som samsvarer med designet i skjermbildene. Start appen lokalt med:
+
+```bash
+python -m client.gui_app
+```
+
+Applikasjonen viser en navigasjonsmeny med oversikt over dashbord, skrivere, jobbkø, nøkler og hendelser. Dummy-data gir et realistisk inntrykk av statuskortene, og brukergrensesnittet er optimalisert for et mørkt tema.
+
+##### Pakke til Windows `.exe`
+
+Det følger med PyInstaller-oppsett slik at klienten kan pakkes til en kjørbar fil. Kjør følgende kommando på Windows etter at avhengighetene er installert:
+
+```bash
+pyinstaller --name PrintMasterDashboard --windowed --noconfirm --collect-all PySide6 --add-data "client:client" client/gui_app.py
+```
+
+Dette oppretter en mappe `dist/PrintMasterDashboard` som inneholder `PrintMasterDashboard.exe`. Distribuer hele mappen for å sikre at alle nødvendige Qt-ressurser følger med.
+
 Tilgjengelige kommandoer:
 
 - **Hente én fil via token**:

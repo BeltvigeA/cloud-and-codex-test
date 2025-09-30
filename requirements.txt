@@ -4,3 +4,5 @@ google-cloud-firestore==2.11.1
 google-cloud-kms==2.12.0
 google-api-core==2.11.1
 requests==2.31.0
+PySide6==6.9.2
+pyinstaller==6.10.0
