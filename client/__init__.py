@@ -1,5 +1,5 @@
-"""Client utilities package providing CLI helpers and GUI tools."""
+"""Client utilities package providing CLI helpers and offline tools."""
 
-from . import client, gui
+from . import client
 
-__all__ = ["client", "gui"]
+__all__ = ["client"]

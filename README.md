@@ -68,33 +68,25 @@ Installer klientavhengigheter (bruk gjerne det samme virtuelle miljøet):
 pip install -r requirements.txt
 ```
 
-### Skrivebordsklient (Tkinter)
+#### Grafisk PrintMaster-klient
 
-Det følger nå en enkel Python-basert GUI-klient som lar deg skrive inn metadata for utskriftsjobber og eksportere dem til JSON.
-
-1. Installer prosjektavhengighetene dersom du ikke allerede har gjort det:
-
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-2. Start GUI-en lokalt:
-
-   ```bash
-   python -m client.gui
-   ```
-
-   Skjemaet lar deg fylle ut de viktigste feltene for en utskriftsjobb, lese inn eksisterende JSON-filer og lagre et nytt metadata-dokument.
-
-#### Bygg GUI-en som en Windows `.exe`
-
-Prosjektet inkluderer PyInstaller i `requirements.txt` slik at du kan generere en frittstående kjørbar fil:
+Den nye skrivebordsklienten gir et brukergrensesnitt som samsvarer med designet i skjermbildene. Start appen lokalt med:
 
 ```bash
-pyinstaller --name PrintMetadataGUI --windowed --onefile client/gui.py
+python -m client.gui_app
 ```
 
-Den ferdige `.exe`-filen finner du i `dist/PrintMetadataGUI.exe`. Kopier hele `dist`-mappen til målmaskinen og kjør programmet derfra.
+Applikasjonen viser en navigasjonsmeny med oversikt over dashbord, skrivere, jobbkø, nøkler og hendelser. Dummy-data gir et realistisk inntrykk av statuskortene, og brukergrensesnittet er optimalisert for et mørkt tema.
+
+##### Pakke til Windows `.exe`
+
+Det følger med PyInstaller-oppsett slik at klienten kan pakkes til en kjørbar fil. Kjør følgende kommando på Windows etter at avhengighetene er installert:
+
+```bash
+pyinstaller --name PrintMasterDashboard --windowed --noconfirm --collect-all PySide6 --add-data "client:client" client/gui_app.py
+```
+
+Dette oppretter en mappe `dist/PrintMasterDashboard` som inneholder `PrintMasterDashboard.exe`. Distribuer hele mappen for å sikre at alle nødvendige Qt-ressurser følger med.
 
 Tilgjengelige kommandoer:
 
