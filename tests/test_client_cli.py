@@ -97,33 +97,4 @@ def testValidateRemoteListenAcceptsDefaultBaseUrl(monkeypatch: pytest.MonkeyPatc
     arguments = client.parseArguments()
 
     assert arguments.baseUrl == client.defaultBaseUrl
-    assert arguments.channel is None
-    assert arguments.jobLogFile == "pendingJobs.log"
     assert client.validateRemoteListenArguments(arguments)
-
-
-def testListenCommandAllowsChannelAndJobLog(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    jobLogPath = tmp_path / "jobs" / "custom.log"
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        [
-            "client",
-            "listen",
-            "--mode",
-            "remote",
-            "--recipientId",
-            "recipientValue",
-            "--outputDir",
-            str(tmp_path),
-            "--channel",
-            "alpha",
-            "--jobLogFile",
-            str(jobLogPath),
-        ],
-    )
-
-    arguments = client.parseArguments()
-
-    assert arguments.channel == "alpha"
-    assert Path(arguments.jobLogFile) == jobLogPath

@@ -7,7 +7,6 @@ import shutil
 import sys
 import time
 import uuid
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -124,15 +123,6 @@ def parseArguments() -> argparse.Namespace:
         type=int,
         default=0,
         help="Maximum number of polling iterations (0 for indefinite).",
-    )
-    listenParser.add_argument(
-        "--channel",
-        help="Optional channel name used to scope pending file lookups.",
-    )
-    listenParser.add_argument(
-        "--jobLogFile",
-        default="pendingJobs.log",
-        help="Filename (or path) used to record received job metadata.",
     )
 
     return parser.parse_args()
@@ -302,12 +292,7 @@ def loadOfflineDataset(datasetPath: str) -> Optional[List[Dict[str, Any]]]:
     return normalizedEntries
 
 
-def listenOffline(
-    datasetPath: str,
-    outputDir: str,
-    channel: Optional[str] = None,
-    jobLogFile: Optional[str] = None,
-) -> None:
+def listenOffline(datasetPath: str, outputDir: str) -> None:
     entries = loadOfflineDataset(datasetPath)
     if entries is None:
         return
@@ -317,23 +302,12 @@ def listenOffline(
         return
 
     datasetDirectory = Path(datasetPath).expanduser().resolve().parent
-    outputPath = ensureOutputDirectory(outputDir)
-    jobLogPath = resolveJobLogPath(jobLogFile, outputPath)
 
     processedCount = 0
     for entry in entries:
         dataFile = entry.get("dataFile")
         if not dataFile:
             logging.warning("Skipping offline entry without dataFile: %s", entry)
-            continue
-
-        entryChannel = entry.get("channel")
-        if channel and entryChannel != channel:
-            logging.info(
-                "Skipping offline entry for channel %s (active channel %s).",
-                entryChannel,
-                channel,
-            )
             continue
 
         dataFilePath = Path(dataFile).expanduser()
@@ -360,15 +334,8 @@ def listenOffline(
         savedFile = performOfflineFetch(metadataSource, str(dataFilePath), outputDir)
         if savedFile is not None:
             processedCount += 1
-            jobMetadata = {
-                "filePath": str(savedFile),
-                "channel": entryChannel,
-                "metadataSource": metadataSource,
-            }
-            recordJobLogEntry(jobLogPath, jobMetadata, "offline")
 
     logging.info("Offline processing complete. Files saved: %d", processedCount)
-    logging.info("Job metadata recorded in %s", jobLogPath)
 
 
 def determineFilename(response: requests.Response, fallbackName: str = "downloaded_file.bin") -> str:
@@ -441,14 +408,11 @@ def performFetch(baseUrl: str, fetchToken: str, outputDir: str) -> None:
     logging.info("Fetch completed successfully. File saved at %s", savedFile)
 
 
-def fetchPendingFiles(
-    baseUrl: str, recipientId: str, channel: Optional[str]
-) -> Optional[List[Dict[str, Any]]]:
+def fetchPendingFiles(baseUrl: str, recipientId: str) -> Optional[List[Dict[str, Any]]]:
     pendingUrl = buildPendingUrl(baseUrl, recipientId)
     logging.info("Checking for pending files for recipient %s", recipientId)
     try:
-        params = {"channel": channel} if channel else None
-        response = requests.get(pendingUrl, params=params, timeout=30)
+        response = requests.get(pendingUrl, timeout=30)
         response.raise_for_status()
     except requests.RequestException as error:
         logging.error("Failed to fetch pending files: %s", error)
@@ -466,29 +430,6 @@ def fetchPendingFiles(
         return None
 
     return pendingFiles
-
-
-def resolveJobLogPath(jobLogFile: Optional[str], outputPath: Path) -> Path:
-    if jobLogFile:
-        jobLogPath = Path(jobLogFile).expanduser()
-        if not jobLogPath.is_absolute():
-            jobLogPath = outputPath / jobLogPath
-    else:
-        jobLogPath = outputPath / "pendingJobs.log"
-
-    jobLogPath.parent.mkdir(parents=True, exist_ok=True)
-    return jobLogPath
-
-
-def recordJobLogEntry(jobLogPath: Path, jobMetadata: Dict[str, Any], source: str) -> None:
-    logEntry = {
-        "loggedAt": datetime.now(timezone.utc).isoformat(),
-        "source": source,
-        "job": jobMetadata,
-    }
-    with jobLogPath.open("a", encoding="utf-8") as logFile:
-        logFile.write(json.dumps(logEntry, ensure_ascii=False))
-        logFile.write("\n")
 
 
 def generateStatusPayload(
@@ -548,14 +489,10 @@ def listenForFiles(
     outputDir: str,
     pollInterval: int,
     maxIterations: int,
-    channel: Optional[str],
-    jobLogFile: Optional[str],
 ) -> None:
-    outputPath = ensureOutputDirectory(outputDir)
-    jobLogPath = resolveJobLogPath(jobLogFile, outputPath)
     iteration = 0
     while True:
-        pendingFiles = fetchPendingFiles(baseUrl, recipientId, channel)
+        pendingFiles = fetchPendingFiles(baseUrl, recipientId)
         if pendingFiles is None:
             logging.warning("Unable to retrieve pending files; will retry after delay.")
         elif not pendingFiles:
@@ -574,11 +511,6 @@ def listenForFiles(
                     filename,
                     fetchToken,
                 )
-                jobMetadata = {
-                    **pendingFile,
-                    "channel": pendingFile.get("channel") or channel,
-                }
-                recordJobLogEntry(jobLogPath, jobMetadata, "remote")
                 performFetch(baseUrl, fetchToken, outputDir)
 
         iteration += 1
@@ -685,12 +617,7 @@ def main() -> None:
                     "Offline listen requires --offlineDataset to reference a JSON description of files."
                 )
                 return
-            listenOffline(
-                arguments.offlineDataset,
-                arguments.outputDir,
-                arguments.channel,
-                arguments.jobLogFile,
-            )
+            listenOffline(arguments.offlineDataset, arguments.outputDir)
         else:
             if not validateRemoteListenArguments(arguments):
                 return
@@ -700,8 +627,6 @@ def main() -> None:
                 arguments.outputDir,
                 arguments.pollInterval,
                 arguments.maxIterations,
-                arguments.channel,
-                arguments.jobLogFile,
             )
     else:
         logging.error("Unknown command: %s", arguments.command)

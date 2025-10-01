@@ -551,7 +551,7 @@ def fetchFile(fetchToken: str):
 
 
 def buildPendingFileList(
-    firestoreClient: firestore.Client, recipientId: str, channel: Optional[str] = None
+    firestoreClient: firestore.Client, recipientId: str
 ) -> Tuple[List[Dict[str, Optional[str]]], List[str]]:
     pendingFiles: List[Dict[str, Optional[str]]] = []
     skippedFiles: List[str] = []
@@ -562,9 +562,6 @@ def buildPendingFileList(
         .where('recipientId', '==', recipientId)
         .where('fetchTokenConsumed', '==', False)
     )
-
-    if channel:
-        fileQuery = fileQuery.where('channel', '==', channel)
 
     for documentSnapshot in fileQuery.stream():
         metadata = documentSnapshot.to_dict() or {}
@@ -586,7 +583,6 @@ def buildPendingFileList(
                 'fetchTokenExpiry': normalizeTimestamp(fetchTokenExpiry),
                 'status': metadata.get('status'),
                 'uploadedAt': normalizeTimestamp(metadata.get('timestamp')),
-                'channel': metadata.get('channel'),
             }
         )
 
@@ -609,20 +605,12 @@ def listPendingFiles(recipientId: str):
             logging.warning('Recipient ID is missing when listing pending files.')
             return jsonify({'error': 'Recipient ID is required'}), 400
 
-        channel = None
-        if hasattr(request, 'args') and request.args is not None:
-            channel = request.args.get('channel')
-
-        pendingFiles, skippedFiles = buildPendingFileList(
-            firestoreClient, recipientId, channel if channel else None
-        )
+        pendingFiles, skippedFiles = buildPendingFileList(firestoreClient, recipientId)
 
         responsePayload = {
             'recipientId': recipientId,
             'pendingFiles': pendingFiles,
         }
-        if channel:
-            responsePayload['channel'] = channel
         if skippedFiles:
             responsePayload['skippedFiles'] = skippedFiles
 
