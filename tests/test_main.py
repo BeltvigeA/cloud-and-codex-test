@@ -96,6 +96,11 @@ class DummyGoogleApiCallError(Exception):
 
 
 exceptionsModule.GoogleAPICallError = DummyGoogleApiCallError
+exceptionsModule.Forbidden = type('DummyForbidden', (DummyGoogleApiCallError,), {})
+exceptionsModule.PermissionDenied = type(
+    'DummyPermissionDenied', (DummyGoogleApiCallError,), {}
+)
+exceptionsModule.Unauthorized = type('DummyUnauthorized', (DummyGoogleApiCallError,), {})
 apiCoreModule = ModuleType('google.api_core')
 apiCoreModule.exceptions = exceptionsModule
 
@@ -310,6 +315,52 @@ def testFetchFileFirstUseSuccess(monkeypatch):
     assert updatePayload['fetchToken'] is main.DELETE_FIELD
     assert updatePayload['fetchTokenExpiry'] is main.DELETE_FIELD
     assert updatePayload['fetchTokenConsumed'] is True
+
+
+def testFetchFileMissingIamPermissions(monkeypatch):
+    metadata = {
+        'encryptedData': '7b7d',
+        'unencryptedData': {'visible': 'info'},
+        'gcsPath': 'recipient123/file.gcode',
+        'fetchTokenExpiry': datetime.now(timezone.utc) + timedelta(minutes=5),
+        'fetchTokenConsumed': False,
+    }
+    documentSnapshot = MockDocumentSnapshot('doc123', metadata)
+    updateRecorder = {'set': None, 'update': []}
+
+    class ForbiddenBlob(MockBlob):
+        def generate_signed_url(self, **_kwargs):
+            raise main.Forbidden('caller does not have storage.objects.sign access')
+
+    class ForbiddenBucket(MockBucket):
+        def blob(self, _name):
+            return ForbiddenBlob()
+
+    class ForbiddenStorageClient(MockStorageClient):
+        def bucket(self, _name):
+            return ForbiddenBucket()
+
+    mockClients = main.ClientBundle(
+        storageClient=ForbiddenStorageClient(),
+        firestoreClient=MockFirestoreClient(
+            documentSnapshot=documentSnapshot, updateRecorder=updateRecorder
+        ),
+        kmsClient=MockEncryptClient({'sensitive': 'value'}),
+        kmsKeyPath='projects/test/locations/test/keyRings/test/cryptoKeys/test',
+        gcsBucketName='test-bucket',
+    )
+    monkeypatch.setattr(main, 'getClients', lambda: mockClients)
+
+    responseBody, statusCode = main.fetchFile('testFetchToken')
+
+    assert statusCode == 403
+    assert responseBody['error'].startswith('Missing required IAM permissions')
+    assert responseBody['missingPermissions'] == [
+        'storage.objects.sign',
+        'iam.serviceAccounts.signBlob',
+    ]
+    assert 'storage.objects.sign' in responseBody['detail']
+    assert updateRecorder['update'] == []
 
 
 def testFetchFileReturnsLegacyUnencryptedMetadata(monkeypatch):
