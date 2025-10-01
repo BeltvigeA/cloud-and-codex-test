@@ -14,6 +14,7 @@ from google.api_core.exceptions import (
     PermissionDenied,
     Unauthorized,
 )
+from google.auth.exceptions import GoogleAuthError
 from google.cloud import firestore, kms_v1, storage
 from google.cloud.firestore_v1 import DELETE_FIELD
 from werkzeug.utils import secure_filename
@@ -545,15 +546,15 @@ def fetchFile(fetchToken: str):
                 expiration=timedelta(minutes=15),
                 method='GET',
             )
-        except (AttributeError, TypeError) as error:
-            logging.error(
+        except (AttributeError, TypeError, GoogleAuthError) as error:
+            logging.exception(
                 'Service account is missing a signing key required for signed URL generation: %s',
                 error,
             )
             return (
                 jsonify(
                     {
-                        'error': 'Service account lacks a signing key for generating signed URLs',
+                        'error': 'Service account lacks a signing capability required for signed URL generation',
                         'detail': str(error),
                     }
                 ),

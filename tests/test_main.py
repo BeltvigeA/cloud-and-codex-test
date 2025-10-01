@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import sys
 from datetime import datetime, timedelta, timezone
@@ -104,6 +105,17 @@ exceptionsModule.Unauthorized = type('DummyUnauthorized', (DummyGoogleApiCallErr
 apiCoreModule = ModuleType('google.api_core')
 apiCoreModule.exceptions = exceptionsModule
 
+authModule = ModuleType('google.auth')
+authExceptionsModule = ModuleType('google.auth.exceptions')
+
+
+class DummyGoogleAuthError(Exception):
+    pass
+
+
+authExceptionsModule.GoogleAuthError = DummyGoogleAuthError
+authModule.exceptions = authExceptionsModule
+
 sys.modules['google'] = googleModule
 sys.modules['google.cloud'] = cloudModule
 sys.modules['google.cloud.firestore'] = firestoreModule
@@ -112,11 +124,14 @@ sys.modules['google.cloud.storage'] = storageModule
 sys.modules['google.cloud.kms_v1'] = kmsModule
 sys.modules['google.api_core'] = apiCoreModule
 sys.modules['google.api_core.exceptions'] = exceptionsModule
+sys.modules['google.auth'] = authModule
+sys.modules['google.auth.exceptions'] = authExceptionsModule
 
 googleModule.cloud = cloudModule
 cloudModule.firestore = firestoreModule
 cloudModule.storage = storageModule
 cloudModule.kms_v1 = kmsModule
+googleModule.auth = authModule
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 os.environ.setdefault('GCP_PROJECT_ID', 'test-project')
@@ -431,9 +446,59 @@ def testFetchFileMissingSigningKey(monkeypatch):
 
     assert statusCode == 503
     assert responseBody == {
-        'error': 'Service account lacks a signing key for generating signed URLs',
+        'error': 'Service account lacks a signing capability required for signed URL generation',
         'detail': 'Credentials lack signing key',
     }
+
+
+def testFetchFileUnsignedCredentialsLogsDetail(monkeypatch, caplog):
+    metadata = {
+        'encryptedData': '7b7d',
+        'unencryptedData': {'visible': 'info'},
+        'gcsPath': 'recipient123/file.gcode',
+        'fetchTokenExpiry': datetime.now(timezone.utc) + timedelta(minutes=5),
+        'fetchTokenConsumed': False,
+    }
+    documentSnapshot = MockDocumentSnapshot('doc123', metadata)
+    updateRecorder = {'set': None, 'update': []}
+
+    class UnsignedCredentialsBlob(MockBlob):
+        def generate_signed_url(self, **_kwargs):
+            raise AttributeError('Credentials are unable to sign blobs')
+
+    class UnsignedCredentialsBucket(MockBucket):
+        def blob(self, _name):
+            return UnsignedCredentialsBlob()
+
+    class UnsignedCredentialsStorageClient(MockStorageClient):
+        def bucket(self, _name):
+            return UnsignedCredentialsBucket()
+
+    mockClients = main.ClientBundle(
+        storageClient=UnsignedCredentialsStorageClient(),
+        firestoreClient=MockFirestoreClient(
+            documentSnapshot=documentSnapshot, updateRecorder=updateRecorder
+        ),
+        kmsClient=MockEncryptClient({'sensitive': 'value'}),
+        kmsKeyPath='projects/test/locations/test/keyRings/test/cryptoKeys/test',
+        gcsBucketName='test-bucket',
+    )
+    monkeypatch.setattr(main, 'getClients', lambda: mockClients)
+
+    caplog.set_level(logging.ERROR)
+
+    responseBody, statusCode = main.fetchFile('testFetchToken')
+
+    assert statusCode == 503
+    assert responseBody == {
+        'error': 'Service account lacks a signing capability required for signed URL generation',
+        'detail': 'Credentials are unable to sign blobs',
+    }
+    assert updateRecorder['update'] == []
+    assert any(
+        'missing a signing key required for signed URL generation' in record.getMessage()
+        for record in caplog.records
+    )
 
 
 def testFetchFileReturnsLegacyUnencryptedMetadata(monkeypatch):
