@@ -535,6 +535,20 @@ def fetchFile(fetchToken: str):
                 expiration=timedelta(minutes=15),
                 method='GET',
             )
+        except (AttributeError, TypeError) as error:
+            logging.error(
+                'Service account is missing a signing key required for signed URL generation: %s',
+                error,
+            )
+            return (
+                jsonify(
+                    {
+                        'error': 'Service account lacks a signing key for generating signed URLs',
+                        'detail': str(error),
+                    }
+                ),
+                503,
+            )
         except (Forbidden, PermissionDenied, Unauthorized) as error:
             missingPermissions = ['storage.objects.sign', 'iam.serviceAccounts.signBlob']
             logging.error(
