@@ -544,6 +544,25 @@ def fetchFile(fetchToken: str):
                 ),
                 403,
             )
+        except (AttributeError, TypeError) as error:
+            logging.error(
+                'Signed URL generation failed because credentials cannot sign URLs: %s',
+                error,
+            )
+            return (
+                jsonify(
+                    {
+                        'error': 'Credentials cannot sign URLs for this bucket',
+                        'detail': str(error),
+                        'operatorResolution': (
+                            'Configure Application Default Credentials with a service account '
+                            'that can sign URLs (for example, one with storage.objects.sign or '
+                            'iam.serviceAccounts.signBlob permissions).'
+                        ),
+                    }
+                ),
+                503,
+            )
         logging.info('Generated signed URL for gs://%s/%s', gcsBucketName, fileMetadata['gcsPath'])
 
         firestoreClient.collection(firestoreCollectionFiles).document(documentSnapshot.id).update(

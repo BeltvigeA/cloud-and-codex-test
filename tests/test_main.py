@@ -363,6 +363,49 @@ def testFetchFileMissingIamPermissions(monkeypatch):
     assert updateRecorder['update'] == []
 
 
+def testFetchFileMissingSigningServiceAccount(monkeypatch):
+    metadata = {
+        'encryptedData': '7b7d',
+        'unencryptedData': {'visible': 'info'},
+        'gcsPath': 'recipient123/file.gcode',
+        'fetchTokenExpiry': datetime.now(timezone.utc) + timedelta(minutes=5),
+        'fetchTokenConsumed': False,
+    }
+    documentSnapshot = MockDocumentSnapshot('doc123', metadata)
+    updateRecorder = {'set': None, 'update': []}
+
+    class UnsignedBlob(MockBlob):
+        def generate_signed_url(self, **_kwargs):
+            raise AttributeError('Credentials object lacks signing key')
+
+    class UnsignedBucket(MockBucket):
+        def blob(self, _name):
+            return UnsignedBlob()
+
+    class UnsignedStorageClient(MockStorageClient):
+        def bucket(self, _name):
+            return UnsignedBucket()
+
+    mockClients = main.ClientBundle(
+        storageClient=UnsignedStorageClient(),
+        firestoreClient=MockFirestoreClient(
+            documentSnapshot=documentSnapshot, updateRecorder=updateRecorder
+        ),
+        kmsClient=MockEncryptClient({'sensitive': 'value'}),
+        kmsKeyPath='projects/test/locations/test/keyRings/test/cryptoKeys/test',
+        gcsBucketName='test-bucket',
+    )
+    monkeypatch.setattr(main, 'getClients', lambda: mockClients)
+
+    responseBody, statusCode = main.fetchFile('testFetchToken')
+
+    assert statusCode == 503
+    assert responseBody['error'].startswith('Credentials cannot sign URLs')
+    assert 'operatorResolution' in responseBody
+    assert 'service account' in responseBody['operatorResolution']
+    assert updateRecorder['update'] == []
+
+
 def testFetchFileReturnsLegacyUnencryptedMetadata(monkeypatch):
     metadata = {
         'unencryptedData': {'legacy': 'info'},
