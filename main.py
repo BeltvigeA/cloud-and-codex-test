@@ -8,7 +8,12 @@ from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 
 from flask import Flask, jsonify, request
-from google.api_core.exceptions import GoogleAPICallError
+from google.api_core.exceptions import (
+    Forbidden,
+    GoogleAPICallError,
+    PermissionDenied,
+    Unauthorized,
+)
 from google.cloud import firestore, kms_v1, storage
 from google.cloud.firestore_v1 import DELETE_FIELD
 from werkzeug.utils import secure_filename
@@ -517,11 +522,28 @@ def fetchFile(fetchToken: str):
         bucket = storageClient.bucket(gcsBucketName)
         blob = bucket.blob(fileMetadata['gcsPath'])
 
-        signedUrl = blob.generate_signed_url(
-            version='v4',
-            expiration=timedelta(minutes=15),
-            method='GET',
-        )
+        try:
+            signedUrl = blob.generate_signed_url(
+                version='v4',
+                expiration=timedelta(minutes=15),
+                method='GET',
+            )
+        except (Forbidden, PermissionDenied, Unauthorized) as error:
+            missingPermissions = ['storage.objects.sign', 'iam.serviceAccounts.signBlob']
+            logging.error(
+                'Missing IAM permissions for signed URL generation: %s',
+                error,
+            )
+            return (
+                jsonify(
+                    {
+                        'error': 'Missing required IAM permissions to generate signed URL',
+                        'missingPermissions': missingPermissions,
+                        'detail': str(error),
+                    }
+                ),
+                403,
+            )
         logging.info('Generated signed URL for gs://%s/%s', gcsBucketName, fileMetadata['gcsPath'])
 
         firestoreClient.collection(firestoreCollectionFiles).document(documentSnapshot.id).update(

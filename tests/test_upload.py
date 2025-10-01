@@ -161,6 +161,13 @@ def installGoogleStubs(monkeypatch):
     firestoreModule.SERVER_TIMESTAMP = object()
     kmsModule.KeyManagementServiceClient = DummyKmsClient
     exceptionsModule.GoogleAPICallError = DummyGoogleApiCallError
+    exceptionsModule.Forbidden = type('DummyForbidden', (DummyGoogleApiCallError,), {})
+    exceptionsModule.PermissionDenied = type(
+        'DummyPermissionDenied', (DummyGoogleApiCallError,), {}
+    )
+    exceptionsModule.Unauthorized = type(
+        'DummyUnauthorized', (DummyGoogleApiCallError,), {}
+    )
     dummyRequest = DummyRequest()
     flaskModule.Flask = DummyFlask
     flaskModule.jsonify = lambda payload: DummyResponse(payload)
