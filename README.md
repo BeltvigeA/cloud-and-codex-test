@@ -82,8 +82,10 @@ Klienten kjøres nå utelukkende via kommandolinjen. Følgende PowerShell-eksemp
 - **Lytte etter jobber for en bestemt mottaker** (klienten henter automatisk nye filer for valgt `recipientId`):
 
   ```powershell
-  python -m client.client listen --baseUrl http://127.0.0.1:5000 --recipientId user-123 --outputDir .\nedlastinger --pollInterval 30
+  python -m client.client listen --baseUrl http://127.0.0.1:5000 --recipientId user-123 --outputDir .\nedlastinger --pollInterval 30 --channel hovedskrivere
   ```
+
+  Når du angir `--channel`, henter klienten kun jobber fra den valgte kanalen. Alle jobber som blir registrert lagres fortløpende i `pendingJobs.log` inne i `outputDir` (eller i filen du oppgir med `--jobLogFile`).
 
 - **Sende statusoppdateringer**:
 
@@ -92,4 +94,20 @@ Klienten kjøres nå utelukkende via kommandolinjen. Følgende PowerShell-eksemp
   ```
 
 Klienten bruker `listen`-kommandoen til å velge hvilken mottaker den skal overvåke og laster automatisk ned alle filer som er tildelt den valgte mottakeren.
+
+### Bygge en Windows-kjørbar fil (.exe)
+
+Du kan bygge en selvstendig `.exe`-fil ved hjelp av [PyInstaller](https://pyinstaller.org/). Etter at avhengighetene er installert:
+
+```powershell
+python -m client.build_executable --help
+```
+
+Eller for å bygge direkte til en katalog (her `dist`):
+
+```powershell
+python -m client.build_executable --outputDirectory dist
+```
+
+Dette oppretter `dist\printer-client.exe` sammen med tilhørende logg- og arbeidsmapper (`dist\build`, `dist\spec`).
 

@@ -1,5 +1,5 @@
 """Client utilities package providing CLI helpers and offline tools."""
 
-from . import client
+from . import build_executable, client
 
-__all__ = ["client"]
+__all__ = ["client", "build_executable"]

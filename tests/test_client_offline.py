@@ -109,14 +109,26 @@ def test_listenOffline_processes_dataset_entries(tmp_path: Path, caplog: pytest.
     outputDirectory = tmp_path / "offlineOutput"
     client.listenOffline(str(datasetPath), str(outputDirectory))
 
-    savedFiles = sorted(path.name for path in outputDirectory.iterdir())
-    assert savedFiles == [
+    savedDataFiles = sorted(
+        path.name for path in outputDirectory.iterdir() if path.name != "pendingJobs.log"
+    )
+    assert savedDataFiles == [
         "firstFile.gcode",
         "inlineMetadataFile.gcode",
         "secondFile.gcode",
     ]
 
     assert any("Offline processing complete" in message for message in caplog.messages)
+
+    jobLogPath = outputDirectory / "pendingJobs.log"
+    assert jobLogPath.exists()
+    logEntries = [json.loads(line) for line in jobLogPath.read_text(encoding="utf-8").splitlines()]
+    assert len(logEntries) == 3
+    assert {Path(entry["job"]["filePath"]).name for entry in logEntries} == {
+        "firstFile.gcode",
+        "inlineMetadataFile.gcode",
+        "secondFile.gcode",
+    }
 
 
 def test_listenOffline_supports_relative_paths(tmp_path: Path) -> None:
@@ -162,7 +174,9 @@ def test_listenOffline_supports_relative_paths(tmp_path: Path) -> None:
     outputDirectory = tmp_path / "relativeOutput"
     client.listenOffline(str(datasetPath), str(outputDirectory))
 
-    savedFiles = sorted(path.name for path in outputDirectory.iterdir())
+    savedFiles = sorted(
+        path.name for path in outputDirectory.iterdir() if path.name != "pendingJobs.log"
+    )
     assert savedFiles == ["inlineRelative.gcode", "relativeFile.gcode"]
 
 
@@ -209,5 +223,49 @@ def test_listenOffline_relative_paths_from_different_working_directory(
     monkeypatch.chdir(alternateWorkingDirectory)
     client.listenOffline(str(datasetPath), str(outputDirectory))
 
-    savedFiles = sorted(path.name for path in outputDirectory.iterdir())
+    savedFiles = sorted(
+        path.name for path in outputDirectory.iterdir() if path.name != "pendingJobs.log"
+    )
     assert savedFiles == ["jobData.gcode"]
+
+
+def test_listenOffline_filters_by_channel(tmp_path: Path) -> None:
+    metadataAlpha = {"originalFilename": "alphaFile.gcode"}
+    metadataBeta = {"originalFilename": "betaFile.gcode"}
+
+    alphaMetadataPath = createMetadataFile(tmp_path, "alphaMetadata.json", metadataAlpha)
+    betaMetadataPath = createMetadataFile(tmp_path, "betaMetadata.json", metadataBeta)
+
+    alphaDataPath = createDataFile(tmp_path, "alphaData.gcode", b"alpha")
+    betaDataPath = createDataFile(tmp_path, "betaData.gcode", b"beta")
+
+    dataset = {
+        "pendingFiles": [
+            {
+                "metadataFile": str(alphaMetadataPath),
+                "dataFile": str(alphaDataPath),
+                "channel": "alpha",
+            },
+            {
+                "metadataFile": str(betaMetadataPath),
+                "dataFile": str(betaDataPath),
+                "channel": "beta",
+            },
+        ]
+    }
+
+    datasetPath = tmp_path / "channelDataset.json"
+    datasetPath.write_text(json.dumps(dataset), encoding="utf-8")
+
+    outputDirectory = tmp_path / "channelOutput"
+    client.listenOffline(str(datasetPath), str(outputDirectory), channel="beta")
+
+    savedFiles = sorted(
+        path.name for path in outputDirectory.iterdir() if path.name != "pendingJobs.log"
+    )
+    assert savedFiles == ["betaFile.gcode"]
+
+    jobLogPath = outputDirectory / "pendingJobs.log"
+    logEntries = [json.loads(line) for line in jobLogPath.read_text(encoding="utf-8").splitlines()]
+    assert len(logEntries) == 1
+    assert logEntries[0]["job"]["channel"] == "beta"
