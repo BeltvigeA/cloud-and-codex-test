@@ -62,50 +62,33 @@ curl.exe -X POST "https://printer-backend-934564650450.europe-west1.run.app/uplo
 
 ### Lokal PC-klient
 
-Installer klientavhengigheter (bruk gjerne det samme virtuelle miljøet):
+Installer klientavhengigheter (bruk gjerne det samme virtuelle miljøet). På Windows med PowerShell:
 
-```bash
+```powershell
+Set-Location -Path <prosjektmappe>
+py -m venv .venv
+.\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 ```
 
-#### Grafisk PrintMaster-klient
-
-Den nye skrivebordsklienten gir et brukergrensesnitt som samsvarer med designet i skjermbildene. Start appen lokalt med:
-
-```bash
-python -m client.gui_app
-```
-
-Applikasjonen viser en navigasjonsmeny med oversikt over dashbord, skrivere, jobbkø, nøkler og hendelser. Dummy-data gir et realistisk inntrykk av statuskortene, og brukergrensesnittet er optimalisert for et mørkt tema.
-
-##### Pakke til Windows `.exe`
-
-Det følger med PyInstaller-oppsett slik at klienten kan pakkes til en kjørbar fil. Kjør følgende kommando på Windows etter at avhengighetene er installert:
-
-```bash
-pyinstaller --name PrintMasterDashboard --windowed --noconfirm --collect-all PySide6 --add-data "client:client" client/gui_app.py
-```
-
-Dette oppretter en mappe `dist/PrintMasterDashboard` som inneholder `PrintMasterDashboard.exe`. Distribuer hele mappen for å sikre at alle nødvendige Qt-ressurser følger med.
-
-Tilgjengelige kommandoer:
+Klienten kjøres nå utelukkende via kommandolinjen. Følgende PowerShell-eksempler viser hvordan du bruker de viktigste kommandoene:
 
 - **Hente én fil via token**:
 
-  ```bash
-  python client/client.py fetch --baseUrl http://127.0.0.1:5000 --fetchToken <token> --outputDir ./nedlastinger
+  ```powershell
+  python -m client.client fetch --baseUrl http://127.0.0.1:5000 --fetchToken <token> --outputDir .\nedlastinger
   ```
 
 - **Lytte etter jobber for en bestemt mottaker** (klienten henter automatisk nye filer for valgt `recipientId`):
 
-  ```bash
-  python client/client.py listen --baseUrl http://127.0.0.1:5000 --recipientId user-123 --outputDir ./nedlastinger --pollInterval 30
+  ```powershell
+  python -m client.client listen --baseUrl http://127.0.0.1:5000 --recipientId user-123 --outputDir .\nedlastinger --pollInterval 30
   ```
 
 - **Sende statusoppdateringer**:
 
-  ```bash
-  python client/client.py status --baseUrl http://127.0.0.1:5000 --apiKey <api-nokkel> --printerSerial PRN-001 --interval 60 --numUpdates 5
+  ```powershell
+  python -m client.client status --baseUrl http://127.0.0.1:5000 --apiKey <api-nokkel> --printerSerial PRN-001 --interval 60 --numUpdates 5
   ```
 
 Klienten bruker `listen`-kommandoen til å velge hvilken mottaker den skal overvåke og laster automatisk ned alle filer som er tildelt den valgte mottakeren.
