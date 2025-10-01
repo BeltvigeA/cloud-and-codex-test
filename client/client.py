@@ -8,7 +8,8 @@ import sys
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from threading import Event
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import requests
 
@@ -230,6 +231,7 @@ def performOfflineFetch(
     metadataSource: Union[str, Path, Dict[str, Any]],
     dataFile: Optional[str],
     outputDir: str,
+    onMetadata: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> Optional[Path]:
     metadata = loadOfflineMetadata(metadataSource)
     if metadata is None:
@@ -243,6 +245,16 @@ def performOfflineFetch(
 
     logging.info("Unencrypted data:\n%s", json.dumps(metadata.get("unencryptedData"), indent=2))
     logging.info("Decrypted data:\n%s", json.dumps(metadata.get("decryptedData"), indent=2))
+    if onMetadata is not None:
+        onMetadata(
+            {
+                "savedFile": str(savedFile),
+                "unencryptedData": metadata.get("unencryptedData", {}),
+                "decryptedData": metadata.get("decryptedData", {}),
+                "timestamp": time.time(),
+                "source": "offline",
+            }
+        )
     return savedFile
 
 
@@ -367,7 +379,7 @@ def saveDownloadedFile(response: requests.Response, outputDir: Path) -> Path:
     return outputPath
 
 
-def performFetch(baseUrl: str, fetchToken: str, outputDir: str) -> None:
+def performFetch(baseUrl: str, fetchToken: str, outputDir: str) -> Optional[Dict[str, Any]]:
     fetchUrl = buildFetchUrl(baseUrl, fetchToken)
     logging.info("Fetching metadata from %s", fetchUrl)
     session = requests.Session()
@@ -376,13 +388,13 @@ def performFetch(baseUrl: str, fetchToken: str, outputDir: str) -> None:
         metadataResponse.raise_for_status()
     except requests.RequestException as error:
         logging.error("Failed to fetch metadata: %s", error)
-        return
+        return None
 
     try:
         payload = metadataResponse.json()
     except json.JSONDecodeError as error:
         logging.error("Invalid JSON response: %s", error)
-        return
+        return None
 
     signedUrl = payload.get("signedUrl")
     unencryptedData = payload.get("unencryptedData")
@@ -390,7 +402,7 @@ def performFetch(baseUrl: str, fetchToken: str, outputDir: str) -> None:
 
     if not signedUrl:
         logging.error("No signedUrl returned from server.")
-        return
+        return None
 
     outputPath = ensureOutputDirectory(outputDir)
     logging.info("Downloading file from signed URL.")
@@ -406,6 +418,43 @@ def performFetch(baseUrl: str, fetchToken: str, outputDir: str) -> None:
     logging.info("Unencrypted data:\n%s", json.dumps(unencryptedData, indent=2))
     logging.info("Decrypted data:\n%s", json.dumps(decryptedData, indent=2))
     logging.info("Fetch completed successfully. File saved at %s", savedFile)
+    return {
+        "savedFile": str(savedFile),
+        "unencryptedData": unencryptedData or {},
+        "decryptedData": decryptedData or {},
+        "timestamp": time.time(),
+        "fetchToken": fetchToken,
+        "source": baseUrl,
+    }
+
+
+def appendJsonLogEntry(logFilePath: Union[str, Path], entry: Dict[str, Any]) -> Path:
+    logPath = Path(logFilePath).expanduser().resolve()
+    logPath.parent.mkdir(parents=True, exist_ok=True)
+    serializedEntry = {
+        "savedFile": entry.get("savedFile"),
+        "unencryptedData": entry.get("unencryptedData", {}),
+        "decryptedData": entry.get("decryptedData", {}),
+        "timestamp": entry.get("timestamp", time.time()),
+        "fetchToken": entry.get("fetchToken"),
+        "source": entry.get("source"),
+    }
+
+    existingEntries: List[Dict[str, Any]] = []
+    if logPath.exists():
+        try:
+            with logPath.open("r", encoding="utf-8") as logFile:
+                loaded = json.load(logFile)
+            if isinstance(loaded, list):
+                existingEntries = loaded
+        except (OSError, json.JSONDecodeError) as error:
+            logging.warning("Unable to load existing log file %s: %s", logPath, error)
+
+    existingEntries.append(serializedEntry)
+    with logPath.open("w", encoding="utf-8") as logFile:
+        json.dump(existingEntries, logFile, indent=2, ensure_ascii=False)
+    logging.info("Appended fetch metadata to %s", logPath)
+    return logPath
 
 
 def fetchPendingFiles(baseUrl: str, recipientId: str) -> Optional[List[Dict[str, Any]]]:
@@ -489,9 +538,13 @@ def listenForFiles(
     outputDir: str,
     pollInterval: int,
     maxIterations: int,
+    onFileFetched: Optional[Callable[[Dict[str, Any]], None]] = None,
+    stopEvent: Optional[Event] = None,
 ) -> None:
     iteration = 0
     while True:
+        if stopEvent and stopEvent.is_set():
+            break
         pendingFiles = fetchPendingFiles(baseUrl, recipientId)
         if pendingFiles is None:
             logging.warning("Unable to retrieve pending files; will retry after delay.")
@@ -511,13 +564,19 @@ def listenForFiles(
                     filename,
                     fetchToken,
                 )
-                performFetch(baseUrl, fetchToken, outputDir)
+                fetchResult = performFetch(baseUrl, fetchToken, outputDir)
+                if onFileFetched and fetchResult is not None:
+                    onFileFetched(fetchResult)
 
         iteration += 1
         if maxIterations and iteration >= maxIterations:
             break
 
-        time.sleep(pollInterval)
+        if stopEvent:
+            if stopEvent.wait(timeout=pollInterval):
+                break
+        else:
+            time.sleep(pollInterval)
 
 
 def performStatusUpdates(
