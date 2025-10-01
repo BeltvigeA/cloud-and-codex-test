@@ -576,6 +576,21 @@ def fetchFile(fetchToken: str):
                 ),
                 403,
             )
+        except GoogleAPICallError as error:
+            logging.exception(
+                'Storage API call failed during signed URL generation: %s',
+                error,
+            )
+            errorDetail = getattr(error, 'message', str(error))
+            return (
+                jsonify(
+                    {
+                        'error': 'Storage service temporarily unavailable for signed URL generation',
+                        'detail': errorDetail,
+                    }
+                ),
+                503,
+            )
         logging.info('Generated signed URL for gs://%s/%s', gcsBucketName, gcsPath)
 
         firestoreClient.collection(firestoreCollectionFiles).document(documentSnapshot.id).update(

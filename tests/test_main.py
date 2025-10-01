@@ -408,6 +408,56 @@ def testFetchFileMissingIamPermissions(monkeypatch):
     assert updateRecorder['update'] == []
 
 
+def testFetchFileStorageApiError(monkeypatch, caplog):
+    metadata = {
+        'encryptedData': '7b7d',
+        'unencryptedData': {'visible': 'info'},
+        'gcsPath': 'recipient123/file.gcode',
+        'fetchTokenExpiry': datetime.now(timezone.utc) + timedelta(minutes=5),
+        'fetchTokenConsumed': False,
+    }
+    documentSnapshot = MockDocumentSnapshot('doc123', metadata)
+    updateRecorder = {'set': None, 'update': []}
+
+    class StorageErrorBlob(MockBlob):
+        def generate_signed_url(self, **_kwargs):
+            raise main.GoogleAPICallError('transient backend failure')
+
+    class StorageErrorBucket(MockBucket):
+        def blob(self, _name):
+            return StorageErrorBlob()
+
+    class StorageErrorClient(MockStorageClient):
+        def bucket(self, _name):
+            return StorageErrorBucket()
+
+    mockClients = main.ClientBundle(
+        storageClient=StorageErrorClient(),
+        firestoreClient=MockFirestoreClient(
+            documentSnapshot=documentSnapshot, updateRecorder=updateRecorder
+        ),
+        kmsClient=MockEncryptClient({'sensitive': 'value'}),
+        kmsKeyPath='projects/test/locations/test/keyRings/test/cryptoKeys/test',
+        gcsBucketName='test-bucket',
+    )
+    monkeypatch.setattr(main, 'getClients', lambda: mockClients)
+
+    caplog.set_level(logging.ERROR)
+
+    responseBody, statusCode = main.fetchFile('testFetchToken')
+
+    assert statusCode == 503
+    assert responseBody == {
+        'error': 'Storage service temporarily unavailable for signed URL generation',
+        'detail': 'transient backend failure',
+    }
+    assert updateRecorder['update'] == []
+    assert any(
+        'Storage API call failed during signed URL generation' in record.getMessage()
+        for record in caplog.records
+    )
+
+
 def testFetchFileMissingSigningKey(monkeypatch):
     metadata = {
         'encryptedData': '7b7d',
