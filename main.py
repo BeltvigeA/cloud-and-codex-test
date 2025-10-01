@@ -527,7 +527,17 @@ def fetchFile(fetchToken: str):
             )
 
         bucket = storageClient.bucket(gcsBucketName)
-        blob = bucket.blob(fileMetadata['gcsPath'])
+        gcsPath = fileMetadata.get('gcsPath')
+        if not gcsPath:
+            logging.warning(
+                'Missing gcsPath in metadata for file %s', documentSnapshot.id
+            )
+            return (
+                jsonify({'error': 'File metadata is incomplete: missing gcsPath'}),
+                422,
+            )
+
+        blob = bucket.blob(gcsPath)
 
         try:
             signedUrl = blob.generate_signed_url(
@@ -565,7 +575,7 @@ def fetchFile(fetchToken: str):
                 ),
                 403,
             )
-        logging.info('Generated signed URL for gs://%s/%s', gcsBucketName, fileMetadata['gcsPath'])
+        logging.info('Generated signed URL for gs://%s/%s', gcsBucketName, gcsPath)
 
         firestoreClient.collection(firestoreCollectionFiles).document(documentSnapshot.id).update(
             {

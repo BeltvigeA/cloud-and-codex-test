@@ -482,6 +482,32 @@ def testFetchFileReturnsLegacyUnencryptedMetadata(monkeypatch):
     assert updatePayload['fetchTokenConsumed'] is True
 
 
+def testFetchFileMissingGcsPath(monkeypatch):
+    metadata = {
+        'unencryptedData': {'visible': 'info'},
+        'fetchTokenExpiry': datetime.now(timezone.utc) + timedelta(minutes=5),
+        'fetchTokenConsumed': False,
+    }
+    documentSnapshot = MockDocumentSnapshot('doc123', metadata)
+    updateRecorder = {'set': None, 'update': []}
+    mockClients = main.ClientBundle(
+        storageClient=MockStorageClient(),
+        firestoreClient=MockFirestoreClient(
+            documentSnapshot=documentSnapshot, updateRecorder=updateRecorder
+        ),
+        kmsClient=MockEncryptClient({'sensitive': 'value'}),
+        kmsKeyPath='projects/test/locations/test/keyRings/test/cryptoKeys/test',
+        gcsBucketName='test-bucket',
+    )
+    monkeypatch.setattr(main, 'getClients', lambda: mockClients)
+
+    responseBody, statusCode = main.fetchFile('testFetchToken')
+
+    assert statusCode == 422
+    assert responseBody == {'error': 'File metadata is incomplete: missing gcsPath'}
+    assert updateRecorder['update'] == []
+
+
 def testFetchFileRejectsConsumedToken(monkeypatch):
     metadata = {
         'encryptedData': '7b7d',
