@@ -124,7 +124,7 @@ os.environ.setdefault('GCS_BUCKET_NAME', 'test-bucket')
 os.environ.setdefault('KMS_KEY_RING', 'test-key-ring')
 os.environ.setdefault('KMS_KEY_NAME', 'test-key')
 os.environ.setdefault('KMS_LOCATION', 'test-location')
-import main
+import main  # noqa: E402
 
 
 class MockBlob:
@@ -315,6 +315,36 @@ def testFetchFileFirstUseSuccess(monkeypatch):
     assert updatePayload['fetchToken'] is main.DELETE_FIELD
     assert updatePayload['fetchTokenExpiry'] is main.DELETE_FIELD
     assert updatePayload['fetchTokenConsumed'] is True
+
+
+def testFetchFileInvalidDecryptedMetadata(monkeypatch):
+    metadata = {
+        'encryptedData': '7b7d',
+        'unencryptedData': {'visible': 'info'},
+        'gcsPath': 'recipient123/file.gcode',
+        'fetchTokenExpiry': datetime.now(timezone.utc) + timedelta(minutes=5),
+        'fetchTokenConsumed': False,
+    }
+    documentSnapshot = MockDocumentSnapshot('doc123', metadata)
+
+    class InvalidJsonKmsClient(MockEncryptClient):
+        def decrypt(self, **_kwargs):
+            return SimpleNamespace(plaintext=b'invalid json')
+
+    updateRecorder = {'set': None, 'update': []}
+    mockClients = main.ClientBundle(
+        storageClient=MockStorageClient(),
+        firestoreClient=MockFirestoreClient(documentSnapshot=documentSnapshot, updateRecorder=updateRecorder),
+        kmsClient=InvalidJsonKmsClient(),
+        kmsKeyPath='projects/test/locations/test/keyRings/test/cryptoKeys/test',
+        gcsBucketName='test-bucket',
+    )
+    monkeypatch.setattr(main, 'getClients', lambda: mockClients)
+
+    responseBody, statusCode = main.fetchFile('testFetchToken')
+
+    assert statusCode == 422
+    assert responseBody == {'error': 'Decrypted metadata is invalid JSON'}
 
 
 def testFetchFileMissingIamPermissions(monkeypatch):

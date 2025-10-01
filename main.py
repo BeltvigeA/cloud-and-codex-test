@@ -500,7 +500,14 @@ def fetchFile(fetchToken: str):
                 decryptResponse = kmsClient.decrypt(
                     request={'name': kmsKeyPath, 'ciphertext': encryptedDataCipherText}
                 )
-                decryptedData = json.loads(decryptResponse.plaintext.decode('utf-8'))
+                try:
+                    decryptedData = json.loads(decryptResponse.plaintext.decode('utf-8'))
+                except json.JSONDecodeError:
+                    logging.warning(
+                        'Decrypted metadata is not valid JSON for file %s',
+                        documentSnapshot.id,
+                    )
+                    return jsonify({'error': 'Decrypted metadata is invalid JSON'}), 422
                 logging.info('Sensitive data decrypted with KMS.')
             except GoogleAPICallError as error:
                 logging.error('KMS decryption failed: %s', error)
