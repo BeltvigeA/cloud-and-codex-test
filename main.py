@@ -15,6 +15,16 @@ from google.api_core.exceptions import (
     Unauthorized,
 )
 from google.auth.exceptions import GoogleAuthError
+
+try:  # pragma: no cover - optional dependency handling
+    from google.auth.iam import Signer
+except ImportError:  # pragma: no cover - fallback when google-auth is unavailable in tests
+    Signer = None  # type: ignore[assignment]
+
+try:  # pragma: no cover - optional dependency handling
+    from google.auth.transport.requests import Request
+except ImportError:  # pragma: no cover - fallback when google-auth is unavailable in tests
+    Request = None  # type: ignore[assignment]
 from google.cloud import firestore, kms_v1, storage
 from google.cloud.firestore_v1 import DELETE_FIELD
 from werkzeug.utils import secure_filename
@@ -541,12 +551,36 @@ def fetchFile(fetchToken: str):
         blob = bucket.blob(gcsPath)
 
         try:
-            signedUrl = blob.generate_signed_url(
-                version='v4',
-                expiration=timedelta(minutes=15),
-                method='GET',
-            )
-        except (AttributeError, TypeError, GoogleAuthError) as error:
+            credentials = getattr(storageClient, '_credentials', None)
+            signer = None
+            serviceAccountEmail = None
+            if credentials is not None:
+                signBytesMethod = getattr(credentials, 'sign_bytes', None)
+                if not callable(signBytesMethod):
+                    if Signer is None or Request is None:
+                        raise ImportError('google.auth Signer and Request are required for IAM signing')
+                    requestAdapter = Request()
+                    credentials.refresh(requestAdapter)
+                    serviceAccountEmail = getattr(credentials, 'service_account_email', None)
+                    if not serviceAccountEmail:
+                        raise AttributeError('Credentials missing service_account_email required for IAM signing')
+                    signer = Signer(requestAdapter, credentials, serviceAccountEmail)
+
+            if signer is not None and serviceAccountEmail is not None:
+                signedUrl = blob.generate_signed_url(
+                    version='v4',
+                    expiration=timedelta(minutes=15),
+                    method='GET',
+                    signer=signer,
+                    service_account_email=serviceAccountEmail,
+                )
+            else:
+                signedUrl = blob.generate_signed_url(
+                    version='v4',
+                    expiration=timedelta(minutes=15),
+                    method='GET',
+                )
+        except (AttributeError, ImportError, TypeError, GoogleAuthError) as error:
             logging.exception(
                 'Service account is missing a signing key required for signed URL generation: %s',
                 error,
