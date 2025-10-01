@@ -436,6 +436,50 @@ def testFetchFileMissingSigningKey(monkeypatch):
     }
 
 
+def testFetchFileGoogleApiCallError(monkeypatch):
+    metadata = {
+        'encryptedData': '7b7d',
+        'unencryptedData': {'visible': 'info'},
+        'gcsPath': 'recipient123/file.gcode',
+        'fetchTokenExpiry': datetime.now(timezone.utc) + timedelta(minutes=5),
+        'fetchTokenConsumed': False,
+    }
+    documentSnapshot = MockDocumentSnapshot('doc123', metadata)
+    updateRecorder = {'set': None, 'update': []}
+
+    class ApiErrorBlob(MockBlob):
+        def generate_signed_url(self, **_kwargs):
+            raise main.GoogleAPICallError('transient backend failure')
+
+    class ApiErrorBucket(MockBucket):
+        def blob(self, _name):
+            return ApiErrorBlob()
+
+    class ApiErrorStorageClient(MockStorageClient):
+        def bucket(self, _name):
+            return ApiErrorBucket()
+
+    mockClients = main.ClientBundle(
+        storageClient=ApiErrorStorageClient(),
+        firestoreClient=MockFirestoreClient(
+            documentSnapshot=documentSnapshot, updateRecorder=updateRecorder
+        ),
+        kmsClient=MockEncryptClient({'sensitive': 'value'}),
+        kmsKeyPath='projects/test/locations/test/keyRings/test/cryptoKeys/test',
+        gcsBucketName='test-bucket',
+    )
+    monkeypatch.setattr(main, 'getClients', lambda: mockClients)
+
+    responseBody, statusCode = main.fetchFile('testFetchToken')
+
+    assert statusCode == 503
+    assert responseBody == {
+        'error': 'Failed to generate signed URL due to upstream service error',
+        'detail': 'transient backend failure',
+    }
+    assert updateRecorder['update'] == []
+
+
 def testFetchFileReturnsLegacyUnencryptedMetadata(monkeypatch):
     metadata = {
         'unencryptedData': {'legacy': 'info'},
