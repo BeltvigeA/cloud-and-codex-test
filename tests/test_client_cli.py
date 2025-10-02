@@ -98,3 +98,24 @@ def testValidateRemoteListenAcceptsDefaultBaseUrl(monkeypatch: pytest.MonkeyPatc
 
     assert arguments.baseUrl == client.defaultBaseUrl
     assert client.validateRemoteListenArguments(arguments)
+
+
+class DummyDownloadResponse:
+    def __init__(self, url: str, body: bytes = b"payload"):
+        self.url = url
+        self.headers: dict[str, str] = {}
+        self._body = body
+
+    def iter_content(self, chunk_size: int = 8192):  # pragma: no cover - simple iterator
+        chunkSize = chunk_size
+        if chunkSize >= 0:
+            yield self._body
+
+
+def testSaveDownloadedFileStripsQueryParameters(tmp_path: Path) -> None:
+    downloadResponse = DummyDownloadResponse("https://example.com/files/document.pdf?token=value#section")
+
+    savedPath = client.saveDownloadedFile(downloadResponse, tmp_path)
+
+    assert savedPath.name == "document.pdf"
+    assert savedPath.read_bytes() == b"payload"
