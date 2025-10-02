@@ -10,6 +10,7 @@ import uuid
 from pathlib import Path
 from threading import Event
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from urllib.parse import urlparse
 
 import requests
 
@@ -360,9 +361,11 @@ def determineFilename(response: requests.Response, fallbackName: str = "download
                 filename = part.split("=", 1)[1].strip('"')
                 if filename:
                     return filename
-    urlPath = response.url
-    if urlPath:
-        candidate = urlPath.rstrip("/").split("/")[-1]
+    urlPath = response.url or ""
+    parsedUrl = urlparse(urlPath)
+    cleanPath = parsedUrl.path.rstrip("/")
+    if cleanPath:
+        candidate = Path(cleanPath).name
         if candidate:
             return candidate
     return fallbackName
