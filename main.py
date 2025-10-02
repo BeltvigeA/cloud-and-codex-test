@@ -17,11 +17,6 @@ from google.api_core.exceptions import (
 from google.auth.exceptions import GoogleAuthError
 
 try:  # pragma: no cover - optional dependency handling
-    from google.auth.iam import Signer
-except ImportError:  # pragma: no cover - fallback when google-auth is unavailable in tests
-    Signer = None  # type: ignore[assignment]
-
-try:  # pragma: no cover - optional dependency handling
     from google.auth.transport.requests import Request
 except ImportError:  # pragma: no cover - fallback when google-auth is unavailable in tests
     Request = None  # type: ignore[assignment]
@@ -552,29 +547,41 @@ def fetchFile(fetchToken: str):
 
         try:
             credentials = getattr(storageClient, '_credentials', None)
-            signer = None
-            serviceAccountEmail = None
+            signedUrl = None
             if credentials is not None:
                 signBytesMethod = getattr(credentials, 'sign_bytes', None)
-                if not callable(signBytesMethod):
-                    if Signer is None or Request is None:
-                        raise ImportError('google.auth Signer and Request are required for IAM signing')
+                if callable(signBytesMethod):
+                    signedUrl = blob.generate_signed_url(
+                        version='v4',
+                        expiration=timedelta(minutes=15),
+                        method='GET',
+                    )
+                else:
+                    if Request is None:
+                        raise ImportError('google.auth Request is required for IAM signing')
                     requestAdapter = Request()
                     credentials.refresh(requestAdapter)
-                    serviceAccountEmail = getattr(credentials, 'service_account_email', None)
+                    accessToken = getattr(credentials, 'token', None)
+                    if not accessToken:
+                        raise AttributeError(
+                            'Credentials missing access token required for IAM signing'
+                        )
+                    serviceAccountEmail = getattr(
+                        credentials, 'service_account_email', None
+                    )
                     if not serviceAccountEmail:
-                        raise AttributeError('Credentials missing service_account_email required for IAM signing')
-                    signer = Signer(requestAdapter, credentials, serviceAccountEmail)
+                        raise AttributeError(
+                            'Credentials missing service_account_email required for IAM signing'
+                        )
+                    signedUrl = blob.generate_signed_url(
+                        version='v4',
+                        expiration=timedelta(minutes=15),
+                        method='GET',
+                        service_account_email=serviceAccountEmail,
+                        access_token=accessToken,
+                    )
 
-            if signer is not None and serviceAccountEmail is not None:
-                signedUrl = blob.generate_signed_url(
-                    version='v4',
-                    expiration=timedelta(minutes=15),
-                    method='GET',
-                    signer=signer,
-                    service_account_email=serviceAccountEmail,
-                )
-            else:
+            if signedUrl is None:
                 signedUrl = blob.generate_signed_url(
                     version='v4',
                     expiration=timedelta(minutes=15),

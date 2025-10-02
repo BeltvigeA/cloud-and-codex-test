@@ -332,6 +332,67 @@ def testFetchFileFirstUseSuccess(monkeypatch):
     assert updatePayload['fetchTokenConsumed'] is True
 
 
+def testFetchFileUsesIamSigningWhenSignBytesMissing(monkeypatch):
+    metadata = {
+        'unencryptedData': {'visible': 'info'},
+        'gcsPath': 'recipient123/file.gcode',
+        'fetchTokenExpiry': datetime.now(timezone.utc) + timedelta(minutes=5),
+        'fetchTokenConsumed': False,
+    }
+    documentSnapshot = MockDocumentSnapshot('doc123', metadata)
+    updateRecorder = {'set': None, 'update': []}
+
+    generateSignedUrlCalls = []
+
+    class IamFallbackBlob(MockBlob):
+        def generate_signed_url(self, **kwargs):
+            generateSignedUrlCalls.append(kwargs)
+            return 'https://example.com/iam-signed-url'
+
+    class IamFallbackBucket(MockBucket):
+        def blob(self, _name):
+            return IamFallbackBlob()
+
+    class IamFallbackCredentials:
+        def __init__(self):
+            self.token = None
+            self.service_account_email = 'service@example.iam.gserviceaccount.com'
+
+        def refresh(self, _requestAdapter):
+            self.token = 'new-access-token'
+
+    class IamFallbackStorageClient(MockStorageClient):
+        def __init__(self):
+            self._credentials = IamFallbackCredentials()
+
+        def bucket(self, _name):
+            return IamFallbackBucket()
+
+    mockClients = main.ClientBundle(
+        storageClient=IamFallbackStorageClient(),
+        firestoreClient=MockFirestoreClient(
+            documentSnapshot=documentSnapshot, updateRecorder=updateRecorder
+        ),
+        kmsClient=MockEncryptClient({'sensitive': 'value'}),
+        kmsKeyPath='projects/test/locations/test/keyRings/test/cryptoKeys/test',
+        gcsBucketName='test-bucket',
+    )
+    monkeypatch.setattr(main, 'getClients', lambda: mockClients)
+    monkeypatch.setattr(main, 'Request', lambda: SimpleNamespace())
+
+    responseBody, statusCode = main.fetchFile('testFetchToken')
+
+    assert statusCode == 200
+    assert responseBody['signedUrl'] == 'https://example.com/iam-signed-url'
+    assert generateSignedUrlCalls
+    kwargs = generateSignedUrlCalls[0]
+    assert kwargs['service_account_email'] == 'service@example.iam.gserviceaccount.com'
+    assert kwargs['access_token'] == 'new-access-token'
+    assert kwargs['method'] == 'GET'
+    assert kwargs['version'] == 'v4'
+    assert updateRecorder['update'], 'Expected Firestore update to be recorded'
+
+
 def testFetchFileInvalidDecryptedMetadata(monkeypatch):
     metadata = {
         'encryptedData': '7b7d',
