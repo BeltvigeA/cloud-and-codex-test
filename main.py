@@ -14,6 +14,10 @@ from google.api_core.exceptions import (
     PermissionDenied,
     Unauthorized,
 )
+try:  # pragma: no cover - optional dependency handling
+    from google.auth import default as googleAuthDefault
+except (ImportError, AttributeError):  # pragma: no cover - fallback when google-auth is unavailable in tests
+    googleAuthDefault = None  # type: ignore[assignment]
 from google.auth.exceptions import GoogleAuthError
 
 try:  # pragma: no cover - optional dependency handling
@@ -247,9 +251,26 @@ def getClients() -> ClientBundle:
         raise MissingEnvironmentError(missingConfig)
 
     try:
-        storageClient = storage.Client(project=gcpProjectId)
-        firestoreClient = firestore.Client(project=gcpProjectId)
-        kmsClient = kms_v1.KeyManagementServiceClient()
+        credentials = None
+        if googleAuthDefault is not None:
+            credentials, _ = googleAuthDefault(
+                scopes=['https://www.googleapis.com/auth/cloud-platform']
+            )
+
+        storageClientKwargs: Dict[str, object] = {'project': gcpProjectId}
+        if credentials is not None:
+            storageClientKwargs['credentials'] = credentials
+        storageClient = storage.Client(**storageClientKwargs)
+
+        firestoreClientKwargs: Dict[str, object] = {'project': gcpProjectId}
+        if credentials is not None:
+            firestoreClientKwargs['credentials'] = credentials
+        firestoreClient = firestore.Client(**firestoreClientKwargs)
+
+        kmsClientKwargs: Dict[str, object] = {}
+        if credentials is not None:
+            kmsClientKwargs['credentials'] = credentials
+        kmsClient = kms_v1.KeyManagementServiceClient(**kmsClientKwargs)
         kmsKeyPath = kmsClient.crypto_key_path(gcpProjectId, kmsLocation, kmsKeyRing, kmsKeyName)
     except Exception as error:  # pylint: disable=broad-except
         raise ClientInitializationError('Google Cloud clients', error) from error
