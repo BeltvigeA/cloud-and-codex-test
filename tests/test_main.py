@@ -332,6 +332,57 @@ def testFetchFileFirstUseSuccess(monkeypatch):
     assert updatePayload['fetchTokenConsumed'] is True
 
 
+def testFetchFileDoesNotPassSignerWhenNativeSigningAvailable(monkeypatch):
+    metadata = {
+        'unencryptedData': {'visible': 'info'},
+        'gcsPath': 'recipient123/file.gcode',
+        'fetchTokenExpiry': datetime.now(timezone.utc) + timedelta(minutes=5),
+        'fetchTokenConsumed': False,
+    }
+    documentSnapshot = MockDocumentSnapshot('doc123', metadata)
+    updateRecorder = {'set': None, 'update': []}
+
+    generateSignedUrlCalls = []
+
+    class NativeSigningBlob(MockBlob):
+        def generate_signed_url(self, **kwargs):
+            generateSignedUrlCalls.append(kwargs)
+            return 'https://example.com/native-signed-url'
+
+    class NativeSigningBucket(MockBucket):
+        def blob(self, _name):
+            return NativeSigningBlob()
+
+    class NativeSigningCredentials:
+        def sign_bytes(self, _data):  # pylint: disable=unused-argument
+            return b'signature'
+
+    class NativeSigningStorageClient(MockStorageClient):
+        def __init__(self):
+            self._credentials = NativeSigningCredentials()
+
+        def bucket(self, _name):
+            return NativeSigningBucket()
+
+    mockClients = main.ClientBundle(
+        storageClient=NativeSigningStorageClient(),
+        firestoreClient=MockFirestoreClient(
+            documentSnapshot=documentSnapshot, updateRecorder=updateRecorder
+        ),
+        kmsClient=MockEncryptClient({'sensitive': 'value'}),
+        kmsKeyPath='projects/test/locations/test/keyRings/test/cryptoKeys/test',
+        gcsBucketName='test-bucket',
+    )
+    monkeypatch.setattr(main, 'getClients', lambda: mockClients)
+
+    responseBody, statusCode = main.fetchFile('testFetchToken')
+
+    assert statusCode == 200
+    assert responseBody['signedUrl'] == 'https://example.com/native-signed-url'
+    assert generateSignedUrlCalls
+    assert 'signer' not in generateSignedUrlCalls[0]
+
+
 def testFetchFileUsesIamSigningWhenSignBytesMissing(monkeypatch):
     metadata = {
         'unencryptedData': {'visible': 'info'},
