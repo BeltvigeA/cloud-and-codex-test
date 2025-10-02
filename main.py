@@ -560,6 +560,15 @@ def fetchFile(fetchToken: str):
                     if Request is None:
                         raise ImportError('google.auth Request is required for IAM signing')
                     requestAdapter = Request()
+                    scopedCredentials = credentials
+                    withScopesMethod = getattr(credentials, 'with_scopes_if_required', None)
+                    if callable(withScopesMethod):
+                        scopedCredentials = withScopesMethod(
+                            ['https://www.googleapis.com/auth/cloud-platform']
+                        )
+                        if scopedCredentials is None:
+                            scopedCredentials = credentials
+                    credentials = scopedCredentials
                     credentials.refresh(requestAdapter)
                     accessToken = getattr(credentials, 'token', None)
                     if not accessToken:
