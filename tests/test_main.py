@@ -393,6 +393,91 @@ def testFetchFileUsesIamSigningWhenSignBytesMissing(monkeypatch):
     assert updateRecorder['update'], 'Expected Firestore update to be recorded'
 
 
+def testFetchFileScopesCredentialsForIamSigning(monkeypatch):
+    metadata = {
+        'unencryptedData': {'visible': 'info'},
+        'gcsPath': 'recipient123/file.gcode',
+        'fetchTokenExpiry': datetime.now(timezone.utc) + timedelta(minutes=5),
+        'fetchTokenConsumed': False,
+    }
+    documentSnapshot = MockDocumentSnapshot('doc123', metadata)
+    updateRecorder = {'set': None, 'update': []}
+
+    generateSignedUrlCalls = []
+
+    class ScopedBlob(MockBlob):
+        def generate_signed_url(self, **kwargs):
+            generateSignedUrlCalls.append(kwargs)
+            return 'https://example.com/scoped-iam-url'
+
+    class ScopedBucket(MockBucket):
+        def blob(self, _name):
+            return ScopedBlob()
+
+    class ScopedCredential:
+        def __init__(self, scopes):
+            self.scopes = scopes
+            self.token = None
+            self.service_account_email = 'scoped@example.iam.gserviceaccount.com'
+            self.refreshCalls = 0
+
+        def refresh(self, _requestAdapter):
+            self.refreshCalls += 1
+            self.token = 'scoped-access-token'
+
+    class CredentialRequiringScopes:
+        def __init__(self):
+            self.withScopesCalledWith = None
+            self.lastScopedCredential = None
+
+        def with_scopes_if_required(self, scopes):
+            self.withScopesCalledWith = scopes
+            self.lastScopedCredential = ScopedCredential(scopes)
+            return self.lastScopedCredential
+
+    class ScopedStorageClient(MockStorageClient):
+        def __init__(self):
+            self._credentials = CredentialRequiringScopes()
+
+        def bucket(self, _name):
+            return ScopedBucket()
+
+    scopedStorageClient = ScopedStorageClient()
+
+    mockClients = main.ClientBundle(
+        storageClient=scopedStorageClient,
+        firestoreClient=MockFirestoreClient(
+            documentSnapshot=documentSnapshot, updateRecorder=updateRecorder
+        ),
+        kmsClient=MockEncryptClient({'sensitive': 'value'}),
+        kmsKeyPath='projects/test/locations/test/keyRings/test/cryptoKeys/test',
+        gcsBucketName='test-bucket',
+    )
+    monkeypatch.setattr(main, 'getClients', lambda: mockClients)
+    monkeypatch.setattr(main, 'Request', lambda: SimpleNamespace())
+
+    responseBody, statusCode = main.fetchFile('testFetchToken')
+
+    assert statusCode == 200
+    assert responseBody['signedUrl'] == 'https://example.com/scoped-iam-url'
+    assert generateSignedUrlCalls, 'Expected IAM signed URL to be generated'
+
+    credentials = scopedStorageClient._credentials  # pylint: disable=protected-access
+    assert credentials.withScopesCalledWith == ['https://www.googleapis.com/auth/cloud-platform']
+
+    scopedCredential = credentials.lastScopedCredential
+    assert scopedCredential.refreshCalls == 1
+
+    kwargs = generateSignedUrlCalls[0]
+    assert kwargs['access_token'] == 'scoped-access-token'
+    assert (
+        kwargs['service_account_email']
+        == 'scoped@example.iam.gserviceaccount.com'
+    )
+
+    assert updateRecorder['update'], 'Expected Firestore update to be recorded'
+
+
 def testFetchFileInvalidDecryptedMetadata(monkeypatch):
     metadata = {
         'encryptedData': '7b7d',
