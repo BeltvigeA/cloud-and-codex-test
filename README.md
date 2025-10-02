@@ -93,3 +93,4 @@ Klienten kjøres nå utelukkende via kommandolinjen. Følgende PowerShell-eksemp
 
 Klienten bruker `listen`-kommandoen til å velge hvilken mottaker den skal overvåke og laster automatisk ned alle filer som er tildelt den valgte mottakeren.
 
+python -m client.gui
