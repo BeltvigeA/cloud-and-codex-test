@@ -4,3 +4,4 @@ build/
 dist/
 node_modules/
 client/web/dist/
+listener-log.json
