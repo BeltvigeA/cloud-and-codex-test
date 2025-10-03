@@ -9,6 +9,8 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 
+import product_store
+
 fakeFlaskModule = ModuleType('flask')
 fakeWerkzeugModule = ModuleType('werkzeug')
 fakeWerkzeugUtilsModule = ModuleType('werkzeug.utils')
@@ -910,3 +912,85 @@ def testParseJsonObjectFieldParsesEqualsFallback():
 
     assert errorResponse is None
     assert parsedValue == {'secret': '1234'}
+
+
+def testLookupProductRouteUpdatesLastUsed(tmp_path, monkeypatch):
+    from product_store import ProductStore
+
+    storePath = tmp_path / 'products.json'
+    storePayload = {
+        'products': [
+            {
+                'productId': 'alpha',
+                'lastUsed': datetime(2023, 1, 1, tzinfo=timezone.utc).isoformat(),
+                'name': 'Widget',
+            }
+        ]
+    }
+    storePath.write_text(json.dumps(storePayload), encoding='utf-8')
+
+    monkeypatch.setattr(main, 'productStore', ProductStore(str(storePath)))
+    monkeypatch.setattr(
+        fakeRequest, 'get_json', lambda silent=True: {'productId': 'alpha'}, raising=False
+    )
+
+    responsePayload = main.lookupProduct()
+
+    assert responsePayload['success'] is True
+    assert responsePayload['product']['productId'] == 'alpha'
+    updatedPayload = json.loads(storePath.read_text(encoding='utf-8'))
+    assert updatedPayload['products'][0]['lastUsed'] == responsePayload['product']['lastUsed']
+
+
+def testLookupProductRouteHandlesMissingProduct(monkeypatch):
+    from product_store import ProductStore
+
+    monkeypatch.setattr(main, 'productStore', ProductStore(str('nonexistent.json')))
+    monkeypatch.setattr(
+        fakeRequest, 'get_json', lambda silent=True: {'productId': 'missing'}, raising=False
+    )
+
+    responsePayload, statusCode = main.lookupProduct()
+
+    assert statusCode == 404
+    assert responsePayload['success'] is False
+    assert responsePayload['error'] == 'Product not found'
+
+
+def testCleanupProductsTaskRemovesExpiredEntries(tmp_path, monkeypatch):
+    from product_store import ProductStore
+
+    storePath = tmp_path / 'products.json'
+    payload = {
+        'products': [
+            {
+                'productId': 'recent',
+                'lastUsed': datetime(2023, 1, 10, tzinfo=timezone.utc).isoformat(),
+            },
+            {
+                'productId': 'stale',
+                'lastUsed': datetime(2022, 12, 1, tzinfo=timezone.utc).isoformat(),
+            },
+        ]
+    }
+    storePath.write_text(json.dumps(payload), encoding='utf-8')
+
+    class FixedDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            baseTimestamp = datetime(2023, 1, 15, tzinfo=timezone.utc)
+            if tz is None:
+                return baseTimestamp.replace(tzinfo=None)
+            return baseTimestamp.astimezone(tz)
+
+    monkeypatch.setenv('PRODUCT_RETENTION_DAYS', '14')
+    monkeypatch.setattr(main, 'productStore', ProductStore(str(storePath)))
+    monkeypatch.setattr(product_store, 'datetime', FixedDatetime)
+
+    responsePayload = main.cleanupProductsTask()
+
+    assert responsePayload['success'] is True
+    assert responsePayload['removed'] == 1
+    storedPayload = json.loads(storePath.read_text(encoding='utf-8'))
+    remainingIds = {item['productId'] for item in storedPayload['products']}
+    assert remainingIds == {'recent'}
