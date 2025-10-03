@@ -90,8 +90,19 @@ def test_listenForFiles_performs_fetch_when_handshake_requires_download(
 
     statusCalls: List[Dict[str, Any]] = []
 
-    def fakeSendStatus(_baseUrl: str, _productId: str, payload: Dict[str, Any]) -> bool:
-        statusCalls.append(json.loads(json.dumps(payload)))
+    def fakeSendStatus(
+        _baseUrl: str,
+        productId: str,
+        recipientId: str,
+        payload: Dict[str, Any],
+    ) -> bool:
+        statusCalls.append(
+            {
+                "productId": productId,
+                "recipientId": recipientId,
+                "payload": json.loads(json.dumps(payload)),
+            }
+        )
         return True
 
     monkeypatch.setattr(client, "sendProductStatusUpdate", fakeSendStatus)
@@ -120,7 +131,13 @@ def test_listenForFiles_performs_fetch_when_handshake_requires_download(
         }
     ]
     assert fetchCalls and fetchCalls[0]["requestMode"] == "full"
-    assert statusCalls and statusCalls[0]["requestedMode"] == "full"
+    assert statusCalls
+    statusPayload = statusCalls[0]["payload"]
+    assert statusCalls[0]["recipientId"] == "recipient-positive"
+    assert statusPayload["recipientId"] == "recipient-positive"
+    assert statusPayload["requestedMode"] == "full"
+    assert statusPayload["printJobId"] == "job-positive"
+    assert statusPayload["message"] == "success"
 
 
 def test_listenForFiles_skips_fetch_when_handshake_opts_out(
@@ -183,7 +200,12 @@ def test_listenForFiles_skips_fetch_when_handshake_opts_out(
 
     statusCalls: List[Dict[str, Any]] = []
 
-    def fakeSendStatus(_baseUrl: str, _productId: str, payload: Dict[str, Any]) -> bool:
+    def fakeSendStatus(
+        _baseUrl: str,
+        _productId: str,
+        _recipientId: str,
+        payload: Dict[str, Any],
+    ) -> bool:
         statusCalls.append(payload)
         return True
 
@@ -213,3 +235,69 @@ def test_listenForFiles_skips_fetch_when_handshake_opts_out(
         }
     ]
     assert statusCalls == []
+
+
+def test_listenForFiles_reports_fetch_errors_with_message(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    databasePath = tmp_path / "fetch-error.db"
+    database = client.LocalDatabase(databasePath)
+
+    pendingFiles: List[Dict[str, Any]] = [
+        {
+            "fetchToken": "token-error",
+            "productId": "product-error",
+            "printJobId": "job-error",
+            "originalFilename": "error.gcode",
+        }
+    ]
+
+    monkeypatch.setattr(client, "fetchPendingFiles", lambda *_args, **_kwargs: pendingFiles)
+
+    monkeypatch.setattr(client, "sendHandshakeResponse", lambda *_args, **_kwargs: None)
+
+    def fakePerformFetch(*_args, **_kwargs) -> Dict[str, Any]:
+        raise RuntimeError("simulated transfer failure")
+
+    monkeypatch.setattr(client, "performFetch", fakePerformFetch)
+
+    statusCalls: List[Dict[str, Any]] = []
+
+    def fakeSendStatus(
+        _baseUrl: str,
+        productId: str,
+        recipientId: str,
+        payload: Dict[str, Any],
+    ) -> bool:
+        statusCalls.append(
+            {
+                "productId": productId,
+                "recipientId": recipientId,
+                "payload": json.loads(json.dumps(payload)),
+            }
+        )
+        return False
+
+    monkeypatch.setattr(client, "sendProductStatusUpdate", fakeSendStatus)
+
+    outputDir = tmp_path / "error-output"
+    outputDir.mkdir()
+
+    client.listenForFiles(
+        "https://example.com",
+        "recipient-error",
+        str(outputDir),
+        pollInterval=0,
+        maxIterations=1,
+        database=database,
+    )
+
+    database.close()
+
+    assert statusCalls
+    statusPayload = statusCalls[0]["payload"]
+    assert statusCalls[0]["recipientId"] == "recipient-error"
+    assert statusPayload["recipientId"] == "recipient-error"
+    assert statusPayload["success"] is False
+    assert statusPayload["message"] == "simulated transfer failure"
+    assert statusPayload["printJobId"] == "job-error"

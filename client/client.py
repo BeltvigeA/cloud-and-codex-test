@@ -614,10 +614,18 @@ def appendJsonLogEntry(logFilePath: Union[str, Path], entry: Dict[str, Any]) -> 
     return logPath
 
 
-def sendProductStatusUpdate(baseUrl: str, productId: str, statusPayload: Dict[str, Any]) -> bool:
+def sendProductStatusUpdate(
+    baseUrl: str,
+    productId: str,
+    recipientId: str,
+    statusPayload: Dict[str, Any],
+) -> bool:
     statusUrl = f"{buildBaseUrl(baseUrl)}/products/{productId}/status"
+    payloadToSend = dict(statusPayload)
+    if "recipientId" not in payloadToSend or not payloadToSend.get("recipientId"):
+        payloadToSend["recipientId"] = recipientId
     try:
-        response = requests.post(statusUrl, json=statusPayload, timeout=30)
+        response = requests.post(statusUrl, json=payloadToSend, timeout=30)
         response.raise_for_status()
     except requests.RequestException as error:
         logging.error("Failed to send product status update for %s: %s", productId, error)
@@ -897,16 +905,38 @@ def listenForFiles(
                         fetchToken,
                         requestMode,
                     )
-                    fetchResult = performFetch(
-                        baseUrl,
-                        fetchToken,
-                        outputDir,
-                        requestMode=requestMode,
-                        database=database,
-                        productId=productId,
-                    )
+                    fetchErrorMessage: Optional[str] = None
+                    try:
+                        fetchResult = performFetch(
+                            baseUrl,
+                            fetchToken,
+                            outputDir,
+                            requestMode=requestMode,
+                            database=database,
+                            productId=productId,
+                        )
+                    except Exception as error:  # noqa: BLE001
+                        logging.exception(
+                            "Unexpected error while fetching product %s with token %s",
+                            productId,
+                            fetchToken,
+                        )
+                        fetchResult = None
+                        fetchErrorMessage = str(error)
 
                     updatedRecord = database.findProductById(productId)
+                    resolvedPrintJobId = (
+                        (fetchResult or {}).get("printJobId")
+                        or handshakePrintJobId
+                        or ((updatedRecord or {}).get("printJobId") if updatedRecord else None)
+                    )
+                    statusMessage = (
+                        "success"
+                        if fetchResult is not None
+                        else fetchErrorMessage
+                        or handshakeMessage
+                        or "File transfer failed"
+                    )
                     statusPayload = {
                         "productId": productId,
                         "requestedMode": requestMode,
@@ -917,8 +947,16 @@ def listenForFiles(
                         "timestamp": time.time(),
                         "fetchToken": fetchToken,
                         "success": fetchResult is not None,
+                        "recipientId": handshakeRecipientId,
+                        "printJobId": resolvedPrintJobId,
+                        "message": statusMessage,
                     }
-                    statusSent = sendProductStatusUpdate(baseUrl, productId, statusPayload)
+                    statusSent = sendProductStatusUpdate(
+                        baseUrl,
+                        productId,
+                        handshakeRecipientId,
+                        statusPayload,
+                    )
                     statusPayload["sent"] = statusSent
 
                     if fetchResult is not None:
