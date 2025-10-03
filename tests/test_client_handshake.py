@@ -131,8 +131,10 @@ def test_listenForFiles_performs_fetch_when_handshake_requires_download(
         }
     ]
     assert fetchCalls and fetchCalls[0]["requestMode"] == "full"
+    assert fetchCalls[0]["productId"] == "product-positive"
     assert statusCalls
     statusPayload = statusCalls[0]["payload"]
+    assert statusCalls[0]["productId"] == "product-positive"
     assert statusCalls[0]["recipientId"] == "recipient-positive"
     assert statusPayload["recipientId"] == "recipient-positive"
     assert statusPayload["requestedMode"] == "full"
@@ -296,6 +298,7 @@ def test_listenForFiles_reports_fetch_errors_with_message(
 
     assert statusCalls
     statusPayload = statusCalls[0]["payload"]
+    assert statusCalls[0]["productId"] == "product-error"
     assert statusCalls[0]["recipientId"] == "recipient-error"
     assert statusPayload["recipientId"] == "recipient-error"
     assert statusPayload["success"] is False
