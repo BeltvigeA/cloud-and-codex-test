@@ -35,8 +35,7 @@ class LocalDatabase:
         defaultPath = Path.home() / ".printmaster" / "printmaster.db"
         self.databasePath = Path(databasePath).expanduser() if databasePath else defaultPath
         self.databasePath.parent.mkdir(parents=True, exist_ok=True)
-        self.productStorageDir = self.databasePath.parent / "products"
-        self.productStorageDir.mkdir(parents=True, exist_ok=True)
+        self.productRecordsPath = self.databasePath.parent / "product-records.json"
         self.connection = sqlite3.connect(self.databasePath)
         self.connection.row_factory = sqlite3.Row
         self.initialize()
@@ -410,145 +409,114 @@ class LocalDatabase:
             "updatedAt": row["updatedAt"],
         }
 
+    def _loadProductLog(self) -> Dict[str, Any]:
+        if self.productRecordsPath.exists():
+            try:
+                with self.productRecordsPath.open("r", encoding="utf-8") as logFile:
+                    loaded = json.load(logFile)
+                if isinstance(loaded, dict):
+                    productLog: Dict[str, Any] = dict(loaded)
+                else:
+                    productLog = {}
+            except (OSError, json.JSONDecodeError):
+                productLog = {}
+        else:
+            productLog = {}
+
+        products = productLog.get("products")
+        if not isinstance(products, dict):
+            products = {}
+        productLog["products"] = products
+        return productLog
+
+    def _writeProductLog(self, productLog: Dict[str, Any]) -> None:
+        with self.productRecordsPath.open("w", encoding="utf-8") as logFile:
+            json.dump(productLog, logFile, indent=2, ensure_ascii=False)
+
     def _persistProductFiles(
         self, record: Dict[str, Any], printJobId: Optional[str]
     ) -> None:
+        productLog = self._loadProductLog()
+        products: Dict[str, Any] = productLog["products"]
+
         productId = record["productId"]
-        productDir = self.productStorageDir / productId
-        productDir.mkdir(parents=True, exist_ok=True)
+        existingEntry = products.get(productId)
+        if isinstance(existingEntry, dict):
+            productEntry: Dict[str, Any] = dict(existingEntry)
+        else:
+            productEntry = {}
 
-        metadataPath = productDir / "metadata.json"
-        requestsPath = productDir / "requests.json"
-        activityPath = productDir / "print-activity.json"
+        if not isinstance(productEntry.get("printActivity"), dict):
+            productEntry["printActivity"] = {}
 
-        existingMetadata: Dict[str, Any] = {}
-        if metadataPath.exists():
-            try:
-                with metadataPath.open("r", encoding="utf-8") as metadataFile:
-                    loadedMetadata = json.load(metadataFile)
-                if isinstance(loadedMetadata, dict):
-                    existingMetadata = loadedMetadata
-            except (OSError, json.JSONDecodeError):
-                existingMetadata = {}
+        if not isinstance(productEntry.get("requestHistory"), list):
+            productEntry["requestHistory"] = []
 
-        createdAt = (
-            existingMetadata.get("createdAt")
-            or record.get("updatedAt")
-            or datetime.utcnow().isoformat()
-        )
-        fileLocation = record.get("fileName") or existingMetadata.get("fileLocation")
-
-        metadataContent: Dict[str, Any] = {
-            "productId": productId,
-            "createdAt": createdAt,
-            "lastRequestedAt": record.get("lastRequestedAt"),
-        }
-
-        if fileLocation:
-            metadataContent["fileLocation"] = str(fileLocation)
-
-        with metadataPath.open("w", encoding="utf-8") as metadataFile:
-            json.dump(metadataContent, metadataFile, indent=2, ensure_ascii=False)
-
-        requestEntries: List[str] = []
-        if requestsPath.exists():
-            try:
-                with requestsPath.open("r", encoding="utf-8") as requestsFile:
-                    loadedRequests = json.load(requestsFile)
-                if isinstance(loadedRequests, list):
-                    requestEntries = [
-                        entry for entry in loadedRequests if isinstance(entry, str)
-                    ]
-            except (OSError, json.JSONDecodeError):
-                requestEntries = []
-
-        latestTimestamp = record.get("lastRequestedAt")
-        if latestTimestamp:
-            latestTimestampStr = str(latestTimestamp)
-            if not requestEntries or requestEntries[-1] != latestTimestampStr:
-                requestEntries.append(latestTimestampStr)
-
-        with requestsPath.open("w", encoding="utf-8") as requestsFile:
-            json.dump(requestEntries, requestsFile, indent=2, ensure_ascii=False)
+        createdAt = productEntry.get("createdAt")
+        if not isinstance(createdAt, str):
+            createdAt = (
+                record.get("lastRequestedAt")
+                or record.get("updatedAt")
+                or datetime.utcnow().isoformat()
+            )
 
         lastRequestedAt = record.get("lastRequestedAt")
-        resolvedLastRequestedAt = (
-            str(lastRequestedAt) if lastRequestedAt is not None else None
-        )
+        requestHistory: List[str] = [
+            entry for entry in productEntry["requestHistory"] if isinstance(entry, str)
+        ]
+        if isinstance(lastRequestedAt, str) and (
+            not requestHistory or requestHistory[-1] != lastRequestedAt
+        ):
+            requestHistory.append(lastRequestedAt)
 
-        self._persistProductActivityFile(
-            activityPath,
-            record["productId"],
-            printJobId,
-            resolvedLastRequestedAt,
-        )
+        printActivityRaw = productEntry["printActivity"]
+        if not isinstance(printActivityRaw.get("printJobs"), dict):
+            printActivityRaw["printJobs"] = {}
 
-    def _persistProductActivityFile(
-        self,
-        activityPath: Path,
-        productId: str,
-        printJobId: Optional[str],
-        lastPrintedAt: Optional[str],
-    ) -> None:
-        existingContent: Dict[str, Any] = {}
-        if activityPath.exists():
-            try:
-                with activityPath.open("r", encoding="utf-8") as activityFile:
-                    loadedContent = json.load(activityFile)
-                if isinstance(loadedContent, dict):
-                    existingContent = loadedContent
-            except (OSError, json.JSONDecodeError):
-                existingContent = {}
+        latestPrintedAt = printActivityRaw.get("latestPrintedAt")
+        if not isinstance(latestPrintedAt, str):
+            latestPrintedAt = None
 
-        existingPrintJobs = existingContent.get("printJobs")
-        if isinstance(existingPrintJobs, dict):
-            updatedPrintJobs: Dict[str, Dict[str, Any]] = dict(existingPrintJobs)
-        else:
-            updatedPrintJobs = {}
-
-        existingLatestPrintJobId = (
-            existingContent.get("latestPrintJobId")
-            if isinstance(existingContent.get("latestPrintJobId"), str)
-            else None
-        )
-        existingLatestPrintedAt = (
-            existingContent.get("latestPrintedAt")
-            if isinstance(existingContent.get("latestPrintedAt"), str)
-            else None
-        )
-
-        latestPrintJobId = existingLatestPrintJobId
-        latestPrintedAt = existingLatestPrintedAt
+        latestPrintJobId = printActivityRaw.get("latestPrintJobId")
+        if not isinstance(latestPrintJobId, str):
+            latestPrintJobId = None
 
         if printJobId is not None:
             jobKey = str(printJobId)
-            existingJobEntry = updatedPrintJobs.get(jobKey)
-            if isinstance(existingJobEntry, dict):
-                jobEntry: Dict[str, Any] = dict(existingJobEntry)
+            existingJob = printActivityRaw["printJobs"].get(jobKey)
+            if isinstance(existingJob, dict):
+                jobEntry = dict(existingJob)
             else:
                 jobEntry = {}
 
-            if lastPrintedAt is None:
-                resolvedPrintedAt = datetime.utcnow().isoformat()
-            else:
-                resolvedPrintedAt = lastPrintedAt
-
+            resolvedPrintedAt = (
+                lastRequestedAt if isinstance(lastRequestedAt, str) else datetime.utcnow().isoformat()
+            )
             jobEntry["lastPrintedAt"] = resolvedPrintedAt
-
-            updatedPrintJobs[jobKey] = jobEntry
+            printActivityRaw["printJobs"][jobKey] = jobEntry
             latestPrintJobId = jobKey
             latestPrintedAt = resolvedPrintedAt
-        else:
-            if lastPrintedAt is not None:
-                latestPrintedAt = lastPrintedAt
+        elif isinstance(lastRequestedAt, str):
+            latestPrintedAt = lastRequestedAt
 
-        updatedContent: Dict[str, Any] = {
-            "productId": productId,
-            "printJobs": updatedPrintJobs,
-            "latestPrintJobId": latestPrintJobId,
-            "latestPrintedAt": latestPrintedAt,
-        }
+        productEntry.update(
+            {
+                "productId": productId,
+                "createdAt": createdAt,
+                "lastRequestedAt": lastRequestedAt,
+                "fileLocation": record.get("fileName"),
+                "downloaded": bool(record.get("downloaded")),
+                "requestHistory": requestHistory,
+                "printActivity": {
+                    "productId": productId,
+                    "latestPrintJobId": latestPrintJobId,
+                    "latestPrintedAt": latestPrintedAt,
+                    "printJobs": printActivityRaw["printJobs"],
+                },
+            }
+        )
 
-        with activityPath.open("w", encoding="utf-8") as activityFile:
-            json.dump(updatedContent, activityFile, indent=2, ensure_ascii=False)
+        products[productId] = productEntry
+        productLog["products"] = products
+        self._writeProductLog(productLog)
 
