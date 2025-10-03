@@ -16,6 +16,7 @@ from urllib.parse import urlparse
 import requests
 
 from .database import LocalDatabase
+from .persistence import storePrintSummary
 
 
 defaultBaseUrl = "https://printer-backend-934564650450.europe-west1.run.app"
@@ -972,10 +973,21 @@ def listenForFiles(
                             "fileName": (updatedRecord or {}).get("fileName"),
                             "requestMode": requestMode,
                         }
+                    entryData["productId"] = productId
                     entryData["productStatus"] = statusPayload
                     entryData["productRecord"] = updatedRecord
 
-                    if resolvedLogPath is not None:
+                    summaryDirectory: Optional[Path] = None
+                    if database is not None:
+                        summaryDirectory = database.productRecordsPath.parent
+
+                    if (
+                        entryData.get("requestMode") == "metadata"
+                        and not entryData.get("savedFile")
+                    ):
+                        summaryPath = storePrintSummary(entryData, summaryDirectory)
+                        entryData["logFilePath"] = str(summaryPath)
+                    elif resolvedLogPath is not None:
                         loggedPath = appendJsonLogEntry(resolvedLogPath, entryData)
                         entryData["logFilePath"] = str(loggedPath)
 
