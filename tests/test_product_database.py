@@ -180,3 +180,57 @@ def test_upsertProductRecord_updates_print_activity(tmp_path: Path) -> None:
     }
 
     database.close()
+
+
+def testUpsertProductRecordCreatesActivityWithoutJobId(tmp_path: Path) -> None:
+    databasePath = tmp_path / "no-job.db"
+    database = LocalDatabase(databasePath)
+
+    requestTimestamp = "2026-01-01T01:01:01"
+    database.upsertProductRecord(
+        "product-100",
+        requestTimestamp=requestTimestamp,
+        printJobId=None,
+    )
+
+    activityPath = tmp_path / "products" / "product-100" / "print-activity.json"
+    assert activityPath.exists()
+
+    activity = json.loads(activityPath.read_text(encoding="utf-8"))
+    assert activity["productId"] == "product-100"
+    assert activity["printJobs"] == {}
+    assert activity["latestPrintedAt"] == requestTimestamp
+    assert "latestPrintJobId" not in activity
+
+    database.close()
+
+
+def testUpsertProductRecordExtendsActivityHistory(tmp_path: Path) -> None:
+    databasePath = tmp_path / "history.db"
+    database = LocalDatabase(databasePath)
+
+    initialTimestamp = "2027-02-02T02:02:02"
+    database.upsertProductRecord(
+        "product-200",
+        requestTimestamp=initialTimestamp,
+        printJobId=None,
+    )
+
+    secondTimestamp = "2027-02-02T03:03:03"
+    database.upsertProductRecord(
+        "product-200",
+        requestTimestamp=secondTimestamp,
+        printJobId="job-xyz",
+    )
+
+    activityPath = tmp_path / "products" / "product-200" / "print-activity.json"
+    activity = json.loads(activityPath.read_text(encoding="utf-8"))
+
+    assert activity["productId"] == "product-200"
+    assert activity["latestPrintJobId"] == "job-xyz"
+    assert activity["latestPrintedAt"] == secondTimestamp
+    assert activity["printJobs"] == {
+        "job-xyz": {"lastPrintedAt": secondTimestamp}
+    }
+
+    database.close()
