@@ -46,14 +46,17 @@ def test_upsertProductRecord_creates_product_files(tmp_path: Path) -> None:
         fileName="initial.gcode",
         downloaded=False,
         requestTimestamp=firstTimestamp,
+        printJobId="job-1",
     )
 
     productDir = tmp_path / "products" / "product-7"
     metadataPath = productDir / "metadata.json"
     requestsPath = productDir / "requests.json"
+    activityPath = productDir / "print-activity.json"
 
     assert metadataPath.exists()
     assert requestsPath.exists()
+    assert activityPath.exists()
 
     metadata = json.loads(metadataPath.read_text(encoding="utf-8"))
     assert metadata["productId"] == "product-7"
@@ -67,6 +70,7 @@ def test_upsertProductRecord_creates_product_files(tmp_path: Path) -> None:
         fileName="finalized.gcode",
         downloaded=True,
         requestTimestamp=secondTimestamp,
+        printJobId="job-2",
     )
 
     metadata = json.loads(metadataPath.read_text(encoding="utf-8"))
@@ -77,6 +81,15 @@ def test_upsertProductRecord_creates_product_files(tmp_path: Path) -> None:
 
     requests = json.loads(requestsPath.read_text(encoding="utf-8"))
     assert requests == [firstTimestamp, secondTimestamp]
+
+    activity = json.loads(activityPath.read_text(encoding="utf-8"))
+    assert activity["productId"] == "product-7"
+    assert activity["latestPrintJobId"] == "job-2"
+    assert activity["latestPrintedAt"] == secondTimestamp
+    assert activity["printJobs"] == {
+        "job-1": {"lastPrintedAt": firstTimestamp},
+        "job-2": {"lastPrintedAt": secondTimestamp},
+    }
 
     database.close()
 
@@ -125,5 +138,45 @@ def test_checkProductAvailability_tracks_transitions(tmp_path: Path) -> None:
     assert finalStatus["shouldRequestFile"] is False
     assert finalStatus["record"]["downloaded"] is True
     assert finalStatus["record"]["lastRequestedAt"] == "2025-03-01T10:15:00"
+
+    database.close()
+
+
+def test_upsertProductRecord_updates_print_activity(tmp_path: Path) -> None:
+    databasePath = tmp_path / "activity.db"
+    database = LocalDatabase(databasePath)
+
+    firstTimestamp = "2025-07-01T08:00:00"
+    database.upsertProductRecord(
+        "product-88",
+        fileName="alpha.gcode",
+        downloaded=True,
+        requestTimestamp=firstTimestamp,
+        printJobId="print-001",
+    )
+
+    productDir = tmp_path / "products" / "product-88"
+    activityPath = productDir / "print-activity.json"
+
+    activity = json.loads(activityPath.read_text(encoding="utf-8"))
+    assert activity["latestPrintJobId"] == "print-001"
+    assert activity["latestPrintedAt"] == firstTimestamp
+    assert activity["printJobs"]["print-001"] == {"lastPrintedAt": firstTimestamp}
+
+    secondTimestamp = "2025-07-01T09:30:00"
+    database.upsertProductRecord(
+        "product-88",
+        fileName="alpha.gcode",
+        downloaded=True,
+        requestTimestamp=secondTimestamp,
+        printJobId="print-001",
+    )
+
+    updatedActivity = json.loads(activityPath.read_text(encoding="utf-8"))
+    assert updatedActivity["latestPrintJobId"] == "print-001"
+    assert updatedActivity["latestPrintedAt"] == secondTimestamp
+    assert updatedActivity["printJobs"]["print-001"] == {
+        "lastPrintedAt": secondTimestamp
+    }
 
     database.close()

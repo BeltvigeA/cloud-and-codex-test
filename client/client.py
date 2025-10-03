@@ -231,6 +231,23 @@ def ensureOutputDirectory(outputDir: str) -> Path:
     return outputPath
 
 
+def extractPrintJobId(*sources: Optional[Dict[str, Any]]) -> Optional[str]:
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        for key in ("printJobId", "printJob"):
+            value = source.get(key)
+            if value is None:
+                continue
+            if isinstance(value, str):
+                candidate = value.strip()
+                if candidate:
+                    return candidate
+            else:
+                return str(value)
+    return None
+
+
 def loadOfflineMetadata(metadataSource: Union[str, Path, Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     if isinstance(metadataSource, dict):
         metadata = metadataSource
@@ -481,6 +498,7 @@ def performFetch(
     unencryptedData = payload.get("unencryptedData") or {}
     decryptedData = payload.get("decryptedData") or {}
     metadataFileName = payload.get("originalFilename") or payload.get("fileName")
+    printJobId = extractPrintJobId(payload, unencryptedData, decryptedData)
 
     result: Dict[str, Any] = {
         "savedFile": None,
@@ -491,6 +509,7 @@ def performFetch(
         "source": baseUrl,
         "requestMode": normalizedMode,
         "fileName": metadataFileName,
+        "printJobId": printJobId,
     }
 
     if normalizedMode == "metadata":
@@ -499,6 +518,7 @@ def performFetch(
                 productId,
                 metadataFileName,
                 downloaded=None,
+                printJobId=printJobId,
             )
             result["productRecord"] = updatedRecord
         logging.info("Metadata retrieved for product %s without downloading file.", productId)
@@ -512,6 +532,7 @@ def performFetch(
                 productId,
                 metadataFileName,
                 downloaded=None,
+                printJobId=printJobId,
             )
         return None
 
@@ -527,6 +548,7 @@ def performFetch(
                 productId,
                 metadataFileName,
                 downloaded=None,
+                printJobId=printJobId,
             )
         return None
 
@@ -543,6 +565,7 @@ def performFetch(
             productId,
             savedFile.name,
             downloaded=True,
+            printJobId=printJobId,
         )
 
     return result
