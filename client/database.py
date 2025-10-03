@@ -528,15 +528,16 @@ class LocalDatabase:
             else:
                 jobEntry = {}
 
-            if lastPrintedAt is not None:
-                jobEntry["lastPrintedAt"] = lastPrintedAt
-            elif "lastPrintedAt" not in jobEntry:
-                jobEntry["lastPrintedAt"] = None
+            if lastPrintedAt is None:
+                resolvedPrintedAt = datetime.utcnow().isoformat()
+            else:
+                resolvedPrintedAt = lastPrintedAt
+
+            jobEntry["lastPrintedAt"] = resolvedPrintedAt
 
             updatedPrintJobs[jobKey] = jobEntry
             latestPrintJobId = jobKey
-            if lastPrintedAt is not None:
-                latestPrintedAt = lastPrintedAt
+            latestPrintedAt = resolvedPrintedAt
         else:
             if lastPrintedAt is not None:
                 latestPrintedAt = lastPrintedAt
