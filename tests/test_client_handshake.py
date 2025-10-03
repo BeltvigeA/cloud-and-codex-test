@@ -301,3 +301,97 @@ def test_listenForFiles_reports_fetch_errors_with_message(
     assert statusPayload["success"] is False
     assert statusPayload["message"] == "simulated transfer failure"
     assert statusPayload["printJobId"] == "job-error"
+
+
+def testListenForFilesStoresMetadataSummary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    databasePath = tmp_path / "metadata.db"
+    database = client.LocalDatabase(databasePath)
+
+    pendingFiles: List[Dict[str, Any]] = [
+        {
+            "fetchToken": "token-meta",
+            "productId": "product-meta",
+            "originalFilename": "meta.json",
+        }
+    ]
+
+    monkeypatch.setattr(client, "fetchPendingFiles", lambda *_args, **_kwargs: pendingFiles)
+
+    monkeypatch.setattr(
+        client,
+        "checkProductAvailability",
+        lambda *_args, **_kwargs: {
+            "status": "metadataCached",
+            "shouldRequestFile": False,
+            "record": {},
+        },
+    )
+
+    appendCalls: List[str] = []
+
+    def fakeAppend(*_args, **_kwargs) -> Path:
+        appendCalls.append("called")
+        raise AssertionError("appendJsonLogEntry should not be used for metadata summaries")
+
+    monkeypatch.setattr(client, "appendJsonLogEntry", fakeAppend)
+
+    def fakePerformFetch(
+        baseUrl: str,
+        fetchToken: str,
+        outputDir: str,
+        *,
+        requestMode: str,
+        database: client.LocalDatabase,
+        productId: str,
+    ) -> Dict[str, Any]:
+        assert requestMode == "metadata"
+        return {
+            "savedFile": None,
+            "unencryptedData": {"summary": "details"},
+            "decryptedData": {"note": "metadata"},
+            "timestamp": 3.14,
+            "fetchToken": fetchToken,
+            "source": baseUrl,
+            "requestMode": requestMode,
+            "fileName": "meta.json",
+            "printJobId": "job-meta",
+        }
+
+    monkeypatch.setattr(client, "performFetch", fakePerformFetch)
+
+    monkeypatch.setattr(client, "sendHandshakeResponse", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(client, "sendProductStatusUpdate", lambda *_args, **_kwargs: True)
+
+    outputDir = tmp_path / "metadata-output"
+    outputDir.mkdir()
+
+    client.listenForFiles(
+        "https://base44.com",
+        "recipient-meta",
+        str(outputDir),
+        pollInterval=0,
+        maxIterations=1,
+        logFilePath=str(tmp_path / "listener-log.json"),
+        database=database,
+    )
+
+    database.close()
+
+    summaryPath = tmp_path / "print-summaries.json"
+    assert summaryPath.exists()
+    with summaryPath.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+
+    assert isinstance(payload, list)
+    assert len(payload) == 1
+    storedSummary = payload[0]
+    assert storedSummary["fetchToken"] == "token-meta"
+    assert storedSummary["fileName"] == "meta.json"
+    assert storedSummary["requestMode"] == "metadata"
+    assert storedSummary["printJobId"] == "job-meta"
+    assert storedSummary["productId"] == "product-meta"
+    assert storedSummary["unencryptedData"] == {"summary": "details"}
+    assert storedSummary["decryptedData"] == {"note": "metadata"}
+    assert not appendCalls
