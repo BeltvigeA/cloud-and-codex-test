@@ -169,6 +169,7 @@ class ListenerGuiApp:
                 maxIterations=0,
                 onFileFetched=self._handleFetchedData,
                 stopEvent=self.stopEvent,
+                logFilePath=str(self.logFilePath) if self.logFilePath else None,
             )
         except Exception as error:  # noqa: BLE001 - surface exceptions to the GUI
             logging.exception("Listener encountered an error: %s", error)
@@ -177,11 +178,21 @@ class ListenerGuiApp:
             self.logQueue.put("__LISTENER_STOPPED__")
 
     def _handleFetchedData(self, details: Dict[str, object]) -> None:
-        logMessage = f"Fetched file: {details.get('savedFile')}"
-        if self.logFilePath is not None:
+        savedFile = details.get("savedFile") or details.get("fileName") or "metadata"
+        logMessage = f"Fetched file: {savedFile}"
+
+        statusDetails = details.get("productStatus")
+        if isinstance(statusDetails, dict):
+            availability = statusDetails.get("availabilityStatus")
+            downloaded = statusDetails.get("downloaded")
+            logMessage += f" | Status: {availability} (downloaded={downloaded})"
+
+        if isinstance(details.get("logFilePath"), str):
+            logMessage += f" | Metadata saved to {details['logFilePath']}"
+        elif self.logFilePath is not None:
             try:
-                appendJsonLogEntry(self.logFilePath, details)
-                logMessage += f" | Metadata saved to {self.logFilePath}"
+                loggedPath = appendJsonLogEntry(self.logFilePath, details)
+                logMessage += f" | Metadata saved to {loggedPath}"
             except Exception as error:  # noqa: BLE001 - ensure UI feedback on errors
                 logging.exception("Failed to append JSON log: %s", error)
                 logMessage += f" | Failed to write log: {error}"

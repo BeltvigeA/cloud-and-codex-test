@@ -85,6 +85,17 @@ class LocalDatabase:
                 )
                 """
             )
+            self.connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS products (
+                    productId TEXT PRIMARY KEY,
+                    fileName TEXT,
+                    downloaded INTEGER NOT NULL,
+                    lastRequestedAt TEXT NOT NULL,
+                    updatedAt TEXT NOT NULL
+                )
+                """
+            )
 
     def close(self) -> None:
         self.connection.close()
@@ -326,4 +337,66 @@ class LocalDatabase:
             signedUrl=row["signedUrl"],
             downloadedFilePath=row["downloadedFilePath"],
         )
+
+    def upsertProductRecord(
+        self,
+        productId: str,
+        fileName: Optional[str] = None,
+        *,
+        downloaded: Optional[bool] = None,
+        requestTimestamp: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        existingRecord = self.findProductById(productId)
+        resolvedTimestamp = requestTimestamp or datetime.utcnow().isoformat()
+        resolvedFileName = fileName if fileName is not None else (existingRecord or {}).get("fileName")
+        if downloaded is None:
+            resolvedDownloaded = bool((existingRecord or {}).get("downloaded", False))
+        else:
+            resolvedDownloaded = downloaded
+
+        with self.connection:
+            self.connection.execute(
+                """
+                INSERT INTO products (
+                    productId,
+                    fileName,
+                    downloaded,
+                    lastRequestedAt,
+                    updatedAt
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(productId) DO UPDATE SET
+                    fileName = CASE WHEN excluded.fileName IS NOT NULL THEN excluded.fileName ELSE fileName END,
+                    downloaded = excluded.downloaded,
+                    lastRequestedAt = excluded.lastRequestedAt,
+                    updatedAt = excluded.updatedAt
+                """,
+                (
+                    productId,
+                    resolvedFileName,
+                    1 if resolvedDownloaded else 0,
+                    resolvedTimestamp,
+                    resolvedTimestamp,
+                ),
+            )
+
+        updatedRecord = self.findProductById(productId)
+        if updatedRecord is None:
+            raise RuntimeError(f"Failed to persist product record for {productId}")
+        return updatedRecord
+
+    def findProductById(self, productId: str) -> Optional[Dict[str, Any]]:
+        cursor = self.connection.execute(
+            "SELECT productId, fileName, downloaded, lastRequestedAt, updatedAt FROM products WHERE productId = ?",
+            (productId,),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return None
+        return {
+            "productId": row["productId"],
+            "fileName": row["fileName"],
+            "downloaded": bool(row["downloaded"]),
+            "lastRequestedAt": row["lastRequestedAt"],
+            "updatedAt": row["updatedAt"],
+        }
 

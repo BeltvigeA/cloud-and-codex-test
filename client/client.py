@@ -7,12 +7,15 @@ import shutil
 import sys
 import time
 import uuid
+from datetime import datetime
 from pathlib import Path
 from threading import Event
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 from urllib.parse import urlparse
 
 import requests
+
+from .database import LocalDatabase
 
 
 defaultBaseUrl = "https://printer-backend-934564650450.europe-west1.run.app"
@@ -115,6 +118,11 @@ def parseArguments() -> argparse.Namespace:
         help="Directory path to save downloaded files.",
     )
     listenParser.add_argument(
+        "--logFile",
+        default=str(Path.home() / ".printmaster" / "listener-log.json"),
+        help="Path to a JSON log file for fetched files and product statuses.",
+    )
+    listenParser.add_argument(
         "--pollInterval",
         type=int,
         default=30,
@@ -162,6 +170,59 @@ def validateBaseUrlArgument(baseUrl: Optional[str], commandName: str) -> bool:
         return False
 
     return True
+
+
+def checkProductAvailability(
+    database: LocalDatabase,
+    productId: str,
+    fileName: Optional[str] = None,
+    *,
+    requestTimestamp: Optional[str] = None,
+) -> Dict[str, Any]:
+    existingRecord = database.findProductById(productId)
+    resolvedTimestamp = requestTimestamp or datetime.utcnow().isoformat()
+
+    if existingRecord is None:
+        status = "notFound"
+        shouldRequestFile = True
+        updatedRecord = database.upsertProductRecord(
+            productId,
+            None,
+            downloaded=False,
+            requestTimestamp=resolvedTimestamp,
+        )
+    elif existingRecord.get("downloaded"):
+        status = "fileCached"
+        shouldRequestFile = False
+        updatedRecord = database.upsertProductRecord(
+            productId,
+            existingRecord.get("fileName"),
+            downloaded=True,
+            requestTimestamp=resolvedTimestamp,
+        )
+    else:
+        status = "metadataCached"
+        shouldRequestFile = True
+        updatedRecord = database.upsertProductRecord(
+            productId,
+            fileName or existingRecord.get("fileName"),
+            downloaded=False,
+            requestTimestamp=resolvedTimestamp,
+        )
+
+    logging.info(
+        "Product %s availability: %s (downloaded=%s)",
+        productId,
+        status,
+        updatedRecord.get("downloaded"),
+    )
+    return {
+        "productId": productId,
+        "status": status,
+        "shouldRequestFile": shouldRequestFile,
+        "record": updatedRecord,
+        "timestamp": resolvedTimestamp,
+    }
 
 
 def ensureOutputDirectory(outputDir: str) -> Path:
@@ -382,12 +443,30 @@ def saveDownloadedFile(response: requests.Response, outputDir: Path) -> Path:
     return outputPath
 
 
-def performFetch(baseUrl: str, fetchToken: str, outputDir: str) -> Optional[Dict[str, Any]]:
+def performFetch(
+    baseUrl: str,
+    fetchToken: str,
+    outputDir: str,
+    *,
+    requestMode: str = "full",
+    database: Optional[LocalDatabase] = None,
+    productId: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    normalizedMode = requestMode if requestMode in {"full", "metadata"} else "full"
     fetchUrl = buildFetchUrl(baseUrl, fetchToken)
-    logging.info("Fetching metadata from %s", fetchUrl)
+    logging.info(
+        "Fetching metadata from %s (mode=%s) for product %s",
+        fetchUrl,
+        normalizedMode,
+        productId or "unknown",
+    )
     session = requests.Session()
     try:
-        metadataResponse = session.get(fetchUrl, timeout=30)
+        metadataResponse = session.get(
+            fetchUrl,
+            timeout=30,
+            params={"mode": normalizedMode} if normalizedMode != "full" else None,
+        )
         metadataResponse.raise_for_status()
     except requests.RequestException as error:
         logging.error("Failed to fetch metadata: %s", error)
@@ -399,36 +478,74 @@ def performFetch(baseUrl: str, fetchToken: str, outputDir: str) -> Optional[Dict
         logging.error("Invalid JSON response: %s", error)
         return None
 
-    signedUrl = payload.get("signedUrl")
-    unencryptedData = payload.get("unencryptedData")
-    decryptedData = payload.get("decryptedData")
+    unencryptedData = payload.get("unencryptedData") or {}
+    decryptedData = payload.get("decryptedData") or {}
+    metadataFileName = payload.get("originalFilename") or payload.get("fileName")
 
+    result: Dict[str, Any] = {
+        "savedFile": None,
+        "unencryptedData": unencryptedData,
+        "decryptedData": decryptedData,
+        "timestamp": time.time(),
+        "fetchToken": fetchToken,
+        "source": baseUrl,
+        "requestMode": normalizedMode,
+        "fileName": metadataFileName,
+    }
+
+    if normalizedMode == "metadata":
+        if database and productId:
+            updatedRecord = database.upsertProductRecord(
+                productId,
+                metadataFileName,
+                downloaded=None,
+            )
+            result["productRecord"] = updatedRecord
+        logging.info("Metadata retrieved for product %s without downloading file.", productId)
+        return result
+
+    signedUrl = payload.get("signedUrl")
     if not signedUrl:
         logging.error("No signedUrl returned from server.")
+        if database and productId:
+            result["productRecord"] = database.upsertProductRecord(
+                productId,
+                metadataFileName,
+                downloaded=None,
+            )
         return None
 
     outputPath = ensureOutputDirectory(outputDir)
-    logging.info("Downloading file from signed URL.")
+    logging.info("Downloading file from signed URL for product %s.", productId)
     try:
         downloadResponse = session.get(signedUrl, stream=True, timeout=60)
         downloadResponse.raise_for_status()
     except requests.RequestException as error:
         logging.error("Failed to download file: %s", error)
-        return
+        if database and productId:
+            result["productRecord"] = database.upsertProductRecord(
+                productId,
+                metadataFileName,
+                downloaded=None,
+            )
+        return None
 
     savedFile = saveDownloadedFile(downloadResponse, outputPath)
-
     logging.info("Unencrypted data:\n%s", json.dumps(unencryptedData, indent=2))
     logging.info("Decrypted data:\n%s", json.dumps(decryptedData, indent=2))
     logging.info("Fetch completed successfully. File saved at %s", savedFile)
-    return {
-        "savedFile": str(savedFile),
-        "unencryptedData": unencryptedData or {},
-        "decryptedData": decryptedData or {},
-        "timestamp": time.time(),
-        "fetchToken": fetchToken,
-        "source": baseUrl,
-    }
+
+    result["savedFile"] = str(savedFile)
+    result["fileName"] = savedFile.name
+
+    if database and productId:
+        result["productRecord"] = database.upsertProductRecord(
+            productId,
+            savedFile.name,
+            downloaded=True,
+        )
+
+    return result
 
 
 def appendJsonLogEntry(logFilePath: Union[str, Path], entry: Dict[str, Any]) -> Path:
@@ -442,6 +559,12 @@ def appendJsonLogEntry(logFilePath: Union[str, Path], entry: Dict[str, Any]) -> 
         "fetchToken": entry.get("fetchToken"),
         "source": entry.get("source"),
     }
+    if entry.get("fileName") is not None:
+        serializedEntry["fileName"] = entry.get("fileName")
+    if entry.get("requestMode") is not None:
+        serializedEntry["requestMode"] = entry.get("requestMode")
+    if entry.get("productStatus") is not None:
+        serializedEntry["productStatus"] = entry.get("productStatus")
 
     existingEntries: List[Dict[str, Any]] = []
     if logPath.exists():
@@ -458,6 +581,23 @@ def appendJsonLogEntry(logFilePath: Union[str, Path], entry: Dict[str, Any]) -> 
         json.dump(existingEntries, logFile, indent=2, ensure_ascii=False)
     logging.info("Appended fetch metadata to %s", logPath)
     return logPath
+
+
+def sendProductStatusUpdate(baseUrl: str, productId: str, statusPayload: Dict[str, Any]) -> bool:
+    statusUrl = f"{buildBaseUrl(baseUrl)}/products/{productId}/status"
+    try:
+        response = requests.post(statusUrl, json=statusPayload, timeout=30)
+        response.raise_for_status()
+    except requests.RequestException as error:
+        logging.error("Failed to send product status update for %s: %s", productId, error)
+        return False
+
+    logging.info(
+        "Sent product status update for %s: %s",
+        productId,
+        response.text.strip() or response.status_code,
+    )
+    return True
 
 
 def fetchPendingFiles(baseUrl: str, recipientId: str) -> Optional[List[Dict[str, Any]]]:
@@ -543,43 +683,114 @@ def listenForFiles(
     maxIterations: int,
     onFileFetched: Optional[Callable[[Dict[str, Any]], None]] = None,
     stopEvent: Optional[Event] = None,
+    *,
+    logFilePath: Optional[Union[str, Path]] = None,
+    database: Optional[LocalDatabase] = None,
 ) -> None:
     iteration = 0
-    while True:
-        if stopEvent and stopEvent.is_set():
-            break
-        pendingFiles = fetchPendingFiles(baseUrl, recipientId)
-        if pendingFiles is None:
-            logging.warning("Unable to retrieve pending files; will retry after delay.")
-        elif not pendingFiles:
-            logging.info("No pending files for recipient %s.", recipientId)
-        else:
-            logging.info("Found %d pending file(s) for recipient %s.", len(pendingFiles), recipientId)
-            for pendingFile in pendingFiles:
-                fetchToken = pendingFile.get("fetchToken")
-                if not fetchToken:
-                    logging.warning("Skipping pending entry without fetchToken: %s", pendingFile)
-                    continue
+    ownDatabase = False
+    resolvedLogPath: Optional[Path] = None
+    if logFilePath:
+        resolvedLogPath = Path(logFilePath).expanduser().resolve()
+    if database is None:
+        database = LocalDatabase()
+        ownDatabase = True
 
-                filename = pendingFile.get("originalFilename") or pendingFile.get("fileId")
-                logging.info(
-                    "Fetching pending file %s with token %s.",
-                    filename,
-                    fetchToken,
-                )
-                fetchResult = performFetch(baseUrl, fetchToken, outputDir)
-                if onFileFetched and fetchResult is not None:
-                    onFileFetched(fetchResult)
-
-        iteration += 1
-        if maxIterations and iteration >= maxIterations:
-            break
-
-        if stopEvent:
-            if stopEvent.wait(timeout=pollInterval):
+    try:
+        while True:
+            if stopEvent and stopEvent.is_set():
                 break
-        else:
-            time.sleep(pollInterval)
+            pendingFiles = fetchPendingFiles(baseUrl, recipientId)
+            if pendingFiles is None:
+                logging.warning("Unable to retrieve pending files; will retry after delay.")
+            elif not pendingFiles:
+                logging.info("No pending files for recipient %s.", recipientId)
+            else:
+                logging.info(
+                    "Found %d pending file(s) for recipient %s.", len(pendingFiles), recipientId
+                )
+                for pendingFile in pendingFiles:
+                    fetchToken = pendingFile.get("fetchToken")
+                    if not fetchToken:
+                        logging.warning("Skipping pending entry without fetchToken: %s", pendingFile)
+                        continue
+
+                    productId = str(
+                        pendingFile.get("productId")
+                        or pendingFile.get("fileId")
+                        or fetchToken
+                    )
+                    availability = checkProductAvailability(
+                        database,
+                        productId,
+                        pendingFile.get("originalFilename"),
+                    )
+                    requestMode = "full" if availability["shouldRequestFile"] else "metadata"
+                    logging.info(
+                        "Processing pending product %s with fetch token %s (mode=%s)",
+                        productId,
+                        fetchToken,
+                        requestMode,
+                    )
+                    fetchResult = performFetch(
+                        baseUrl,
+                        fetchToken,
+                        outputDir,
+                        requestMode=requestMode,
+                        database=database,
+                        productId=productId,
+                    )
+
+                    updatedRecord = database.findProductById(productId)
+                    statusPayload = {
+                        "productId": productId,
+                        "requestedMode": requestMode,
+                        "availabilityStatus": availability["status"],
+                        "downloaded": bool((updatedRecord or {}).get("downloaded", False)),
+                        "fileName": (updatedRecord or {}).get("fileName"),
+                        "lastRequestedAt": (updatedRecord or {}).get("lastRequestedAt"),
+                        "timestamp": time.time(),
+                        "fetchToken": fetchToken,
+                        "success": fetchResult is not None,
+                    }
+                    statusSent = sendProductStatusUpdate(baseUrl, productId, statusPayload)
+                    statusPayload["sent"] = statusSent
+
+                    if fetchResult is not None:
+                        entryData: Dict[str, Any] = dict(fetchResult)
+                    else:
+                        entryData = {
+                            "savedFile": None,
+                            "unencryptedData": {},
+                            "decryptedData": {},
+                            "timestamp": time.time(),
+                            "fetchToken": fetchToken,
+                            "source": baseUrl,
+                            "fileName": (updatedRecord or {}).get("fileName"),
+                            "requestMode": requestMode,
+                        }
+                    entryData["productStatus"] = statusPayload
+                    entryData["productRecord"] = updatedRecord
+
+                    if resolvedLogPath is not None:
+                        loggedPath = appendJsonLogEntry(resolvedLogPath, entryData)
+                        entryData["logFilePath"] = str(loggedPath)
+
+                    if fetchResult is not None and onFileFetched:
+                        onFileFetched(entryData)
+
+            iteration += 1
+            if maxIterations and iteration >= maxIterations:
+                break
+
+            if stopEvent:
+                if stopEvent.wait(timeout=pollInterval):
+                    break
+            else:
+                time.sleep(pollInterval)
+    finally:
+        if ownDatabase and database is not None:
+            database.close()
 
 
 def performStatusUpdates(
@@ -689,6 +900,7 @@ def main() -> None:
                 arguments.outputDir,
                 arguments.pollInterval,
                 arguments.maxIterations,
+                logFilePath=arguments.logFile,
             )
     else:
         logging.error("Unknown command: %s", arguments.command)
