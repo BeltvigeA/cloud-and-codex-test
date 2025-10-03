@@ -81,6 +81,36 @@ def test_upsertProductRecord_creates_product_files(tmp_path: Path) -> None:
     database.close()
 
 
+def test_upsertProductRecord_keeps_request_history_when_timestamp_absent(tmp_path: Path) -> None:
+    databasePath = tmp_path / "history.db"
+    database = LocalDatabase(databasePath)
+
+    initialTimestamp = "2024-07-01T08:00:00"
+    initialRecord = database.upsertProductRecord(
+        "product-11",
+        requestTimestamp=initialTimestamp,
+    )
+
+    assert initialRecord["lastRequestedAt"] == initialTimestamp
+
+    updatedRecord = database.upsertProductRecord(
+        "product-11",
+        downloaded=True,
+    )
+
+    assert updatedRecord["downloaded"] is True
+    assert updatedRecord["lastRequestedAt"] == initialTimestamp
+
+    productDir = tmp_path / "products" / "product-11"
+    requestsPath = productDir / "requests.json"
+    assert requestsPath.exists()
+
+    requests = json.loads(requestsPath.read_text(encoding="utf-8"))
+    assert requests == [initialTimestamp]
+
+    database.close()
+
+
 def test_checkProductAvailability_tracks_transitions(tmp_path: Path) -> None:
     databasePath = tmp_path / "availability.db"
     database = LocalDatabase(databasePath)

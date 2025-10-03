@@ -349,7 +349,12 @@ class LocalDatabase:
         requestTimestamp: Optional[str] = None,
     ) -> Dict[str, Any]:
         existingRecord = self.findProductById(productId)
-        resolvedTimestamp = requestTimestamp or datetime.utcnow().isoformat()
+        if requestTimestamp is not None:
+            resolvedTimestamp = requestTimestamp
+        elif existingRecord and existingRecord.get("lastRequestedAt"):
+            resolvedTimestamp = existingRecord["lastRequestedAt"]
+        else:
+            resolvedTimestamp = datetime.utcnow().isoformat()
         resolvedFileName = fileName if fileName is not None else (existingRecord or {}).get("fileName")
         if downloaded is None:
             resolvedDownloaded = bool((existingRecord or {}).get("downloaded", False))
@@ -454,7 +459,9 @@ class LocalDatabase:
                 requestEntries = []
 
         if record.get("lastRequestedAt"):
-            requestEntries.append(str(record.get("lastRequestedAt")))
+            latestTimestamp = str(record.get("lastRequestedAt"))
+            if not requestEntries or requestEntries[-1] != latestTimestamp:
+                requestEntries.append(latestTimestamp)
 
         with requestsPath.open("w", encoding="utf-8") as requestsFile:
             json.dump(requestEntries, requestsFile, indent=2, ensure_ascii=False)
