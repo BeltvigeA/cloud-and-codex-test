@@ -359,10 +359,15 @@ def uploadFile():
         unencryptedDataRaw = request.form.get('unencrypted_data', '{}')
         encryptedDataPayloadRaw = request.form.get('encrypted_data_payload', '{}')
         recipientId = request.form.get('recipient_id')
+        productId = request.form.get('product_id')
 
         if not recipientId:
             logging.warning('Recipient ID is missing.')
             return jsonify({'error': 'Recipient ID is required'}), 400
+
+        if not productId:
+            logging.warning('Product ID is missing.')
+            return jsonify({'error': 'Product ID is required'}), 400
 
         unencryptedData, errorResponse = parseJsonObjectField(unencryptedDataRaw, 'unencrypted_data')
         if errorResponse:
@@ -442,11 +447,14 @@ def uploadFile():
             'encryptedData': encryptedDataCipherText,
             'unencryptedData': unencryptedData,
             'recipientId': recipientId,
+            'productId': productId,
             'fetchToken': fetchToken,
             'fetchTokenExpiry': datetime.now(timezone.utc) + timedelta(minutes=fetchTokenTtlMinutes),
             'fetchTokenConsumed': False,
             'status': 'uploaded',
             'timestamp': firestore.SERVER_TIMESTAMP,
+            'lastRequestTimestamp': None,
+            'lastRequestFileName': normalizedFilename,
         }
 
         firestoreClient.collection(firestoreCollectionFiles).document(fileId).set(metadata)
@@ -462,6 +470,156 @@ def uploadFile():
 
     except Exception:  # pylint: disable=broad-except
         logging.exception('An unexpected error occurred during file upload.')
+        return jsonify({'error': 'Internal server error'}), 500
+
+
+def pickLatestDocumentByTimestamp(documentSnapshots: List):
+    latestSnapshot = None
+    latestTimestamp = None
+    for snapshot in documentSnapshots:
+        metadata = snapshot.to_dict() or {}
+        timestamp = metadata.get('timestamp')
+        if isinstance(timestamp, datetime):
+            candidateTimestamp = timestamp
+        else:
+            candidateTimestamp = None
+
+        if latestSnapshot is None:
+            latestSnapshot = snapshot
+            latestTimestamp = candidateTimestamp
+            continue
+
+        if candidateTimestamp is None:
+            continue
+
+        if latestTimestamp is None or candidateTimestamp > latestTimestamp:
+            latestSnapshot = snapshot
+            latestTimestamp = candidateTimestamp
+
+    return latestSnapshot
+
+
+def buildHandshakeResponseMetadata(fileMetadata: dict) -> dict:
+    metadataPayload = fileMetadata.get('unencryptedData')
+    if isinstance(metadataPayload, dict):
+        return metadataPayload
+    if metadataPayload is None:
+        return {}
+    if isinstance(metadataPayload, str):
+        return {'value': metadataPayload}
+    return {}
+
+
+@app.route('/products/<productId>/handshake', methods=['POST'])
+def productHandshake(productId: str):
+    logging.info('Received request to /products/%s/handshake', productId)
+    try:
+        clients, errorResponse = fetchClientsOrResponse()
+        if errorResponse:
+            return jsonify(errorResponse[0]), errorResponse[1]
+
+        firestoreClient = clients.firestoreClient
+
+        if not productId:
+            logging.warning('Product ID is missing during handshake.')
+            return jsonify({'error': 'Product ID is required'}), 400
+
+        if not request.is_json:
+            logging.warning('Handshake request must be JSON.')
+            return jsonify({'error': 'Request must be JSON'}), 400
+
+        payload = request.get_json()
+        if not isinstance(payload, dict):
+            logging.warning('Handshake payload is not a JSON object.')
+            return jsonify({'error': 'Invalid JSON format: expected object'}), 400
+
+        clientStatus = payload.get('status')
+        if clientStatus not in {'hasFile', 'needsFile'}:
+            logging.warning('Invalid handshake status received: %s', clientStatus)
+            return jsonify({'error': 'Invalid status value'}), 400
+
+        fileQuery = firestoreClient.collection(firestoreCollectionFiles).where(
+            'productId', '==', productId
+        )
+        documentSnapshots = list(fileQuery.stream())
+
+        if not documentSnapshots:
+            logging.info('No files found in handshake for product %s', productId)
+            return jsonify({'error': 'File not found for product'}), 404
+
+        documentSnapshot = pickLatestDocumentByTimestamp(documentSnapshots)
+        if documentSnapshot is None:
+            logging.info('No valid document snapshots for product %s', productId)
+            return jsonify({'error': 'File not found for product'}), 404
+
+        fileMetadata = documentSnapshot.to_dict() or {}
+        fetchToken = fileMetadata.get('fetchToken')
+        fetchTokenConsumed = fileMetadata.get('fetchTokenConsumed')
+        fetchTokenExpiry = fileMetadata.get('fetchTokenExpiry')
+        originalFilename = fileMetadata.get('originalFilename')
+        previousRequestTimestamp = normalizeTimestamp(
+            fileMetadata.get('lastRequestTimestamp')
+        )
+
+        currentTime = datetime.now(timezone.utc)
+        fetchMode = 'metadata' if clientStatus == 'hasFile' else 'full'
+
+        if fetchMode == 'full':
+            if fetchTokenConsumed:
+                logging.warning(
+                    'Fetch token already consumed for product %s during handshake.',
+                    productId,
+                )
+                return jsonify({'error': 'Fetch token already used'}), 410
+
+            if not fetchToken:
+                logging.warning(
+                    'Missing fetch token for product %s during handshake.', productId
+                )
+                return jsonify({'error': 'Fetch token missing'}), 422
+
+            if isinstance(fetchTokenExpiry, datetime) and fetchTokenExpiry < currentTime:
+                logging.warning(
+                    'Fetch token expired for product %s during handshake.', productId
+                )
+                return jsonify({'error': 'Fetch token expired'}), 410
+
+        handshakeStatus = (
+            'handshake-metadata' if fetchMode == 'metadata' else 'handshake-download'
+        )
+        firestoreClient.collection(firestoreCollectionFiles).document(
+            documentSnapshot.id
+        ).update(
+            {
+                'lastRequestTimestamp': currentTime,
+                'lastRequestFileName': originalFilename,
+                'status': handshakeStatus,
+                'handshakeClientStatus': clientStatus,
+            }
+        )
+
+        responsePayload = {
+            'productId': productId,
+            'fileId': documentSnapshot.id,
+            'clientStatus': clientStatus,
+            'decision': fetchMode,
+            'fetchMode': fetchMode,
+            'fetchToken': fetchToken,
+            'originalFilename': originalFilename,
+            'lastRequestTimestamp': currentTime.isoformat(),
+            'previousRequestTimestamp': previousRequestTimestamp,
+            'lastRequestFileName': originalFilename,
+            'metadata': buildHandshakeResponseMetadata(fileMetadata),
+            'downloadRequired': fetchMode == 'full',
+        }
+
+        if isinstance(fetchTokenExpiry, datetime):
+            responsePayload['fetchTokenExpiry'] = fetchTokenExpiry.isoformat()
+
+        return jsonify(responsePayload), 200
+
+    except Exception:  # pylint: disable=broad-except
+        logging.exception('Unexpected error during product handshake.')
         return jsonify({'error': 'Internal server error'}), 500
 
 
@@ -553,137 +711,167 @@ def fetchFile(fetchToken: str):
                 documentSnapshot.id,
             )
 
-        bucket = storageClient.bucket(gcsBucketName)
+        requestArgs = getattr(request, 'args', {}) or {}
+        fetchMode = str(requestArgs.get('mode', 'full')).lower()
+        metadataOnly = fetchMode == 'metadata'
+
+        signedUrl = None
         gcsPath = fileMetadata.get('gcsPath')
-        if not gcsPath:
-            logging.warning(
-                'Missing gcsPath in metadata for file %s', documentSnapshot.id
-            )
-            return (
-                jsonify({'error': 'File metadata is incomplete: missing gcsPath'}),
-                422,
-            )
-
-        blob = bucket.blob(gcsPath)
-
-        try:
-            credentials = getattr(storageClient, '_credentials', None)
-            signedUrl = None
-            if credentials is not None:
-                signBytesMethod = getattr(credentials, 'sign_bytes', None)
-                if callable(signBytesMethod):
-                    signedUrl = blob.generate_signed_url(
-                        version='v4',
-                        expiration=timedelta(minutes=15),
-                        method='GET',
-                    )
-                else:
-                    if Request is None:
-                        raise ImportError('google.auth Request is required for IAM signing')
-                    requestAdapter = Request()
-                    scopedCredentials = credentials
-                    withScopesMethod = getattr(credentials, 'with_scopes_if_required', None)
-                    if callable(withScopesMethod):
-                        scopedCredentials = withScopesMethod(
-                            ['https://www.googleapis.com/auth/cloud-platform']
-                        )
-                        if scopedCredentials is None:
-                            scopedCredentials = credentials
-                    credentials = scopedCredentials
-                    credentials.refresh(requestAdapter)
-                    accessToken = getattr(credentials, 'token', None)
-                    if not accessToken:
-                        raise AttributeError(
-                            'Credentials missing access token required for IAM signing'
-                        )
-                    serviceAccountEmail = getattr(
-                        credentials, 'service_account_email', None
-                    )
-                    if not serviceAccountEmail:
-                        raise AttributeError(
-                            'Credentials missing service_account_email required for IAM signing'
-                        )
-                    signedUrl = blob.generate_signed_url(
-                        version='v4',
-                        expiration=timedelta(minutes=15),
-                        method='GET',
-                        service_account_email=serviceAccountEmail,
-                        access_token=accessToken,
-                    )
-
-            if signedUrl is None:
-                signedUrl = blob.generate_signed_url(
-                    version='v4',
-                    expiration=timedelta(minutes=15),
-                    method='GET',
+        if not metadataOnly:
+            bucket = storageClient.bucket(gcsBucketName)
+            if not gcsPath:
+                logging.warning(
+                    'Missing gcsPath in metadata for file %s', documentSnapshot.id
                 )
-        except (AttributeError, ImportError, TypeError, GoogleAuthError) as error:
-            logging.exception(
-                'Service account is missing a signing key required for signed URL generation: %s',
-                error,
-            )
-            return (
-                jsonify(
-                    {
-                        'error': 'Service account lacks a signing capability required for signed URL generation',
-                        'detail': str(error),
-                    }
-                ),
-                503,
-            )
-        except (Forbidden, PermissionDenied, Unauthorized) as error:
-            missingPermissions = ['storage.objects.sign', 'iam.serviceAccounts.signBlob']
-            logging.error(
-                'Missing IAM permissions for signed URL generation: %s',
-                error,
-            )
-            return (
-                jsonify(
-                    {
-                        'error': 'Missing required IAM permissions to generate signed URL',
-                        'missingPermissions': missingPermissions,
-                        'detail': str(error),
-                    }
-                ),
-                403,
-            )
-        except GoogleAPICallError as error:
-            logging.exception(
-                'Storage API call failed during signed URL generation: %s',
-                error,
-            )
-            errorDetail = getattr(error, 'message', str(error))
-            return (
-                jsonify(
-                    {
-                        'error': 'Storage service temporarily unavailable for signed URL generation',
-                        'detail': errorDetail,
-                    }
-                ),
-                503,
-            )
-        logging.info('Generated signed URL for gs://%s/%s', gcsBucketName, gcsPath)
+                return (
+                    jsonify({'error': 'File metadata is incomplete: missing gcsPath'}),
+                    422,
+                )
 
-        firestoreClient.collection(firestoreCollectionFiles).document(documentSnapshot.id).update(
-            {
-                'status': 'fetched',
-                'fetchedTimestamp': firestore.SERVER_TIMESTAMP,
-                'fetchToken': DELETE_FIELD,
-                'fetchTokenExpiry': DELETE_FIELD,
-                'fetchTokenConsumed': True,
-                'fetchTokenConsumedTimestamp': firestore.SERVER_TIMESTAMP,
-            }
-        )
-        logging.info('Updated status for file %s to fetched.', documentSnapshot.id)
+            blob = bucket.blob(gcsPath)
 
-        return jsonify(
-            {
-                'message': 'File and data retrieved successfully',
-                'signedUrl': signedUrl,
-                'unencryptedData': unencryptedData if isinstance(unencryptedData, dict) else unencryptedData or {},
-                'decryptedData': decryptedData,
-            }
-        ), 200
+            try:
+                credentials = getattr(storageClient, '_credentials', None)
+                if credentials is not None:
+                    signBytesMethod = getattr(credentials, 'sign_bytes', None)
+                    if callable(signBytesMethod):
+                        signedUrl = blob.generate_signed_url(
+                            version='v4',
+                            expiration=timedelta(minutes=15),
+                            method='GET',
+                        )
+                    else:
+                        if Request is None:
+                            raise ImportError('google.auth Request is required for IAM signing')
+                        requestAdapter = Request()
+                        scopedCredentials = credentials
+                        withScopesMethod = getattr(credentials, 'with_scopes_if_required', None)
+                        if callable(withScopesMethod):
+                            scopedCredentials = withScopesMethod(
+                                ['https://www.googleapis.com/auth/cloud-platform']
+                            )
+                            if scopedCredentials is None:
+                                scopedCredentials = credentials
+                        credentials = scopedCredentials
+                        credentials.refresh(requestAdapter)
+                        accessToken = getattr(credentials, 'token', None)
+                        if not accessToken:
+                            raise AttributeError(
+                                'Credentials missing access token required for IAM signing'
+                            )
+                        serviceAccountEmail = getattr(
+                            credentials, 'service_account_email', None
+                        )
+                        if not serviceAccountEmail:
+                            raise AttributeError(
+                                'Credentials missing service_account_email required for IAM signing'
+                            )
+                        signedUrl = blob.generate_signed_url(
+                            version='v4',
+                            expiration=timedelta(minutes=15),
+                            method='GET',
+                            service_account_email=serviceAccountEmail,
+                            access_token=accessToken,
+                        )
+
+                if signedUrl is None:
+                    signedUrl = blob.generate_signed_url(
+                        version='v4',
+                        expiration=timedelta(minutes=15),
+                        method='GET',
+                    )
+            except (AttributeError, ImportError, TypeError, GoogleAuthError) as error:
+                logging.exception(
+                    'Service account is missing a signing key required for signed URL generation: %s',
+                    error,
+                )
+                return (
+                    jsonify(
+                        {
+                            'error': 'Service account lacks a signing capability required for signed URL generation',
+                            'detail': str(error),
+                        }
+                    ),
+                    503,
+                )
+            except (Forbidden, PermissionDenied, Unauthorized) as error:
+                missingPermissions = ['storage.objects.sign', 'iam.serviceAccounts.signBlob']
+                logging.error(
+                    'Missing IAM permissions for signed URL generation: %s',
+                    error,
+                )
+                return (
+                    jsonify(
+                        {
+                            'error': 'Missing required IAM permissions to generate signed URL',
+                            'missingPermissions': missingPermissions,
+                            'detail': str(error),
+                        }
+                    ),
+                    403,
+                )
+            except GoogleAPICallError as error:
+                logging.exception(
+                    'Storage API call failed during signed URL generation: %s',
+                    error,
+                )
+                errorDetail = getattr(error, 'message', str(error))
+                return (
+                    jsonify(
+                        {
+                            'error': 'Storage service temporarily unavailable for signed URL generation',
+                            'detail': errorDetail,
+                        }
+                    ),
+                    503,
+                )
+            logging.info('Generated signed URL for gs://%s/%s', gcsBucketName, gcsPath)
+
+        requestTimestamp = datetime.now(timezone.utc)
+        updatePayload = {
+            'lastRequestTimestamp': requestTimestamp,
+            'lastRequestFileName': fileMetadata.get('originalFilename'),
+            'lastFetchMode': fetchMode,
+        }
+
+        if metadataOnly:
+            updatePayload['status'] = 'metadata-fetched'
+            updatePayload['metadataFetchTimestamp'] = firestore.SERVER_TIMESTAMP
+        else:
+            updatePayload.update(
+                {
+                    'status': 'fetched',
+                    'fetchedTimestamp': firestore.SERVER_TIMESTAMP,
+                    'fetchToken': DELETE_FIELD,
+                    'fetchTokenExpiry': DELETE_FIELD,
+                    'fetchTokenConsumed': True,
+                    'fetchTokenConsumedTimestamp': firestore.SERVER_TIMESTAMP,
+                }
+            )
+
+        firestoreClient.collection(firestoreCollectionFiles).document(
+            documentSnapshot.id
+        ).update(updatePayload)
+        logging.info('Updated status for file %s to %s.', documentSnapshot.id, updatePayload['status'])
+
+        responsePayload = {
+            'message': (
+                'Metadata retrieved successfully'
+                if metadataOnly
+                else 'File and data retrieved successfully'
+            ),
+            'unencryptedData': unencryptedData if isinstance(unencryptedData, dict) else unencryptedData or {},
+            'decryptedData': decryptedData,
+            'fetchMode': fetchMode,
+            'lastRequestTimestamp': requestTimestamp.isoformat(),
+            'lastRequestFileName': fileMetadata.get('originalFilename'),
+        }
+
+        if not metadataOnly:
+            responsePayload['signedUrl'] = signedUrl
+            responsePayload['gcsPath'] = gcsPath
+
+        return jsonify(responsePayload), 200
 
     except Exception:  # pylint: disable=broad-except
         logging.exception('An unexpected error occurred during file fetch.')

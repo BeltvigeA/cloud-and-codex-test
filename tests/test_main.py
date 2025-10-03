@@ -36,7 +36,25 @@ def secureFilename(value):
     return sanitized.strip(' .')
 
 
-fakeRequest = SimpleNamespace(files={}, form={})
+class FakeRequest(SimpleNamespace):
+    def __init__(self):
+        super().__init__(files={}, form={}, args={}, headers={})
+        self._jsonPayload = None
+        self.is_json = False
+
+    def set_json(self, payload):
+        self._jsonPayload = payload
+        self.is_json = True
+
+    def clear_json(self):
+        self._jsonPayload = None
+        self.is_json = False
+
+    def get_json(self):
+        return self._jsonPayload
+
+
+fakeRequest = FakeRequest()
 fakeFlaskModule.Flask = DummyFlask
 fakeFlaskModule.jsonify = dummyJsonify
 fakeFlaskModule.request = fakeRequest
@@ -194,16 +212,24 @@ class MockDocument:
 
 
 class MockQuery:
-    def __init__(self, documentSnapshots):
+    def __init__(self, documentSnapshots, filters=None):
         if documentSnapshots is None:
             self.documentSnapshots = []
         elif isinstance(documentSnapshots, list):
-            self.documentSnapshots = documentSnapshots
+            self.documentSnapshots = list(documentSnapshots)
         else:
             self.documentSnapshots = [documentSnapshots]
+        self.filters = filters or []
 
-    def where(self, *_args, **_kwargs):  # pylint: disable=unused-argument
-        return self
+    def where(self, field, operator, value):  # pylint: disable=unused-argument
+        if operator != '==':
+            raise NotImplementedError('Only equality filters are supported in tests')
+        filteredSnapshots = []
+        for snapshot in self.documentSnapshots:
+            metadata = snapshot.to_dict() or {}
+            if metadata.get(field) == value:
+                filteredSnapshots.append(snapshot)
+        return MockQuery(filteredSnapshots, self.filters + [(field, operator, value)])
 
     def limit(self, _count):
         return self
@@ -263,6 +289,9 @@ def resetClients(monkeypatch):
     monkeypatch.setattr(main, 'getClients', lambda: defaultBundle)
     fakeRequest.files = {}
     fakeRequest.form = {}
+    fakeRequest.args = {}
+    fakeRequest.headers = {}
+    fakeRequest.clear_json()
     yield
 
 
@@ -283,6 +312,7 @@ def testUploadFileStoresExpiryMetadata(monkeypatch):
         'unencrypted_data': json.dumps({'visible': 'info'}),
         'encrypted_data_payload': json.dumps({'secure': 'payload'}),
         'recipient_id': 'recipient123',
+        'product_id': 'product-001',
     }
 
     responseBody, statusCode = main.uploadFile()
@@ -293,7 +323,101 @@ def testUploadFileStoresExpiryMetadata(monkeypatch):
     assert storedMetadata is not None
     assert storedMetadata['fetchTokenConsumed'] is False
     assert storedMetadata['fetchTokenExpiry'] > datetime.now(timezone.utc)
+    assert storedMetadata['productId'] == 'product-001'
+    assert storedMetadata['lastRequestFileName'] == 'test.gcode'
 
+
+def testProductHandshakeDownloadFlow(monkeypatch):
+    currentTime = datetime.now(timezone.utc)
+    metadata = {
+        'productId': 'prod-1',
+        'fetchToken': 'token-123',
+        'fetchTokenConsumed': False,
+        'fetchTokenExpiry': currentTime + timedelta(minutes=5),
+        'originalFilename': 'part-a.gcode',
+        'timestamp': currentTime,
+        'unencryptedData': {'visible': 'info'},
+    }
+    documentSnapshot = MockDocumentSnapshot('doc123', metadata)
+    updateRecorder = {'set': None, 'update': []}
+    mockClients = main.ClientBundle(
+        storageClient=MockStorageClient(),
+        firestoreClient=MockFirestoreClient(
+            documentSnapshot=documentSnapshot, updateRecorder=updateRecorder
+        ),
+        kmsClient=MockEncryptClient({'sensitive': 'value'}),
+        kmsKeyPath='projects/test/locations/test/keyRings/test/cryptoKeys/test',
+        gcsBucketName='test-bucket',
+    )
+    monkeypatch.setattr(main, 'getClients', lambda: mockClients)
+
+    fakeRequest.clear_json()
+    fakeRequest.args = {}
+    fakeRequest.set_json({'status': 'needsFile'})
+
+    responseBody, statusCode = main.productHandshake('prod-1')
+
+    assert statusCode == 200
+    assert responseBody['decision'] == 'full'
+    assert responseBody['downloadRequired'] is True
+    assert responseBody['fetchToken'] == 'token-123'
+    assert responseBody['metadata'] == {'visible': 'info'}
+    assert responseBody['originalFilename'] == 'part-a.gcode'
+    assert responseBody['lastRequestFileName'] == 'part-a.gcode'
+    assert 'lastRequestTimestamp' in responseBody
+
+    assert updateRecorder['update'], 'Expected Firestore handshake update'
+    updatePayload = updateRecorder['update'][0]
+    assert updatePayload['status'] == 'handshake-download'
+    assert updatePayload['handshakeClientStatus'] == 'needsFile'
+    assert isinstance(updatePayload['lastRequestTimestamp'], datetime)
+    assert updatePayload['lastRequestFileName'] == 'part-a.gcode'
+
+
+def testProductHandshakeMetadataFlow(monkeypatch):
+    earlierTime = datetime.now(timezone.utc) - timedelta(hours=1)
+    metadata = {
+        'productId': 'prod-2',
+        'fetchToken': 'token-456',
+        'fetchTokenConsumed': False,
+        'fetchTokenExpiry': datetime.now(timezone.utc) + timedelta(minutes=5),
+        'originalFilename': 'part-b.gcode',
+        'timestamp': datetime.now(timezone.utc),
+        'lastRequestTimestamp': earlierTime,
+        'unencryptedData': {'preview': 'info'},
+    }
+    documentSnapshot = MockDocumentSnapshot('doc456', metadata)
+    updateRecorder = {'set': None, 'update': []}
+    mockClients = main.ClientBundle(
+        storageClient=MockStorageClient(),
+        firestoreClient=MockFirestoreClient(
+            documentSnapshot=documentSnapshot, updateRecorder=updateRecorder
+        ),
+        kmsClient=MockEncryptClient({'sensitive': 'value'}),
+        kmsKeyPath='projects/test/locations/test/keyRings/test/cryptoKeys/test',
+        gcsBucketName='test-bucket',
+    )
+    monkeypatch.setattr(main, 'getClients', lambda: mockClients)
+
+    fakeRequest.clear_json()
+    fakeRequest.args = {}
+    fakeRequest.set_json({'status': 'hasFile'})
+
+    responseBody, statusCode = main.productHandshake('prod-2')
+
+    assert statusCode == 200
+    assert responseBody['decision'] == 'metadata'
+    assert responseBody['downloadRequired'] is False
+    assert responseBody['metadata'] == {'preview': 'info'}
+    assert responseBody['previousRequestTimestamp'] == earlierTime.isoformat()
+    assert responseBody['fetchMode'] == 'metadata'
+
+    assert updateRecorder['update'], 'Expected Firestore handshake update'
+    updatePayload = updateRecorder['update'][0]
+    assert updatePayload['status'] == 'handshake-metadata'
+    assert updatePayload['handshakeClientStatus'] == 'hasFile'
+    assert isinstance(updatePayload['lastRequestTimestamp'], datetime)
+    assert updatePayload['lastRequestFileName'] == 'part-b.gcode'
 
 def testFetchFileFirstUseSuccess(monkeypatch):
     metadata = {
@@ -302,6 +426,7 @@ def testFetchFileFirstUseSuccess(monkeypatch):
         'gcsPath': 'recipient123/file.gcode',
         'fetchTokenExpiry': datetime.now(timezone.utc) + timedelta(minutes=5),
         'fetchTokenConsumed': False,
+        'originalFilename': None,
     }
     documentSnapshot = MockDocumentSnapshot('doc123', metadata)
     updateRecorder = {'set': None, 'update': []}
@@ -318,19 +443,72 @@ def testFetchFileFirstUseSuccess(monkeypatch):
 
     fakeRequest.files = {}
     fakeRequest.form = {}
+    fakeRequest.args = {}
+    fakeRequest.clear_json()
 
     responseBody, statusCode = main.fetchFile('testFetchToken')
 
     assert statusCode == 200
     assert responseBody['decryptedData'] == {'sensitive': 'value'}
     assert responseBody['unencryptedData'] == {'visible': 'info'}
+    assert responseBody['fetchMode'] == 'full'
+    assert 'signedUrl' in responseBody
+    assert 'lastRequestTimestamp' in responseBody
+    assert responseBody['lastRequestFileName'] is None
 
     assert updateRecorder['update'], 'Expected Firestore update to be recorded'
     updatePayload = updateRecorder['update'][0]
     assert updatePayload['fetchToken'] is main.DELETE_FIELD
     assert updatePayload['fetchTokenExpiry'] is main.DELETE_FIELD
     assert updatePayload['fetchTokenConsumed'] is True
+    assert updatePayload['status'] == 'fetched'
+    assert updatePayload['lastFetchMode'] == 'full'
+    assert isinstance(updatePayload['lastRequestTimestamp'], datetime)
+    assert updatePayload['lastRequestFileName'] is None
 
+
+def testFetchFileMetadataOnly(monkeypatch):
+    metadata = {
+        'encryptedData': '7b7d',
+        'unencryptedData': {'visible': 'info'},
+        'gcsPath': 'recipient123/file.gcode',
+        'fetchTokenExpiry': datetime.now(timezone.utc) + timedelta(minutes=5),
+        'fetchTokenConsumed': False,
+        'originalFilename': 'part-c.gcode',
+    }
+    documentSnapshot = MockDocumentSnapshot('doc789', metadata)
+    updateRecorder = {'set': None, 'update': []}
+    mockClients = main.ClientBundle(
+        storageClient=MockStorageClient(),
+        firestoreClient=MockFirestoreClient(
+            documentSnapshot=documentSnapshot, updateRecorder=updateRecorder
+        ),
+        kmsClient=MockEncryptClient({'sensitive': 'value'}),
+        kmsKeyPath='projects/test/locations/test/keyRings/test/cryptoKeys/test',
+        gcsBucketName='test-bucket',
+    )
+    monkeypatch.setattr(main, 'getClients', lambda: mockClients)
+
+    fakeRequest.files = {}
+    fakeRequest.form = {}
+    fakeRequest.args = {'mode': 'metadata'}
+    fakeRequest.clear_json()
+
+    responseBody, statusCode = main.fetchFile('testFetchToken')
+
+    assert statusCode == 200
+    assert responseBody['fetchMode'] == 'metadata'
+    assert responseBody['message'] == 'Metadata retrieved successfully'
+    assert 'signedUrl' not in responseBody
+    assert responseBody['lastRequestFileName'] == 'part-c.gcode'
+
+    updatePayload = updateRecorder['update'][0]
+    assert updatePayload['status'] == 'metadata-fetched'
+    assert updatePayload['lastFetchMode'] == 'metadata'
+    assert isinstance(updatePayload['lastRequestTimestamp'], datetime)
+    assert updatePayload['lastRequestFileName'] == 'part-c.gcode'
+    assert 'fetchToken' not in updatePayload
+    assert 'fetchTokenConsumed' not in updatePayload
 
 def testFetchFileUsesIamSigningWhenSignBytesMissing(monkeypatch):
     metadata = {
