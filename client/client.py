@@ -139,10 +139,18 @@ def parseArguments() -> argparse.Namespace:
 
 
 def buildBaseUrl(baseUrl: str) -> str:
-    sanitized = baseUrl.strip().rstrip("/")
+    sanitized = baseUrl.strip()
+    if not sanitized:
+        raise ValueError("baseUrl must not be empty")
+
     if not sanitized.startswith("http://") and not sanitized.startswith("https://"):
-        raise ValueError("baseUrl must include the protocol, e.g., https://")
-    return sanitized
+        sanitized = f"https://{sanitized}"
+
+    parsedUrl = urlparse(sanitized)
+    if parsedUrl.scheme not in {"http", "https"} or not parsedUrl.netloc:
+        raise ValueError("baseUrl must be a valid HTTP(S) URL")
+
+    return sanitized.rstrip("/")
 
 
 def buildFetchUrl(baseUrl: str, fetchToken: str) -> str:
