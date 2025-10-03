@@ -627,13 +627,22 @@ def testFetchFileMetadataOnly(monkeypatch):
     assert 'signedUrl' not in responseBody
     assert responseBody['lastRequestFileName'] == 'part-c.gcode'
 
+    assert updateRecorder['update'], 'Expected Firestore update to be recorded'
     updatePayload = updateRecorder['update'][0]
     assert updatePayload['status'] == 'metadata-fetched'
     assert updatePayload['lastFetchMode'] == 'metadata'
     assert isinstance(updatePayload['lastRequestTimestamp'], datetime)
     assert updatePayload['lastRequestFileName'] == 'part-c.gcode'
-    assert 'fetchToken' not in updatePayload
-    assert 'fetchTokenConsumed' not in updatePayload
+    assert updatePayload['fetchToken'] is main.DELETE_FIELD
+    assert updatePayload['fetchTokenExpiry'] is main.DELETE_FIELD
+    assert updatePayload['fetchTokenConsumed'] is True
+    assert (
+        updatePayload['fetchTokenConsumedTimestamp']
+        is main.firestore.SERVER_TIMESTAMP
+    )
+    assert (
+        updatePayload['metadataFetchTimestamp'] is main.firestore.SERVER_TIMESTAMP
+    )
 
 def testFetchFileUsesIamSigningWhenSignBytesMissing(monkeypatch):
     metadata = {
