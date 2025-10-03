@@ -20,6 +20,7 @@ from .persistence import storePrintSummary
 
 
 defaultBaseUrl = "https://printer-backend-934564650450.europe-west1.run.app"
+defaultFilesDirectory = Path.home() / ".printmaster" / "files"
 
 
 def configureLogging() -> None:
@@ -62,8 +63,10 @@ def parseArguments() -> argparse.Namespace:
     )
     fetchParser.add_argument(
         "--outputDir",
-        required=True,
-        help="Directory path to save the downloaded file.",
+        default=str(defaultFilesDirectory),
+        help=(
+            "Directory path to save the downloaded file (default: ~/.printmaster/files)."
+        ),
     )
 
     statusParser = subparsers.add_parser(
@@ -115,8 +118,10 @@ def parseArguments() -> argparse.Namespace:
     )
     listenParser.add_argument(
         "--outputDir",
-        required=True,
-        help="Directory path to save downloaded files.",
+        default=str(defaultFilesDirectory),
+        help=(
+            "Directory path to save downloaded files (default: ~/.printmaster/files)."
+        ),
     )
     listenParser.add_argument(
         "--logFile",
