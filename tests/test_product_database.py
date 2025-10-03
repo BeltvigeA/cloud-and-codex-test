@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 from client.database import LocalDatabase
@@ -31,6 +32,51 @@ def test_upsertProductRecord_updates_lastRequested(tmp_path: Path) -> None:
     assert secondRecord["downloaded"] is True
     assert secondRecord["lastRequestedAt"] == secondTimestamp
     assert database.findProductById("product-1") == secondRecord
+
+    database.close()
+
+
+def test_upsertProductRecord_creates_product_files(tmp_path: Path) -> None:
+    databasePath = tmp_path / "records.db"
+    database = LocalDatabase(databasePath)
+
+    firstTimestamp = "2023-05-05T05:05:05"
+    database.upsertProductRecord(
+        "product-7",
+        fileName="initial.gcode",
+        downloaded=False,
+        requestTimestamp=firstTimestamp,
+    )
+
+    productDir = tmp_path / "products" / "product-7"
+    metadataPath = productDir / "metadata.json"
+    requestsPath = productDir / "requests.json"
+
+    assert metadataPath.exists()
+    assert requestsPath.exists()
+
+    metadata = json.loads(metadataPath.read_text(encoding="utf-8"))
+    assert metadata["productId"] == "product-7"
+    assert metadata["createdAt"] == firstTimestamp
+    assert metadata["lastRequestedAt"] == firstTimestamp
+    assert metadata["fileLocation"] == "initial.gcode"
+
+    secondTimestamp = "2024-06-06T06:06:06"
+    database.upsertProductRecord(
+        "product-7",
+        fileName="finalized.gcode",
+        downloaded=True,
+        requestTimestamp=secondTimestamp,
+    )
+
+    metadata = json.loads(metadataPath.read_text(encoding="utf-8"))
+    assert metadata["productId"] == "product-7"
+    assert metadata["createdAt"] == firstTimestamp
+    assert metadata["lastRequestedAt"] == secondTimestamp
+    assert metadata["fileLocation"] == "finalized.gcode"
+
+    requests = json.loads(requestsPath.read_text(encoding="utf-8"))
+    assert requests == [firstTimestamp, secondTimestamp]
 
     database.close()
 
