@@ -161,8 +161,19 @@ import main  # noqa: E402
 
 
 class MockBlob:
+    def __init__(self, name=None, bucket=None):
+        self.name = name
+        self.bucket = bucket
+
     def upload_from_file(self, fileObj):
         fileObj.read()
+        if self.bucket is not None:
+            self.bucket.uploadedNames.append(self.name)
+
+    def exists(self, _client=None):
+        if self.bucket is None or self.name is None:
+            return False
+        return self.name in self.bucket.existingPaths
 
     def generate_signed_url(self, **_kwargs):
         return 'https://example.com/signed-url'
@@ -179,13 +190,20 @@ class MockUploadFile:
 
 
 class MockBucket:
-    def blob(self, _name):
-        return MockBlob()
+    def __init__(self, existingPaths=None):
+        self.existingPaths = set(existingPaths or set())
+        self.uploadedNames = []
+
+    def blob(self, name):
+        return MockBlob(name, self)
 
 
 class MockStorageClient:
+    def __init__(self, bucket=None):
+        self.bucketInstance = bucket or MockBucket()
+
     def bucket(self, _name):
-        return MockBucket()
+        return self.bucketInstance
 
 
 class MockEncryptClient:
@@ -341,6 +359,47 @@ def testUploadFileStoresExpiryMetadata(monkeypatch):
     assert storedMetadata['fetchTokenExpiry'] > datetime.now(timezone.utc)
     assert storedMetadata['productId'] == '123e4567-e89b-12d3-a456-426614174000'
     assert storedMetadata['lastRequestFileName'] == 'test.gcode'
+    expectedGcsPath = 'recipient123/123e4567-e89b-12d3-a456-426614174000_test.gcode'
+    assert storedMetadata['gcsPath'] == expectedGcsPath
+    assert 'gcsOriginalPath' not in storedMetadata
+
+
+def testUploadFileGeneratesUniquePathWhenBlobExists(monkeypatch):
+    metadataRecorder = {'set': None, 'update': []}
+    recipientId = 'recipient123'
+    productId = '123e4567-e89b-12d3-a456-426614174000'
+    normalizedFilename = 'test.gcode'
+    originalPath = f"{recipientId}/{productId}_{normalizedFilename}"
+    mockBucket = MockBucket(existingPaths={originalPath})
+    mockStorageClient = MockStorageClient(bucket=mockBucket)
+    mockClients = main.ClientBundle(
+        storageClient=mockStorageClient,
+        firestoreClient=MockFirestoreClient(updateRecorder=metadataRecorder),
+        kmsClient=MockEncryptClient({'sensitive': 'value'}),
+        kmsKeyPath='projects/test/locations/test/keyRings/test/cryptoKeys/test',
+        gcsBucketName='test-bucket',
+    )
+    monkeypatch.setattr(main, 'getClients', lambda: mockClients)
+    monkeypatch.setattr(main, 'generateFetchToken', lambda: 'testFetchToken')
+
+    fakeRequest.files = {'file': MockUploadFile(b'file-contents', normalizedFilename)}
+    fakeRequest.form = {
+        'unencrypted_data': json.dumps({'visible': 'info'}),
+        'encrypted_data_payload': json.dumps({'secure': 'payload'}),
+        'recipient_id': recipientId,
+        'product_id': productId,
+    }
+
+    responseBody, statusCode = main.uploadFile()
+
+    assert statusCode == 200
+    storedMetadata = metadataRecorder['set']
+    assert storedMetadata is not None
+    assert storedMetadata['gcsPath'] != originalPath
+    assert storedMetadata['gcsPath'].startswith(f'{recipientId}/{productId}_')
+    assert storedMetadata['gcsPath'].endswith(f'_{normalizedFilename}')
+    assert storedMetadata['gcsOriginalPath'] == originalPath
+    assert mockBucket.uploadedNames == [storedMetadata['gcsPath']]
 
 
 def testProductHandshakeDownloadFlow(monkeypatch):
