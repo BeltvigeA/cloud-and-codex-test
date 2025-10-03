@@ -520,3 +520,35 @@ class LocalDatabase:
         productLog["products"] = products
         self._writeProductLog(productLog)
 
+    def findPrintJobInProductLog(self, printJobId: str) -> Optional[Dict[str, Any]]:
+        if not isinstance(printJobId, str) or not printJobId:
+            return None
+
+        productLog = self._loadProductLog()
+        products = productLog.get("products")
+        if not isinstance(products, dict):
+            return None
+
+        jobKey = str(printJobId)
+        for productId, productEntry in products.items():
+            if not isinstance(productEntry, dict):
+                continue
+
+            printActivity = productEntry.get("printActivity")
+            if not isinstance(printActivity, dict):
+                continue
+
+            printJobs = printActivity.get("printJobs")
+            if not isinstance(printJobs, dict):
+                continue
+
+            jobEntry = printJobs.get(jobKey)
+            if isinstance(jobEntry, dict):
+                return {
+                    "productId": productId,
+                    "productEntry": dict(productEntry),
+                    "printJob": dict(jobEntry),
+                }
+
+        return None
+

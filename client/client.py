@@ -631,6 +631,46 @@ def sendProductStatusUpdate(baseUrl: str, productId: str, statusPayload: Dict[st
     return True
 
 
+def sendHandshakeResponse(
+    baseUrl: str,
+    productId: str,
+    recipientId: str,
+    printJobId: Optional[str],
+    jobExists: bool,
+) -> Optional[Dict[str, Any]]:
+    handshakeUrl = f"{buildBaseUrl(baseUrl)}/products/{productId}/handshake"
+    handshakeMessage = "printJobId found" if jobExists else "printJobId not found"
+    payload = {
+        "status": "hasFile" if jobExists else "needsFile",
+        "recipientId": recipientId,
+        "printJobId": printJobId,
+        "handshakeMessage": handshakeMessage,
+    }
+
+    try:
+        response = requests.post(handshakeUrl, json=payload, timeout=30)
+        response.raise_for_status()
+    except requests.RequestException as error:
+        logging.error(
+            "Failed to send handshake response for %s (job %s): %s",
+            productId,
+            printJobId,
+            error,
+        )
+        return None
+
+    try:
+        return response.json()
+    except json.JSONDecodeError as error:
+        logging.error(
+            "Invalid JSON handshake response for %s (job %s): %s",
+            productId,
+            printJobId,
+            error,
+        )
+        return None
+
+
 def fetchPendingFiles(baseUrl: str, recipientId: str) -> Optional[List[Dict[str, Any]]]:
     pendingUrl = buildPendingUrl(baseUrl, recipientId)
     logging.info("Checking for pending files for recipient %s", recipientId)
@@ -757,6 +797,100 @@ def listenForFiles(
                         pendingFile.get("originalFilename"),
                     )
                     requestMode = "full" if availability["shouldRequestFile"] else "metadata"
+                    handshakeInfo = pendingFile.get("handshake")
+                    handshakeRecipientId = recipientId
+                    handshakePrintJobId: Optional[str] = None
+                    if isinstance(handshakeInfo, dict):
+                        handshakeRecipient = handshakeInfo.get("recipientId")
+                        if isinstance(handshakeRecipient, str) and handshakeRecipient.strip():
+                            handshakeRecipientId = handshakeRecipient
+                        rawHandshakeJobId = handshakeInfo.get("printJobId")
+                        if isinstance(rawHandshakeJobId, str) and rawHandshakeJobId.strip():
+                            handshakePrintJobId = rawHandshakeJobId
+
+                    if handshakePrintJobId is None:
+                        rawPendingPrintJobId = pendingFile.get("printJobId")
+                        if isinstance(rawPendingPrintJobId, str) and rawPendingPrintJobId.strip():
+                            handshakePrintJobId = rawPendingPrintJobId
+
+                    handshakeResponse: Optional[Dict[str, Any]] = None
+                    jobExists = False
+                    handshakeMessage: Optional[str] = None
+                    if handshakePrintJobId and database is not None:
+                        existingJob = database.findPrintJobInProductLog(handshakePrintJobId)
+                        jobExists = existingJob is not None
+                        handshakeMessage = "printJobId found" if jobExists else "printJobId not found"
+                        handshakeResponse = sendHandshakeResponse(
+                            baseUrl,
+                            productId,
+                            handshakeRecipientId,
+                            handshakePrintJobId,
+                            jobExists,
+                        )
+                        if handshakeResponse:
+                            fetchTokenOverride = handshakeResponse.get("fetchToken")
+                            if isinstance(fetchTokenOverride, str) and fetchTokenOverride.strip():
+                                fetchToken = fetchTokenOverride
+
+                    shouldFetch = True
+                    if handshakeResponse:
+                        handshakeDecision = handshakeResponse.get("fetchMode") or handshakeResponse.get(
+                            "decision"
+                        )
+                        if isinstance(handshakeDecision, str) and handshakeDecision in {"full", "metadata"}:
+                            requestMode = handshakeDecision
+                        downloadRequired = handshakeResponse.get("downloadRequired")
+                        if downloadRequired is False or handshakeDecision == "metadata":
+                            shouldFetch = False
+
+                    if not shouldFetch:
+                        logging.info(
+                            "Skipping fetch for product %s after handshake decision.",
+                            productId,
+                        )
+                        if database is not None and handshakePrintJobId:
+                            availabilityRecord = (
+                                availability.get("record") if isinstance(availability.get("record"), dict) else {}
+                            )
+                            resolvedFileName = (
+                                handshakeResponse.get("originalFilename")
+                                if handshakeResponse and isinstance(handshakeResponse.get("originalFilename"), str)
+                                else pendingFile.get("originalFilename")
+                            )
+                            database.upsertProductRecord(
+                                productId,
+                                resolvedFileName,
+                                downloaded=jobExists if handshakeResponse else bool(availabilityRecord.get("downloaded")),
+                                printJobId=handshakePrintJobId,
+                                requestTimestamp=(
+                                    handshakeResponse.get("lastRequestTimestamp")
+                                    if handshakeResponse
+                                    and isinstance(handshakeResponse.get("lastRequestTimestamp"), str)
+                                    else None
+                                ),
+                            )
+
+                        if resolvedLogPath is not None:
+                            handshakeEntry: Dict[str, Any] = {
+                                "savedFile": None,
+                                "unencryptedData": {},
+                                "decryptedData": {},
+                                "timestamp": time.time(),
+                                "fetchToken": fetchToken,
+                                "source": baseUrl,
+                                "fileName": (
+                                    (handshakeResponse or {}).get("originalFilename")
+                                    or pendingFile.get("originalFilename")
+                                ),
+                                "requestMode": requestMode,
+                                "printJobId": handshakePrintJobId,
+                                "handshakeResponse": handshakeResponse,
+                                "handshakeMessage": handshakeMessage,
+                                "handshakeSkippedFetch": True,
+                            }
+                            loggedPath = appendJsonLogEntry(resolvedLogPath, handshakeEntry)
+                            handshakeEntry["logFilePath"] = str(loggedPath)
+                        continue
                     logging.info(
                         "Processing pending product %s with fetch token %s (mode=%s)",
                         productId,
