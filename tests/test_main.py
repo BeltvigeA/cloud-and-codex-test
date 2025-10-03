@@ -328,7 +328,7 @@ def testUploadFileStoresExpiryMetadata(monkeypatch):
         'unencrypted_data': json.dumps({'visible': 'info'}),
         'encrypted_data_payload': json.dumps({'secure': 'payload'}),
         'recipient_id': 'recipient123',
-        'product_id': 'product-001',
+        'product_id': '123e4567-e89b-12d3-a456-426614174000',
     }
 
     responseBody, statusCode = main.uploadFile()
@@ -339,7 +339,7 @@ def testUploadFileStoresExpiryMetadata(monkeypatch):
     assert storedMetadata is not None
     assert storedMetadata['fetchTokenConsumed'] is False
     assert storedMetadata['fetchTokenExpiry'] > datetime.now(timezone.utc)
-    assert storedMetadata['productId'] == 'product-001'
+    assert storedMetadata['productId'] == '123e4567-e89b-12d3-a456-426614174000'
     assert storedMetadata['lastRequestFileName'] == 'test.gcode'
 
 
