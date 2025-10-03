@@ -1000,8 +1000,16 @@ def fetchFile(fetchToken: str):
         }
 
         if metadataOnly:
-            updatePayload['status'] = 'metadata-fetched'
-            updatePayload['metadataFetchTimestamp'] = firestore.SERVER_TIMESTAMP
+            updatePayload.update(
+                {
+                    'status': 'metadata-fetched',
+                    'metadataFetchTimestamp': firestore.SERVER_TIMESTAMP,
+                    'fetchToken': DELETE_FIELD,
+                    'fetchTokenExpiry': DELETE_FIELD,
+                    'fetchTokenConsumed': True,
+                    'fetchTokenConsumedTimestamp': firestore.SERVER_TIMESTAMP,
+                }
+            )
         else:
             updatePayload.update(
                 {
