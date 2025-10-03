@@ -1,4 +1,5 @@
 import logging
+import time
 import sys
 import types
 from pathlib import Path
@@ -268,3 +269,97 @@ def testSaveDownloadedFileStripsQueryParameters(tmp_path: Path) -> None:
 
     assert savedPath.name == "document.pdf"
     assert savedPath.read_bytes() == b"payload"
+
+
+def testListenRequestsFreshDownloadWhenCachedFileMissing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    databasePath = tmp_path / "listener.db"
+    downloadsDir = tmp_path / "downloads"
+    downloadsDir.mkdir()
+    database = client.LocalDatabase(databasePath)
+
+    cachedFilePath = downloadsDir / "missing.gcode"
+    cachedFilePath.write_text("old-data", encoding="utf-8")
+    database.upsertProductRecord(
+        "product-123",
+        fileName="missing.gcode",
+        downloaded=True,
+        downloadedFilePath=str(cachedFilePath.resolve()),
+        requestTimestamp="2025-08-01T12:00:00",
+    )
+    cachedFilePath.unlink()
+
+    recordedRequestModes: list[str] = []
+
+    def fakeFetchPendingFiles(_baseUrl: str, _recipientId: str) -> list[dict[str, object]]:
+        return [
+            {
+                "fetchToken": "token-xyz",
+                "productId": "product-123",
+                "originalFilename": "missing.gcode",
+            }
+        ]
+
+    newFilePath = downloadsDir / "missing.gcode"
+
+    def fakePerformFetch(
+        baseUrl: str,
+        fetchToken: str,
+        outputDir: str,
+        *,
+        requestMode: str,
+        database: client.LocalDatabase,
+        productId: str,
+    ) -> dict[str, object]:
+        recordedRequestModes.append(requestMode)
+        newFilePath.write_text("new-data", encoding="utf-8")
+        updatedRecord = database.upsertProductRecord(
+            productId,
+            newFilePath.name,
+            downloaded=True,
+            downloadedFilePath=str(newFilePath.resolve()),
+        )
+        return {
+            "savedFile": str(newFilePath.resolve()),
+            "fileName": newFilePath.name,
+            "requestMode": requestMode,
+            "productRecord": updatedRecord,
+            "printJobId": None,
+            "timestamp": time.time(),
+            "source": baseUrl,
+            "fetchToken": fetchToken,
+            "unencryptedData": {},
+            "decryptedData": {},
+        }
+
+    def fakeSendProductStatusUpdate(
+        _baseUrl: str,
+        _productId: str,
+        _recipientId: str,
+        _payload: dict[str, object],
+    ) -> bool:
+        return True
+
+    monkeypatch.setattr(client, "fetchPendingFiles", fakeFetchPendingFiles)
+    monkeypatch.setattr(client, "performFetch", fakePerformFetch)
+    monkeypatch.setattr(client, "sendProductStatusUpdate", fakeSendProductStatusUpdate)
+
+    logFilePath = tmp_path / "listener-log.json"
+    client.listenForFiles(
+        "https://example.com",
+        "recipient-1",
+        str(downloadsDir),
+        pollInterval=0,
+        maxIterations=1,
+        logFilePath=logFilePath,
+        database=database,
+    )
+
+    assert recordedRequestModes == ["full"]
+    updatedRecord = database.findProductById("product-123")
+    assert updatedRecord is not None
+    assert updatedRecord["downloaded"] is True
+    assert updatedRecord["downloadedFilePath"] == str(newFilePath.resolve())
+
+    database.close()
