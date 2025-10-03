@@ -37,7 +37,7 @@ def test_upsertProductRecord_updates_lastRequested(tmp_path: Path) -> None:
     database.close()
 
 
-def test_upsertProductRecord_creates_product_files(tmp_path: Path) -> None:
+def test_upsertProductRecord_creates_single_log_entry(tmp_path: Path) -> None:
     databasePath = tmp_path / "records.db"
     database = LocalDatabase(databasePath)
 
@@ -50,20 +50,17 @@ def test_upsertProductRecord_creates_product_files(tmp_path: Path) -> None:
         printJobId="job-1",
     )
 
-    productDir = tmp_path / "products" / "product-7"
-    metadataPath = productDir / "metadata.json"
-    requestsPath = productDir / "requests.json"
-    activityPath = productDir / "print-activity.json"
+    productLogPath = tmp_path / "product-records.json"
+    assert productLogPath.exists()
 
-    assert metadataPath.exists()
-    assert requestsPath.exists()
-    assert activityPath.exists()
+    productLog = json.loads(productLogPath.read_text(encoding="utf-8"))
+    productEntry = productLog["products"]["product-7"]
 
-    metadata = json.loads(metadataPath.read_text(encoding="utf-8"))
-    assert metadata["productId"] == "product-7"
-    assert metadata["createdAt"] == firstTimestamp
-    assert metadata["lastRequestedAt"] == firstTimestamp
-    assert metadata["fileLocation"] == "initial.gcode"
+    assert productEntry["productId"] == "product-7"
+    assert productEntry["createdAt"] == firstTimestamp
+    assert productEntry["lastRequestedAt"] == firstTimestamp
+    assert productEntry["fileLocation"] == "initial.gcode"
+    assert productEntry["requestHistory"] == [firstTimestamp]
 
     secondTimestamp = "2024-06-06T06:06:06"
     database.upsertProductRecord(
@@ -74,16 +71,16 @@ def test_upsertProductRecord_creates_product_files(tmp_path: Path) -> None:
         printJobId="job-2",
     )
 
-    metadata = json.loads(metadataPath.read_text(encoding="utf-8"))
-    assert metadata["productId"] == "product-7"
-    assert metadata["createdAt"] == firstTimestamp
-    assert metadata["lastRequestedAt"] == secondTimestamp
-    assert metadata["fileLocation"] == "finalized.gcode"
+    updatedLog = json.loads(productLogPath.read_text(encoding="utf-8"))
+    updatedEntry = updatedLog["products"]["product-7"]
 
-    requests = json.loads(requestsPath.read_text(encoding="utf-8"))
-    assert requests == [firstTimestamp, secondTimestamp]
+    assert updatedEntry["productId"] == "product-7"
+    assert updatedEntry["createdAt"] == firstTimestamp
+    assert updatedEntry["lastRequestedAt"] == secondTimestamp
+    assert updatedEntry["fileLocation"] == "finalized.gcode"
+    assert updatedEntry["requestHistory"] == [firstTimestamp, secondTimestamp]
 
-    activity = json.loads(activityPath.read_text(encoding="utf-8"))
+    activity = updatedEntry["printActivity"]
     assert activity["productId"] == "product-7"
     assert activity["latestPrintJobId"] == "job-2"
     assert activity["latestPrintedAt"] == secondTimestamp
@@ -115,15 +112,13 @@ def test_upsertProductRecord_preserves_lastRequested_without_new_request(tmp_pat
     assert updatedRecord["downloaded"] is True
     assert updatedRecord["lastRequestedAt"] == initialTimestamp
 
-    productDir = tmp_path / "products" / "product-9"
-    metadataPath = productDir / "metadata.json"
-    requestsPath = productDir / "requests.json"
+    productLogPath = tmp_path / "product-records.json"
+    productLog = json.loads(productLogPath.read_text(encoding="utf-8"))
+    entry = productLog["products"]["product-9"]
 
-    metadata = json.loads(metadataPath.read_text(encoding="utf-8"))
-    assert metadata["lastRequestedAt"] == initialTimestamp
-
-    requests = json.loads(requestsPath.read_text(encoding="utf-8"))
-    assert requests == [initialTimestamp]
+    assert entry["lastRequestedAt"] == initialTimestamp
+    assert entry["requestHistory"] == [initialTimestamp]
+    assert entry["printActivity"]["latestPrintedAt"] == initialTimestamp
 
     database.close()
 
@@ -189,10 +184,9 @@ def test_upsertProductRecord_updates_print_activity(tmp_path: Path) -> None:
         printJobId="print-001",
     )
 
-    productDir = tmp_path / "products" / "product-88"
-    activityPath = productDir / "print-activity.json"
-
-    activity = json.loads(activityPath.read_text(encoding="utf-8"))
+    productLogPath = tmp_path / "product-records.json"
+    productLog = json.loads(productLogPath.read_text(encoding="utf-8"))
+    activity = productLog["products"]["product-88"]["printActivity"]
     assert activity["latestPrintJobId"] == "print-001"
     assert activity["latestPrintedAt"] == firstTimestamp
     assert activity["printJobs"]["print-001"] == {"lastPrintedAt": firstTimestamp}
@@ -206,7 +200,8 @@ def test_upsertProductRecord_updates_print_activity(tmp_path: Path) -> None:
         printJobId="print-001",
     )
 
-    updatedActivity = json.loads(activityPath.read_text(encoding="utf-8"))
+    updatedLog = json.loads(productLogPath.read_text(encoding="utf-8"))
+    updatedActivity = updatedLog["products"]["product-88"]["printActivity"]
     assert updatedActivity["latestPrintJobId"] == "print-001"
     assert updatedActivity["latestPrintedAt"] == secondTimestamp
     assert updatedActivity["printJobs"]["print-001"] == {
@@ -227,10 +222,9 @@ def testUpsertProductRecordCreatesActivityWithoutJobId(tmp_path: Path) -> None:
         printJobId=None,
     )
 
-    activityPath = tmp_path / "products" / "product-100" / "print-activity.json"
-    assert activityPath.exists()
-
-    activity = json.loads(activityPath.read_text(encoding="utf-8"))
+    productLogPath = tmp_path / "product-records.json"
+    productLog = json.loads(productLogPath.read_text(encoding="utf-8"))
+    activity = productLog["products"]["product-100"]["printActivity"]
     assert activity["productId"] == "product-100"
     assert activity["printJobs"] == {}
     assert activity["latestPrintJobId"] is None
@@ -251,10 +245,9 @@ def testUpsertProductRecordExtendsActivityHistory(tmp_path: Path) -> None:
         printJobId=None,
     )
 
-    activityPath = tmp_path / "products" / productId / "print-activity.json"
-    assert activityPath.exists()
-
-    baselineActivity = json.loads(activityPath.read_text(encoding="utf-8"))
+    productLogPath = tmp_path / "product-records.json"
+    productLog = json.loads(productLogPath.read_text(encoding="utf-8"))
+    baselineActivity = productLog["products"][productId]["printActivity"]
     assert baselineActivity["productId"] == productId
     assert baselineActivity["printJobs"] == {}
     assert baselineActivity["latestPrintJobId"] is None
@@ -274,7 +267,8 @@ def testUpsertProductRecordExtendsActivityHistory(tmp_path: Path) -> None:
         printJobId="job-abc",
     )
 
-    activity = json.loads(activityPath.read_text(encoding="utf-8"))
+    updatedLog = json.loads(productLogPath.read_text(encoding="utf-8"))
+    activity = updatedLog["products"][productId]["printActivity"]
 
     assert activity["productId"] == productId
     assert activity["latestPrintJobId"] == "job-abc"
@@ -305,10 +299,9 @@ def testUpsertProductRecordGeneratesTimestampForMissingRequest(
     generatedTimestamp = record["lastRequestedAt"]
     datetime.fromisoformat(generatedTimestamp)
 
-    activityPath = tmp_path / "products" / productId / "print-activity.json"
-    assert activityPath.exists()
-
-    activity = json.loads(activityPath.read_text(encoding="utf-8"))
+    productLogPath = tmp_path / "product-records.json"
+    productLog = json.loads(productLogPath.read_text(encoding="utf-8"))
+    activity = productLog["products"][productId]["printActivity"]
     assert activity["latestPrintJobId"] == printJobId
 
     jobEntry = activity["printJobs"][printJobId]
