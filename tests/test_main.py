@@ -1133,6 +1133,7 @@ def testFetchFileRejectsExpiredToken(monkeypatch):
 def testListPendingFilesReturnsActiveEntries(monkeypatch):
     activeMetadata = {
         'originalFilename': 'file.gcode',
+        'productId': 'product-active',
         'fetchToken': 'token-active',
         'fetchTokenExpiry': datetime.now(timezone.utc) + timedelta(minutes=5),
         'fetchTokenConsumed': False,
@@ -1141,6 +1142,7 @@ def testListPendingFilesReturnsActiveEntries(monkeypatch):
     }
     expiredMetadata = {
         'originalFilename': 'old-file.gcode',
+        'productId': 'product-expired',
         'fetchToken': 'token-expired',
         'fetchTokenExpiry': datetime.now(timezone.utc) - timedelta(minutes=1),
         'fetchTokenConsumed': False,
@@ -1168,6 +1170,7 @@ def testListPendingFilesReturnsActiveEntries(monkeypatch):
     assert len(pendingFiles) == 1
     assert pendingFiles[0]['fileId'] == 'doc-active'
     assert pendingFiles[0]['fetchToken'] == 'token-active'
+    assert pendingFiles[0]['productId'] == 'product-active'
     assert responseBody['skippedFiles'] == ['doc-expired']
 
 

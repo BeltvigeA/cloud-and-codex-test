@@ -1062,6 +1062,7 @@ def buildPendingFileList(
             {
                 'fileId': documentSnapshot.id,
                 'originalFilename': metadata.get('originalFilename'),
+                'productId': metadata.get('productId'),
                 'fetchToken': fetchToken,
                 'fetchTokenExpiry': normalizeTimestamp(fetchTokenExpiry),
                 'status': metadata.get('status'),
