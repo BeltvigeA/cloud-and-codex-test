@@ -619,16 +619,26 @@ def productHandshake(productId: str):
         handshakeStatus = (
             'handshake-metadata' if fetchMode == 'metadata' else 'handshake-download'
         )
+        handshakeUpdatePayload = {
+            'lastRequestTimestamp': currentTime,
+            'lastRequestFileName': originalFilename,
+            'status': handshakeStatus,
+            'handshakeClientStatus': clientStatus,
+        }
+
+        if fetchMode == 'metadata':
+            handshakeUpdatePayload.update(
+                {
+                    'fetchToken': DELETE_FIELD,
+                    'fetchTokenExpiry': DELETE_FIELD,
+                    'fetchTokenConsumed': True,
+                    'fetchTokenConsumedTimestamp': currentTime,
+                }
+            )
+
         firestoreClient.collection(firestoreCollectionFiles).document(
             documentSnapshot.id
-        ).update(
-            {
-                'lastRequestTimestamp': currentTime,
-                'lastRequestFileName': originalFilename,
-                'status': handshakeStatus,
-                'handshakeClientStatus': clientStatus,
-            }
-        )
+        ).update(handshakeUpdatePayload)
 
         responsePayload = {
             'productId': productId,
