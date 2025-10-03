@@ -19,9 +19,6 @@ class DummyBlob:
         self.uploadedPayloads.append(fileHandle.read())
         fileHandle.seek(0)
 
-    def exists(self, _client=None):
-        return False
-
     def generate_signed_url(self, **_kwargs):
         return 'http://example.com/download'
 
