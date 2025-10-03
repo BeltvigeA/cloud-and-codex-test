@@ -434,6 +434,10 @@ def testProductHandshakeMetadataFlow(monkeypatch):
     assert updatePayload['handshakeClientStatus'] == 'hasFile'
     assert isinstance(updatePayload['lastRequestTimestamp'], datetime)
     assert updatePayload['lastRequestFileName'] == 'part-b.gcode'
+    assert updatePayload['fetchToken'] is main.DELETE_FIELD
+    assert updatePayload['fetchTokenExpiry'] is main.DELETE_FIELD
+    assert updatePayload['fetchTokenConsumed'] is True
+    assert isinstance(updatePayload['fetchTokenConsumedTimestamp'], datetime)
 
 
 def testProductStatusUpdateSuccess(monkeypatch):
