@@ -1,4 +1,5 @@
 import json
+from datetime import datetime
 from pathlib import Path
 
 from client.database import LocalDatabase
@@ -282,5 +283,37 @@ def testUpsertProductRecordExtendsActivityHistory(tmp_path: Path) -> None:
         "job-xyz": {"lastPrintedAt": firstJobTimestamp},
         "job-abc": {"lastPrintedAt": secondJobTimestamp},
     }
+
+    database.close()
+
+
+def testUpsertProductRecordGeneratesTimestampForMissingRequest(
+    tmp_path: Path,
+) -> None:
+    databasePath = tmp_path / "auto.db"
+    database = LocalDatabase(databasePath)
+
+    productId = "product-auto"
+    printJobId = "job-auto"
+
+    record = database.upsertProductRecord(
+        productId,
+        printJobId=printJobId,
+    )
+
+    assert "lastRequestedAt" in record
+    generatedTimestamp = record["lastRequestedAt"]
+    datetime.fromisoformat(generatedTimestamp)
+
+    activityPath = tmp_path / "products" / productId / "print-activity.json"
+    assert activityPath.exists()
+
+    activity = json.loads(activityPath.read_text(encoding="utf-8"))
+    assert activity["latestPrintJobId"] == printJobId
+
+    jobEntry = activity["printJobs"][printJobId]
+    assert jobEntry["lastPrintedAt"] == generatedTimestamp
+    assert activity["latestPrintedAt"] == generatedTimestamp
+    datetime.fromisoformat(activity["latestPrintedAt"])
 
     database.close()
