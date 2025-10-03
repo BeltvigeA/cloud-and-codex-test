@@ -92,11 +92,18 @@ class LocalDatabase:
                     productId TEXT PRIMARY KEY,
                     fileName TEXT,
                     downloaded INTEGER NOT NULL,
+                    downloadedFilePath TEXT,
                     lastRequestedAt TEXT NOT NULL,
                     updatedAt TEXT NOT NULL
                 )
                 """
             )
+            cursor = self.connection.execute("PRAGMA table_info(products)")
+            existingColumns = {row["name"] for row in cursor.fetchall()}
+            if "downloadedFilePath" not in existingColumns:
+                self.connection.execute(
+                    "ALTER TABLE products ADD COLUMN downloadedFilePath TEXT"
+                )
 
     def close(self) -> None:
         self.connection.close()
@@ -345,6 +352,7 @@ class LocalDatabase:
         fileName: Optional[str] = None,
         *,
         downloaded: Optional[bool] = None,
+        downloadedFilePath: Optional[str] = None,
         requestTimestamp: Optional[str] = None,
         printJobId: Optional[str] = None,
     ) -> Dict[str, Any]:
@@ -361,6 +369,13 @@ class LocalDatabase:
         else:
             resolvedDownloaded = downloaded
 
+        if downloadedFilePath is not None:
+            resolvedDownloadedFilePath = downloadedFilePath
+        elif resolvedDownloaded:
+            resolvedDownloadedFilePath = (existingRecord or {}).get("downloadedFilePath")
+        else:
+            resolvedDownloadedFilePath = None
+
         with self.connection:
             self.connection.execute(
                 """
@@ -368,12 +383,14 @@ class LocalDatabase:
                     productId,
                     fileName,
                     downloaded,
+                    downloadedFilePath,
                     lastRequestedAt,
                     updatedAt
-                ) VALUES (?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(productId) DO UPDATE SET
                     fileName = CASE WHEN excluded.fileName IS NOT NULL THEN excluded.fileName ELSE fileName END,
                     downloaded = excluded.downloaded,
+                    downloadedFilePath = excluded.downloadedFilePath,
                     lastRequestedAt = excluded.lastRequestedAt,
                     updatedAt = excluded.updatedAt
                 """,
@@ -381,6 +398,7 @@ class LocalDatabase:
                     productId,
                     resolvedFileName,
                     1 if resolvedDownloaded else 0,
+                    resolvedDownloadedFilePath,
                     resolvedTimestamp,
                     resolvedTimestamp,
                 ),
@@ -395,7 +413,10 @@ class LocalDatabase:
 
     def findProductById(self, productId: str) -> Optional[Dict[str, Any]]:
         cursor = self.connection.execute(
-            "SELECT productId, fileName, downloaded, lastRequestedAt, updatedAt FROM products WHERE productId = ?",
+            """
+            SELECT productId, fileName, downloaded, downloadedFilePath, lastRequestedAt, updatedAt
+            FROM products WHERE productId = ?
+            """,
             (productId,),
         )
         row = cursor.fetchone()
@@ -405,6 +426,7 @@ class LocalDatabase:
             "productId": row["productId"],
             "fileName": row["fileName"],
             "downloaded": bool(row["downloaded"]),
+            "downloadedFilePath": row["downloadedFilePath"],
             "lastRequestedAt": row["lastRequestedAt"],
             "updatedAt": row["updatedAt"],
         }
@@ -505,6 +527,7 @@ class LocalDatabase:
                 "createdAt": createdAt,
                 "lastRequestedAt": lastRequestedAt,
                 "fileLocation": record.get("fileName"),
+                "filePath": record.get("downloadedFilePath"),
                 "downloaded": bool(record.get("downloaded")),
                 "requestHistory": requestHistory,
                 "printActivity": {

@@ -203,26 +203,32 @@ def checkProductAvailability(
             productId,
             None,
             downloaded=False,
-            requestTimestamp=resolvedTimestamp,
-        )
-    elif existingRecord.get("downloaded"):
-        status = "fileCached"
-        shouldRequestFile = False
-        updatedRecord = database.upsertProductRecord(
-            productId,
-            existingRecord.get("fileName"),
-            downloaded=True,
+            downloadedFilePath=None,
             requestTimestamp=resolvedTimestamp,
         )
     else:
-        status = "metadataCached"
-        shouldRequestFile = True
-        updatedRecord = database.upsertProductRecord(
-            productId,
-            fileName or existingRecord.get("fileName"),
-            downloaded=False,
-            requestTimestamp=resolvedTimestamp,
-        )
+        cachedPath = existingRecord.get("downloadedFilePath")
+        cachedFileExists = bool(cachedPath) and Path(cachedPath).is_file()
+        if existingRecord.get("downloaded") and cachedFileExists:
+            status = "fileCached"
+            shouldRequestFile = False
+            updatedRecord = database.upsertProductRecord(
+                productId,
+                existingRecord.get("fileName"),
+                downloaded=True,
+                downloadedFilePath=cachedPath,
+                requestTimestamp=resolvedTimestamp,
+            )
+        else:
+            status = "metadataCached"
+            shouldRequestFile = True
+            updatedRecord = database.upsertProductRecord(
+                productId,
+                fileName or existingRecord.get("fileName"),
+                downloaded=False,
+                downloadedFilePath=None,
+                requestTimestamp=resolvedTimestamp,
+            )
 
     logging.info(
         "Product %s availability: %s (downloaded=%s)",
@@ -532,6 +538,7 @@ def performFetch(
                 productId,
                 metadataFileName,
                 downloaded=None,
+                downloadedFilePath=None,
                 printJobId=printJobId,
             )
             result["productRecord"] = updatedRecord
@@ -546,6 +553,7 @@ def performFetch(
                 productId,
                 metadataFileName,
                 downloaded=None,
+                downloadedFilePath=None,
                 printJobId=printJobId,
             )
         return None
@@ -579,6 +587,7 @@ def performFetch(
             productId,
             savedFile.name,
             downloaded=True,
+            downloadedFilePath=str(savedFile),
             printJobId=printJobId,
         )
 
@@ -602,6 +611,11 @@ def appendJsonLogEntry(logFilePath: Union[str, Path], entry: Dict[str, Any]) -> 
         serializedEntry["requestMode"] = entry.get("requestMode")
     if entry.get("productStatus") is not None:
         serializedEntry["productStatus"] = entry.get("productStatus")
+    productRecord = entry.get("productRecord")
+    if isinstance(productRecord, dict):
+        downloadedFilePath = productRecord.get("downloadedFilePath")
+        if downloadedFilePath is not None:
+            serializedEntry["downloadedFilePath"] = downloadedFilePath
 
     existingEntries: List[Dict[str, Any]] = []
     if logPath.exists():

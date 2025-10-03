@@ -19,6 +19,7 @@ def test_upsertProductRecord_updates_lastRequested(tmp_path: Path) -> None:
     assert firstRecord["productId"] == "product-1"
     assert firstRecord["fileName"] is None
     assert firstRecord["downloaded"] is False
+    assert firstRecord["downloadedFilePath"] is None
     assert firstRecord["lastRequestedAt"] == firstTimestamp
 
     secondTimestamp = "2024-02-02T12:30:45"
@@ -31,6 +32,7 @@ def test_upsertProductRecord_updates_lastRequested(tmp_path: Path) -> None:
 
     assert secondRecord["fileName"] == "widget-v2.gcode"
     assert secondRecord["downloaded"] is True
+    assert secondRecord["downloadedFilePath"] is None
     assert secondRecord["lastRequestedAt"] == secondTimestamp
     assert database.findProductById("product-1") == secondRecord
 
@@ -60,6 +62,7 @@ def test_upsertProductRecord_creates_single_log_entry(tmp_path: Path) -> None:
     assert productEntry["createdAt"] == firstTimestamp
     assert productEntry["lastRequestedAt"] == firstTimestamp
     assert productEntry["fileLocation"] == "initial.gcode"
+    assert productEntry["filePath"] is None
     assert productEntry["requestHistory"] == [firstTimestamp]
 
     secondTimestamp = "2024-06-06T06:06:06"
@@ -78,6 +81,7 @@ def test_upsertProductRecord_creates_single_log_entry(tmp_path: Path) -> None:
     assert updatedEntry["createdAt"] == firstTimestamp
     assert updatedEntry["lastRequestedAt"] == secondTimestamp
     assert updatedEntry["fileLocation"] == "finalized.gcode"
+    assert updatedEntry["filePath"] is None
     assert updatedEntry["requestHistory"] == [firstTimestamp, secondTimestamp]
 
     activity = updatedEntry["printActivity"]
@@ -119,6 +123,7 @@ def test_upsertProductRecord_preserves_lastRequested_without_new_request(tmp_pat
     assert entry["lastRequestedAt"] == initialTimestamp
     assert entry["requestHistory"] == [initialTimestamp]
     assert entry["printActivity"]["latestPrintedAt"] == initialTimestamp
+    assert entry["filePath"] is None
 
     database.close()
 
@@ -150,10 +155,14 @@ def test_checkProductAvailability_tracks_transitions(tmp_path: Path) -> None:
     assert secondStatus["shouldRequestFile"] is True
     assert secondStatus["record"]["lastRequestedAt"] == "2025-03-01T10:05:00"
 
+    cachedFilePath = tmp_path / "alpha.gcode"
+    cachedFilePath.write_text("GCODE", encoding="utf-8")
+
     database.upsertProductRecord(
         "product-42",
         fileName="alpha.gcode",
         downloaded=True,
+        downloadedFilePath=str(cachedFilePath),
         requestTimestamp="2025-03-01T10:10:00",
     )
 
@@ -166,6 +175,7 @@ def test_checkProductAvailability_tracks_transitions(tmp_path: Path) -> None:
     assert finalStatus["status"] == "fileCached"
     assert finalStatus["shouldRequestFile"] is False
     assert finalStatus["record"]["downloaded"] is True
+    assert finalStatus["record"]["downloadedFilePath"] == str(cachedFilePath)
     assert finalStatus["record"]["lastRequestedAt"] == "2025-03-01T10:15:00"
 
     database.close()
