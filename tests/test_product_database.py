@@ -94,6 +94,39 @@ def test_upsertProductRecord_creates_product_files(tmp_path: Path) -> None:
     database.close()
 
 
+def test_upsertProductRecord_preserves_lastRequested_without_new_request(tmp_path: Path) -> None:
+    databasePath = tmp_path / "preserve.db"
+    database = LocalDatabase(databasePath)
+
+    initialTimestamp = "2023-07-07T07:07:07"
+    database.upsertProductRecord(
+        "product-9",
+        fileName="draft.gcode",
+        downloaded=False,
+        requestTimestamp=initialTimestamp,
+    )
+
+    updatedRecord = database.upsertProductRecord(
+        "product-9",
+        downloaded=True,
+    )
+
+    assert updatedRecord["downloaded"] is True
+    assert updatedRecord["lastRequestedAt"] == initialTimestamp
+
+    productDir = tmp_path / "products" / "product-9"
+    metadataPath = productDir / "metadata.json"
+    requestsPath = productDir / "requests.json"
+
+    metadata = json.loads(metadataPath.read_text(encoding="utf-8"))
+    assert metadata["lastRequestedAt"] == initialTimestamp
+
+    requests = json.loads(requestsPath.read_text(encoding="utf-8"))
+    assert requests == [initialTimestamp]
+
+    database.close()
+
+
 def test_checkProductAvailability_tracks_transitions(tmp_path: Path) -> None:
     databasePath = tmp_path / "availability.db"
     database = LocalDatabase(databasePath)
