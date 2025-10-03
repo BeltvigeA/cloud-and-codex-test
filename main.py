@@ -333,6 +333,29 @@ def normalizeTimestamp(value: Optional[datetime]) -> Optional[str]:
     return value.astimezone(timezone.utc).isoformat()
 
 
+def parseIso8601Timestamp(rawTimestamp: object) -> Optional[datetime]:
+    if not isinstance(rawTimestamp, str):
+        return None
+
+    trimmedTimestamp = rawTimestamp.strip()
+    if not trimmedTimestamp:
+        return None
+
+    sanitizedTimestamp = trimmedTimestamp
+    if sanitizedTimestamp.endswith('Z'):
+        sanitizedTimestamp = sanitizedTimestamp[:-1] + '+00:00'
+
+    try:
+        parsedTimestamp = datetime.fromisoformat(sanitizedTimestamp)
+    except ValueError:
+        return None
+
+    if parsedTimestamp.tzinfo is None:
+        parsedTimestamp = parsedTimestamp.replace(tzinfo=timezone.utc)
+
+    return parsedTimestamp.astimezone(timezone.utc)
+
+
 @app.route('/upload', methods=['POST'])
 def uploadFile():
     logging.info('Received request to /upload')
@@ -620,6 +643,129 @@ def productHandshake(productId: str):
 
     except Exception:  # pylint: disable=broad-except
         logging.exception('Unexpected error during product handshake.')
+        return jsonify({'error': 'Internal server error'}), 500
+
+
+@app.route('/products/<productId>/status', methods=['POST'])
+def productStatusUpdate(productId: str):
+    logging.info('Received request to /products/%s/status', productId)
+    try:
+        clients, errorResponse = fetchClientsOrResponse()
+        if errorResponse:
+            return jsonify(errorResponse[0]), errorResponse[1]
+
+        firestoreClient = clients.firestoreClient
+
+        if not productId:
+            logging.warning('Product ID is missing during status update.')
+            return jsonify({'error': 'Product ID is required'}), 400
+
+        if not request.is_json:
+            logging.warning('Product status update must be JSON.')
+            return jsonify({'error': 'Request must be JSON'}), 400
+
+        try:
+            payload = request.get_json()
+        except Exception as error:  # pylint: disable=broad-except
+            logging.warning('Failed to parse product status JSON payload: %s', error)
+            return jsonify({'error': 'Invalid JSON payload'}), 400
+
+        if not isinstance(payload, dict):
+            logging.warning('Product status payload is not a JSON object.')
+            return jsonify({'error': 'Invalid JSON format: expected object'}), 400
+
+        requiredFields = ['productId', 'requestedMode', 'success', 'fileName', 'lastRequestedAt']
+        missingFields = [field for field in requiredFields if field not in payload]
+        if missingFields:
+            logging.warning('Missing required fields in product status update: %s', ', '.join(missingFields))
+            return (
+                jsonify({'error': f"Missing required field(s): {', '.join(missingFields)}"}),
+                400,
+            )
+
+        bodyProductId = payload.get('productId')
+        if not isinstance(bodyProductId, str) or not bodyProductId.strip():
+            logging.warning('Invalid productId value in status payload: %s', bodyProductId)
+            return jsonify({'error': 'Invalid productId value'}), 400
+
+        if bodyProductId != productId:
+            logging.warning('Product ID mismatch between path and payload: %s vs %s', productId, bodyProductId)
+            return jsonify({'error': 'Product ID mismatch'}), 409
+
+        requestedMode = payload.get('requestedMode')
+        if requestedMode not in {'full', 'metadata'}:
+            logging.warning('Invalid requestedMode value in status payload: %s', requestedMode)
+            return jsonify({'error': 'Invalid requestedMode value'}), 400
+
+        successValue = payload.get('success')
+        if not isinstance(successValue, bool):
+            logging.warning('Invalid success value type in status payload for product %s', productId)
+            return jsonify({'error': 'success must be a boolean'}), 400
+
+        fileName = payload.get('fileName')
+        if not isinstance(fileName, str) or not fileName.strip():
+            logging.warning('Invalid fileName value in status payload for product %s', productId)
+            return jsonify({'error': 'Invalid fileName value'}), 400
+
+        parsedLastRequestedAt = parseIso8601Timestamp(payload.get('lastRequestedAt'))
+        if parsedLastRequestedAt is None:
+            logging.warning('Invalid lastRequestedAt timestamp in status payload for product %s', productId)
+            return jsonify({'error': 'Invalid lastRequestedAt timestamp'}), 400
+
+        fileQuery = firestoreClient.collection(firestoreCollectionFiles).where('productId', '==', productId)
+        documentSnapshots = list(fileQuery.stream())
+
+        if not documentSnapshots:
+            logging.info('No files found when recording status for product %s', productId)
+            return jsonify({'error': 'File not found for product'}), 404
+
+        documentSnapshot = pickLatestDocumentByTimestamp(documentSnapshots)
+        if documentSnapshot is None:
+            logging.info('No valid file snapshots found when recording status for product %s', productId)
+            return jsonify({'error': 'File not found for product'}), 404
+
+        fileMetadata = documentSnapshot.to_dict() or {}
+
+        fetchTokenData: Dict[str, object] = {
+            'fetchToken': fileMetadata.get('fetchToken'),
+            'fetchTokenConsumed': fileMetadata.get('fetchTokenConsumed'),
+        }
+
+        fetchTokenExpiryNormalized = normalizeTimestamp(fileMetadata.get('fetchTokenExpiry'))
+        if fetchTokenExpiryNormalized:
+            fetchTokenData['fetchTokenExpiry'] = fetchTokenExpiryNormalized
+
+        fetchTokenConsumedTimestamp = normalizeTimestamp(fileMetadata.get('fetchTokenConsumedTimestamp'))
+        if fetchTokenConsumedTimestamp:
+            fetchTokenData['fetchTokenConsumedTimestamp'] = fetchTokenConsumedTimestamp
+
+        statusRecord: Dict[str, object] = {
+            'productId': productId,
+            'fileId': documentSnapshot.id,
+            'requestedMode': requestedMode,
+            'success': successValue,
+            'fileName': fileName,
+            'lastRequestedAt': parsedLastRequestedAt.isoformat(),
+            'receivedAt': firestore.SERVER_TIMESTAMP,
+            'payload': dict(payload),
+            'fetchTokenData': fetchTokenData,
+        }
+
+        fileTimestamp = normalizeTimestamp(fileMetadata.get('timestamp'))
+        if fileTimestamp:
+            statusRecord['fileTimestamp'] = fileTimestamp
+
+        currentFileStatus = fileMetadata.get('status')
+        if currentFileStatus is not None:
+            statusRecord['fileStatus'] = currentFileStatus
+
+        firestoreClient.collection(firestoreCollectionPrinterStatus).add(statusRecord)
+        logging.info('Stored product status update for %s with file %s', productId, documentSnapshot.id)
+
+        return jsonify({'message': 'Product status recorded'}), 200
+
+    except Exception:  # pylint: disable=broad-except
+        logging.exception('Unexpected error while recording product status update for %s', productId)
         return jsonify({'error': 'Internal server error'}), 500
 
 
