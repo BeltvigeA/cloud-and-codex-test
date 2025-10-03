@@ -347,6 +347,7 @@ class LocalDatabase:
         *,
         downloaded: Optional[bool] = None,
         requestTimestamp: Optional[str] = None,
+        printJobId: Optional[str] = None,
     ) -> Dict[str, Any]:
         existingRecord = self.findProductById(productId)
         resolvedTimestamp = requestTimestamp or datetime.utcnow().isoformat()
@@ -385,7 +386,7 @@ class LocalDatabase:
         if updatedRecord is None:
             raise RuntimeError(f"Failed to persist product record for {productId}")
 
-        self._persistProductFiles(updatedRecord)
+        self._persistProductFiles(updatedRecord, printJobId)
         return updatedRecord
 
     def findProductById(self, productId: str) -> Optional[Dict[str, Any]]:
@@ -404,13 +405,16 @@ class LocalDatabase:
             "updatedAt": row["updatedAt"],
         }
 
-    def _persistProductFiles(self, record: Dict[str, Any]) -> None:
+    def _persistProductFiles(
+        self, record: Dict[str, Any], printJobId: Optional[str]
+    ) -> None:
         productId = record["productId"]
         productDir = self.productStorageDir / productId
         productDir.mkdir(parents=True, exist_ok=True)
 
         metadataPath = productDir / "metadata.json"
         requestsPath = productDir / "requests.json"
+        activityPath = productDir / "print-activity.json"
 
         existingMetadata: Dict[str, Any] = {}
         if metadataPath.exists():
@@ -458,4 +462,64 @@ class LocalDatabase:
 
         with requestsPath.open("w", encoding="utf-8") as requestsFile:
             json.dump(requestEntries, requestsFile, indent=2, ensure_ascii=False)
+
+        lastRequestedAt = record.get("lastRequestedAt")
+        resolvedLastRequestedAt = (
+            str(lastRequestedAt) if lastRequestedAt is not None else None
+        )
+
+        self._persistProductActivityFile(
+            activityPath,
+            record["productId"],
+            printJobId,
+            resolvedLastRequestedAt,
+        )
+
+    def _persistProductActivityFile(
+        self,
+        activityPath: Path,
+        productId: str,
+        printJobId: Optional[str],
+        lastPrintedAt: Optional[str],
+    ) -> None:
+        if not printJobId or not lastPrintedAt:
+            return
+
+        existingContent: Dict[str, Any] = {
+            "productId": productId,
+            "printJobs": {},
+        }
+        if activityPath.exists():
+            try:
+                with activityPath.open("r", encoding="utf-8") as activityFile:
+                    loadedContent = json.load(activityFile)
+                if isinstance(loadedContent, dict):
+                    existingContent.update(
+                        {
+                            key: value
+                            for key, value in loadedContent.items()
+                            if key in {"productId", "printJobs", "latestPrintJobId", "latestPrintedAt"}
+                        }
+                    )
+            except (OSError, json.JSONDecodeError):
+                existingContent = {
+                    "productId": productId,
+                    "printJobs": {},
+                }
+
+        printJobs = existingContent.get("printJobs")
+        if not isinstance(printJobs, dict):
+            printJobs = {}
+
+        printJobs[str(printJobId)] = {"lastPrintedAt": lastPrintedAt}
+
+        updatedContent: Dict[str, Any] = {
+            "productId": productId,
+            "printJobs": printJobs,
+            "latestPrintJobId": str(printJobId),
+            "latestPrintedAt": lastPrintedAt,
+        }
+
+        with activityPath.open("w", encoding="utf-8") as activityFile:
+            json.dump(updatedContent, activityFile, indent=2, ensure_ascii=False)
 
