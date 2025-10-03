@@ -382,15 +382,23 @@ def uploadFile():
         unencryptedDataRaw = request.form.get('unencrypted_data', '{}')
         encryptedDataPayloadRaw = request.form.get('encrypted_data_payload', '{}')
         recipientId = request.form.get('recipient_id')
-        productId = request.form.get('product_id')
+        productIdRaw = request.form.get('product_id')
 
         if not recipientId:
             logging.warning('Recipient ID is missing.')
             return jsonify({'error': 'Recipient ID is required'}), 400
 
-        if not productId:
+        if not productIdRaw:
             logging.warning('Product ID is missing.')
             return jsonify({'error': 'Product ID is required'}), 400
+
+        try:
+            productUuid = uuid.UUID(str(productIdRaw))
+        except (ValueError, AttributeError, TypeError):
+            logging.warning('Invalid product ID provided: %s', productIdRaw)
+            return jsonify({'error': 'Invalid product ID format'}), 400
+
+        productId = str(productUuid)
 
         unencryptedData, errorResponse = parseJsonObjectField(unencryptedDataRaw, 'unencrypted_data')
         if errorResponse:
@@ -440,7 +448,7 @@ def uploadFile():
                 400,
             )
 
-        gcsObjectName = f"{recipientId}/{fileId}_{normalizedFilename}"
+        gcsObjectName = f"{recipientId}/{productId}_{normalizedFilename}"
         bucket = storageClient.bucket(gcsBucketName)
         blob = bucket.blob(gcsObjectName)
 
@@ -487,6 +495,7 @@ def uploadFile():
             {
                 'message': 'File uploaded successfully',
                 'fileId': fileId,
+                'productId': productId,
                 'fetchToken': fetchToken,
             }
         ), 200
