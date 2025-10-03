@@ -232,8 +232,8 @@ def testUpsertProductRecordCreatesActivityWithoutJobId(tmp_path: Path) -> None:
     activity = json.loads(activityPath.read_text(encoding="utf-8"))
     assert activity["productId"] == "product-100"
     assert activity["printJobs"] == {}
+    assert activity["latestPrintJobId"] is None
     assert activity["latestPrintedAt"] == requestTimestamp
-    assert "latestPrintJobId" not in activity
 
     database.close()
 
@@ -243,27 +243,44 @@ def testUpsertProductRecordExtendsActivityHistory(tmp_path: Path) -> None:
     database = LocalDatabase(databasePath)
 
     initialTimestamp = "2027-02-02T02:02:02"
+    productId = "product-200"
     database.upsertProductRecord(
-        "product-200",
+        productId,
         requestTimestamp=initialTimestamp,
         printJobId=None,
     )
 
-    secondTimestamp = "2027-02-02T03:03:03"
+    activityPath = tmp_path / "products" / productId / "print-activity.json"
+    assert activityPath.exists()
+
+    baselineActivity = json.loads(activityPath.read_text(encoding="utf-8"))
+    assert baselineActivity["productId"] == productId
+    assert baselineActivity["printJobs"] == {}
+    assert baselineActivity["latestPrintJobId"] is None
+    assert baselineActivity["latestPrintedAt"] == initialTimestamp
+
+    firstJobTimestamp = "2027-02-02T03:03:03"
     database.upsertProductRecord(
-        "product-200",
-        requestTimestamp=secondTimestamp,
+        productId,
+        requestTimestamp=firstJobTimestamp,
         printJobId="job-xyz",
     )
 
-    activityPath = tmp_path / "products" / "product-200" / "print-activity.json"
+    secondJobTimestamp = "2027-02-02T04:04:04"
+    database.upsertProductRecord(
+        productId,
+        requestTimestamp=secondJobTimestamp,
+        printJobId="job-abc",
+    )
+
     activity = json.loads(activityPath.read_text(encoding="utf-8"))
 
-    assert activity["productId"] == "product-200"
-    assert activity["latestPrintJobId"] == "job-xyz"
-    assert activity["latestPrintedAt"] == secondTimestamp
+    assert activity["productId"] == productId
+    assert activity["latestPrintJobId"] == "job-abc"
+    assert activity["latestPrintedAt"] == secondJobTimestamp
     assert activity["printJobs"] == {
-        "job-xyz": {"lastPrintedAt": secondTimestamp}
+        "job-xyz": {"lastPrintedAt": firstJobTimestamp},
+        "job-abc": {"lastPrintedAt": secondJobTimestamp},
     }
 
     database.close()
