@@ -1,3 +1,4 @@
+import logging
 import sys
 import types
 from pathlib import Path
@@ -98,6 +99,116 @@ def testValidateRemoteListenAcceptsDefaultBaseUrl(monkeypatch: pytest.MonkeyPatc
 
     assert arguments.baseUrl == client.defaultBaseUrl
     assert client.validateRemoteListenArguments(arguments)
+
+
+@pytest.mark.parametrize(
+    ("baseUrl", "expected"),
+    [
+        ("example.com", "https://example.com"),
+        ("https://api.example.com", "https://api.example.com"),
+    ],
+)
+def testValidateRemoteFetchAcceptsBareAndQualifiedBaseUrls(
+    baseUrl: str, expected: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "client",
+            "fetch",
+            "--mode",
+            "remote",
+            "--baseUrl",
+            baseUrl,
+            "--fetchToken",
+            "tokenValue",
+            "--outputDir",
+            str(tmp_path),
+        ],
+    )
+
+    arguments = client.parseArguments()
+
+    assert client.validateRemoteFetchArguments(arguments)
+    assert (
+        client.buildFetchUrl(arguments.baseUrl, "tokenValue")
+        == f"{expected}/fetch/tokenValue"
+    )
+
+
+@pytest.mark.parametrize(
+    ("baseUrl", "expected"),
+    [
+        ("listener.example.com", "https://listener.example.com"),
+        ("http://listener.example.com", "http://listener.example.com"),
+    ],
+)
+def testValidateRemoteListenAcceptsBareAndQualifiedBaseUrls(
+    baseUrl: str, expected: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "client",
+            "listen",
+            "--mode",
+            "remote",
+            "--baseUrl",
+            baseUrl,
+            "--recipientId",
+            "recipientValue",
+            "--outputDir",
+            str(tmp_path),
+        ],
+    )
+
+    arguments = client.parseArguments()
+
+    assert client.validateRemoteListenArguments(arguments)
+    assert (
+        client.buildPendingUrl(arguments.baseUrl, "recipientValue")
+        == f"{expected}/recipients/recipientValue/pending"
+    )
+
+
+@pytest.mark.parametrize(
+    ("baseUrl", "expected"),
+    [
+        ("status.example.com", "https://status.example.com"),
+        ("https://status.example.com", "https://status.example.com"),
+    ],
+)
+def testStatusCommandBuildsUrlsWithBareAndQualifiedBaseUrls(
+    baseUrl: str, expected: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "client",
+            "status",
+            "--baseUrl",
+            baseUrl,
+            "--apiKey",
+            "testKey",
+            "--printerSerial",
+            "printer123",
+        ],
+    )
+
+    arguments = client.parseArguments()
+
+    assert client.buildBaseUrl(arguments.baseUrl) == expected
+    assert f"{expected}/printer-status" == f"{client.buildBaseUrl(arguments.baseUrl)}/printer-status"
+
+
+def testValidateBaseUrlArgumentLogsErrorForEmptyInput(caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.ERROR)
+
+    assert not client.validateBaseUrlArgument("   ", "fetch")
+    assert "Missing required options for remote fetch: --baseUrl" in caplog.text
 
 
 class DummyDownloadResponse:
