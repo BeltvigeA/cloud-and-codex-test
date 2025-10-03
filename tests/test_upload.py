@@ -236,6 +236,7 @@ def test_uploadAcceptsAllowedExtension(appModule):
             'unencrypted_data': json.dumps({'info': 'value'}),
             'encrypted_data_payload': json.dumps({'secret': 'value'}),
             'recipient_id': 'recipient123',
+            'product_id': 'product-001',
         },
     )
 
@@ -253,6 +254,7 @@ def test_uploadRejectsDisallowedExtension(appModule):
             'unencrypted_data': '{}',
             'encrypted_data_payload': '{}',
             'recipient_id': 'recipient123',
+            'product_id': 'product-001',
         },
     )
 
@@ -270,6 +272,7 @@ def test_uploadRejectsDisallowedMimeType(appModule):
             'unencrypted_data': '{}',
             'encrypted_data_payload': '{}',
             'recipient_id': 'recipient123',
+            'product_id': 'product-001',
         },
     )
 
@@ -287,6 +290,7 @@ def test_uploadAcceptsUppercaseExtension(appModule):
             'unencrypted_data': json.dumps({'info': 'value'}),
             'encrypted_data_payload': json.dumps({'secret': 'value'}),
             'recipient_id': 'recipient123',
+            'product_id': 'product-001',
         },
     )
 
@@ -312,6 +316,7 @@ def test_uploadAcceptsDoubleEncodedJson(appModule):
             'unencrypted_data': doubleEncodedValue,
             'encrypted_data_payload': doubleEncodedValue,
             'recipient_id': 'recipient123',
+            'product_id': 'product-001',
         },
     )
 
@@ -329,6 +334,7 @@ def test_uploadRejectsNonObjectJsonMetadata(appModule):
             'unencrypted_data': '[]',
             'encrypted_data_payload': '{}',
             'recipient_id': 'recipient123',
+            'product_id': 'product-001',
         },
     )
 
@@ -346,6 +352,7 @@ def test_uploadRejectsExtensionBeforeUpload(appModule):
             'unencrypted_data': '{}',
             'encrypted_data_payload': '{}',
             'recipient_id': 'recipient123',
+            'product_id': 'product-001',
         },
     )
 
