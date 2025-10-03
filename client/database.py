@@ -506,26 +506,47 @@ class LocalDatabase:
         else:
             updatedPrintJobs = {}
 
+        existingLatestPrintJobId = (
+            existingContent.get("latestPrintJobId")
+            if isinstance(existingContent.get("latestPrintJobId"), str)
+            else None
+        )
+        existingLatestPrintedAt = (
+            existingContent.get("latestPrintedAt")
+            if isinstance(existingContent.get("latestPrintedAt"), str)
+            else None
+        )
+
+        latestPrintJobId = existingLatestPrintJobId
+        latestPrintedAt = existingLatestPrintedAt
+
+        if printJobId is not None:
+            jobKey = str(printJobId)
+            existingJobEntry = updatedPrintJobs.get(jobKey)
+            if isinstance(existingJobEntry, dict):
+                jobEntry: Dict[str, Any] = dict(existingJobEntry)
+            else:
+                jobEntry = {}
+
+            if lastPrintedAt is not None:
+                jobEntry["lastPrintedAt"] = lastPrintedAt
+            elif "lastPrintedAt" not in jobEntry:
+                jobEntry["lastPrintedAt"] = None
+
+            updatedPrintJobs[jobKey] = jobEntry
+            latestPrintJobId = jobKey
+            if lastPrintedAt is not None:
+                latestPrintedAt = lastPrintedAt
+        else:
+            if lastPrintedAt is not None:
+                latestPrintedAt = lastPrintedAt
+
         updatedContent: Dict[str, Any] = {
             "productId": productId,
             "printJobs": updatedPrintJobs,
+            "latestPrintJobId": latestPrintJobId,
+            "latestPrintedAt": latestPrintedAt,
         }
-
-        existingLatestPrintJobId = existingContent.get("latestPrintJobId")
-        existingLatestPrintedAt = existingContent.get("latestPrintedAt")
-
-        if printJobId is not None and lastPrintedAt is not None:
-            jobKey = str(printJobId)
-            updatedPrintJobs[jobKey] = {"lastPrintedAt": lastPrintedAt}
-            updatedContent["latestPrintJobId"] = jobKey
-            updatedContent["latestPrintedAt"] = lastPrintedAt
-        else:
-            if isinstance(existingLatestPrintJobId, str):
-                updatedContent["latestPrintJobId"] = existingLatestPrintJobId
-            if lastPrintedAt is not None:
-                updatedContent["latestPrintedAt"] = lastPrintedAt
-            elif isinstance(existingLatestPrintedAt, str):
-                updatedContent["latestPrintedAt"] = existingLatestPrintedAt
 
         with activityPath.open("w", encoding="utf-8") as activityFile:
             json.dump(updatedContent, activityFile, indent=2, ensure_ascii=False)
