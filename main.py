@@ -28,8 +28,6 @@ from google.cloud import firestore, kms_v1, storage
 from google.cloud.firestore_v1 import DELETE_FIELD
 from werkzeug.utils import secure_filename
 
-from product_store import DuplicateProductIdError, MalformedProductError, ProductStore
-
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -51,8 +49,6 @@ apiKeysPrinterStatusStr = os.environ.get('API_KEYS_PRINTER_STATUS', '')
 validPrinterApiKeys = {apiKey.strip() for apiKey in apiKeysPrinterStatusStr.split(',') if apiKey.strip()}
 port = int(os.environ.get('PORT', '8080'))
 fetchTokenTtlMinutes = int(os.environ.get('FETCH_TOKEN_TTL_MINUTES', '15'))
-productsFilePath = os.environ.get('PRODUCTS_FILE_PATH', 'products.json')
-productStore = ProductStore(productsFilePath)
 
 
 class MissingEnvironmentError(RuntimeError):
@@ -821,51 +817,6 @@ def printerStatusUpdate():
     except Exception:  # pylint: disable=broad-except
         logging.exception('An unexpected error occurred during printer status update.')
         return jsonify({'error': 'Internal server error'}), 500
-
-
-@app.route('/api/products/lookup', methods=['POST'])
-def lookupProduct():
-    requestPayload = request.get_json(silent=True) or {}
-    productId = requestPayload.get('productId') or requestPayload.get('product_id')
-    if not isinstance(productId, str) or not productId.strip():
-        logging.warning('Product lookup missing productId')
-        return jsonify({'success': False, 'error': 'productId is required'}), 400
-
-    normalizedProductId = productId.strip()
-    logging.info('Looking up product %s', normalizedProductId)
-
-    try:
-        productData = productStore.lookupProduct(normalizedProductId)
-    except (DuplicateProductIdError, MalformedProductError) as error:
-        logging.exception('Failed to read product store')
-        return jsonify({'success': False, 'error': 'Product store is unavailable'}), 500
-
-    if productData is None:
-        logging.info('Product %s not found', normalizedProductId)
-        return jsonify({'success': False, 'error': 'Product not found'}), 404
-
-    logging.info('Product %s found; lastUsed updated', normalizedProductId)
-    return jsonify({'success': True, 'product': productData})
-
-
-@app.route('/tasks/products/cleanup', methods=['POST'])
-def cleanupProductsTask():
-    retentionDaysValue = os.environ.get('PRODUCT_RETENTION_DAYS', '14')
-    try:
-        retentionDays = int(retentionDaysValue)
-    except ValueError:
-        logging.warning('Invalid PRODUCT_RETENTION_DAYS value: %s', retentionDaysValue)
-        retentionDays = 14
-
-    retentionPeriod = timedelta(days=retentionDays)
-
-    try:
-        removedCount = productStore.cleanupExpiredProducts(retentionPeriod)
-    except (DuplicateProductIdError, MalformedProductError):
-        logging.exception('Failed to clean product store')
-        return jsonify({'success': False, 'error': 'Product store is unavailable'}), 500
-
-    return jsonify({'success': True, 'removed': removedCount})
 
 
 @app.route('/', methods=['GET'])
