@@ -35,6 +35,8 @@ class LocalDatabase:
         defaultPath = Path.home() / ".printmaster" / "printmaster.db"
         self.databasePath = Path(databasePath).expanduser() if databasePath else defaultPath
         self.databasePath.parent.mkdir(parents=True, exist_ok=True)
+        self.productStorageDir = self.databasePath.parent / "products"
+        self.productStorageDir.mkdir(parents=True, exist_ok=True)
         self.connection = sqlite3.connect(self.databasePath)
         self.connection.row_factory = sqlite3.Row
         self.initialize()
@@ -382,6 +384,8 @@ class LocalDatabase:
         updatedRecord = self.findProductById(productId)
         if updatedRecord is None:
             raise RuntimeError(f"Failed to persist product record for {productId}")
+
+        self._persistProductFiles(updatedRecord)
         return updatedRecord
 
     def findProductById(self, productId: str) -> Optional[Dict[str, Any]]:
@@ -399,4 +403,59 @@ class LocalDatabase:
             "lastRequestedAt": row["lastRequestedAt"],
             "updatedAt": row["updatedAt"],
         }
+
+    def _persistProductFiles(self, record: Dict[str, Any]) -> None:
+        productId = record["productId"]
+        productDir = self.productStorageDir / productId
+        productDir.mkdir(parents=True, exist_ok=True)
+
+        metadataPath = productDir / "metadata.json"
+        requestsPath = productDir / "requests.json"
+
+        existingMetadata: Dict[str, Any] = {}
+        if metadataPath.exists():
+            try:
+                with metadataPath.open("r", encoding="utf-8") as metadataFile:
+                    loadedMetadata = json.load(metadataFile)
+                if isinstance(loadedMetadata, dict):
+                    existingMetadata = loadedMetadata
+            except (OSError, json.JSONDecodeError):
+                existingMetadata = {}
+
+        createdAt = (
+            existingMetadata.get("createdAt")
+            or record.get("updatedAt")
+            or datetime.utcnow().isoformat()
+        )
+        fileLocation = record.get("fileName") or existingMetadata.get("fileLocation")
+
+        metadataContent: Dict[str, Any] = {
+            "productId": productId,
+            "createdAt": createdAt,
+            "lastRequestedAt": record.get("lastRequestedAt"),
+        }
+
+        if fileLocation:
+            metadataContent["fileLocation"] = str(fileLocation)
+
+        with metadataPath.open("w", encoding="utf-8") as metadataFile:
+            json.dump(metadataContent, metadataFile, indent=2, ensure_ascii=False)
+
+        requestEntries: List[str] = []
+        if requestsPath.exists():
+            try:
+                with requestsPath.open("r", encoding="utf-8") as requestsFile:
+                    loadedRequests = json.load(requestsFile)
+                if isinstance(loadedRequests, list):
+                    requestEntries = [
+                        entry for entry in loadedRequests if isinstance(entry, str)
+                    ]
+            except (OSError, json.JSONDecodeError):
+                requestEntries = []
+
+        if record.get("lastRequestedAt"):
+            requestEntries.append(str(record.get("lastRequestedAt")))
+
+        with requestsPath.open("w", encoding="utf-8") as requestsFile:
+            json.dump(requestEntries, requestsFile, indent=2, ensure_ascii=False)
 
