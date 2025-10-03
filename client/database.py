@@ -482,43 +482,42 @@ class LocalDatabase:
         printJobId: Optional[str],
         lastPrintedAt: Optional[str],
     ) -> None:
-        if not printJobId or not lastPrintedAt:
-            return
-
-        existingContent: Dict[str, Any] = {
-            "productId": productId,
-            "printJobs": {},
-        }
+        existingContent: Dict[str, Any] = {}
         if activityPath.exists():
             try:
                 with activityPath.open("r", encoding="utf-8") as activityFile:
                     loadedContent = json.load(activityFile)
                 if isinstance(loadedContent, dict):
-                    existingContent.update(
-                        {
-                            key: value
-                            for key, value in loadedContent.items()
-                            if key in {"productId", "printJobs", "latestPrintJobId", "latestPrintedAt"}
-                        }
-                    )
+                    existingContent = loadedContent
             except (OSError, json.JSONDecodeError):
-                existingContent = {
-                    "productId": productId,
-                    "printJobs": {},
-                }
+                existingContent = {}
 
-        printJobs = existingContent.get("printJobs")
-        if not isinstance(printJobs, dict):
-            printJobs = {}
-
-        printJobs[str(printJobId)] = {"lastPrintedAt": lastPrintedAt}
+        existingPrintJobs = existingContent.get("printJobs")
+        if isinstance(existingPrintJobs, dict):
+            updatedPrintJobs: Dict[str, Dict[str, Any]] = dict(existingPrintJobs)
+        else:
+            updatedPrintJobs = {}
 
         updatedContent: Dict[str, Any] = {
             "productId": productId,
-            "printJobs": printJobs,
-            "latestPrintJobId": str(printJobId),
-            "latestPrintedAt": lastPrintedAt,
+            "printJobs": updatedPrintJobs,
         }
+
+        existingLatestPrintJobId = existingContent.get("latestPrintJobId")
+        existingLatestPrintedAt = existingContent.get("latestPrintedAt")
+
+        if printJobId is not None and lastPrintedAt is not None:
+            jobKey = str(printJobId)
+            updatedPrintJobs[jobKey] = {"lastPrintedAt": lastPrintedAt}
+            updatedContent["latestPrintJobId"] = jobKey
+            updatedContent["latestPrintedAt"] = lastPrintedAt
+        else:
+            if isinstance(existingLatestPrintJobId, str):
+                updatedContent["latestPrintJobId"] = existingLatestPrintJobId
+            if lastPrintedAt is not None:
+                updatedContent["latestPrintedAt"] = lastPrintedAt
+            elif isinstance(existingLatestPrintedAt, str):
+                updatedContent["latestPrintedAt"] = existingLatestPrintedAt
 
         with activityPath.open("w", encoding="utf-8") as activityFile:
             json.dump(updatedContent, activityFile, indent=2, ensure_ascii=False)
