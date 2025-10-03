@@ -15,6 +15,7 @@ from .client import (
     appendJsonLogEntry,
     configureLogging,
     defaultBaseUrl,
+    defaultFilesDirectory,
     ensureOutputDirectory,
     listenForFiles,
 )
@@ -58,7 +59,7 @@ class ListenerGuiApp:
         ttk.Label(mainFrame, text="Output Directory:").grid(
             row=2, column=0, sticky=tk.W, **paddingOptions
         )
-        self.outputDirVar = tk.StringVar(value=str(Path.home() / "cloud-and-codex-test"))
+        self.outputDirVar = tk.StringVar(value=str(defaultFilesDirectory))
         outputDirFrame = ttk.Frame(mainFrame)
         outputDirFrame.grid(row=2, column=1, sticky=tk.EW, **paddingOptions)
         outputDirEntry = ttk.Entry(outputDirFrame, textvariable=self.outputDirVar, width=40)
@@ -66,7 +67,9 @@ class ListenerGuiApp:
         ttk.Button(outputDirFrame, text="Browse", command=self._chooseOutputDir).pack(side=tk.LEFT, padx=4)
 
         ttk.Label(mainFrame, text="JSON Log File:").grid(row=3, column=0, sticky=tk.W, **paddingOptions)
-        self.logFileVar = tk.StringVar(value=str(Path.home() / "cloud-and-codex-test" / "listener-log.json"))
+        self.logFileVar = tk.StringVar(
+            value=str(Path.home() / ".printmaster" / "listener-log.json")
+        )
         logFileFrame = ttk.Frame(mainFrame)
         logFileFrame.grid(row=3, column=1, sticky=tk.EW, **paddingOptions)
         logFileEntry = ttk.Entry(logFileFrame, textvariable=self.logFileVar, width=40)

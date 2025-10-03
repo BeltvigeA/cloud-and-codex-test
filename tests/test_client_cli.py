@@ -60,6 +60,25 @@ def testParseArgumentsUsesProductionBaseUrlByDefault(monkeypatch: pytest.MonkeyP
     assert client.validateRemoteFetchArguments(arguments)
 
 
+def testFetchCommandDefaultsOutputDirectory(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "client",
+            "fetch",
+            "--mode",
+            "remote",
+            "--fetchToken",
+            "tokenValue",
+        ],
+    )
+
+    arguments = client.parseArguments()
+
+    assert arguments.outputDir == str(client.defaultFilesDirectory)
+
+
 def testStatusCommandDefaultsToProductionBaseUrl(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         sys,
@@ -99,6 +118,25 @@ def testValidateRemoteListenAcceptsDefaultBaseUrl(monkeypatch: pytest.MonkeyPatc
 
     assert arguments.baseUrl == client.defaultBaseUrl
     assert client.validateRemoteListenArguments(arguments)
+
+
+def testListenCommandDefaultsOutputDirectory(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "client",
+            "listen",
+            "--mode",
+            "remote",
+            "--recipientId",
+            "recipientValue",
+        ],
+    )
+
+    arguments = client.parseArguments()
+
+    assert arguments.outputDir == str(client.defaultFilesDirectory)
 
 
 @pytest.mark.parametrize(
