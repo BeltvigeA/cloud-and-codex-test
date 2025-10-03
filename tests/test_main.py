@@ -201,14 +201,18 @@ class MockEncryptClient:
 
 
 class MockDocument:
-    def __init__(self, updateRecorder):
+    def __init__(self, updateRecorder, addRecorder):
         self.updateRecorder = updateRecorder
+        self.addRecorder = addRecorder
 
     def set(self, metadata):
         self.updateRecorder['set'] = metadata
 
     def update(self, payload):
         self.updateRecorder['update'].append(payload)
+
+    def collection(self, _name):
+        return MockCollection([], self.updateRecorder, self.addRecorder)
 
 
 class MockQuery:
@@ -239,19 +243,30 @@ class MockQuery:
 
 
 class MockCollection:
-    def __init__(self, documentSnapshots, updateRecorder):
+    def __init__(self, documentSnapshots, updateRecorder, addRecorder):
         self.documentSnapshots = documentSnapshots
         self.updateRecorder = updateRecorder
+        self.addRecorder = addRecorder
 
     def document(self, _docId):
-        return MockDocument(self.updateRecorder)
+        return MockDocument(self.updateRecorder, self.addRecorder)
 
     def where(self, _field, _operator, _value):
         return MockQuery(self.documentSnapshots)
 
+    def add(self, payload):
+        self.addRecorder.append(payload)
+        return SimpleNamespace(id=f'status-{len(self.addRecorder)}')
+
 
 class MockFirestoreClient:
-    def __init__(self, documentSnapshot=None, documentSnapshots=None, updateRecorder=None):
+    def __init__(
+        self,
+        documentSnapshot=None,
+        documentSnapshots=None,
+        updateRecorder=None,
+        addRecorder=None,
+    ):
         if documentSnapshots is not None:
             self.documentSnapshots = documentSnapshots
         elif documentSnapshot is not None:
@@ -259,11 +274,12 @@ class MockFirestoreClient:
         else:
             self.documentSnapshots = []
         self.updateRecorder = updateRecorder or {'set': None, 'update': []}
+        self.addRecorder = addRecorder if addRecorder is not None else []
 
     def collection(self, _name):
         if not self.documentSnapshots:
-            return MockCollection([], self.updateRecorder)
-        return MockCollection(self.documentSnapshots, self.updateRecorder)
+            return MockCollection([], self.updateRecorder, self.addRecorder)
+        return MockCollection(self.documentSnapshots, self.updateRecorder, self.addRecorder)
 
 
 class MockDocumentSnapshot:
@@ -418,6 +434,111 @@ def testProductHandshakeMetadataFlow(monkeypatch):
     assert updatePayload['handshakeClientStatus'] == 'hasFile'
     assert isinstance(updatePayload['lastRequestTimestamp'], datetime)
     assert updatePayload['lastRequestFileName'] == 'part-b.gcode'
+
+
+def testProductStatusUpdateSuccess(monkeypatch):
+    currentTime = datetime.now(timezone.utc)
+    fetchTokenExpiry = currentTime + timedelta(minutes=10)
+    metadata = {
+        'productId': 'prod-123',
+        'fetchToken': 'token-789',
+        'fetchTokenConsumed': False,
+        'fetchTokenExpiry': fetchTokenExpiry,
+        'timestamp': currentTime,
+        'status': 'available',
+    }
+    documentSnapshot = MockDocumentSnapshot('doc789', metadata)
+    statusAddRecorder = []
+    mockClients = main.ClientBundle(
+        storageClient=MockStorageClient(),
+        firestoreClient=MockFirestoreClient(
+            documentSnapshot=documentSnapshot, addRecorder=statusAddRecorder
+        ),
+        kmsClient=MockEncryptClient({'sensitive': 'value'}),
+        kmsKeyPath='projects/test/locations/test/keyRings/test/cryptoKeys/test',
+        gcsBucketName='test-bucket',
+    )
+    monkeypatch.setattr(main, 'getClients', lambda: mockClients)
+
+    statusPayload = {
+        'productId': 'prod-123',
+        'requestedMode': 'full',
+        'success': True,
+        'fileName': 'print-job.gcode',
+        'lastRequestedAt': '2024-01-01T12:00:00Z',
+        'statusMessage': 'Completed',
+    }
+    fakeRequest.set_json(statusPayload)
+
+    responseBody, statusCode = main.productStatusUpdate('prod-123')
+
+    assert statusCode == 200
+    assert responseBody == {'message': 'Product status recorded'}
+    assert len(statusAddRecorder) == 1
+    storedStatus = statusAddRecorder[0]
+    assert storedStatus['productId'] == 'prod-123'
+    assert storedStatus['fileId'] == 'doc789'
+    assert storedStatus['requestedMode'] == 'full'
+    assert storedStatus['success'] is True
+    assert storedStatus['fileName'] == 'print-job.gcode'
+    assert storedStatus['lastRequestedAt'] == '2024-01-01T12:00:00+00:00'
+    assert storedStatus['payload'] == statusPayload
+    fetchTokenData = storedStatus['fetchTokenData']
+    assert fetchTokenData['fetchToken'] == 'token-789'
+    assert fetchTokenData['fetchTokenConsumed'] is False
+    assert fetchTokenData['fetchTokenExpiry'] == fetchTokenExpiry.isoformat()
+    assert storedStatus['fileStatus'] == 'available'
+    assert storedStatus['fileTimestamp'] == currentTime.isoformat()
+
+
+def testProductStatusUpdateMissingFields(monkeypatch):
+    statusAddRecorder = []
+    mockClients = main.ClientBundle(
+        storageClient=MockStorageClient(),
+        firestoreClient=MockFirestoreClient(addRecorder=statusAddRecorder),
+        kmsClient=MockEncryptClient({'sensitive': 'value'}),
+        kmsKeyPath='projects/test/locations/test/keyRings/test/cryptoKeys/test',
+        gcsBucketName='test-bucket',
+    )
+    monkeypatch.setattr(main, 'getClients', lambda: mockClients)
+
+    incompletePayload = {
+        'productId': 'prod-123',
+        'success': True,
+        'fileName': 'missing-fields.gcode',
+    }
+    fakeRequest.set_json(incompletePayload)
+
+    responseBody, statusCode = main.productStatusUpdate('prod-123')
+
+    assert statusCode == 400
+    assert 'error' in responseBody
+    assert statusAddRecorder == []
+
+
+def testProductStatusUpdateInvalidJson(monkeypatch):
+    statusAddRecorder = []
+    mockClients = main.ClientBundle(
+        storageClient=MockStorageClient(),
+        firestoreClient=MockFirestoreClient(addRecorder=statusAddRecorder),
+        kmsClient=MockEncryptClient({'sensitive': 'value'}),
+        kmsKeyPath='projects/test/locations/test/keyRings/test/cryptoKeys/test',
+        gcsBucketName='test-bucket',
+    )
+    monkeypatch.setattr(main, 'getClients', lambda: mockClients)
+
+    fakeRequest.is_json = True
+
+    def raiseJsonError():
+        raise ValueError('invalid json')
+
+    monkeypatch.setattr(fakeRequest, 'get_json', raiseJsonError)
+
+    responseBody, statusCode = main.productStatusUpdate('prod-123')
+
+    assert statusCode == 400
+    assert responseBody == {'error': 'Invalid JSON payload'}
+    assert statusAddRecorder == []
 
 def testFetchFileFirstUseSuccess(monkeypatch):
     metadata = {
