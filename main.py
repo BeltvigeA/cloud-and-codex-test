@@ -452,24 +452,9 @@ def uploadFile():
         bucket = storageClient.bucket(gcsBucketName)
         blob = bucket.blob(gcsObjectName)
 
-        finalGcsObjectName = gcsObjectName
-        gcsOriginalPath = None
-        if blob.exists(storageClient):
-            uniqueSuffix = uuid.uuid4().hex
-            finalGcsObjectName = (
-                f"{recipientId}/{productId}_{uniqueSuffix}_{normalizedFilename}"
-            )
-            gcsOriginalPath = gcsObjectName
-            logging.info(
-                'GCS object %s already exists. Using alternate path %s.',
-                gcsObjectName,
-                finalGcsObjectName,
-            )
-            blob = bucket.blob(finalGcsObjectName)
-
         blob.upload_from_file(upload)
         logging.info(
-            'File %s uploaded to gs://%s/%s', normalizedFilename, gcsBucketName, finalGcsObjectName
+            'File %s uploaded to gs://%s/%s', normalizedFilename, gcsBucketName, gcsObjectName
         )
 
         try:
@@ -489,7 +474,7 @@ def uploadFile():
         metadata = {
             'fileId': fileId,
             'originalFilename': normalizedFilename,
-            'gcsPath': finalGcsObjectName,
+            'gcsPath': gcsObjectName,
             'encryptedData': encryptedDataCipherText,
             'unencryptedData': unencryptedData,
             'recipientId': recipientId,
@@ -502,9 +487,6 @@ def uploadFile():
             'lastRequestTimestamp': None,
             'lastRequestFileName': normalizedFilename,
         }
-
-        if gcsOriginalPath:
-            metadata['gcsOriginalPath'] = gcsOriginalPath
 
         firestoreClient.collection(firestoreCollectionFiles).document(fileId).set(metadata)
         logging.info('Metadata for file %s stored in Firestore.', fileId)
