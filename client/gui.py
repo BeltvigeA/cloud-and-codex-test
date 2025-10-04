@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
 from pathlib import Path
@@ -33,70 +34,289 @@ class ListenerGuiApp:
         self.stopEvent: Optional[threading.Event] = None
         self.logFilePath: Optional[Path] = None
 
+        self.printerStoragePath = Path.home() / ".printmaster" / "printers.json"
+        self.printers: list[Dict[str, str]] = self._loadPrinters()
+        self.selectedPrinterIndex: Optional[int] = None
+
         self._buildLayout()
         self.root.after(200, self._processLogQueue)
 
     def _buildLayout(self) -> None:
         paddingOptions = {"padx": 8, "pady": 4}
 
-        mainFrame = ttk.Frame(self.root)
-        mainFrame.pack(fill=tk.BOTH, expand=True)
+        notebook = ttk.Notebook(self.root)
+        notebook.pack(fill=tk.BOTH, expand=True)
 
-        ttk.Label(mainFrame, text="Base URL:").grid(row=0, column=0, sticky=tk.W, **paddingOptions)
+        listenerFrame = ttk.Frame(notebook)
+        notebook.add(listenerFrame, text="Listener")
+        self._buildListenerTab(listenerFrame, paddingOptions)
+
+        printersFrame = ttk.Frame(notebook)
+        notebook.add(printersFrame, text="3D Printers")
+        self._buildPrintersTab(printersFrame)
+
+    def _buildListenerTab(self, parent: ttk.Frame, paddingOptions: Dict[str, int]) -> None:
+        ttk.Label(parent, text="Base URL:").grid(row=0, column=0, sticky=tk.W, **paddingOptions)
         self.baseUrlVar = tk.StringVar(value=defaultBaseUrl)
-        ttk.Entry(mainFrame, textvariable=self.baseUrlVar, width=50).grid(
+        ttk.Entry(parent, textvariable=self.baseUrlVar, width=50).grid(
             row=0, column=1, sticky=tk.EW, **paddingOptions
         )
 
-        ttk.Label(mainFrame, text="Channel (Recipient ID):").grid(
+        ttk.Label(parent, text="Channel (Recipient ID):").grid(
             row=1, column=0, sticky=tk.W, **paddingOptions
         )
         self.recipientVar = tk.StringVar()
-        ttk.Entry(mainFrame, textvariable=self.recipientVar, width=30).grid(
+        ttk.Entry(parent, textvariable=self.recipientVar, width=30).grid(
             row=1, column=1, sticky=tk.EW, **paddingOptions
         )
 
-        ttk.Label(mainFrame, text="Output Directory:").grid(
-            row=2, column=0, sticky=tk.W, **paddingOptions
-        )
+        ttk.Label(parent, text="Output Directory:").grid(row=2, column=0, sticky=tk.W, **paddingOptions)
         self.outputDirVar = tk.StringVar(value=str(defaultFilesDirectory))
-        outputDirFrame = ttk.Frame(mainFrame)
+        outputDirFrame = ttk.Frame(parent)
         outputDirFrame.grid(row=2, column=1, sticky=tk.EW, **paddingOptions)
         outputDirEntry = ttk.Entry(outputDirFrame, textvariable=self.outputDirVar, width=40)
         outputDirEntry.pack(side=tk.LEFT, fill=tk.X, expand=True)
         ttk.Button(outputDirFrame, text="Browse", command=self._chooseOutputDir).pack(side=tk.LEFT, padx=4)
 
-        ttk.Label(mainFrame, text="JSON Log File:").grid(row=3, column=0, sticky=tk.W, **paddingOptions)
+        ttk.Label(parent, text="JSON Log File:").grid(row=3, column=0, sticky=tk.W, **paddingOptions)
         self.logFileVar = tk.StringVar(
             value=str(Path.home() / ".printmaster" / "listener-log.json")
         )
-        logFileFrame = ttk.Frame(mainFrame)
+        logFileFrame = ttk.Frame(parent)
         logFileFrame.grid(row=3, column=1, sticky=tk.EW, **paddingOptions)
         logFileEntry = ttk.Entry(logFileFrame, textvariable=self.logFileVar, width=40)
         logFileEntry.pack(side=tk.LEFT, fill=tk.X, expand=True)
         ttk.Button(logFileFrame, text="Browse", command=self._chooseLogFile).pack(side=tk.LEFT, padx=4)
 
-        ttk.Label(mainFrame, text="Poll Interval (seconds):").grid(
-            row=4, column=0, sticky=tk.W, **paddingOptions
-        )
+        ttk.Label(parent, text="Poll Interval (seconds):").grid(row=4, column=0, sticky=tk.W, **paddingOptions)
         self.pollIntervalVar = tk.IntVar(value=30)
-        ttk.Spinbox(mainFrame, from_=5, to=3600, textvariable=self.pollIntervalVar).grid(
+        ttk.Spinbox(parent, from_=5, to=3600, textvariable=self.pollIntervalVar).grid(
             row=4, column=1, sticky=tk.W, **paddingOptions
         )
 
-        buttonFrame = ttk.Frame(mainFrame)
+        buttonFrame = ttk.Frame(parent)
         buttonFrame.grid(row=5, column=0, columnspan=2, pady=12)
         self.startButton = ttk.Button(buttonFrame, text="Start Listening", command=self.startListening)
         self.startButton.pack(side=tk.LEFT, padx=6)
         self.stopButton = ttk.Button(buttonFrame, text="Stop", command=self.stopListening, state=tk.DISABLED)
         self.stopButton.pack(side=tk.LEFT, padx=6)
 
-        ttk.Label(mainFrame, text="Event Log:").grid(row=6, column=0, sticky=tk.W, **paddingOptions)
-        self.logText = tk.Text(mainFrame, height=10, state=tk.DISABLED)
+        ttk.Label(parent, text="Event Log:").grid(row=6, column=0, sticky=tk.W, **paddingOptions)
+        self.logText = tk.Text(parent, height=10, state=tk.DISABLED)
         self.logText.grid(row=6, column=1, sticky=tk.NSEW, **paddingOptions)
 
-        mainFrame.columnconfigure(1, weight=1)
-        mainFrame.rowconfigure(6, weight=1)
+        parent.columnconfigure(1, weight=1)
+        parent.rowconfigure(6, weight=1)
+
+    def _buildPrintersTab(self, parent: ttk.Frame) -> None:
+        self.printerNicknameVar = tk.StringVar()
+        self.printerIpAddressVar = tk.StringVar()
+        self.printerAccessCodeVar = tk.StringVar()
+        self.printerSerialNumberVar = tk.StringVar()
+        self.printerBrandVar = tk.StringVar()
+        self.printerSearchVar = tk.StringVar()
+
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(2, weight=1)
+
+        searchFrame = ttk.Frame(parent)
+        searchFrame.grid(row=0, column=0, sticky=tk.EW, padx=8, pady=(8, 4))
+        ttk.Label(searchFrame, text="Search by Name or IP:").pack(side=tk.LEFT)
+        searchEntry = ttk.Entry(searchFrame, textvariable=self.printerSearchVar, width=30)
+        searchEntry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6)
+        ttk.Button(searchFrame, text="Clear", command=self._clearPrinterSearch).pack(side=tk.LEFT)
+        self.printerSearchVar.trace_add("write", lambda *_: self._refreshPrinterList())
+
+        formFrame = ttk.LabelFrame(parent, text="Printer Details")
+        formFrame.grid(row=1, column=0, sticky=tk.EW, padx=8, pady=4)
+        formFrame.columnconfigure(1, weight=1)
+
+        ttk.Label(formFrame, text="Nickname:").grid(row=0, column=0, sticky=tk.W, padx=6, pady=4)
+        ttk.Entry(formFrame, textvariable=self.printerNicknameVar).grid(
+            row=0, column=1, sticky=tk.EW, padx=6, pady=4
+        )
+
+        ttk.Label(formFrame, text="IP Address:").grid(row=1, column=0, sticky=tk.W, padx=6, pady=4)
+        ttk.Entry(formFrame, textvariable=self.printerIpAddressVar).grid(
+            row=1, column=1, sticky=tk.EW, padx=6, pady=4
+        )
+
+        ttk.Label(formFrame, text="Access Code:").grid(row=2, column=0, sticky=tk.W, padx=6, pady=4)
+        ttk.Entry(formFrame, textvariable=self.printerAccessCodeVar).grid(
+            row=2, column=1, sticky=tk.EW, padx=6, pady=4
+        )
+
+        ttk.Label(formFrame, text="Serial Number:").grid(row=3, column=0, sticky=tk.W, padx=6, pady=4)
+        ttk.Entry(formFrame, textvariable=self.printerSerialNumberVar).grid(
+            row=3, column=1, sticky=tk.EW, padx=6, pady=4
+        )
+
+        ttk.Label(formFrame, text="Brand:").grid(row=4, column=0, sticky=tk.W, padx=6, pady=4)
+        ttk.Entry(formFrame, textvariable=self.printerBrandVar).grid(
+            row=4, column=1, sticky=tk.EW, padx=6, pady=4
+        )
+
+        actionFrame = ttk.Frame(formFrame)
+        actionFrame.grid(row=5, column=0, columnspan=2, pady=6)
+        self.savePrinterButton = ttk.Button(actionFrame, text="Add Printer", command=self._handleSavePrinter)
+        self.savePrinterButton.pack(side=tk.LEFT, padx=4)
+        ttk.Button(actionFrame, text="Clear Selection", command=self._clearPrinterSelection).pack(
+            side=tk.LEFT, padx=4
+        )
+
+        treeFrame = ttk.Frame(parent)
+        treeFrame.grid(row=2, column=0, sticky=tk.NSEW, padx=8, pady=(4, 8))
+        columns = ("nickname", "ipAddress", "accessCode", "serialNumber", "brand")
+        self.printerTree = ttk.Treeview(treeFrame, columns=columns, show="headings", selectmode="browse")
+        self.printerTree.heading("nickname", text="Nickname")
+        self.printerTree.heading("ipAddress", text="IP Address")
+        self.printerTree.heading("accessCode", text="Access Code")
+        self.printerTree.heading("serialNumber", text="Serial Number")
+        self.printerTree.heading("brand", text="Brand")
+        self.printerTree.column("nickname", width=120)
+        self.printerTree.column("ipAddress", width=110)
+        self.printerTree.column("accessCode", width=110)
+        self.printerTree.column("serialNumber", width=120)
+        self.printerTree.column("brand", width=100)
+
+        scrollbar = ttk.Scrollbar(treeFrame, orient=tk.VERTICAL, command=self.printerTree.yview)
+        self.printerTree.configure(yscrollcommand=scrollbar.set)
+        self.printerTree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self.printerTree.bind("<<TreeviewSelect>>", self._onPrinterSelect)
+
+        self._refreshPrinterList()
+
+    def _loadPrinters(self) -> list[Dict[str, str]]:
+        try:
+            self.printerStoragePath.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as error:
+            logging.warning("Unable to prepare printer storage directory: %s", error)
+        if self.printerStoragePath.exists():
+            try:
+                with self.printerStoragePath.open("r", encoding="utf-8") as printerFile:
+                    loadedPrinters = json.load(printerFile)
+                if isinstance(loadedPrinters, list):
+                    sanitizedPrinters: list[Dict[str, str]] = []
+                    for entry in loadedPrinters:
+                        if isinstance(entry, dict):
+                            sanitizedPrinters.append(
+                                {
+                                    "nickname": str(entry.get("nickname", "")),
+                                    "ipAddress": str(entry.get("ipAddress", "")),
+                                    "accessCode": str(entry.get("accessCode", "")),
+                                    "serialNumber": str(entry.get("serialNumber", "")),
+                                    "brand": str(entry.get("brand", "")),
+                                }
+                            )
+                    return sanitizedPrinters
+            except (OSError, json.JSONDecodeError) as error:
+                logging.warning("Unable to load printers from %s: %s", self.printerStoragePath, error)
+        return []
+
+    def _savePrinters(self) -> None:
+        try:
+            self.printerStoragePath.parent.mkdir(parents=True, exist_ok=True)
+            with self.printerStoragePath.open("w", encoding="utf-8") as printerFile:
+                json.dump(self.printers, printerFile, ensure_ascii=False, indent=2)
+        except OSError as error:
+            logging.exception("Failed to save printers: %s", error)
+            messagebox.showerror("Printer Storage", f"Unable to save printers: {error}")
+
+    def _refreshPrinterList(self) -> None:
+        if not hasattr(self, "printerTree"):
+            return
+        for itemId in self.printerTree.get_children():
+            self.printerTree.delete(itemId)
+        searchTerm = self.printerSearchVar.get().strip().lower()
+        visibleIds: list[str] = []
+        for index, printer in enumerate(self.printers):
+            nickname = printer.get("nickname", "")
+            ipAddress = printer.get("ipAddress", "")
+            if searchTerm and searchTerm not in nickname.lower() and searchTerm not in ipAddress.lower():
+                continue
+            itemId = str(index)
+            visibleIds.append(itemId)
+            self.printerTree.insert(
+                "",
+                tk.END,
+                iid=itemId,
+                values=(
+                    nickname,
+                    ipAddress,
+                    printer.get("accessCode", ""),
+                    printer.get("serialNumber", ""),
+                    printer.get("brand", ""),
+                ),
+            )
+        if self.selectedPrinterIndex is not None:
+            selectedId = str(self.selectedPrinterIndex)
+            if selectedId in visibleIds:
+                self.printerTree.selection_set(selectedId)
+            else:
+                self._clearPrinterSelection()
+
+    def _clearPrinterSearch(self) -> None:
+        self.printerSearchVar.set("")
+
+    def _handleSavePrinter(self) -> None:
+        nickname = self.printerNicknameVar.get().strip()
+        ipAddress = self.printerIpAddressVar.get().strip()
+        accessCode = self.printerAccessCodeVar.get().strip()
+        serialNumber = self.printerSerialNumberVar.get().strip()
+        brand = self.printerBrandVar.get().strip()
+
+        if not nickname or not ipAddress:
+            messagebox.showerror("Printer Details", "Nickname and IP address are required.")
+            return
+
+        printerDetails = {
+            "nickname": nickname,
+            "ipAddress": ipAddress,
+            "accessCode": accessCode,
+            "serialNumber": serialNumber,
+            "brand": brand,
+        }
+
+        if self.selectedPrinterIndex is not None:
+            self.printers[self.selectedPrinterIndex] = printerDetails
+        else:
+            self.printers.append(printerDetails)
+        self._savePrinters()
+        self._refreshPrinterList()
+        self._clearPrinterSelection()
+
+    def _clearPrinterSelection(self) -> None:
+        if hasattr(self, "printerTree"):
+            self.printerTree.selection_remove(self.printerTree.selection())
+        self.selectedPrinterIndex = None
+        self.printerNicknameVar.set("")
+        self.printerIpAddressVar.set("")
+        self.printerAccessCodeVar.set("")
+        self.printerSerialNumberVar.set("")
+        self.printerBrandVar.set("")
+        self.savePrinterButton.config(text="Add Printer")
+
+    def _onPrinterSelect(self, _event: tk.Event) -> None:
+        selection = self.printerTree.selection()
+        if not selection:
+            return
+        selectedId = selection[0]
+        try:
+            self.selectedPrinterIndex = int(selectedId)
+        except ValueError:
+            self.selectedPrinterIndex = None
+            return
+        if self.selectedPrinterIndex is None or self.selectedPrinterIndex >= len(self.printers):
+            return
+        printer = self.printers[self.selectedPrinterIndex]
+        self.printerNicknameVar.set(printer.get("nickname", ""))
+        self.printerIpAddressVar.set(printer.get("ipAddress", ""))
+        self.printerAccessCodeVar.set(printer.get("accessCode", ""))
+        self.printerSerialNumberVar.set(printer.get("serialNumber", ""))
+        self.printerBrandVar.set(printer.get("brand", ""))
+        self.savePrinterButton.config(text="Update Printer")
 
     def _chooseOutputDir(self) -> None:
         selectedDir = filedialog.askdirectory(title="Select Output Directory")
