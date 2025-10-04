@@ -22,172 +22,6 @@ from .client import (
 )
 
 
-class PrinterWizard(tk.Toplevel):
-    def __init__(
-        self,
-        parent: tk.Misc,
-        initialDetails: Optional[Dict[str, str]] = None,
-    ) -> None:
-        super().__init__(parent)
-        self.title("Printer Wizard")
-        self.transient(parent)
-        self.grab_set()
-        self.resizable(False, False)
-        self.protocol("WM_DELETE_WINDOW", self._onCancel)
-
-        details = initialDetails or {}
-        self.nicknameVar = tk.StringVar(value=details.get("nickname", ""))
-        self.brandVar = tk.StringVar(value=details.get("brand", ""))
-        self.ipAddressVar = tk.StringVar(value=details.get("ipAddress", ""))
-        self.accessCodeVar = tk.StringVar(value=details.get("accessCode", ""))
-        self.serialNumberVar = tk.StringVar(value=details.get("serialNumber", ""))
-
-        self.result: Optional[Dict[str, str]] = None
-        self.currentStep = 0
-
-        container = ttk.Frame(self)
-        container.pack(fill=tk.BOTH, expand=True, padx=16, pady=16)
-
-        self.stepTitleVar = tk.StringVar()
-        ttk.Label(container, textvariable=self.stepTitleVar, font=("TkDefaultFont", 12, "bold")).pack(
-            anchor=tk.W, pady=(0, 8)
-        )
-
-        self.stepFrames: list[ttk.Frame] = []
-        self.stepTitles = [
-            "Basic Information",
-            "Connection Details",
-            "Optional Extras",
-        ]
-
-        self._buildBasicStep(container)
-        self._buildConnectionStep(container)
-        self._buildExtrasStep(container)
-
-        self.navigationFrame = ttk.Frame(self)
-        self.navigationFrame.pack(fill=tk.X, padx=16, pady=(0, 16))
-
-        self.backButton = ttk.Button(self.navigationFrame, text="Back", command=self._onBack)
-        self.backButton.pack(side=tk.LEFT)
-
-        self.nextButton = ttk.Button(self.navigationFrame, text="Next", command=self._onNext)
-        self.nextButton.pack(side=tk.LEFT, padx=8)
-
-        self.finishButton = ttk.Button(
-            self.navigationFrame,
-            text="Finish",
-            command=self._onFinish,
-        )
-        self.finishButton.pack(side=tk.LEFT)
-
-        ttk.Button(self.navigationFrame, text="Cancel", command=self._onCancel).pack(side=tk.RIGHT)
-
-        self._showStep(0)
-        self.focus_set()
-
-    def _buildBasicStep(self, container: ttk.Frame) -> None:
-        frame = ttk.Frame(container)
-        ttk.Label(frame, text="Nickname:").grid(row=0, column=0, sticky=tk.W, pady=4)
-        self.nicknameEntry = ttk.Entry(frame, textvariable=self.nicknameVar, width=32)
-        self.nicknameEntry.grid(row=0, column=1, sticky=tk.EW, pady=4)
-
-        ttk.Label(frame, text="Brand:").grid(row=1, column=0, sticky=tk.W, pady=4)
-        ttk.Entry(frame, textvariable=self.brandVar, width=32).grid(row=1, column=1, sticky=tk.EW, pady=4)
-
-        frame.columnconfigure(1, weight=1)
-        self.stepFrames.append(frame)
-
-    def _buildConnectionStep(self, container: ttk.Frame) -> None:
-        frame = ttk.Frame(container)
-        ttk.Label(frame, text="IP Address:").grid(row=0, column=0, sticky=tk.W, pady=4)
-        self.ipAddressEntry = ttk.Entry(frame, textvariable=self.ipAddressVar, width=32)
-        self.ipAddressEntry.grid(row=0, column=1, sticky=tk.EW, pady=4)
-
-        ttk.Label(frame, text="Access Code:").grid(row=1, column=0, sticky=tk.W, pady=4)
-        ttk.Entry(frame, textvariable=self.accessCodeVar, width=32).grid(row=1, column=1, sticky=tk.EW, pady=4)
-
-        frame.columnconfigure(1, weight=1)
-        self.stepFrames.append(frame)
-
-    def _buildExtrasStep(self, container: ttk.Frame) -> None:
-        frame = ttk.Frame(container)
-        ttk.Label(frame, text="Serial Number:").grid(row=0, column=0, sticky=tk.W, pady=4)
-        ttk.Entry(frame, textvariable=self.serialNumberVar, width=32).grid(
-            row=0,
-            column=1,
-            sticky=tk.EW,
-            pady=4,
-        )
-
-        frame.columnconfigure(1, weight=1)
-        self.stepFrames.append(frame)
-
-    def _showStep(self, index: int) -> None:
-        index = max(0, min(index, len(self.stepFrames) - 1))
-        for frame in self.stepFrames:
-            frame.pack_forget()
-        self.stepFrames[index].pack(fill=tk.BOTH, expand=True)
-        self.stepTitleVar.set(self.stepTitles[index])
-        self.currentStep = index
-
-        self.backButton.config(state=tk.NORMAL if index > 0 else tk.DISABLED)
-        if index >= len(self.stepFrames) - 1:
-            self.nextButton.config(state=tk.DISABLED)
-            self.finishButton.config(state=tk.NORMAL)
-        else:
-            self.nextButton.config(state=tk.NORMAL)
-            self.finishButton.config(state=tk.DISABLED)
-
-        if index == 0:
-            self.nicknameEntry.focus_set()
-        elif index == 1:
-            self.ipAddressEntry.focus_set()
-
-    def _onBack(self) -> None:
-        self._showStep(self.currentStep - 1)
-
-    def _onNext(self) -> None:
-        self._showStep(self.currentStep + 1)
-
-    def _collectResult(self) -> Optional[Dict[str, str]]:
-        nickname = self.nicknameVar.get().strip()
-        if not nickname:
-            messagebox.showerror("Printer Wizard", "Nickname is required.")
-            self._showStep(0)
-            self.nicknameEntry.focus_set()
-            return None
-
-        ipAddress = self.ipAddressVar.get().strip()
-        if not ipAddress:
-            messagebox.showerror("Printer Wizard", "IP address is required.")
-            self._showStep(1)
-            self.ipAddressEntry.focus_set()
-            return None
-
-        return {
-            "nickname": nickname,
-            "ipAddress": ipAddress,
-            "accessCode": self.accessCodeVar.get().strip(),
-            "serialNumber": self.serialNumberVar.get().strip(),
-            "brand": self.brandVar.get().strip(),
-        }
-
-    def _onFinish(self) -> None:
-        result = self._collectResult()
-        if result is None:
-            return
-        self.result = result
-        self.destroy()
-
-    def _onCancel(self) -> None:
-        self.result = None
-        self.destroy()
-
-    def show(self) -> Optional[Dict[str, str]]:
-        self.wait_window()
-        return self.result
-
-
 class ListenerGuiApp:
     def __init__(self) -> None:
         configureLogging()
@@ -324,11 +158,7 @@ class ListenerGuiApp:
 
         actionFrame = ttk.Frame(formFrame)
         actionFrame.grid(row=5, column=0, columnspan=2, pady=6)
-        self.savePrinterButton = ttk.Button(
-            actionFrame,
-            text="Add Printer",
-            command=self._openPrinterWizard,
-        )
+        self.savePrinterButton = ttk.Button(actionFrame, text="Add Printer", command=self._handleSavePrinter)
         self.savePrinterButton.pack(side=tk.LEFT, padx=4)
         ttk.Button(actionFrame, text="Clear Selection", command=self._clearPrinterSelection).pack(
             side=tk.LEFT, padx=4
@@ -430,58 +260,32 @@ class ListenerGuiApp:
     def _clearPrinterSearch(self) -> None:
         self.printerSearchVar.set("")
 
-    def _openPrinterWizard(self) -> None:
-        initialDetails = {
-            "nickname": self.printerNicknameVar.get().strip(),
-            "ipAddress": self.printerIpAddressVar.get().strip(),
-            "accessCode": self.printerAccessCodeVar.get().strip(),
-            "serialNumber": self.printerSerialNumberVar.get().strip(),
-            "brand": self.printerBrandVar.get().strip(),
+    def _handleSavePrinter(self) -> None:
+        nickname = self.printerNicknameVar.get().strip()
+        ipAddress = self.printerIpAddressVar.get().strip()
+        accessCode = self.printerAccessCodeVar.get().strip()
+        serialNumber = self.printerSerialNumberVar.get().strip()
+        brand = self.printerBrandVar.get().strip()
+
+        if not nickname or not ipAddress:
+            messagebox.showerror("Printer Details", "Nickname and IP address are required.")
+            return
+
+        printerDetails = {
+            "nickname": nickname,
+            "ipAddress": ipAddress,
+            "accessCode": accessCode,
+            "serialNumber": serialNumber,
+            "brand": brand,
         }
 
-        if (
-            self.selectedPrinterIndex is not None
-            and 0 <= self.selectedPrinterIndex < len(self.printers)
-        ):
-            storedDetails = self.printers[self.selectedPrinterIndex]
-            for key, value in storedDetails.items():
-                if not initialDetails.get(key):
-                    initialDetails[key] = value
-
-        wizard = PrinterWizard(self.root, initialDetails)
-        printerDetails = wizard.show()
-        if printerDetails:
-            self._savePrinterDetails(printerDetails)
-
-    def _savePrinterDetails(self, printerDetails: Dict[str, str]) -> None:
-        isEditing = (
-            self.selectedPrinterIndex is not None
-            and 0 <= self.selectedPrinterIndex < len(self.printers)
-        )
-
-        if isEditing and self.selectedPrinterIndex is not None:
+        if self.selectedPrinterIndex is not None:
             self.printers[self.selectedPrinterIndex] = printerDetails
         else:
             self.printers.append(printerDetails)
-
         self._savePrinters()
         self._refreshPrinterList()
-
-        if isEditing and self.selectedPrinterIndex is not None:
-            self.printerNicknameVar.set(printerDetails.get("nickname", ""))
-            self.printerIpAddressVar.set(printerDetails.get("ipAddress", ""))
-            self.printerAccessCodeVar.set(printerDetails.get("accessCode", ""))
-            self.printerSerialNumberVar.set(printerDetails.get("serialNumber", ""))
-            self.printerBrandVar.set(printerDetails.get("brand", ""))
-            self.savePrinterButton.config(text="Update Printer")
-            if hasattr(self, "printerTree"):
-                itemId = str(self.selectedPrinterIndex)
-                if self.printerTree.exists(itemId):
-                    self.printerTree.selection_set(itemId)
-                    self.printerTree.focus(itemId)
-                    self.printerTree.see(itemId)
-        else:
-            self._clearPrinterSelection()
+        self._clearPrinterSelection()
 
     def _clearPrinterSelection(self) -> None:
         if hasattr(self, "printerTree"):
