@@ -668,7 +668,7 @@ class ListenerGuiApp:
             _userdata: Any,
             _flags: Dict[str, Any],
             reasonCode: Any,
-            _properties: Optional[Any] = None,
+            *extraArgs: Any,
         ) -> None:
             isFailure = False
             if getattr(reasonCode, "is_failure", None):
