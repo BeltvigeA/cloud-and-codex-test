@@ -668,9 +668,15 @@ class ListenerGuiApp:
             _userdata: Any,
             _flags: Dict[str, Any],
             reasonCode: Any,
-            _properties: Any,
+            _properties: Optional[Any] = None,
         ) -> None:
-            if getattr(reasonCode, "is_failure", False):
+            isFailure = False
+            if getattr(reasonCode, "is_failure", None):
+                isFailure = bool(reasonCode.is_failure)
+            elif isinstance(reasonCode, int):
+                isFailure = reasonCode != 0
+
+            if isFailure:
                 receivedTelemetry["status"] = "Offline"
                 telemetryEvent.set()
                 return
