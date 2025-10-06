@@ -902,6 +902,33 @@ def performFetch(
     }
 
     if normalizedMode == "metadata":
+        cachedSavedFile: Optional[Path] = None
+        existingRecord: Optional[Dict[str, Any]] = None
+        if database and productId:
+            try:
+                existingRecord = database.findProductById(productId)
+            except Exception as error:
+                logging.warning(
+                    "Unable to load existing product record for %s: %s",
+                    productId,
+                    error,
+                )
+            if existingRecord:
+                cachedPathValue = existingRecord.get("downloadedFilePath")
+                if (
+                    existingRecord.get("downloaded")
+                    and isinstance(cachedPathValue, str)
+                    and cachedPathValue
+                ):
+                    candidatePath = Path(cachedPathValue).expanduser()
+                    if candidatePath.exists():
+                        cachedSavedFile = candidatePath.resolve()
+                        result["savedFile"] = str(cachedSavedFile)
+                        logging.info(
+                            "Reusing cached download for product %s at %s",
+                            productId,
+                            cachedSavedFile,
+                        )
         if database and productId:
             updatedRecord = database.upsertProductRecord(
                 productId,
@@ -911,6 +938,19 @@ def performFetch(
                 printJobId=printJobId,
             )
             result["productRecord"] = updatedRecord
+            if not result.get("savedFile"):
+                cachedPathValue = updatedRecord.get("downloadedFilePath")
+                if (
+                    updatedRecord.get("downloaded")
+                    and isinstance(cachedPathValue, str)
+                    and cachedPathValue
+                ):
+                    candidatePath = Path(cachedPathValue).expanduser()
+                    if candidatePath.exists():
+                        cachedSavedFile = candidatePath.resolve()
+                        result["savedFile"] = str(cachedSavedFile)
+        if cachedSavedFile and not result.get("fileName"):
+            result["fileName"] = cachedSavedFile.name
         logging.info("Metadata retrieved for product %s without downloading file.", productId)
         return result
 
