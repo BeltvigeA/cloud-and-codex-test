@@ -203,6 +203,16 @@ def interpretInteger(value: Any) -> Optional[int]:
     return None
 
 
+def normalizeTextValue(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        candidate = value.strip()
+    else:
+        candidate = str(value).strip()
+    return candidate or None
+
+
 def normalizePrinterDetails(details: Dict[str, Any]) -> Dict[str, Any]:
     normalized: Dict[str, Any] = {}
     for rawKey, rawValue in details.items():
@@ -210,17 +220,29 @@ def normalizePrinterDetails(details: Dict[str, Any]) -> Dict[str, Any]:
             continue
         key = rawKey.replace("-", "").replace("_", "").lower()
         if key in {"brand", "printerbrand"}:
-            normalized["brand"] = str(rawValue)
+            brandValue = normalizeTextValue(rawValue)
+            if brandValue is not None:
+                normalized["brand"] = brandValue
         elif key in {"serial", "serialnumber", "printersn", "printerserial", "serialno"}:
-            normalized["serialNumber"] = str(rawValue)
+            serialValue = normalizeTextValue(rawValue)
+            if serialValue is not None:
+                normalized["serialNumber"] = serialValue
         elif key in {"ip", "ipaddress", "printerip", "host", "hostname"}:
-            normalized["ipAddress"] = str(rawValue)
+            ipValue = normalizeTextValue(rawValue)
+            if ipValue is not None:
+                normalized["ipAddress"] = ipValue
         elif key in {"accesscode", "lanaccesscode", "password"}:
-            normalized["accessCode"] = str(rawValue)
+            accessValue = normalizeTextValue(rawValue)
+            if accessValue is not None:
+                normalized["accessCode"] = accessValue
         elif key in {"nickname", "printername", "name", "label"}:
-            normalized["nickname"] = str(rawValue)
+            nicknameValue = normalizeTextValue(rawValue)
+            if nicknameValue is not None:
+                normalized["nickname"] = nicknameValue
         elif key in {"printerid", "printeridentifier"}:
-            normalized.setdefault("nickname", str(rawValue))
+            nicknameValue = normalizeTextValue(rawValue)
+            if nicknameValue is not None:
+                normalized.setdefault("nickname", nicknameValue)
         elif key == "useams":
             interpreted = interpretBoolean(rawValue)
             if interpreted is not None:
