@@ -644,6 +644,25 @@ class ListenerGuiApp:
         if callbackApiVersion is not None:
             clientKwargs["callback_api_version"] = callbackApiVersion.VERSION2  # type: ignore[attr-defined]
 
+        telemetryLock = threading.Lock()
+
+        def mergeTelemetry(update: Dict[str, Any]) -> bool:
+            significantKeys = {"progressPercent", "remainingTimeSeconds", "nozzleTemp", "bedTemp", "gcodeState"}
+            hasChange = False
+            hasDetails = False
+            with telemetryLock:
+                for key, value in update.items():
+                    if key not in ("status", *significantKeys):
+                        continue
+                    if key != "status" and value is not None:
+                        hasDetails = True
+                    if receivedTelemetry.get(key) != value:
+                        receivedTelemetry[key] = value
+                        hasChange = True
+            if hasChange and (hasDetails or receivedTelemetry.get("status")):
+                return True
+            return False
+
         def onConnect(
             client: mqtt.Client,  # type: ignore[name-defined]
             _userdata: Any,
@@ -656,11 +675,16 @@ class ListenerGuiApp:
                 telemetryEvent.set()
                 return
             client.subscribe(topicReport, qos=1)
-            client.publish(
-                topicRequest,
-                json.dumps({"pushed": {"command": "get_status"}}),
-                qos=1,
-            )
+            commandsToSend = [
+                {"pushed": {"command": "get_status"}},
+                {"pushed": {"command": "pushall"}},
+                {"print": {"command": "getstate"}},
+            ]
+            for command in commandsToSend:
+                try:
+                    client.publish(topicRequest, json.dumps(command), qos=1)
+                except Exception:  # noqa: BLE001 - telemetry is best-effort
+                    continue
 
         def onMessage(
             _client: mqtt.Client,  # type: ignore[name-defined]
@@ -694,8 +718,8 @@ class ListenerGuiApp:
                 "nozzle_temper": findKey(payload, "nozzle_temper"),
                 "bed_temper": findKey(payload, "bed_temper"),
             }
-            receivedTelemetry.update(self._interpretBambuStatus(statusPayload))
-            telemetryEvent.set()
+            if mergeTelemetry(self._interpretBambuStatus(statusPayload)):
+                telemetryEvent.set()
 
         client = mqtt.Client(**clientKwargs)  # type: ignore[name-defined]
         client.username_pw_set("bblp", accessCode)
@@ -704,11 +728,14 @@ class ListenerGuiApp:
         client.on_connect = onConnect
         client.on_message = onMessage
 
-        client.connect(ipAddress, 8883, keepalive=30)
         client.loop_start()
-        telemetryEvent.wait(timeoutSeconds)
-        client.loop_stop()
-        client.disconnect()
+        try:
+            client.connect(ipAddress, 8883, keepalive=30)
+            telemetryEvent.wait(timeoutSeconds)
+        finally:
+            client.loop_stop()
+            with contextlib.suppress(Exception):
+                client.disconnect()
 
         return receivedTelemetry
 
