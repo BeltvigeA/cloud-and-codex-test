@@ -6,9 +6,10 @@ import contextlib
 import json
 import logging
 import socket
+import ssl
 import threading
 from pathlib import Path
-from queue import Queue, Empty
+from queue import Empty, Queue
 from typing import Any, Callable, Dict, Optional
 
 import tkinter as tk
@@ -22,6 +23,11 @@ from .client import (
     ensureOutputDirectory,
     listenForFiles,
 )
+
+try:  # pragma: no cover - optional dependency in some test environments
+    import paho.mqtt.client as mqtt  # type: ignore
+except ImportError:  # pragma: no cover - gracefully handled when MQTT is unavailable
+    mqtt = None  # type: ignore
 
 
 class ListenerGuiApp:
@@ -37,7 +43,7 @@ class ListenerGuiApp:
         self.logFilePath: Optional[Path] = None
 
         self.printerStoragePath = Path.home() / ".printmaster" / "printers.json"
-        self.printers: list[Dict[str, str]] = self._loadPrinters()
+        self.printers: list[Dict[str, Any]] = self._loadPrinters()
         self.printerStatusQueue: "Queue[tuple[str, Any]]" = Queue()
         self.statusRefreshThread: Optional[threading.Thread] = None
         self.statusRefreshIntervalMs = 60_000
@@ -165,7 +171,17 @@ class ListenerGuiApp:
 
         treeFrame = ttk.Frame(parent)
         treeFrame.grid(row=2, column=0, sticky=tk.NSEW, padx=8, pady=(4, 8))
-        columns = ("nickname", "ipAddress", "accessCode", "serialNumber", "brand", "status")
+        columns = (
+            "nickname",
+            "ipAddress",
+            "accessCode",
+            "serialNumber",
+            "brand",
+            "status",
+            "nozzleTemp",
+            "bedTemp",
+            "progress",
+        )
         self.printerTree = ttk.Treeview(treeFrame, columns=columns, show="headings", selectmode="browse")
         self.printerTree.heading("nickname", text="Nickname")
         self.printerTree.heading("ipAddress", text="IP Address")
@@ -173,12 +189,18 @@ class ListenerGuiApp:
         self.printerTree.heading("serialNumber", text="Serial Number")
         self.printerTree.heading("brand", text="Brand")
         self.printerTree.heading("status", text="Status")
+        self.printerTree.heading("nozzleTemp", text="Nozzle Temp")
+        self.printerTree.heading("bedTemp", text="Bed Temp")
+        self.printerTree.heading("progress", text="Progress")
         self.printerTree.column("nickname", width=120)
         self.printerTree.column("ipAddress", width=110)
         self.printerTree.column("accessCode", width=110)
         self.printerTree.column("serialNumber", width=120)
         self.printerTree.column("brand", width=100)
         self.printerTree.column("status", width=100)
+        self.printerTree.column("nozzleTemp", width=110)
+        self.printerTree.column("bedTemp", width=100)
+        self.printerTree.column("progress", width=140)
 
         scrollbar = ttk.Scrollbar(treeFrame, orient=tk.VERTICAL, command=self.printerTree.yview)
         self.printerTree.configure(yscrollcommand=scrollbar.set)
@@ -188,7 +210,7 @@ class ListenerGuiApp:
 
         self._refreshPrinterList()
 
-    def _loadPrinters(self) -> list[Dict[str, str]]:
+    def _loadPrinters(self) -> list[Dict[str, Any]]:
         try:
             self.printerStoragePath.parent.mkdir(parents=True, exist_ok=True)
         except OSError as error:
@@ -198,10 +220,12 @@ class ListenerGuiApp:
                 with self.printerStoragePath.open("r", encoding="utf-8") as printerFile:
                     loadedPrinters = json.load(printerFile)
                 if isinstance(loadedPrinters, list):
-                    sanitizedPrinters: list[Dict[str, str]] = []
+                    sanitizedPrinters: list[Dict[str, Any]] = []
                     for entry in loadedPrinters:
-                        if isinstance(entry, dict):
-                            sanitizedPrinters.append(
+                        if not isinstance(entry, dict):
+                            continue
+                        sanitizedPrinters.append(
+                            self._applyTelemetryDefaults(
                                 {
                                     "nickname": str(entry.get("nickname", "")),
                                     "ipAddress": str(entry.get("ipAddress", "")),
@@ -209,12 +233,117 @@ class ListenerGuiApp:
                                     "serialNumber": str(entry.get("serialNumber", "")),
                                     "brand": str(entry.get("brand", "")),
                                     "status": str(entry.get("status", "")) or "Unknown",
+                                    "nozzleTemp": self._parseOptionalFloat(entry.get("nozzleTemp")),
+                                    "bedTemp": self._parseOptionalFloat(entry.get("bedTemp")),
+                                    "progressPercent": self._parseOptionalFloat(entry.get("progressPercent")),
+                                    "remainingTimeSeconds": self._parseOptionalInt(entry.get("remainingTimeSeconds")),
+                                    "gcodeState": self._parseOptionalString(entry.get("gcodeState")),
                                 }
                             )
+                        )
                     return sanitizedPrinters
             except (OSError, json.JSONDecodeError) as error:
                 logging.warning("Unable to load printers from %s: %s", self.printerStoragePath, error)
         return []
+
+    def _parseOptionalFloat(self, value: Any) -> Optional[float]:
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return float(value)
+        if isinstance(value, str):
+            candidate = value.strip().replace("°C", "")
+            if candidate:
+                try:
+                    return float(candidate)
+                except ValueError:
+                    return None
+        return None
+
+    def _parseOptionalInt(self, value: Any) -> Optional[int]:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float):
+            return int(value)
+        if isinstance(value, str):
+            candidate = (
+                value.strip()
+                .lower()
+                .replace("seconds", "")
+                .replace("second", "")
+                .replace("minutes", "")
+                .replace("minute", "")
+                .replace("hrs", "")
+                .replace("hr", "")
+                .replace("hours", "")
+                .replace("hour", "")
+                .replace("s", "")
+                .replace("m", "")
+                .replace("h", "")
+            )
+            candidate = candidate.strip()
+            if candidate:
+                try:
+                    return int(float(candidate))
+                except ValueError:
+                    return None
+        return None
+
+    def _parseOptionalString(self, value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            stripped = value.strip()
+            return stripped or None
+        return str(value)
+
+    def _applyTelemetryDefaults(self, printerDetails: Dict[str, Any]) -> Dict[str, Any]:
+        printerDetails["status"] = str(printerDetails.get("status", "")) or "Unknown"
+        printerDetails["nozzleTemp"] = self._parseOptionalFloat(printerDetails.get("nozzleTemp"))
+        printerDetails["bedTemp"] = self._parseOptionalFloat(printerDetails.get("bedTemp"))
+        printerDetails["progressPercent"] = self._parseOptionalFloat(printerDetails.get("progressPercent"))
+        printerDetails["remainingTimeSeconds"] = self._parseOptionalInt(
+            printerDetails.get("remainingTimeSeconds")
+        )
+        printerDetails["gcodeState"] = self._parseOptionalString(printerDetails.get("gcodeState"))
+        return printerDetails
+
+    def _formatTemperature(self, value: Optional[float]) -> str:
+        if value is None:
+            return "-"
+        return f"{value:.1f}°C"
+
+    def _formatDuration(self, seconds: int) -> str:
+        if seconds < 0:
+            return "-"
+        minutes, remainingSeconds = divmod(seconds, 60)
+        hours, minutes = divmod(minutes, 60)
+        segments: list[str] = []
+        if hours:
+            segments.append(f"{hours}h")
+        if minutes:
+            segments.append(f"{minutes}m")
+        if remainingSeconds and not hours:
+            segments.append(f"{remainingSeconds}s")
+        return " ".join(segments) if segments else "0s"
+
+    def _formatProgress(
+        self,
+        percent: Optional[float],
+        remainingSeconds: Optional[int],
+        state: Optional[str],
+    ) -> str:
+        if percent is None and remainingSeconds is None and not state:
+            return "-"
+        parts: list[str] = []
+        if percent is not None:
+            parts.append(f"{percent:.0f}%")
+        if remainingSeconds is not None:
+            parts.append(self._formatDuration(max(0, remainingSeconds)))
+        if state:
+            normalizedState = state.title() if state.isupper() else state
+            parts.append(normalizedState)
+        return " | ".join(parts)
 
     def _savePrinters(self) -> None:
         try:
@@ -236,6 +365,13 @@ class ListenerGuiApp:
             ipAddress = printer.get("ipAddress", "")
             if searchTerm and searchTerm not in nickname.lower() and searchTerm not in ipAddress.lower():
                 continue
+            nozzleTempDisplay = self._formatTemperature(self._parseOptionalFloat(printer.get("nozzleTemp")))
+            bedTempDisplay = self._formatTemperature(self._parseOptionalFloat(printer.get("bedTemp")))
+            progressDisplay = self._formatProgress(
+                self._parseOptionalFloat(printer.get("progressPercent")),
+                self._parseOptionalInt(printer.get("remainingTimeSeconds")),
+                self._parseOptionalString(printer.get("gcodeState")),
+            )
             self.printerTree.insert(
                 "",
                 tk.END,
@@ -247,6 +383,9 @@ class ListenerGuiApp:
                     printer.get("serialNumber", ""),
                     printer.get("brand", ""),
                     printer.get("status", "Unknown"),
+                    nozzleTempDisplay,
+                    bedTempDisplay,
+                    progressDisplay,
                 ),
             )
         self._onPrinterSelection(None)
@@ -275,8 +414,8 @@ class ListenerGuiApp:
         self,
         *,
         title: str,
-        initialValues: Optional[Dict[str, str]],
-        onSave: Callable[[Dict[str, str]], None],
+        initialValues: Optional[Dict[str, Any]],
+        onSave: Callable[[Dict[str, Any]], None],
     ) -> None:
         dialog = tk.Toplevel(self.root)
         dialog.title(title)
@@ -355,7 +494,7 @@ class ListenerGuiApp:
         serialNumberVar: tk.StringVar,
         brandVar: tk.StringVar,
         statusVar: tk.StringVar,
-        onSave: Callable[[Dict[str, str]], None],
+        onSave: Callable[[Dict[str, Any]], None],
     ) -> None:
         nickname = nicknameVar.get().strip()
         ipAddress = ipAddressVar.get().strip()
@@ -382,17 +521,19 @@ class ListenerGuiApp:
             "status": status,
         }
 
-        onSave(printerDetails)
+        onSave(self._applyTelemetryDefaults(printerDetails))
         dialog.destroy()
 
-    def _handleCreatePrinter(self, printerDetails: Dict[str, str]) -> None:
-        self.printers.append(printerDetails)
+    def _handleCreatePrinter(self, printerDetails: Dict[str, Any]) -> None:
+        self.printers.append(self._applyTelemetryDefaults(dict(printerDetails)))
         self._savePrinters()
         self._refreshPrinterList()
         self._scheduleStatusRefresh(0)
 
-    def _handleUpdatePrinter(self, index: int, printerDetails: Dict[str, str]) -> None:
-        self.printers[index] = printerDetails
+    def _handleUpdatePrinter(self, index: int, printerDetails: Dict[str, Any]) -> None:
+        existing = dict(self.printers[index]) if 0 <= index < len(self.printers) else {}
+        existing.update(printerDetails)
+        self.printers[index] = self._applyTelemetryDefaults(existing)
         self._savePrinters()
         self._refreshPrinterList()
         self._scheduleStatusRefresh(0)
@@ -427,39 +568,232 @@ class ListenerGuiApp:
         worker.start()
 
     def _refreshPrinterStatusesWorker(self) -> None:
-        updates: list[tuple[int, str]] = []
+        updates: list[Dict[str, Any]] = []
         printersSnapshot = list(enumerate(list(self.printers)))
         for index, printer in printersSnapshot:
-            ipAddress = printer.get("ipAddress", "").strip()
+            ipAddress = str(printer.get("ipAddress", "")).strip()
             if not ipAddress:
                 continue
-            detectedStatus = self._probePrinterStatus(ipAddress)
-            currentStatus = printer.get("status", "Unknown") or "Unknown"
-            if detectedStatus != currentStatus:
-                logging.info(
-                    "Printer %s status changed from %s to %s",
-                    ipAddress,
-                    currentStatus,
-                    detectedStatus,
-                )
-                updates.append((index, detectedStatus))
+            telemetry = self._collectPrinterTelemetry(printer)
+            if not telemetry:
+                continue
+            pendingChanges: Dict[str, Any] = {}
+            currentDetails = self.printers[index] if 0 <= index < len(self.printers) else {}
+            for key, value in telemetry.items():
+                if currentDetails.get(key) != value:
+                    pendingChanges[key] = value
+            if pendingChanges:
+                if "status" in pendingChanges:
+                    logging.info(
+                        "Printer %s status changed from %s to %s",
+                        ipAddress,
+                        currentDetails.get("status", "Unknown"),
+                        pendingChanges["status"],
+                    )
+                updates.append({"index": index, "changes": pendingChanges})
         if updates:
             self.printerStatusQueue.put(("updates", updates))
         self.printerStatusQueue.put(("complete", None))
+
+    def _collectPrinterTelemetry(self, printer: Dict[str, Any]) -> Dict[str, Any]:
+        ipAddress = str(printer.get("ipAddress", "")).strip()
+        availabilityStatus = self._probePrinterAvailability(ipAddress) if ipAddress else "Offline"
+        telemetry: Dict[str, Any] = {
+            "status": availabilityStatus,
+            "nozzleTemp": None,
+            "bedTemp": None,
+            "progressPercent": None,
+            "remainingTimeSeconds": None,
+            "gcodeState": None,
+        }
+        if availabilityStatus == "Offline":
+            return telemetry
+
+        serialNumber = self._parseOptionalString(printer.get("serialNumber"))
+        accessCode = self._parseOptionalString(printer.get("accessCode"))
+        brand = self._parseOptionalString(printer.get("brand"))
+
+        looksLikeBambu = brand is None or "bambu" in brand.lower()
+        if serialNumber and accessCode and mqtt is not None and looksLikeBambu:
+            try:
+                bambuTelemetry = self._fetchBambuTelemetry(ipAddress, serialNumber, accessCode)
+                if bambuTelemetry:
+                    telemetry.update(bambuTelemetry)
+            except Exception as error:  # noqa: BLE001 - telemetry is best-effort
+                logging.debug("Unable to fetch Bambu telemetry from %s: %s", ipAddress, error)
+
+        return telemetry
+
+    def _fetchBambuTelemetry(
+        self,
+        ipAddress: str,
+        serialNumber: str,
+        accessCode: str,
+        timeoutSeconds: float = 4.0,
+    ) -> Dict[str, Any]:
+        if mqtt is None:  # pragma: no cover - guarded by caller
+            return {}
+
+        topicReport = f"device/{serialNumber}/report"
+        topicRequest = f"device/{serialNumber}/request"
+        receivedTelemetry: Dict[str, Any] = {}
+        telemetryEvent = threading.Event()
+
+        callbackApiVersion = getattr(mqtt, "CallbackAPIVersion", None)
+        clientKwargs: Dict[str, Any] = {"protocol": mqtt.MQTTv311}  # type: ignore[attr-defined]
+        if callbackApiVersion is not None:
+            clientKwargs["callback_api_version"] = callbackApiVersion.VERSION2  # type: ignore[attr-defined]
+
+        def onConnect(
+            client: mqtt.Client,  # type: ignore[name-defined]
+            _userdata: Any,
+            _flags: Dict[str, Any],
+            reasonCode: Any,
+            _properties: Any,
+        ) -> None:
+            if getattr(reasonCode, "is_failure", False):
+                receivedTelemetry["status"] = "Offline"
+                telemetryEvent.set()
+                return
+            client.subscribe(topicReport, qos=1)
+            client.publish(
+                topicRequest,
+                json.dumps({"pushed": {"command": "get_status"}}),
+                qos=1,
+            )
+
+        def onMessage(
+            _client: mqtt.Client,  # type: ignore[name-defined]
+            _userdata: Any,
+            message: Any,
+        ) -> None:
+            try:
+                payload = json.loads(message.payload.decode("utf-8"))
+            except Exception:  # noqa: BLE001 - ignore malformed payloads
+                return
+
+            def findKey(obj: Any, key: str) -> Any:
+                if isinstance(obj, dict):
+                    if key in obj:
+                        return obj[key]
+                    for nested in obj.values():
+                        result = findKey(nested, key)
+                        if result is not None:
+                            return result
+                elif isinstance(obj, list):
+                    for nested in obj:
+                        result = findKey(nested, key)
+                        if result is not None:
+                            return result
+                return None
+
+            statusPayload = {
+                "mc_percent": findKey(payload, "mc_percent"),
+                "gcode_state": findKey(payload, "gcode_state"),
+                "mc_remaining_time": findKey(payload, "mc_remaining_time"),
+                "nozzle_temper": findKey(payload, "nozzle_temper"),
+                "bed_temper": findKey(payload, "bed_temper"),
+            }
+            receivedTelemetry.update(self._interpretBambuStatus(statusPayload))
+            telemetryEvent.set()
+
+        client = mqtt.Client(**clientKwargs)  # type: ignore[name-defined]
+        client.username_pw_set("bblp", accessCode)
+        client.tls_set(cert_reqs=ssl.CERT_NONE)
+        client.tls_insecure_set(True)
+        client.on_connect = onConnect
+        client.on_message = onMessage
+
+        client.connect(ipAddress, 8883, keepalive=30)
+        client.loop_start()
+        telemetryEvent.wait(timeoutSeconds)
+        client.loop_stop()
+        client.disconnect()
+
+        return receivedTelemetry
+
+    def _interpretBambuStatus(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        percent = self._parseOptionalFloat(payload.get("mc_percent"))
+        remainingSeconds = self._parseOptionalInt(payload.get("mc_remaining_time"))
+        nozzleTemp = self._parseOptionalFloat(payload.get("nozzle_temper"))
+        bedTemp = self._parseOptionalFloat(payload.get("bed_temper"))
+        state = self._parseOptionalString(payload.get("gcode_state"))
+
+        status = self._mapBambuState(state, percent)
+
+        return {
+            "status": status,
+            "progressPercent": percent,
+            "remainingTimeSeconds": remainingSeconds,
+            "nozzleTemp": nozzleTemp,
+            "bedTemp": bedTemp,
+            "gcodeState": state,
+        }
+
+    def _mapBambuState(self, state: Optional[str], percent: Optional[float]) -> str:
+        normalized = state.strip().upper() if state else ""
+        mapping = {
+            "IDLE": "Idle",
+            "READY": "Idle",
+            "STANDBY": "Idle",
+            "PRINTING": "Printing",
+            "RUNNING": "Printing",
+            "PAUSE": "Paused",
+            "PAUSED": "Paused",
+            "FINISH": "Completed",
+            "FINISHED": "Completed",
+            "COMPLETED": "Completed",
+            "FAILED": "Error",
+            "FAIL": "Error",
+            "ERROR": "Error",
+            "OFFLINE": "Offline",
+        }
+        if normalized in mapping:
+            return mapping[normalized]
+        if normalized:
+            return normalized.title()
+        if percent is not None and percent > 0:
+            return "Printing"
+        return "Online"
+
+    def _probePrinterAvailability(self, ipAddress: str, timeoutSeconds: float = 2.0) -> str:
+        if not ipAddress:
+            return "Offline"
+        portsToTry = (8883, 443, 80)
+        for port in portsToTry:
+            try:
+                with contextlib.closing(socket.create_connection((ipAddress, port), timeoutSeconds)):
+                    return "Online"
+            except (OSError, ValueError):
+                continue
+        return "Offline"
 
     def _processPrinterStatusUpdates(self) -> None:
         try:
             while True:
                 messageType, payload = self.printerStatusQueue.get_nowait()
                 if messageType == "updates":
-                    updatesPayload: list[tuple[int, str]] = (
-                        payload if isinstance(payload, list) else []
-                    )
+                    updatesPayload = payload if isinstance(payload, list) else []
                     hasChanges = False
-                    for index, status in updatesPayload:
-                        if 0 <= index < len(self.printers):
-                            self.printers[index]["status"] = status
-                            hasChanges = True
+                    for item in updatesPayload:
+                        if isinstance(item, dict):
+                            index = item.get("index")
+                            changes = item.get("changes")
+                            if (
+                                isinstance(index, int)
+                                and isinstance(changes, dict)
+                                and 0 <= index < len(self.printers)
+                            ):
+                                self.printers[index].update(changes)
+                                hasChanges = True
+                        elif isinstance(item, (tuple, list)) and len(item) == 2:
+                            indexCandidate, statusCandidate = item
+                            if (
+                                isinstance(indexCandidate, int)
+                                and 0 <= indexCandidate < len(self.printers)
+                            ):
+                                self.printers[indexCandidate]["status"] = str(statusCandidate)
+                                hasChanges = True
                     if hasChanges:
                         self._savePrinters()
                         self._refreshPrinterList()
@@ -470,16 +804,6 @@ class ListenerGuiApp:
         except Empty:
             pass
         self.root.after(500, self._processPrinterStatusUpdates)
-
-    def _probePrinterStatus(self, ipAddress: str, timeoutSeconds: float = 2.0) -> str:
-        portsToTry = (8883, 443, 80)
-        for port in portsToTry:
-            try:
-                with contextlib.closing(socket.create_connection((ipAddress, port), timeoutSeconds)):
-                    return "Online"
-            except (OSError, ValueError):
-                continue
-        return "Offline"
 
     def _chooseOutputDir(self) -> None:
         selectedDir = filedialog.askdirectory(title="Select Output Directory")
