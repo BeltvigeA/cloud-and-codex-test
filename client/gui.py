@@ -7,7 +7,7 @@ import logging
 import threading
 from pathlib import Path
 from queue import Queue, Empty
-from typing import Dict, Optional
+from typing import Callable, Dict, Optional
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -119,6 +119,16 @@ class ListenerGuiApp:
             "MakerBot",
             "Formlabs",
         ]
+        self.printerStatusOptions = [
+            "Unknown",
+            "Online",
+            "Idle",
+            "Printing",
+            "Paused",
+            "Completed",
+            "Error",
+            "Offline",
+        ]
 
         parent.columnconfigure(0, weight=1)
         parent.rowconfigure(2, weight=1)
@@ -136,27 +146,37 @@ class ListenerGuiApp:
         ttk.Button(actionFrame, text="Add Printer", command=self._openAddPrinterDialog).pack(
             side=tk.LEFT
         )
+        self.editPrinterButton = ttk.Button(
+            actionFrame,
+            text="Edit Selected",
+            command=self._openEditPrinterDialog,
+            state=tk.DISABLED,
+        )
+        self.editPrinterButton.pack(side=tk.LEFT, padx=(8, 0))
         actionFrame.columnconfigure(0, weight=1)
 
         treeFrame = ttk.Frame(parent)
         treeFrame.grid(row=2, column=0, sticky=tk.NSEW, padx=8, pady=(4, 8))
-        columns = ("nickname", "ipAddress", "accessCode", "serialNumber", "brand")
+        columns = ("nickname", "ipAddress", "accessCode", "serialNumber", "brand", "status")
         self.printerTree = ttk.Treeview(treeFrame, columns=columns, show="headings", selectmode="browse")
         self.printerTree.heading("nickname", text="Nickname")
         self.printerTree.heading("ipAddress", text="IP Address")
         self.printerTree.heading("accessCode", text="Access Code")
         self.printerTree.heading("serialNumber", text="Serial Number")
         self.printerTree.heading("brand", text="Brand")
+        self.printerTree.heading("status", text="Status")
         self.printerTree.column("nickname", width=120)
         self.printerTree.column("ipAddress", width=110)
         self.printerTree.column("accessCode", width=110)
         self.printerTree.column("serialNumber", width=120)
         self.printerTree.column("brand", width=100)
+        self.printerTree.column("status", width=100)
 
         scrollbar = ttk.Scrollbar(treeFrame, orient=tk.VERTICAL, command=self.printerTree.yview)
         self.printerTree.configure(yscrollcommand=scrollbar.set)
         self.printerTree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.printerTree.bind("<<TreeviewSelect>>", self._onPrinterSelection)
 
         self._refreshPrinterList()
 
@@ -180,6 +200,7 @@ class ListenerGuiApp:
                                     "accessCode": str(entry.get("accessCode", "")),
                                     "serialNumber": str(entry.get("serialNumber", "")),
                                     "brand": str(entry.get("brand", "")),
+                                    "status": str(entry.get("status", "")) or "Unknown",
                                 }
                             )
                     return sanitizedPrinters
@@ -217,26 +238,56 @@ class ListenerGuiApp:
                     printer.get("accessCode", ""),
                     printer.get("serialNumber", ""),
                     printer.get("brand", ""),
+                    printer.get("status", "Unknown"),
                 ),
             )
+        self._onPrinterSelection(None)
 
     def _clearPrinterSearch(self) -> None:
         self.printerSearchVar.set("")
 
     def _openAddPrinterDialog(self) -> None:
+        self._showPrinterDialog(
+            title="Add 3D Printer",
+            initialValues=None,
+            onSave=self._handleCreatePrinter,
+        )
+
+    def _openEditPrinterDialog(self) -> None:
+        selectedIndex = self._getSelectedPrinterIndex()
+        if selectedIndex is None:
+            return
+        self._showPrinterDialog(
+            title="Edit 3D Printer",
+            initialValues=self.printers[selectedIndex],
+            onSave=lambda updated: self._handleUpdatePrinter(selectedIndex, updated),
+        )
+
+    def _showPrinterDialog(
+        self,
+        *,
+        title: str,
+        initialValues: Optional[Dict[str, str]],
+        onSave: Callable[[Dict[str, str]], None],
+    ) -> None:
         dialog = tk.Toplevel(self.root)
-        dialog.title("Add 3D Printer")
+        dialog.title(title)
         dialog.transient(self.root)
         dialog.grab_set()
 
         for index in range(2):
             dialog.columnconfigure(index, weight=1)
 
-        nicknameVar = tk.StringVar()
-        ipAddressVar = tk.StringVar()
-        accessCodeVar = tk.StringVar()
-        serialNumberVar = tk.StringVar()
-        brandVar = tk.StringVar()
+        nicknameVar = tk.StringVar(value=(initialValues or {}).get("nickname", ""))
+        ipAddressVar = tk.StringVar(value=(initialValues or {}).get("ipAddress", ""))
+        accessCodeVar = tk.StringVar(value=(initialValues or {}).get("accessCode", ""))
+        serialNumberVar = tk.StringVar(value=(initialValues or {}).get("serialNumber", ""))
+        brandVar = tk.StringVar(value=(initialValues or {}).get("brand", ""))
+        initialStatus = (initialValues or {}).get("status", "Unknown") or "Unknown"
+        statusChoices = list(self.printerStatusOptions)
+        if initialStatus not in statusChoices:
+            statusChoices.append(initialStatus)
+        statusVar = tk.StringVar(value=initialStatus)
 
         ttk.Label(dialog, text="Nickname:").grid(row=0, column=0, sticky=tk.W, padx=12, pady=(12, 4))
         ttk.Entry(dialog, textvariable=nicknameVar).grid(row=0, column=1, sticky=tk.EW, padx=12, pady=(12, 4))
@@ -258,25 +309,36 @@ class ListenerGuiApp:
         )
         brandCombo.grid(row=4, column=1, sticky=tk.EW, padx=12, pady=4)
 
+        ttk.Label(dialog, text="Status:").grid(row=5, column=0, sticky=tk.W, padx=12, pady=4)
+        statusCombo = ttk.Combobox(
+            dialog,
+            textvariable=statusVar,
+            values=tuple(statusChoices),
+            state="readonly",
+        )
+        statusCombo.grid(row=5, column=1, sticky=tk.EW, padx=12, pady=4)
+
         buttonFrame = ttk.Frame(dialog)
-        buttonFrame.grid(row=5, column=0, columnspan=2, pady=12)
+        buttonFrame.grid(row=6, column=0, columnspan=2, pady=12)
         ttk.Button(
             buttonFrame,
             text="Save",
-            command=lambda: self._handleAddPrinter(
+            command=lambda: self._handlePrinterDialogSave(
                 dialog,
                 nicknameVar,
                 ipAddressVar,
                 accessCodeVar,
                 serialNumberVar,
                 brandVar,
+                statusVar,
+                onSave,
             ),
         ).pack(side=tk.LEFT, padx=6)
         ttk.Button(buttonFrame, text="Cancel", command=dialog.destroy).pack(side=tk.LEFT, padx=6)
 
         dialog.wait_window(dialog)
 
-    def _handleAddPrinter(
+    def _handlePrinterDialogSave(
         self,
         dialog: tk.Toplevel,
         nicknameVar: tk.StringVar,
@@ -284,12 +346,15 @@ class ListenerGuiApp:
         accessCodeVar: tk.StringVar,
         serialNumberVar: tk.StringVar,
         brandVar: tk.StringVar,
+        statusVar: tk.StringVar,
+        onSave: Callable[[Dict[str, str]], None],
     ) -> None:
         nickname = nicknameVar.get().strip()
         ipAddress = ipAddressVar.get().strip()
         accessCode = accessCodeVar.get().strip()
         serialNumber = serialNumberVar.get().strip()
         brand = brandVar.get().strip()
+        status = statusVar.get().strip() or "Unknown"
 
         if not nickname or not ipAddress:
             messagebox.showerror(
@@ -306,12 +371,35 @@ class ListenerGuiApp:
             "accessCode": accessCode,
             "serialNumber": serialNumber,
             "brand": brand,
+            "status": status,
         }
 
+        onSave(printerDetails)
+        dialog.destroy()
+
+    def _handleCreatePrinter(self, printerDetails: Dict[str, str]) -> None:
         self.printers.append(printerDetails)
         self._savePrinters()
         self._refreshPrinterList()
-        dialog.destroy()
+
+    def _handleUpdatePrinter(self, index: int, printerDetails: Dict[str, str]) -> None:
+        self.printers[index] = printerDetails
+        self._savePrinters()
+        self._refreshPrinterList()
+
+    def _onPrinterSelection(self, event: object) -> None:  # noqa: ARG002 - required by Tk callback
+        state = tk.NORMAL if self._getSelectedPrinterIndex() is not None else tk.DISABLED
+        self.editPrinterButton.config(state=state)
+
+    def _getSelectedPrinterIndex(self) -> Optional[int]:
+        selection = self.printerTree.selection() if hasattr(self, "printerTree") else ()
+        if not selection:
+            return None
+        selectedId = selection[0]
+        try:
+            return int(selectedId)
+        except (TypeError, ValueError):
+            return None
 
     def _chooseOutputDir(self) -> None:
         selectedDir = filedialog.askdirectory(title="Select Output Directory")
