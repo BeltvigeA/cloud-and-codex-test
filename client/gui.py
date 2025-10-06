@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
+import socket
 import threading
 from pathlib import Path
 from queue import Queue, Empty
-from typing import Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -36,9 +38,15 @@ class ListenerGuiApp:
 
         self.printerStoragePath = Path.home() / ".printmaster" / "printers.json"
         self.printers: list[Dict[str, str]] = self._loadPrinters()
+        self.printerStatusQueue: "Queue[tuple[str, Any]]" = Queue()
+        self.statusRefreshThread: Optional[threading.Thread] = None
+        self.statusRefreshIntervalMs = 60_000
+        self.pendingImmediateStatusRefresh = False
 
         self._buildLayout()
         self.root.after(200, self._processLogQueue)
+        self.root.after(200, self._processPrinterStatusUpdates)
+        self._scheduleStatusRefresh(0)
 
     def _buildLayout(self) -> None:
         paddingOptions = {"padx": 8, "pady": 4}
@@ -381,11 +389,13 @@ class ListenerGuiApp:
         self.printers.append(printerDetails)
         self._savePrinters()
         self._refreshPrinterList()
+        self._scheduleStatusRefresh(0)
 
     def _handleUpdatePrinter(self, index: int, printerDetails: Dict[str, str]) -> None:
         self.printers[index] = printerDetails
         self._savePrinters()
         self._refreshPrinterList()
+        self._scheduleStatusRefresh(0)
 
     def _onPrinterSelection(self, event: object) -> None:  # noqa: ARG002 - required by Tk callback
         state = tk.NORMAL if self._getSelectedPrinterIndex() is not None else tk.DISABLED
@@ -400,6 +410,76 @@ class ListenerGuiApp:
             return int(selectedId)
         except (TypeError, ValueError):
             return None
+
+    def _scheduleStatusRefresh(self, delayMs: int) -> None:
+        if self.statusRefreshThread and self.statusRefreshThread.is_alive():
+            if delayMs == 0:
+                self.pendingImmediateStatusRefresh = True
+            return
+        self.pendingImmediateStatusRefresh = False
+        self.root.after(delayMs, self._refreshPrinterStatusesAsync)
+
+    def _refreshPrinterStatusesAsync(self) -> None:
+        if self.statusRefreshThread and self.statusRefreshThread.is_alive():
+            return
+        worker = threading.Thread(target=self._refreshPrinterStatusesWorker, daemon=True)
+        self.statusRefreshThread = worker
+        worker.start()
+
+    def _refreshPrinterStatusesWorker(self) -> None:
+        updates: list[tuple[int, str]] = []
+        printersSnapshot = list(enumerate(list(self.printers)))
+        for index, printer in printersSnapshot:
+            ipAddress = printer.get("ipAddress", "").strip()
+            if not ipAddress:
+                continue
+            detectedStatus = self._probePrinterStatus(ipAddress)
+            currentStatus = printer.get("status", "Unknown") or "Unknown"
+            if detectedStatus != currentStatus:
+                logging.info(
+                    "Printer %s status changed from %s to %s",
+                    ipAddress,
+                    currentStatus,
+                    detectedStatus,
+                )
+                updates.append((index, detectedStatus))
+        if updates:
+            self.printerStatusQueue.put(("updates", updates))
+        self.printerStatusQueue.put(("complete", None))
+
+    def _processPrinterStatusUpdates(self) -> None:
+        try:
+            while True:
+                messageType, payload = self.printerStatusQueue.get_nowait()
+                if messageType == "updates":
+                    updatesPayload: list[tuple[int, str]] = (
+                        payload if isinstance(payload, list) else []
+                    )
+                    hasChanges = False
+                    for index, status in updatesPayload:
+                        if 0 <= index < len(self.printers):
+                            self.printers[index]["status"] = status
+                            hasChanges = True
+                    if hasChanges:
+                        self._savePrinters()
+                        self._refreshPrinterList()
+                elif messageType == "complete":
+                    self.statusRefreshThread = None
+                    delay = 0 if self.pendingImmediateStatusRefresh else self.statusRefreshIntervalMs
+                    self._scheduleStatusRefresh(delay)
+        except Empty:
+            pass
+        self.root.after(500, self._processPrinterStatusUpdates)
+
+    def _probePrinterStatus(self, ipAddress: str, timeoutSeconds: float = 2.0) -> str:
+        portsToTry = (8883, 443, 80)
+        for port in portsToTry:
+            try:
+                with contextlib.closing(socket.create_connection((ipAddress, port), timeoutSeconds)):
+                    return "Online"
+            except (OSError, ValueError):
+                continue
+        return "Offline"
 
     def _chooseOutputDir(self) -> None:
         selectedDir = filedialog.askdirectory(title="Select Output Directory")
