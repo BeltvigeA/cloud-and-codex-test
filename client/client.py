@@ -17,6 +17,7 @@ import requests
 
 from .database import LocalDatabase
 from .persistence import storePrintSummary
+from .bambuPrinter import BambuPrintOptions, sendBambuPrintJob
 
 
 defaultBaseUrl = "https://printer-backend-934564650450.europe-west1.run.app"
@@ -171,6 +172,352 @@ def buildPendingUrl(baseUrl: str, recipientId: str) -> str:
         raise ValueError("recipientId must not be empty")
     return f"{sanitizedBase}/recipients/{sanitizedRecipient}/pending"
 
+
+def interpretBoolean(value: Any) -> Optional[bool]:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        candidate = value.strip().lower()
+        if candidate in {"true", "1", "yes", "y", "on"}:
+            return True
+        if candidate in {"false", "0", "no", "n", "off"}:
+            return False
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return None
+
+
+def interpretInteger(value: Any) -> Optional[int]:
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        candidate = value.strip()
+        if not candidate:
+            return None
+        try:
+            return int(candidate)
+        except ValueError:
+            return None
+    return None
+
+
+def normalizePrinterDetails(details: Dict[str, Any]) -> Dict[str, Any]:
+    normalized: Dict[str, Any] = {}
+    for rawKey, rawValue in details.items():
+        if rawValue is None:
+            continue
+        key = rawKey.replace("-", "").replace("_", "").lower()
+        if key in {"brand", "printerbrand"}:
+            normalized["brand"] = str(rawValue)
+        elif key in {"serial", "serialnumber", "printersn", "printerserial", "serialno"}:
+            normalized["serialNumber"] = str(rawValue)
+        elif key in {"ip", "ipaddress", "printerip", "host", "hostname"}:
+            normalized["ipAddress"] = str(rawValue)
+        elif key in {"accesscode", "lanaccesscode", "password"}:
+            normalized["accessCode"] = str(rawValue)
+        elif key in {"nickname", "printername", "name", "label"}:
+            normalized["nickname"] = str(rawValue)
+        elif key in {"printerid", "printeridentifier"}:
+            normalized.setdefault("nickname", str(rawValue))
+        elif key == "useams":
+            interpreted = interpretBoolean(rawValue)
+            if interpreted is not None:
+                normalized["useAms"] = interpreted
+        elif key == "bedleveling":
+            interpreted = interpretBoolean(rawValue)
+            if interpreted is not None:
+                normalized["bedLeveling"] = interpreted
+        elif key == "layerinspect":
+            interpreted = interpretBoolean(rawValue)
+            if interpreted is not None:
+                normalized["layerInspect"] = interpreted
+        elif key in {"flowcalibration", "flowcali"}:
+            interpreted = interpretBoolean(rawValue)
+            if interpreted is not None:
+                normalized["flowCalibration"] = interpreted
+        elif key in {"vibrationcalibration", "vibrationcali"}:
+            interpreted = interpretBoolean(rawValue)
+            if interpreted is not None:
+                normalized["vibrationCalibration"] = interpreted
+        elif key in {"usecloud", "cloudprint"}:
+            interpreted = interpretBoolean(rawValue)
+            if interpreted is not None:
+                normalized["useCloud"] = interpreted
+        elif key in {"secureconnection", "secure"}:
+            interpreted = interpretBoolean(rawValue)
+            if interpreted is not None:
+                normalized["secureConnection"] = interpreted
+        elif key == "cloudurl":
+            normalized["cloudUrl"] = str(rawValue)
+        elif key == "cloudtimeout":
+            interpretedInt = interpretInteger(rawValue)
+            if interpretedInt is not None:
+                normalized["cloudTimeout"] = interpretedInt
+        elif key in {"plateindex", "plate"}:
+            interpretedInt = interpretInteger(rawValue)
+            if interpretedInt is not None:
+                normalized["plateIndex"] = interpretedInt
+        elif key in {"waitseconds", "waittime", "mqttwait"}:
+            interpretedInt = interpretInteger(rawValue)
+            if interpretedInt is not None:
+                normalized["waitSeconds"] = interpretedInt
+    return normalized
+
+
+def extractPrinterAssignment(*candidates: Any) -> Optional[Dict[str, Any]]:
+    def search(value: Any) -> Optional[Dict[str, Any]]:
+        if isinstance(value, dict):
+            normalized = normalizePrinterDetails(value)
+            combined = dict(normalized)
+            for nestedValue in value.values():
+                if isinstance(nestedValue, (dict, list)):
+                    nested = search(nestedValue)
+                    if nested:
+                        for key, nestedValue in nested.items():
+                            combined.setdefault(key, nestedValue)
+            return combined or None
+        if isinstance(value, list):
+            for item in value:
+                nested = search(item)
+                if nested:
+                    return nested
+        return None
+
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        details = search(candidate)
+        if details:
+            return details
+    return None
+
+
+def loadConfiguredPrinters(configPath: Optional[Union[str, Path]] = None) -> List[Dict[str, Any]]:
+    path = Path(configPath).expanduser() if configPath else Path.home() / ".printmaster" / "printers.json"
+    if not path.exists():
+        return []
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, json.JSONDecodeError) as error:
+        logging.warning("Unable to load printers from %s: %s", path, error)
+        return []
+    if not isinstance(payload, list):
+        logging.warning("Printer configuration in %s is not a list", path)
+        return []
+    printers: List[Dict[str, Any]] = []
+    for entry in payload:
+        if isinstance(entry, dict):
+            printers.append(entry)
+    return printers
+
+
+def resolvePrinterDetails(
+    metadata: Dict[str, Any],
+    configuredPrinters: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    normalizedMetadata = normalizePrinterDetails(metadata)
+    candidates = [normalizePrinterDetails(printer) for printer in configuredPrinters if isinstance(printer, dict)]
+
+    def matchBy(predicate: Callable[[Dict[str, Any]], bool]) -> Optional[Dict[str, Any]]:
+        for candidate in candidates:
+            if predicate(candidate):
+                return candidate
+        return None
+
+    match: Optional[Dict[str, Any]] = None
+    serial = normalizedMetadata.get("serialNumber")
+    nickname = normalizedMetadata.get("nickname")
+    ipAddress = normalizedMetadata.get("ipAddress")
+
+    if serial:
+        loweredSerial = serial.lower()
+        match = matchBy(lambda item: str(item.get("serialNumber", "")).lower() == loweredSerial)
+    if match is None and nickname:
+        loweredNickname = nickname.lower()
+        match = matchBy(lambda item: str(item.get("nickname", "")).lower() == loweredNickname)
+    if match is None and ipAddress:
+        loweredIp = ipAddress.lower()
+        match = matchBy(lambda item: str(item.get("ipAddress", "")).lower() == loweredIp)
+
+    resolved: Dict[str, Any] = {}
+    if match:
+        for key, value in match.items():
+            if value is not None:
+                resolved[key] = value
+
+    for key, value in normalizedMetadata.items():
+        if value is not None:
+            resolved[key] = value
+
+    return resolved or None
+
+
+def createPrinterStatusReporter(
+    baseUrl: str,
+    productId: str,
+    recipientId: str,
+    statusTemplate: Dict[str, Any],
+    printerDetails: Dict[str, Any],
+) -> Callable[[Dict[str, Any]], None]:
+    def reporter(event: Dict[str, Any]) -> None:
+        message = event.get("message")
+        eventType = event.get("event")
+        if not message:
+            if eventType == "uploadComplete":
+                remoteFile = event.get("remoteFile")
+                message = f"Uploaded to printer storage as {remoteFile}" if remoteFile else "Uploaded to printer"
+            elif eventType == "cloudAccepted":
+                message = "Print job accepted by Bambu Cloud"
+            elif eventType == "starting":
+                message = "Starting print on printer"
+            elif eventType == "progress":
+                status = event.get("status") or {}
+                segments: List[str] = []
+                percent = status.get("mc_percent")
+                if percent is not None:
+                    segments.append(f"{percent}%")
+                state = status.get("gcode_state")
+                if state:
+                    segments.append(str(state))
+                remaining = status.get("mc_remaining_time")
+                if remaining is not None:
+                    segments.append(f"ETA {remaining}s")
+                message = " | ".join(segments) if segments else "Printer status update"
+            elif eventType == "error":
+                message = f"Printer error: {event.get('error')}"
+            else:
+                message = f"Printer event: {eventType}" if eventType else "Printer update"
+
+        payload = dict(statusTemplate)
+        payload["message"] = message
+        payload["printerDetails"] = printerDetails
+        payload["printerEvent"] = event
+        payload.setdefault("success", statusTemplate.get("success", True))
+        payload.setdefault("recipientId", recipientId)
+        sendProductStatusUpdate(baseUrl, productId, recipientId, payload)
+
+    return reporter
+
+
+def dispatchBambuPrintIfPossible(
+    *,
+    baseUrl: str,
+    productId: str,
+    recipientId: str,
+    entryData: Dict[str, Any],
+    statusPayload: Dict[str, Any],
+    configuredPrinters: Optional[List[Dict[str, Any]]] = None,
+) -> Optional[Dict[str, Any]]:
+    savedFile = entryData.get("savedFile")
+    if not savedFile:
+        return None
+
+    printerAssignment = extractPrinterAssignment(entryData.get("unencryptedData"), entryData.get("decryptedData"))
+    if not printerAssignment:
+        return None
+
+    printers = configuredPrinters if configuredPrinters is not None else loadConfiguredPrinters()
+    resolvedDetails = resolvePrinterDetails(printerAssignment, printers)
+    if not resolvedDetails:
+        logging.info("No matching printer configuration for product %s", productId)
+        return None
+
+    brand = str(resolvedDetails.get("brand", "")).strip()
+    if brand and "bambu" not in brand.lower():
+        logging.info("Skipping printer dispatch for non-Bambu brand %s", brand)
+        return None
+
+    ipAddress = resolvedDetails.get("ipAddress")
+    accessCode = resolvedDetails.get("accessCode")
+    serialNumber = resolvedDetails.get("serialNumber")
+
+    if not ipAddress or not accessCode or not serialNumber:
+        logging.warning(
+            "Incomplete printer credentials for product %s (ip=%s, accessCode=%s, serial=%s)",
+            productId,
+            ipAddress,
+            bool(accessCode),
+            serialNumber,
+        )
+        return None
+
+    try:
+        filePath = Path(savedFile)
+    except Exception:
+        logging.warning("Invalid file path for printer dispatch: %s", savedFile)
+        return None
+    if not filePath.exists():
+        logging.warning("Downloaded file missing for printer dispatch: %s", filePath)
+        return None
+
+    options = BambuPrintOptions(
+        ipAddress=str(ipAddress),
+        serialNumber=str(serialNumber),
+        accessCode=str(accessCode),
+        brand=brand or "Bambu Lab",
+        nickname=resolvedDetails.get("nickname") or resolvedDetails.get("printerName"),
+        useCloud=bool(resolvedDetails.get("useCloud", False)),
+        cloudUrl=resolvedDetails.get("cloudUrl"),
+        cloudTimeout=resolvedDetails.get("cloudTimeout", 180),
+        useAms=bool(resolvedDetails.get("useAms", False)),
+        bedLeveling=resolvedDetails.get("bedLeveling", True),
+        layerInspect=resolvedDetails.get("layerInspect", True),
+        flowCalibration=resolvedDetails.get("flowCalibration", False),
+        vibrationCalibration=resolvedDetails.get("vibrationCalibration", False),
+        secureConnection=bool(resolvedDetails.get("secureConnection", False)),
+        plateIndex=resolvedDetails.get("plateIndex"),
+        waitSeconds=resolvedDetails.get("waitSeconds", 12),
+    )
+
+    printerDetails = {
+        "serialNumber": options.serialNumber,
+        "ipAddress": options.ipAddress,
+        "brand": options.brand,
+        "nickname": options.nickname,
+        "useCloud": options.useCloud,
+    }
+
+    statusTemplate = dict(statusPayload)
+    statusTemplate.pop("sent", None)
+    statusTemplate.setdefault("recipientId", recipientId)
+
+    requiredStatusKeys = ("fileName", "lastRequestedAt", "requestedMode", "success")
+    for requiredKey in requiredStatusKeys:
+        if statusTemplate.get(requiredKey) in {None, ""}:
+            logging.info(
+                "Skipping printer dispatch for product %s due to missing %s in status payload",
+                productId,
+                requiredKey,
+            )
+            return None
+
+    reporter = createPrinterStatusReporter(baseUrl, productId, recipientId, statusTemplate, printerDetails)
+
+    reporter({"event": "dispatching", "message": f"Dispatching print job to {options.nickname or options.serialNumber}"})
+
+    statusEvents: List[Dict[str, Any]] = []
+
+    def capture(event: Dict[str, Any]) -> None:
+        statusEvents.append(dict(event))
+        reporter(event)
+
+    try:
+        result = sendBambuPrintJob(filePath=filePath, options=options, statusCallback=capture)
+        capture(
+            {
+                "event": "dispatched",
+                "message": "Print job sent to printer",
+                "result": result,
+            }
+        )
+        return {"success": True, "details": printerDetails, "result": result, "events": statusEvents}
+    except Exception as error:  # noqa: BLE001 - propagate via status
+        logging.exception("Failed to dispatch print job for product %s: %s", productId, error)
+        capture({"event": "error", "error": str(error)})
+        return {"success": False, "details": printerDetails, "error": str(error), "events": statusEvents}
 
 def validateBaseUrlArgument(baseUrl: Optional[str], commandName: str) -> bool:
     if not isinstance(baseUrl, str) or not baseUrl.strip():
@@ -995,6 +1342,17 @@ def listenForFiles(
                     entryData["productId"] = productId
                     entryData["productStatus"] = statusPayload
                     entryData["productRecord"] = updatedRecord
+
+                    if fetchResult is not None:
+                        dispatchResult = dispatchBambuPrintIfPossible(
+                            baseUrl=baseUrl,
+                            productId=productId,
+                            recipientId=handshakeRecipientId,
+                            entryData=entryData,
+                            statusPayload=statusPayload,
+                        )
+                        if dispatchResult:
+                            entryData["printerDispatch"] = dispatchResult
 
                     summaryDirectory: Optional[Path] = None
                     if database is not None:
