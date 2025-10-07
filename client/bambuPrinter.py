@@ -396,11 +396,23 @@ class BambuPrintOptions:
     waitSeconds: int = 12
 
 
-def buildRemoteFileName(localPath: Path) -> str:
-    safeName = re.sub(r"[^A-Za-z0-9._-]+", "_", localPath.name)
+def normalizeRemoteFileName(name: str) -> str:
+    safeName = re.sub(r"[^A-Za-z0-9._-]+", "_", name)
     if not safeName.lower().endswith(".3mf"):
         safeName += ".3mf"
     return safeName
+
+
+def buildRemoteFileName(localPath: Path) -> str:
+    return normalizeRemoteFileName(localPath.name)
+
+
+def buildPrinterTransferFileName(localPath: Path) -> str:
+    trimmedName = localPath.name
+    match = re.match(r"^[0-9a-fA-F-]+_[0-9a-fA-F-]+_(.+)$", trimmedName)
+    if match:
+        trimmedName = match.group(1)
+    return normalizeRemoteFileName(trimmedName)
 
 
 def sendBambuPrintJob(
@@ -416,6 +428,7 @@ def sendBambuPrintJob(
         raise FileNotFoundError(resolvedPath)
 
     remoteName = buildRemoteFileName(resolvedPath)
+    printerFileName = buildPrinterTransferFileName(resolvedPath)
     paramPath, _ = pickGcodeParamFrom3mf(resolvedPath, options.plateIndex)
 
     if options.useCloud and options.cloudUrl:
@@ -443,11 +456,18 @@ def sendBambuPrintJob(
         ip=options.ipAddress,
         accessCode=options.accessCode,
         localPath=resolvedPath,
-        remoteName=remoteName,
+        remoteName=printerFileName,
         insecureTls=not options.secureConnection,
     )
     if statusCallback:
-        statusCallback({"event": "uploadComplete", "remoteFile": uploadedName, "paramPath": paramPath})
+        statusCallback(
+            {
+                "event": "uploadComplete",
+                "remoteFile": uploadedName,
+                "originalRemoteFile": remoteName,
+                "paramPath": paramPath,
+            }
+        )
 
     startPrintViaMqtt(
         ip=options.ipAddress,
@@ -464,7 +484,12 @@ def sendBambuPrintJob(
         waitSeconds=options.waitSeconds,
         statusCallback=statusCallback,
     )
-    return {"method": "lan", "remoteFile": uploadedName, "paramPath": paramPath}
+    return {
+        "method": "lan",
+        "remoteFile": uploadedName,
+        "originalRemoteFile": remoteName,
+        "paramPath": paramPath,
+    }
 
 
 def summarizeStatusMessages(events: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -478,6 +503,7 @@ __all__ = [
     "ImplicitFtpTls",
     "buildCloudJobPayload",
     "buildRemoteFileName",
+    "buildPrinterTransferFileName",
     "encodeFileToBase64",
     "makeTlsContext",
     "pickGcodeParamFrom3mf",
