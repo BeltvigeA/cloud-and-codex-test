@@ -29,6 +29,8 @@ class DummyFtpClient:
         self.storedData: bytes = b""
         self.closed = False
         self.failCwd = False
+        self.deletedPaths: List[str] = []
+        self.deleteFailures: Dict[str, Exception] = {}
 
     def connect(self, host: str, port: int, timeout: int | None = None, source_address=None):  # type: ignore[override]
         self.connected = (host, port, timeout)
@@ -55,6 +57,13 @@ class DummyFtpClient:
         self.storageCommand = command
         self.storedData = handle.read()
         self.commands.append(("storbinary", (command,), {"blocksize": blocksize}))
+
+    def delete(self, path: str) -> None:
+        self.deletedPaths.append(path)
+        self.commands.append(("delete", (path,), {}))
+        failure = self.deleteFailures.get(path)
+        if failure:
+            raise failure
 
     def voidresp(self) -> None:
         self.commands.append(("voidresp", tuple(), {}))
@@ -93,6 +102,7 @@ def test_upload_via_ftps_changes_directory(monkeypatch: pytest.MonkeyPatch, temp
     assert dummy.cwdCalls and dummy.cwdCalls[0] in {"/sdcard", "sdcard"}
     assert dummy.storageCommand == "STOR example.3mf"
     assert dummy.storedData == b"dummy-data"
+    assert dummy.deletedPaths == ["example.3mf"]
     assert dummy.closed is True
     storbinaryCalls = [entry for entry in dummy.commands if entry[0] == "storbinary"]
     assert storbinaryCalls, "Expected storbinary to be invoked"
@@ -114,6 +124,25 @@ def test_upload_via_ftps_falls_back_when_cwd_fails(monkeypatch: pytest.MonkeyPat
     assert result == "example.3mf"
     assert dummy.storageCommand == "STOR sdcard/example.3mf"
     assert dummy.storedData == b"dummy-data"
+    assert dummy.deletedPaths == ["sdcard/example.3mf"]
+
+
+def test_upload_via_ftps_ignores_missing_file(monkeypatch: pytest.MonkeyPatch, temp_file: Path) -> None:
+    dummy = DummyFtpClient()
+    dummy.deleteFailures["example.3mf"] = RuntimeError("550 File not found")
+    _install_dummy(monkeypatch, dummy)
+
+    result = bambuPrinter.uploadViaFtps(
+        ip="192.0.2.10",
+        accessCode="abcd",
+        localPath=temp_file,
+        remoteName="example.3mf",
+    )
+
+    assert result == "example.3mf"
+    assert dummy.deletedPaths == ["example.3mf"]
+    storbinaryCalls = [entry for entry in dummy.commands if entry[0] == "storbinary"]
+    assert storbinaryCalls, "Expected storbinary to be invoked even when delete reports missing file"
 
 
 def test_build_printer_transfer_file_name_trims_prefixes() -> None:

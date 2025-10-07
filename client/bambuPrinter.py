@@ -164,13 +164,30 @@ def uploadViaFtps(
         fileName = os.path.basename(remoteName)
 
         storageCommand = f"STOR {fileName}"
+        remoteDeleteTargets = []
+
+        def deleteRemotePath(remotePath: str) -> None:
+            try:
+                ftps.delete(remotePath)
+            except Exception as deleteError:  # pragma: no cover - exercised via specific tests
+                errorMessage = str(deleteError).lower()
+                if "550" in errorMessage or "not found" in errorMessage:
+                    return
+                raise
+
         try:
             ftps.cwd("/sdcard")
+            remoteDeleteTargets.append(fileName)
         except Exception:
             try:
                 ftps.cwd("sdcard")
+                remoteDeleteTargets.append(fileName)
             except Exception:
                 storageCommand = f"STOR sdcard/{fileName}"
+                remoteDeleteTargets.append(f"sdcard/{fileName}")
+
+        for remoteTarget in remoteDeleteTargets:
+            deleteRemotePath(remoteTarget)
 
         with open(localPath, "rb") as handle:
             ftps.storbinary(storageCommand, handle, blocksize=64 * 1024)
