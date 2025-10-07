@@ -115,3 +115,15 @@ def test_upload_via_ftps_falls_back_when_cwd_fails(monkeypatch: pytest.MonkeyPat
     assert dummy.storageCommand == "STOR sdcard/example.3mf"
     assert dummy.storedData == b"dummy-data"
 
+
+def test_build_printer_transfer_file_name_trims_prefixes() -> None:
+    local_path = Path("/downloads/123e4567-e89b-12d3-a456-426614174000_123e4567-e89b-12d3-a456-426614174000_Drage.3mf")
+    result = bambuPrinter.buildPrinterTransferFileName(local_path)
+    assert result == "Drage.3mf"
+
+
+def test_build_printer_transfer_file_name_preserves_regular_names() -> None:
+    local_path = Path("/downloads/Cool Model.3mf")
+    result = bambuPrinter.buildPrinterTransferFileName(local_path)
+    assert result == "Cool_Model.3mf"
+
