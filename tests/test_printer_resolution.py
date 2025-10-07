@@ -1,4 +1,12 @@
-from client.client import resolvePrinterDetails
+import sys
+from pathlib import Path
+
+projectRoot = Path(__file__).resolve().parents[1]
+projectRootPath = str(projectRoot)
+if projectRootPath not in sys.path:
+    sys.path.append(projectRootPath)
+
+from client.client import extractPrinterAssignment, resolvePrinterDetails
 
 
 def test_resolvePrinterDetails_matches_serial_with_whitespace_in_config():
@@ -30,3 +38,24 @@ def test_resolvePrinterDetails_trims_metadata_values_before_matching():
     assert resolved is not None
     assert resolved["nickname"] == "Speedy"
     assert resolved["serialNumber"] == "ABC-999"
+
+
+def test_extractPrinterAssignment_prefers_decrypted_access_code_for_matching_serial():
+    unencryptedData = {
+        "printer": {
+            "serialNumber": "SN-0001",
+            "accessCode": "1111",
+        }
+    }
+    decryptedData = {
+        "printer": {
+            "serialNumber": "sn-0001",
+            "accessCode": "2222",
+        }
+    }
+
+    assignment = extractPrinterAssignment(unencryptedData, decryptedData)
+
+    assert assignment is not None
+    assert assignment["serialNumber"].lower() == "sn-0001"
+    assert assignment["accessCode"] == "2222"
