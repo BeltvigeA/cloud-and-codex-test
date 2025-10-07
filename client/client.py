@@ -289,31 +289,63 @@ def normalizePrinterDetails(details: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def extractPrinterAssignment(*candidates: Any) -> Optional[Dict[str, Any]]:
-    def search(value: Any) -> Optional[Dict[str, Any]]:
+    def search(value: Any) -> List[Dict[str, Any]]:
+        collected: List[Dict[str, Any]] = []
         if isinstance(value, dict):
             normalized = normalizePrinterDetails(value)
-            combined = dict(normalized)
+            if normalized:
+                collected.append(dict(normalized))
             for nestedValue in value.values():
                 if isinstance(nestedValue, (dict, list)):
-                    nested = search(nestedValue)
-                    if nested:
-                        for key, nestedValue in nested.items():
-                            combined.setdefault(key, nestedValue)
-            return combined or None
-        if isinstance(value, list):
+                    collected.extend(search(nestedValue))
+        elif isinstance(value, list):
             for item in value:
-                nested = search(item)
-                if nested:
-                    return nested
-        return None
+                collected.extend(search(item))
+        return collected
 
+    merged: Dict[str, Any] = {}
     for candidate in candidates:
         if candidate is None:
             continue
-        details = search(candidate)
-        if details:
-            return details
-    return None
+        for details in search(candidate):
+            if not details:
+                continue
+            if not merged:
+                merged.update(details)
+                continue
+
+            existingSerial = merged.get("serialNumber")
+            existingSerialNormalized = (
+                str(existingSerial).lower() if isinstance(existingSerial, str) else None
+            )
+            newSerial = details.get("serialNumber")
+            newSerialNormalized = (
+                str(newSerial).lower() if isinstance(newSerial, str) else None
+            )
+
+            if (
+                existingSerialNormalized
+                and newSerialNormalized
+                and existingSerialNormalized != newSerialNormalized
+            ):
+                continue
+
+            if newSerial is not None and existingSerialNormalized != newSerialNormalized:
+                merged["serialNumber"] = newSerial
+                existingSerial = newSerial
+                existingSerialNormalized = newSerialNormalized
+
+            canOverride = existingSerial is None or newSerialNormalized is not None
+
+            for key, value in details.items():
+                if value is None:
+                    continue
+                if key not in merged:
+                    merged[key] = value
+                elif canOverride:
+                    merged[key] = value
+
+    return merged or None
 
 
 def loadConfiguredPrinters(configPath: Optional[Union[str, Path]] = None) -> List[Dict[str, Any]]:
