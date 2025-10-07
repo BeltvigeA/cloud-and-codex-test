@@ -7,6 +7,8 @@ from typing import Any, Dict, List, Tuple
 
 import sys
 
+from ftplib import error_perm
+
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -31,6 +33,8 @@ class DummyFtpClient:
         self.failCwd = False
         self.deletedPaths: List[str] = []
         self.deleteFailures: Dict[str, Exception] = {}
+        self.sendcmdCalls: List[str] = []
+        self.storbinaryFailures: List[Exception] = []
 
     def connect(self, host: str, port: int, timeout: int | None = None, source_address=None):  # type: ignore[override]
         self.connected = (host, port, timeout)
@@ -54,9 +58,12 @@ class DummyFtpClient:
             raise RuntimeError("CWD failed")
 
     def storbinary(self, command: str, handle, blocksize: int = 8192) -> None:  # noqa: ANN001 - signature matches ftplib
+        self.commands.append(("storbinary", (command,), {"blocksize": blocksize}))
+        if self.storbinaryFailures:
+            failure = self.storbinaryFailures.pop(0)
+            raise failure
         self.storageCommand = command
         self.storedData = handle.read()
-        self.commands.append(("storbinary", (command,), {"blocksize": blocksize}))
 
     def delete(self, path: str) -> None:
         self.deletedPaths.append(path)
@@ -64,6 +71,13 @@ class DummyFtpClient:
         failure = self.deleteFailures.get(path)
         if failure:
             raise failure
+
+    def sendcmd(self, command: str) -> str:
+        self.sendcmdCalls.append(command)
+        self.commands.append(("sendcmd", (command,), {}))
+        if command in {"SITE FAIL"}:
+            raise RuntimeError("SITE command failed")
+        return "200 OK"
 
     def voidresp(self) -> None:
         self.commands.append(("voidresp", tuple(), {}))
@@ -143,6 +157,26 @@ def test_upload_via_ftps_ignores_missing_file(monkeypatch: pytest.MonkeyPatch, t
     assert dummy.deletedPaths == ["example.3mf"]
     storbinaryCalls = [entry for entry in dummy.commands if entry[0] == "storbinary"]
     assert storbinaryCalls, "Expected storbinary to be invoked even when delete reports missing file"
+
+
+def test_upload_via_ftps_retries_after_reactivating_stor(monkeypatch: pytest.MonkeyPatch, temp_file: Path) -> None:
+    dummy = DummyFtpClient()
+    dummy.storbinaryFailures.append(error_perm("550 Permission denied"))
+    _install_dummy(monkeypatch, dummy)
+    monkeypatch.setenv("BAMBU_FTPS_REACTIVATE_STOR_COMMANDS", "RESET_STOR")
+
+    result = bambuPrinter.uploadViaFtps(
+        ip="192.0.2.10",
+        accessCode="abcd",
+        localPath=temp_file,
+        remoteName="example.3mf",
+    )
+
+    assert result == "example.3mf"
+    sendcmdCalls = [entry for entry in dummy.sendcmdCalls if entry.startswith("SITE ")]
+    assert sendcmdCalls == ["SITE RESET_STOR"]
+    storbinaryCalls = [entry for entry in dummy.commands if entry[0] == "storbinary"]
+    assert len(storbinaryCalls) == 2
 
 
 def test_build_printer_transfer_file_name_trims_prefixes() -> None:

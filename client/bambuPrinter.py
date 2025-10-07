@@ -17,7 +17,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional
 
 from urllib.parse import urljoin
 
-from ftplib import FTP_TLS
+from ftplib import FTP_TLS, error_perm
 
 try:  # pragma: no cover - optional dependency in tests
     import paho.mqtt.client as mqtt  # type: ignore
@@ -140,6 +140,29 @@ def sendPrintJobViaCloud(baseUrl: str, jobPayload: Dict[str, Any], timeoutSecond
     return {}
 
 
+def _parseReactivateStorCommands() -> List[str]:
+    envValue = os.environ.get("BAMBU_FTPS_REACTIVATE_STOR_COMMANDS")
+    if not envValue:
+        return ["ENABLE_STOR"]
+
+    commands = [entry.strip() for entry in envValue.split(",")]
+    return [command for command in commands if command]
+
+
+def reactivateStor(ftpsClient: FTP_TLS) -> None:
+    commands = _parseReactivateStorCommands()
+    for command in commands:
+        normalized = command.upper()
+        if normalized.startswith("SITE "):
+            fullCommand = command
+        else:
+            fullCommand = f"SITE {command}"
+        try:
+            ftpsClient.sendcmd(fullCommand)
+        except Exception:
+            continue
+
+
 def uploadViaFtps(
     *,
     ip: str,
@@ -189,8 +212,17 @@ def uploadViaFtps(
         for remoteTarget in remoteDeleteTargets:
             deleteRemotePath(remoteTarget)
 
-        with open(localPath, "rb") as handle:
-            ftps.storbinary(storageCommand, handle, blocksize=64 * 1024)
+        def performUpload() -> None:
+            with open(localPath, "rb") as handle:
+                ftps.storbinary(storageCommand, handle, blocksize=64 * 1024)
+
+        try:
+            performUpload()
+        except error_perm as uploadError:
+            if "550" not in str(uploadError):
+                raise
+            reactivateStor(ftps)
+            performUpload()
 
         ftps.voidresp()
         return fileName
