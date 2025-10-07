@@ -162,30 +162,18 @@ def uploadViaFtps(
         ftps.voidcmd("TYPE I")
 
         fileName = os.path.basename(remoteName)
-        connection = ftps.transfercmd(f"STOR {fileName}")
-        try:
-            with open(localPath, "rb") as handle:
-                while True:
-                    chunk = handle.read(64 * 1024)
-                    if not chunk:
-                        break
-                    connection.sendall(chunk)
 
-            try:  # pragma: no cover - depends on SSL implementation
-                unwrap = getattr(connection, "unwrap", None)
-                if callable(unwrap):
-                    unwrap()
-            except Exception:
-                pass
+        storageCommand = f"STOR {fileName}"
+        try:
+            ftps.cwd("/sdcard")
+        except Exception:
             try:
-                connection.shutdown(socket.SHUT_WR)
+                ftps.cwd("sdcard")
             except Exception:
-                pass
-        finally:
-            try:
-                connection.close()
-            except Exception:
-                pass
+                storageCommand = f"STOR sdcard/{fileName}"
+
+        with open(localPath, "rb") as handle:
+            ftps.storbinary(storageCommand, handle, blocksize=64 * 1024)
 
         ftps.voidresp()
         return fileName
