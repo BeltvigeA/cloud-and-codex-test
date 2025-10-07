@@ -12,6 +12,7 @@ import time
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Event
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
 from urllib.parse import urljoin
@@ -251,6 +252,7 @@ def startPrintViaMqtt(
     vibrationCalibration: bool = False,
     insecureTls: bool = True,
     waitSeconds: int = 12,
+    statusWarmupSeconds: int = 5,
     statusCallback: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> None:
     """Start a print job via MQTT and stream status messages."""
@@ -264,6 +266,10 @@ def startPrintViaMqtt(
 
     lastStatus: Dict[str, Any] = {}
 
+    connectionReady = Event()
+    connectionError: Optional[str] = None
+    initialStatus = Event()
+
     def handleStatus(statusPayload: Dict[str, Any]) -> None:
         nonlocal lastStatus
         filteredKeys = ("mc_percent", "gcode_state", "mc_remaining_time", "nozzle_temper", "bed_temper")
@@ -272,11 +278,15 @@ def startPrintViaMqtt(
             lastStatus = statusSnapshot
             if statusCallback:
                 statusCallback({"event": "progress", "status": statusSnapshot})
+            initialStatus.set()
 
     def onConnect(client: mqtt.Client, _userdata, _flags, reasonCode, _properties):  # type: ignore[no-redef]
+        nonlocal connectionError
         if getattr(reasonCode, "is_failure", False):
-            raise RuntimeError(f"MQTT connection failed: {reasonCode}")
-        client.subscribe(topicReport, qos=1)
+            connectionError = f"MQTT connection failed: {reasonCode}"
+        else:
+            client.subscribe(topicReport, qos=1)
+        connectionReady.set()
 
     def onMessage(_client: mqtt.Client, _userdata, message):  # type: ignore[no-redef]
         try:
@@ -316,7 +326,25 @@ def startPrintViaMqtt(
     client.connect(ip, port, keepalive=60)
     client.loop_start()
 
-    sequenceId = str(int(time.time()))
+    if not connectionReady.wait(timeout=10):
+        client.loop_stop()
+        client.disconnect()
+        raise TimeoutError("Timed out waiting for MQTT connection")
+
+    if connectionError:
+        client.loop_stop()
+        client.disconnect()
+        raise RuntimeError(connectionError)
+
+    sequenceBase = str(int(time.time()))
+    statusSequenceId = f"{sequenceBase}-status"
+    statusRequestPayload = {"pushing": {"command": "pushall", "sequence_id": statusSequenceId}}
+    client.publish(topicRequest, json.dumps(statusRequestPayload), qos=1)
+
+    if not initialStatus.wait(timeout=max(0, statusWarmupSeconds)) and statusCallback:
+        statusCallback({"event": "statusWarmupTimeout"})
+
+    sequenceId = f"{sequenceBase}-print"
     url = f"file:///sdcard/{sdFileName}"
     payload: Dict[str, Any] = {
         "print": {
