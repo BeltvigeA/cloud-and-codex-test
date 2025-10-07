@@ -431,10 +431,6 @@ class ListenerGuiApp:
         serialNumberVar = tk.StringVar(value=(initialValues or {}).get("serialNumber", ""))
         brandVar = tk.StringVar(value=(initialValues or {}).get("brand", ""))
         initialStatus = (initialValues or {}).get("status", "Unknown") or "Unknown"
-        statusChoices = list(self.printerStatusOptions)
-        if initialStatus not in statusChoices:
-            statusChoices.append(initialStatus)
-        statusVar = tk.StringVar(value=initialStatus)
 
         ttk.Label(dialog, text="Nickname:").grid(row=0, column=0, sticky=tk.W, padx=12, pady=(12, 4))
         ttk.Entry(dialog, textvariable=nicknameVar).grid(row=0, column=1, sticky=tk.EW, padx=12, pady=(12, 4))
@@ -457,16 +453,17 @@ class ListenerGuiApp:
         brandCombo.grid(row=4, column=1, sticky=tk.EW, padx=12, pady=4)
 
         ttk.Label(dialog, text="Status:").grid(row=5, column=0, sticky=tk.W, padx=12, pady=4)
-        statusCombo = ttk.Combobox(
+        ttk.Label(dialog, text=initialStatus).grid(row=5, column=1, sticky=tk.W, padx=12, pady=4)
+
+        statusInfoLabel = ttk.Label(
             dialog,
-            textvariable=statusVar,
-            values=tuple(statusChoices),
-            state="readonly",
+            text="Status is updated automatically based on telemetry.",
         )
-        statusCombo.grid(row=5, column=1, sticky=tk.EW, padx=12, pady=4)
+        statusInfoLabel.grid(row=6, column=0, columnspan=2, sticky=tk.W, padx=12, pady=(0, 4))
+        statusInfoLabel.configure(foreground="gray")
 
         buttonFrame = ttk.Frame(dialog)
-        buttonFrame.grid(row=6, column=0, columnspan=2, pady=12)
+        buttonFrame.grid(row=7, column=0, columnspan=2, pady=12)
         ttk.Button(
             buttonFrame,
             text="Save",
@@ -477,7 +474,6 @@ class ListenerGuiApp:
                 accessCodeVar,
                 serialNumberVar,
                 brandVar,
-                statusVar,
                 onSave,
             ),
         ).pack(side=tk.LEFT, padx=6)
@@ -493,7 +489,6 @@ class ListenerGuiApp:
         accessCodeVar: tk.StringVar,
         serialNumberVar: tk.StringVar,
         brandVar: tk.StringVar,
-        statusVar: tk.StringVar,
         onSave: Callable[[Dict[str, Any]], None],
     ) -> None:
         nickname = nicknameVar.get().strip()
@@ -501,7 +496,6 @@ class ListenerGuiApp:
         accessCode = accessCodeVar.get().strip()
         serialNumber = serialNumberVar.get().strip()
         brand = brandVar.get().strip()
-        status = statusVar.get().strip() or "Unknown"
 
         if not nickname or not ipAddress:
             messagebox.showerror(
@@ -518,7 +512,6 @@ class ListenerGuiApp:
             "accessCode": accessCode,
             "serialNumber": serialNumber,
             "brand": brand,
-            "status": status,
         }
 
         onSave(self._applyTelemetryDefaults(printerDetails))
