@@ -167,6 +167,13 @@ class ListenerGuiApp:
             state=tk.DISABLED,
         )
         self.editPrinterButton.pack(side=tk.LEFT, padx=(8, 0))
+        self.connectPrintersButton = ttk.Button(
+            actionFrame,
+            text="Connect Printers",
+            command=self.refreshPrintersNow,
+            state=tk.NORMAL,
+        )
+        self.connectPrintersButton.pack(side=tk.LEFT, padx=8)
         actionFrame.columnconfigure(0, weight=1)
 
         treeFrame = ttk.Frame(parent)
@@ -535,6 +542,14 @@ class ListenerGuiApp:
         state = tk.NORMAL if self._getSelectedPrinterIndex() is not None else tk.DISABLED
         self.editPrinterButton.config(state=state)
 
+    def refreshPrintersNow(self) -> None:
+        if self.statusRefreshThread and self.statusRefreshThread.is_alive():
+            self.pendingImmediateStatusRefresh = True
+            return
+        if hasattr(self, "connectPrintersButton"):
+            self.connectPrintersButton.config(state=tk.DISABLED)
+        self._scheduleStatusRefresh(0)
+
     def _getSelectedPrinterIndex(self) -> Optional[int]:
         selection = self.printerTree.selection() if hasattr(self, "printerTree") else ()
         if not selection:
@@ -825,6 +840,8 @@ class ListenerGuiApp:
                         self._refreshPrinterList()
                 elif messageType == "complete":
                     self.statusRefreshThread = None
+                    if hasattr(self, "connectPrintersButton"):
+                        self.connectPrintersButton.config(state=tk.NORMAL)
                     delay = 0 if self.pendingImmediateStatusRefresh else self.statusRefreshIntervalMs
                     self._scheduleStatusRefresh(delay)
         except Empty:
