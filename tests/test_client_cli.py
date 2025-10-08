@@ -1,3 +1,4 @@
+import json
 import logging
 import time
 import sys
@@ -119,6 +120,71 @@ def testStatusCommandAcceptsRecipientId(monkeypatch: pytest.MonkeyPatch) -> None
     arguments = client.parseArguments()
 
     assert arguments.recipientId == "recipient-42"
+
+
+def testStatusCommandParsesStatusSequence(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "client",
+            "status",
+            "--apiKey",
+            "testKey",
+            "--printerSerial",
+            "printer123",
+            "--statusSequence",
+            "idle,printing",
+        ],
+    )
+
+    arguments = client.parseArguments()
+
+    assert arguments.statusSequence == ["idle", "printing"]
+
+
+def testStatusCommandRejectsEmptyStatusSequence(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "client",
+            "status",
+            "--apiKey",
+            "testKey",
+            "--printerSerial",
+            "printer123",
+            "--statusSequence",
+            "idle, ",
+        ],
+    )
+
+    with pytest.raises(SystemExit):
+        client.parseArguments()
+
+
+def testStatusCommandAcceptsPayloadFile(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    payloadFile = tmp_path / "payload.json"
+    payloadFile.write_text("{}", encoding="utf-8")
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "client",
+            "status",
+            "--apiKey",
+            "testKey",
+            "--printerSerial",
+            "printer123",
+            "--payloadFile",
+            str(payloadFile),
+        ],
+    )
+
+    arguments = client.parseArguments()
+
+    assert arguments.payloadFile == payloadFile
 
 
 def testValidateRemoteListenAcceptsDefaultBaseUrl(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -277,6 +343,45 @@ def testGenerateStatusPayloadIncludesRecipientId() -> None:
     assert payload["recipientId"] == "recipient-55"
 
 
+def testGenerateStatusPayloadRespectsManualOverrides(monkeypatch: pytest.MonkeyPatch) -> None:
+    manualPayload = {"printJobId": "manual-job", "status": "printing", "custom": True}
+    originalPayload = dict(manualPayload)
+    monkeypatch.setattr(client.time, "time", lambda: 123.456)
+
+    payload, nextJobId = client.generateStatusPayload(
+        "printer-override",
+        iteration=3,
+        currentJobId=None,
+        recipientId="recipient-override",
+        forcedStatus="finished",
+        manualPayload=manualPayload,
+    )
+
+    assert manualPayload == originalPayload
+    assert payload["printerSerial"] == "printer-override"
+    assert payload["status"] == "finished"
+    assert payload["printJobId"] == "manual-job"
+    assert payload["recipientId"] == "recipient-override"
+    assert payload["timestamp"] == 123.456
+    assert payload["custom"] is True
+    assert "materialLevel" not in payload
+    assert nextJobId is None
+
+
+def testGenerateStatusPayloadFillsMissingPrintJobId(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(client.time, "time", lambda: 321.0)
+
+    payload, nextJobId = client.generateStatusPayload(
+        "printer-missing-job",
+        iteration=1,
+        currentJobId=None,
+        manualPayload={"status": "idle"},
+    )
+
+    assert payload["printJobId"]
+    assert nextJobId is None
+
+
 def testValidateBaseUrlArgumentLogsErrorForEmptyInput(caplog: pytest.LogCaptureFixture) -> None:
     caplog.set_level(logging.ERROR)
 
@@ -397,3 +502,125 @@ def testListenRequestsFreshDownloadWhenCachedFileMissing(
     assert updatedRecord["downloadedFilePath"] == str(newFilePath.resolve())
 
     database.close()
+
+
+def testPerformStatusUpdatesUsesStatusSequence(monkeypatch: pytest.MonkeyPatch) -> None:
+    forcedStatuses: list[str | None] = []
+
+    class DummyResponse:
+        text = ""
+        status_code = 200
+
+        def raise_for_status(self) -> None:
+            return None
+
+    class DummySession:
+        def post(self, *_args, **_kwargs):  # pragma: no cover - simple stub
+            return DummyResponse()
+
+    def fakeGenerateStatusPayload(
+        printerSerial: str,
+        iteration: int,
+        currentJobId: str | None,
+        recipientId: str | None = None,
+        *,
+        forcedStatus: str | None = None,
+        manualPayload: dict | None = None,
+    ) -> tuple[dict, str | None]:
+        forcedStatuses.append(forcedStatus)
+        nextJobId = currentJobId or "job-sequence"
+        payload = {"printJobId": nextJobId, "status": forcedStatus or "default"}
+        return payload, nextJobId
+
+    monkeypatch.setattr(client.requests, "Session", lambda: DummySession())
+    monkeypatch.setattr(client.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(client, "generateStatusPayload", fakeGenerateStatusPayload)
+
+    client.performStatusUpdates(
+        "https://status.example.com",
+        "api-key",
+        "printer-sequence",
+        intervalSeconds=0,
+        numUpdates=3,
+        statusSequence=["ready", "printing"],
+    )
+
+    assert forcedStatuses == ["ready", "printing", "ready"]
+
+
+def testPerformStatusUpdatesLoadsPayloadTemplate(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    payloadTemplate = {"status": "printing", "printJobId": "manual-job", "custom": "value"}
+    payloadPath = tmp_path / "payload.json"
+    payloadPath.write_text(json.dumps(payloadTemplate), encoding="utf-8")
+
+    capturedPayloads: list[dict] = []
+
+    class DummyResponse:
+        text = ""
+        status_code = 200
+
+        def raise_for_status(self) -> None:
+            return None
+
+    class DummySession:
+        def post(self, *_args, **_kwargs):  # pragma: no cover - simple stub
+            return DummyResponse()
+
+    def fakeGenerateStatusPayload(
+        printerSerial: str,
+        iteration: int,
+        currentJobId: str | None,
+        recipientId: str | None = None,
+        *,
+        forcedStatus: str | None = None,
+        manualPayload: dict | None = None,
+    ) -> tuple[dict, str | None]:
+        capturedPayloads.append(manualPayload or {})
+        payload = {
+            "printJobId": (manualPayload or {}).get("printJobId", "job-template"),
+            "status": (manualPayload or {}).get("status", forcedStatus or "idle"),
+        }
+        return payload, None
+
+    monkeypatch.setattr(client.requests, "Session", lambda: DummySession())
+    monkeypatch.setattr(client.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(client, "generateStatusPayload", fakeGenerateStatusPayload)
+
+    client.performStatusUpdates(
+        "https://status.example.com",
+        "api-key",
+        "printer-template",
+        intervalSeconds=0,
+        numUpdates=2,
+        payloadFile=payloadPath,
+    )
+
+    assert len(capturedPayloads) == 2
+    assert capturedPayloads[0] == payloadTemplate
+    assert capturedPayloads[1] == payloadTemplate
+    assert capturedPayloads[0] is not capturedPayloads[1]
+
+
+def testPerformStatusUpdatesRaisesForMalformedPayload(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    payloadPath = tmp_path / "payload.json"
+    payloadPath.write_text("{invalid", encoding="utf-8")
+
+    class DummySession:
+        def post(self, *_args, **_kwargs):  # pragma: no cover - simple stub
+            raise AssertionError("post should not be called when payload is invalid")
+
+    monkeypatch.setattr(client.requests, "Session", lambda: DummySession())
+
+    with pytest.raises(ValueError):
+        client.performStatusUpdates(
+            "https://status.example.com",
+            "api-key",
+            "printer-template",
+            intervalSeconds=0,
+            numUpdates=1,
+            payloadFile=payloadPath,
+        )

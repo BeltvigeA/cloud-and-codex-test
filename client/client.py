@@ -7,6 +7,7 @@ import shutil
 import sys
 import time
 import uuid
+from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
 from threading import Event
@@ -30,6 +31,13 @@ def configureLogging() -> None:
         format="%(asctime)s - %(levelname)s - %(message)s",
         stream=sys.stdout,
     )
+
+
+def parseStatusSequence(value: str) -> List[str]:
+    parts = [part.strip() for part in value.split(",")]
+    if not parts or not all(parts):
+        raise argparse.ArgumentTypeError("statusSequence must contain non-empty statuses")
+    return parts
 
 
 def parseArguments() -> argparse.Namespace:
@@ -97,6 +105,17 @@ def parseArguments() -> argparse.Namespace:
         "--recipientId",
         default=None,
         help="Optional recipient identifier to associate with status updates.",
+    )
+    statusManualGroup = statusParser.add_mutually_exclusive_group()
+    statusManualGroup.add_argument(
+        "--statusSequence",
+        type=parseStatusSequence,
+        help="Comma-separated list of statuses to cycle through when sending updates.",
+    )
+    statusManualGroup.add_argument(
+        "--payloadFile",
+        type=Path,
+        help="Path to a JSON payload template for manual status updates.",
     )
 
     listenParser = subparsers.add_parser(
@@ -1174,9 +1193,34 @@ def generateStatusPayload(
     iteration: int,
     currentJobId: Optional[str],
     recipientId: Optional[str] = None,
+    *,
+    forcedStatus: Optional[str] = None,
+    manualPayload: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Dict[str, Any], Optional[str]]:
     statuses = ["idle", "printing", "pausing", "error", "finished"]
-    status = statuses[iteration % len(statuses)]
+
+    if manualPayload is not None:
+        payload = deepcopy(manualPayload)
+        payload["printerSerial"] = printerSerial
+        payload["timestamp"] = time.time()
+        if recipientId is not None:
+            payload["recipientId"] = recipientId
+
+        resolvedStatus = forcedStatus or payload.get("status")
+        if resolvedStatus is None:
+            resolvedStatus = statuses[iteration % len(statuses)]
+        payload["status"] = resolvedStatus
+
+        jobId = payload.get("printJobId") or currentJobId or str(uuid.uuid4())
+        payload["printJobId"] = jobId
+
+        nextJobId = jobId
+        if resolvedStatus in {"finished", "error", "idle"}:
+            nextJobId = None
+
+        return payload, nextJobId
+
+    status = forcedStatus or statuses[iteration % len(statuses)]
 
     if status == "printing":
         jobId = currentJobId or str(uuid.uuid4())
@@ -1185,7 +1229,7 @@ def generateStatusPayload(
         jobId = currentJobId or str(uuid.uuid4())
         jobProgress = 100
     else:
-        jobId = currentJobId
+        jobId = currentJobId or str(uuid.uuid4())
         jobProgress = 0
 
     materialLevel = {
@@ -1200,7 +1244,7 @@ def generateStatusPayload(
         "printerSerial": printerSerial,
         "objectName": f"dummy_print_object_v{1 + (iteration % 3)}",
         "useAms": iteration % 2 == 0,
-        "printJobId": jobId or str(uuid.uuid4()),
+        "printJobId": jobId,
         "productName": f"widget_v{1 + (iteration % 4)}",
         "platesRequested": 1 + (iteration % 2),
         "status": status,
@@ -1495,19 +1539,46 @@ def performStatusUpdates(
     intervalSeconds: int,
     numUpdates: int,
     recipientId: Optional[str] = None,
+    statusSequence: Optional[List[str]] = None,
+    payloadFile: Optional[Path] = None,
 ) -> None:
     statusUrl = f"{buildBaseUrl(baseUrl)}/printer-status"
     session = requests.Session()
     headers = {"X-API-Key": apiKey, "Content-Type": "application/json"}
 
+    manualStatuses = list(statusSequence) if statusSequence else None
+    manualTemplate: Optional[Dict[str, Any]] = None
+    if payloadFile is not None:
+        resolvedPayloadPath = Path(payloadFile).expanduser()
+        try:
+            with resolvedPayloadPath.open("r", encoding="utf-8") as payloadHandle:
+                manualTemplate = json.load(payloadHandle)
+        except FileNotFoundError as error:
+            raise FileNotFoundError(
+                f"Payload template not found at {resolvedPayloadPath}"
+            ) from error
+        except json.JSONDecodeError as error:
+            raise ValueError("Payload template must contain valid JSON") from error
+        if not isinstance(manualTemplate, dict):
+            raise ValueError("Payload template must be a JSON object")
+
     iteration = 0
     currentJobId: Optional[str] = None
     while True:
+        forcedStatus: Optional[str] = None
+        manualPayload: Optional[Dict[str, Any]] = None
+        if manualStatuses:
+            forcedStatus = manualStatuses[iteration % len(manualStatuses)]
+        if manualTemplate is not None:
+            manualPayload = deepcopy(manualTemplate)
+
         payload, currentJobId = generateStatusPayload(
             printerSerial,
             iteration,
             currentJobId,
             recipientId=recipientId,
+            forcedStatus=forcedStatus,
+            manualPayload=manualPayload,
         )
         try:
             response = session.post(statusUrl, headers=headers, json=payload, timeout=30)
@@ -1584,6 +1655,8 @@ def main() -> None:
             arguments.interval,
             arguments.numUpdates,
             arguments.recipientId,
+            arguments.statusSequence,
+            arguments.payloadFile,
         )
     elif arguments.command == "listen":
         if arguments.mode == "offline":
