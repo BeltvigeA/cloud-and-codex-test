@@ -12,10 +12,12 @@ import ssl
 import tempfile
 import time
 import zipfile
+import xml.etree.ElementTree as ET
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Event
-from typing import Any, Callable, Dict, Iterable, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
 
 from urllib.parse import urljoin
 
@@ -466,11 +468,161 @@ def buildPrinterTransferFileName(localPath: Path) -> str:
     return normalizeRemoteFileName(trimmedName)
 
 
+def _normalizeString(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _extractPlateIndex(plateElement: Any) -> Optional[str]:
+    if plateElement is None:
+        return None
+    for metadataElement in plateElement.findall("metadata"):
+        if metadataElement.get("key") == "index":
+            return metadataElement.get("value")
+    return None
+
+
+def _findObjectElement(plateElement: Any, *, identifyId: Optional[str], objectName: Optional[str]) -> Optional[Any]:
+    for objectElement in plateElement.findall("object"):
+        elementId = _normalizeString(objectElement.get("identify_id") or objectElement.get("object_id") or objectElement.get("id"))
+        if identifyId and elementId and identifyId == elementId:
+            return objectElement
+        elementName = _normalizeString(objectElement.get("name"))
+        if objectName and elementName and objectName == elementName:
+            return objectElement
+    return None
+
+
+def _ensureSkippedContainer(plateElement: Any) -> Any:
+    skippedContainer = plateElement.find("skipped_objects")
+    if skippedContainer is None:
+        skippedContainer = ET.SubElement(plateElement, "skipped_objects")
+    return skippedContainer
+
+
+def _updateSkippedContainer(
+    skippedContainer: Any,
+    *,
+    orderNumber: int,
+    identifyId: Optional[str],
+    objectName: Optional[str],
+    plateId: Optional[str],
+) -> None:
+    orderText = str(orderNumber)
+    existingElement: Optional[Any] = None
+    for candidate in skippedContainer.findall("object"):
+        candidateOrder = _normalizeString(candidate.get("order"))
+        if candidateOrder == orderText:
+            existingElement = candidate
+            break
+
+    if existingElement is None:
+        existingElement = ET.SubElement(skippedContainer, "object")
+
+    existingElement.set("order", orderText)
+    if identifyId:
+        existingElement.set("identify_id", identifyId)
+    if objectName:
+        existingElement.set("name", objectName)
+    if plateId:
+        existingElement.set("plate_id", plateId)
+
+
+def applySkippedObjectsToArchive(archivePath: Path, skipTargets: Sequence[Dict[str, Any]]) -> None:
+    if not skipTargets:
+        return
+
+    try:
+        with zipfile.ZipFile(archivePath, "r") as archive:
+            try:
+                sliceInfo = archive.read("Metadata/slice_info.config")
+            except KeyError as error:
+                raise ValueError("3MF archive is missing slicer metadata (Metadata/slice_info.config)") from error
+    except zipfile.BadZipFile as error:
+        raise ValueError(f"{archivePath} is not a valid 3MF archive") from error
+
+    root = ET.fromstring(sliceInfo)
+
+    unmatchedOrders: List[int] = []
+    appliedOrders: List[int] = []
+
+    for target in skipTargets:
+        orderNumber = target.get("order")
+        if not isinstance(orderNumber, int):
+            continue
+        identifyId = _normalizeString(target.get("identifyId"))
+        objectName = _normalizeString(target.get("objectName"))
+        plateId = _normalizeString(target.get("plateId"))
+
+        matchedObject: Optional[Any] = None
+        matchedPlate: Optional[Any] = None
+
+        for plateElement in root.findall("plate"):
+            plateIndex = _normalizeString(_extractPlateIndex(plateElement))
+            if plateId and plateIndex and plateId != plateIndex:
+                continue
+            candidateObject = _findObjectElement(
+                plateElement,
+                identifyId=identifyId,
+                objectName=objectName,
+            )
+            if candidateObject is not None:
+                matchedObject = candidateObject
+                matchedPlate = plateElement
+                break
+
+        if matchedObject is None or matchedPlate is None:
+            unmatchedOrders.append(orderNumber)
+            continue
+
+        matchedObject.set("skipped", "true")
+        skippedContainer = _ensureSkippedContainer(matchedPlate)
+        _updateSkippedContainer(
+            skippedContainer,
+            orderNumber=orderNumber,
+            identifyId=identifyId,
+            objectName=objectName,
+            plateId=plateId,
+        )
+        appliedOrders.append(orderNumber)
+
+    if unmatchedOrders:
+        orderSummary = ", ".join(str(number) for number in sorted(set(unmatchedOrders)))
+        logging.error("Unable to locate slicer objects for order(s): %s", orderSummary)
+        raise ValueError(f"Unable to locate slicer objects for order(s): {orderSummary}")
+
+    if not appliedOrders:
+        return
+
+    updatedSliceInfo = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
+    with zipfile.ZipFile(archivePath, "r") as archive:
+        entries: List[zipfile.ZipInfo] = []
+        contents: Dict[str, bytes] = {}
+        for info in archive.infolist():
+            entries.append(info)
+            contents[info.filename] = archive.read(info.filename)
+
+    contents["Metadata/slice_info.config"] = updatedSliceInfo
+
+    with zipfile.ZipFile(archivePath, "w") as archive:
+        for info in entries:
+            data = contents.pop(info.filename, None)
+            if data is None:
+                continue
+            archive.writestr(info, data)
+        for name, data in contents.items():
+            archive.writestr(name, data)
+
+
 def sendBambuPrintJob(
     *,
     filePath: Path,
     options: BambuPrintOptions,
     statusCallback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    skippedObjects: Optional[Sequence[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Upload a file and start a Bambu print job."""
 
@@ -491,6 +643,8 @@ def sendBambuPrintJob(
                     pass
             except zipfile.BadZipFile as zipError:
                 raise ValueError(f"{resolvedPath} is not a valid 3MF archive") from zipError
+
+        applySkippedObjectsToArchive(temporaryPath, skippedObjects or [])
 
         paramPath, _ = pickGcodeParamFrom3mf(temporaryPath, options.plateIndex)
 
@@ -569,6 +723,7 @@ __all__ = [
     "buildPrinterTransferFileName",
     "encodeFileToBase64",
     "makeTlsContext",
+    "applySkippedObjectsToArchive",
     "pickGcodeParamFrom3mf",
     "sendBambuPrintJob",
     "sendPrintJobViaCloud",
