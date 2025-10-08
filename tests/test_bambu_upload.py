@@ -186,6 +186,52 @@ def test_upload_via_ftps_renames_when_delete_denied(monkeypatch: pytest.MonkeyPa
     assert storbinaryCalls and storbinaryCalls[0][1] == (f"STOR {expectedName}",)
 
 
+def test_upload_via_ftps_generates_new_fallback_after_delete_failure(
+    monkeypatch: pytest.MonkeyPatch, temp_file: Path
+) -> None:
+    dummy = DummyFtpClient()
+    dummy.deleteFailures["example.3mf"] = error_perm("550 Permission denied")
+    dummy.storbinaryFailures.extend(
+        [
+            error_perm("550 Permission denied"),
+            error_perm("550 Permission denied"),
+        ]
+    )
+    _install_dummy(monkeypatch, dummy)
+
+    timeValues = iter([1_700_000_000, 1_700_000_001])
+    monkeypatch.setattr(bambuPrinter.time, "time", lambda: next(timeValues))
+
+    class SequencedUuid:
+        def __init__(self, hexValue: str) -> None:
+            self.hex = hexValue
+
+    uuidValues = iter(
+        [
+            "0123456789abcdef0123456789abcdef",
+            "fedcba9876543210fedcba9876543210",
+        ]
+    )
+    monkeypatch.setattr(bambuPrinter.uuid, "uuid4", lambda: SequencedUuid(next(uuidValues)))
+
+    result = bambuPrinter.uploadViaFtps(
+        ip="192.0.2.10",
+        accessCode="abcd",
+        localPath=temp_file,
+        remoteName="example.3mf",
+    )
+
+    firstFallback = "example_1700000000_01234567.3mf"
+    secondFallback = "example_1700000001_fedcba98.3mf"
+
+    assert result == secondFallback
+    storbinaryCalls = [entry for entry in dummy.commands if entry[0] == "storbinary"]
+    assert len(storbinaryCalls) == 3
+    assert storbinaryCalls[-1][1] == (f"STOR {secondFallback}",)
+    assert dummy.deletedPaths == ["example.3mf"]
+    assert firstFallback in {call[1][0].split(" ", 1)[1] for call in storbinaryCalls[:2]}
+
+
 def test_upload_via_ftps_retries_after_reactivating_stor(monkeypatch: pytest.MonkeyPatch, temp_file: Path) -> None:
     dummy = DummyFtpClient()
     dummy.storbinaryFailures.append(error_perm("550 Permission denied"))

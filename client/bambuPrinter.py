@@ -190,6 +190,7 @@ def uploadViaFtps(
         ftps.voidcmd("TYPE I")
 
         fileName = os.path.basename(remoteName)
+        fallbackSeedName = fileName
 
         storageCommand = f"STOR {fileName}"
         remoteDeleteTargets = []
@@ -222,9 +223,12 @@ def uploadViaFtps(
                 remoteDeleteTargets.append(f"sdcard/{fileName}")
 
         fallbackActive = False
+        fallbackSource: Optional[str] = None
+        fallbackRetriesAfterDelete = 0
+        maxFallbackRetriesAfterDelete = 1
 
-        def activateFallbackName(generatedName: str) -> None:
-            nonlocal storageCommand, fileName, fallbackActive
+        def activateFallbackName(generatedName: str, *, source: str) -> None:
+            nonlocal storageCommand, fileName, fallbackActive, fallbackSource, fallbackRetriesAfterDelete
 
             _, remoteStoragePath = storageCommand.split(" ", 1)
             remoteDirectory, _ = os.path.split(remoteStoragePath)
@@ -235,13 +239,16 @@ def uploadViaFtps(
             storageCommand = f"STOR {newRemotePath}"
             fileName = generatedName
             fallbackActive = True
+            fallbackSource = source
+            if source == "delete":
+                fallbackRetriesAfterDelete = 0
         for remoteTarget in remoteDeleteTargets:
             try:
                 deleteRemotePath(remoteTarget)
             except error_perm as deleteError:
                 if "550" in str(deleteError):
-                    generatedName = buildFallbackFileName(fileName)
-                    activateFallbackName(generatedName)
+                    generatedName = buildFallbackFileName(fallbackSeedName)
+                    activateFallbackName(generatedName, source="delete")
                     break
                 raise
 
@@ -260,12 +267,24 @@ def uploadViaFtps(
             except error_perm as secondError:
                 if "550" not in str(secondError):
                     raise
-                if fallbackActive:
+                allowExtraFallback = (
+                    fallbackActive
+                    and fallbackSource == "delete"
+                    and fallbackRetriesAfterDelete < maxFallbackRetriesAfterDelete
+                )
+                if fallbackActive and not allowExtraFallback:
                     raise
-                generatedName = buildFallbackFileName(fileName)
-                activateFallbackName(generatedName)
+                if allowExtraFallback:
+                    fallbackRetriesAfterDelete += 1
+                generatedName = buildFallbackFileName(fallbackSeedName)
+                activateFallbackName(generatedName, source="stor")
                 reactivateStor(ftps)
-                performUpload()
+                try:
+                    performUpload()
+                except error_perm as thirdError:
+                    if "550" in str(thirdError):
+                        raise
+                    raise
 
         ftps.voidresp()
         return fileName
