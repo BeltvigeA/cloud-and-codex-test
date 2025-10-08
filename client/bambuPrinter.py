@@ -6,8 +6,10 @@ import base64
 import json
 import os
 import re
+import shutil
 import socket
 import ssl
+import tempfile
 import time
 import zipfile
 from dataclasses import dataclass
@@ -478,67 +480,79 @@ def sendBambuPrintJob(
 
     remoteName = buildRemoteFileName(resolvedPath)
     printerFileName = buildPrinterTransferFileName(resolvedPath)
-    paramPath, _ = pickGcodeParamFrom3mf(resolvedPath, options.plateIndex)
 
-    if options.useCloud and options.cloudUrl:
-        payload = buildCloudJobPayload(
+    with tempfile.TemporaryDirectory() as temporaryDirectory:
+        temporaryPath = Path(temporaryDirectory) / resolvedPath.name
+        shutil.copy2(resolvedPath, temporaryPath)
+
+        if temporaryPath.suffix.lower().endswith(".3mf"):
+            try:
+                with zipfile.ZipFile(temporaryPath, "a"):
+                    pass
+            except zipfile.BadZipFile as zipError:
+                raise ValueError(f"{resolvedPath} is not a valid 3MF archive") from zipError
+
+        paramPath, _ = pickGcodeParamFrom3mf(temporaryPath, options.plateIndex)
+
+        if options.useCloud and options.cloudUrl:
+            payload = buildCloudJobPayload(
+                ip=options.ipAddress,
+                serial=options.serialNumber,
+                accessCode=options.accessCode,
+                safeName=remoteName,
+                paramPath=paramPath,
+                plateIndex=options.plateIndex,
+                useAms=options.useAms,
+                bedLeveling=options.bedLeveling,
+                layerInspect=options.layerInspect,
+                flowCalibration=options.flowCalibration,
+                vibrationCalibration=options.vibrationCalibration,
+                secureConnection=options.secureConnection,
+                localPath=temporaryPath,
+            )
+            response = sendPrintJobViaCloud(options.cloudUrl, payload, timeoutSeconds=options.cloudTimeout)
+            if statusCallback:
+                statusCallback({"event": "cloudAccepted", "response": response})
+            return {"method": "cloud", "remoteFile": remoteName, "paramPath": paramPath, "response": response}
+
+        uploadedName = uploadViaFtps(
+            ip=options.ipAddress,
+            accessCode=options.accessCode,
+            localPath=temporaryPath,
+            remoteName=printerFileName,
+            insecureTls=not options.secureConnection,
+        )
+        if statusCallback:
+            statusCallback(
+                {
+                    "event": "uploadComplete",
+                    "remoteFile": uploadedName,
+                    "originalRemoteFile": remoteName,
+                    "paramPath": paramPath,
+                }
+            )
+
+        startPrintViaMqtt(
             ip=options.ipAddress,
             serial=options.serialNumber,
             accessCode=options.accessCode,
-            safeName=remoteName,
+            sdFileName=uploadedName,
             paramPath=paramPath,
-            plateIndex=options.plateIndex,
             useAms=options.useAms,
             bedLeveling=options.bedLeveling,
             layerInspect=options.layerInspect,
             flowCalibration=options.flowCalibration,
             vibrationCalibration=options.vibrationCalibration,
-            secureConnection=options.secureConnection,
-            localPath=resolvedPath,
+            insecureTls=not options.secureConnection,
+            waitSeconds=options.waitSeconds,
+            statusCallback=statusCallback,
         )
-        response = sendPrintJobViaCloud(options.cloudUrl, payload, timeoutSeconds=options.cloudTimeout)
-        if statusCallback:
-            statusCallback({"event": "cloudAccepted", "response": response})
-        return {"method": "cloud", "remoteFile": remoteName, "paramPath": paramPath, "response": response}
-
-    uploadedName = uploadViaFtps(
-        ip=options.ipAddress,
-        accessCode=options.accessCode,
-        localPath=resolvedPath,
-        remoteName=printerFileName,
-        insecureTls=not options.secureConnection,
-    )
-    if statusCallback:
-        statusCallback(
-            {
-                "event": "uploadComplete",
-                "remoteFile": uploadedName,
-                "originalRemoteFile": remoteName,
-                "paramPath": paramPath,
-            }
-        )
-
-    startPrintViaMqtt(
-        ip=options.ipAddress,
-        serial=options.serialNumber,
-        accessCode=options.accessCode,
-        sdFileName=uploadedName,
-        paramPath=paramPath,
-        useAms=options.useAms,
-        bedLeveling=options.bedLeveling,
-        layerInspect=options.layerInspect,
-        flowCalibration=options.flowCalibration,
-        vibrationCalibration=options.vibrationCalibration,
-        insecureTls=not options.secureConnection,
-        waitSeconds=options.waitSeconds,
-        statusCallback=statusCallback,
-    )
-    return {
-        "method": "lan",
-        "remoteFile": uploadedName,
-        "originalRemoteFile": remoteName,
-        "paramPath": paramPath,
-    }
+        return {
+            "method": "lan",
+            "remoteFile": uploadedName,
+            "originalRemoteFile": remoteName,
+            "paramPath": paramPath,
+        }
 
 
 def summarizeStatusMessages(events: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
