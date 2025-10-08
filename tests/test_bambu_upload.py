@@ -159,6 +159,33 @@ def test_upload_via_ftps_ignores_missing_file(monkeypatch: pytest.MonkeyPatch, t
     assert storbinaryCalls, "Expected storbinary to be invoked even when delete reports missing file"
 
 
+def test_upload_via_ftps_renames_when_delete_denied(monkeypatch: pytest.MonkeyPatch, temp_file: Path) -> None:
+    dummy = DummyFtpClient()
+    dummy.deleteFailures["example.3mf"] = error_perm("550 Permission denied")
+    _install_dummy(monkeypatch, dummy)
+
+    monkeypatch.setattr(bambuPrinter.time, "time", lambda: 1_700_000_000)
+
+    class FixedUuid:
+        hex = "0123456789abcdef0123456789abcdef"
+
+    monkeypatch.setattr(bambuPrinter.uuid, "uuid4", lambda: FixedUuid())
+
+    result = bambuPrinter.uploadViaFtps(
+        ip="192.0.2.10",
+        accessCode="abcd",
+        localPath=temp_file,
+        remoteName="example.3mf",
+    )
+
+    expectedName = "example_1700000000_01234567.3mf"
+    assert result == expectedName
+    assert dummy.storageCommand == f"STOR {expectedName}"
+    assert dummy.deletedPaths == ["example.3mf"]
+    storbinaryCalls = [entry for entry in dummy.commands if entry[0] == "storbinary"]
+    assert storbinaryCalls and storbinaryCalls[0][1] == (f"STOR {expectedName}",)
+
+
 def test_upload_via_ftps_retries_after_reactivating_stor(monkeypatch: pytest.MonkeyPatch, temp_file: Path) -> None:
     dummy = DummyFtpClient()
     dummy.storbinaryFailures.append(error_perm("550 Permission denied"))

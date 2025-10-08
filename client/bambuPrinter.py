@@ -11,6 +11,7 @@ import socket
 import ssl
 import tempfile
 import time
+import uuid
 import zipfile
 import xml.etree.ElementTree as ET
 import logging
@@ -198,9 +199,16 @@ def uploadViaFtps(
                 ftps.delete(remotePath)
             except Exception as deleteError:  # pragma: no cover - exercised via specific tests
                 errorMessage = str(deleteError).lower()
-                if "550" in errorMessage or "not found" in errorMessage:
+                if "not found" in errorMessage or "no such file" in errorMessage:
                     return
                 raise
+
+        def buildFallbackFileName(originalName: str) -> str:
+            baseName, extension = os.path.splitext(originalName)
+            safeBase = baseName or "upload"
+            timestampPart = str(int(time.time()))
+            uniquePart = uuid.uuid4().hex[:8]
+            return f"{safeBase}_{timestampPart}_{uniquePart}{extension}"
 
         try:
             ftps.cwd("/sdcard")
@@ -213,8 +221,25 @@ def uploadViaFtps(
                 storageCommand = f"STOR sdcard/{fileName}"
                 remoteDeleteTargets.append(f"sdcard/{fileName}")
 
+        fallbackFileName: Optional[str] = None
         for remoteTarget in remoteDeleteTargets:
-            deleteRemotePath(remoteTarget)
+            try:
+                deleteRemotePath(remoteTarget)
+            except error_perm as deleteError:
+                if "550" in str(deleteError):
+                    fallbackFileName = buildFallbackFileName(fileName)
+                    break
+                raise
+
+        if fallbackFileName:
+            remoteStoragePath = storageCommand.split(" ", 1)[1]
+            remoteDirectory, _ = os.path.split(remoteStoragePath)
+            if remoteDirectory:
+                newRemotePath = f"{remoteDirectory}/{fallbackFileName}"
+            else:
+                newRemotePath = fallbackFileName
+            storageCommand = f"STOR {newRemotePath}"
+            fileName = fallbackFileName
 
         def performUpload() -> None:
             with open(localPath, "rb") as handle:
