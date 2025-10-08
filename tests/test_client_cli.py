@@ -97,6 +97,28 @@ def testStatusCommandDefaultsToProductionBaseUrl(monkeypatch: pytest.MonkeyPatch
     arguments = client.parseArguments()
 
     assert arguments.baseUrl == client.defaultBaseUrl
+    assert arguments.recipientId is None
+
+
+def testStatusCommandAcceptsRecipientId(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "client",
+            "status",
+            "--apiKey",
+            "testKey",
+            "--printerSerial",
+            "printer123",
+            "--recipientId",
+            "recipient-42",
+        ],
+    )
+
+    arguments = client.parseArguments()
+
+    assert arguments.recipientId == "recipient-42"
 
 
 def testValidateRemoteListenAcceptsDefaultBaseUrl(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -241,6 +263,18 @@ def testStatusCommandBuildsUrlsWithBareAndQualifiedBaseUrls(
 
     assert client.buildBaseUrl(arguments.baseUrl) == expected
     assert f"{expected}/printer-status" == f"{client.buildBaseUrl(arguments.baseUrl)}/printer-status"
+    assert arguments.recipientId is None
+
+
+def testGenerateStatusPayloadIncludesRecipientId() -> None:
+    payload, _ = client.generateStatusPayload(
+        "printer-1",
+        iteration=0,
+        currentJobId=None,
+        recipientId="recipient-55",
+    )
+
+    assert payload["recipientId"] == "recipient-55"
 
 
 def testValidateBaseUrlArgumentLogsErrorForEmptyInput(caplog: pytest.LogCaptureFixture) -> None:

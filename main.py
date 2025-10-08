@@ -1147,6 +1147,20 @@ def printerStatusUpdate():
             logging.warning('JSON payload is not a dictionary.')
             return jsonify({'error': 'Invalid JSON format: expected a dictionary'}), 400
 
+        recipientId = statusData.get('recipientId')
+        if recipientId is not None:
+            if not isinstance(recipientId, str):
+                logging.warning(
+                    'Invalid recipientId type in printer status update: %s',
+                    type(recipientId).__name__,
+                )
+                return jsonify({'error': 'recipientId must be a non-empty string'}), 400
+            sanitizedRecipientId = recipientId.strip()
+            if not sanitizedRecipientId:
+                logging.warning('Empty recipientId provided in printer status update.')
+                return jsonify({'error': 'recipientId must be a non-empty string'}), 400
+            statusData['recipientId'] = sanitizedRecipientId
+
         requiredFields = [
             'printerIp',
             'publicKey',
