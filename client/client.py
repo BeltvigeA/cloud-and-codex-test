@@ -40,6 +40,13 @@ def parseStatusSequence(value: str) -> List[str]:
     return parts
 
 
+def parseStatusValue(value: str) -> str:
+    statusValue = value.strip()
+    if not statusValue:
+        raise argparse.ArgumentTypeError("statusValue must be a non-empty string")
+    return statusValue
+
+
 def parseArguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Local PC client for interacting with the Cloud Run printer backend.",
@@ -111,6 +118,11 @@ def parseArguments() -> argparse.Namespace:
         "--statusSequence",
         type=parseStatusSequence,
         help="Comma-separated list of statuses to cycle through when sending updates.",
+    )
+    statusManualGroup.add_argument(
+        "--statusValue",
+        type=parseStatusValue,
+        help="Single status value to send with every update.",
     )
     statusManualGroup.add_argument(
         "--payloadFile",
@@ -1540,6 +1552,7 @@ def performStatusUpdates(
     numUpdates: int,
     recipientId: Optional[str] = None,
     statusSequence: Optional[List[str]] = None,
+    statusValue: Optional[str] = None,
     payloadFile: Optional[Path] = None,
 ) -> None:
     statusUrl = f"{buildBaseUrl(baseUrl)}/printer-status"
@@ -1569,6 +1582,8 @@ def performStatusUpdates(
         manualPayload: Optional[Dict[str, Any]] = None
         if manualStatuses:
             forcedStatus = manualStatuses[iteration % len(manualStatuses)]
+        elif statusValue:
+            forcedStatus = statusValue
         if manualTemplate is not None:
             manualPayload = deepcopy(manualTemplate)
 
@@ -1656,6 +1671,7 @@ def main() -> None:
             arguments.numUpdates,
             arguments.recipientId,
             arguments.statusSequence,
+            arguments.statusValue,
             arguments.payloadFile,
         )
     elif arguments.command == "listen":
