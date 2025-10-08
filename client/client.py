@@ -461,6 +461,168 @@ def createPrinterStatusReporter(
     return reporter
 
 
+def _normalizeMetadataKey(name: str) -> str:
+    return "".join(character for character in name.lower() if character.isalnum())
+
+
+def _extractListFromMetadata(
+    sources: List[Dict[str, Any]],
+    *,
+    keyAliases: List[str],
+) -> Optional[List[Any]]:
+    normalizedAliases = {alias.lower() for alias in keyAliases}
+    queue: List[Any] = [source for source in sources if isinstance(source, dict)]
+    seen: set[int] = set()
+
+    while queue:
+        current = queue.pop()
+        identifier = id(current)
+        if identifier in seen:
+            continue
+        seen.add(identifier)
+        if not isinstance(current, dict):
+            continue
+        for key, value in current.items():
+            normalizedKey = _normalizeMetadataKey(str(key))
+            if normalizedKey in normalizedAliases and isinstance(value, list):
+                return value
+            if isinstance(value, dict):
+                queue.append(value)
+            elif isinstance(value, list):
+                for item in value:
+                    if isinstance(item, dict):
+                        queue.append(item)
+    return None
+
+
+def _parseOrderValue(value: Any) -> Optional[int]:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if value.is_integer():
+            return int(value)
+        return None
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return None
+        if stripped.isdigit():
+            return int(stripped)
+        if stripped.startswith("-") and stripped[1:].isdigit():
+            return int(stripped)
+    return None
+
+
+def _extractMetadataValue(entry: Dict[str, Any], aliases: List[str]) -> Optional[Any]:
+    normalizedAliases = {alias.lower() for alias in aliases}
+    for key, value in entry.items():
+        normalizedKey = _normalizeMetadataKey(str(key))
+        if normalizedKey in normalizedAliases:
+            return value
+    return None
+
+
+def _parseOrderedObject(entry: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(entry, dict):
+        return None
+
+    orderValue = _extractMetadataValue(entry, ["order", "objectorder", "sequence", "index"])
+    parsedOrder = _parseOrderValue(orderValue)
+    if parsedOrder is None:
+        return None
+
+    identifyValue = _extractMetadataValue(entry, ["identifyid", "objectid", "id", "modelid"])
+    plateValue = _extractMetadataValue(entry, ["plate", "plateid", "plateindex", "plateorder"])
+    nameValue = _extractMetadataValue(entry, ["name", "objectname", "displayname"])
+
+    parsedEntry: Dict[str, Any] = {"order": parsedOrder}
+    if identifyValue is not None:
+        parsedEntry["identifyId"] = str(identifyValue)
+    if plateValue is not None:
+        parsedEntry["plateId"] = str(plateValue)
+    if nameValue is not None:
+        parsedEntry["objectName"] = str(nameValue)
+    return parsedEntry
+
+
+def _parseSkippedObject(entry: Any) -> Optional[Dict[str, Any]]:
+    if isinstance(entry, dict):
+        orderValue = _extractMetadataValue(entry, ["order", "objectorder", "sequence", "index"])
+        parsedOrder = _parseOrderValue(orderValue)
+        if parsedOrder is None:
+            return None
+        parsedEntry: Dict[str, Any] = {"order": parsedOrder}
+        identifyValue = _extractMetadataValue(entry, ["identifyid", "objectid", "id", "modelid"])
+        plateValue = _extractMetadataValue(entry, ["plate", "plateid", "plateindex", "plateorder"])
+        nameValue = _extractMetadataValue(entry, ["name", "objectname", "displayname"])
+        if identifyValue is not None:
+            parsedEntry["identifyId"] = str(identifyValue)
+        if plateValue is not None:
+            parsedEntry["plateId"] = str(plateValue)
+        if nameValue is not None:
+            parsedEntry["objectName"] = str(nameValue)
+        return parsedEntry
+
+    parsedOrder = _parseOrderValue(entry)
+    if parsedOrder is None:
+        return None
+    return {"order": parsedOrder}
+
+
+def extractSkippedObjectTargets(
+    entryData: Dict[str, Any],
+    statusPayload: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    metadataSources: List[Dict[str, Any]] = []
+    for source in (
+        statusPayload,
+        entryData.get("unencryptedData"),
+        entryData.get("decryptedData"),
+    ):
+        if isinstance(source, dict):
+            metadataSources.append(source)
+
+    orderedObjects = _extractListFromMetadata(metadataSources, keyAliases=["ordered_objects", "orderedObjects"])
+    skippedObjects = _extractListFromMetadata(metadataSources, keyAliases=["skipped_objects", "skippedObjects"])
+
+    if not orderedObjects or not skippedObjects:
+        return []
+
+    orderMapping: Dict[int, Dict[str, Any]] = {}
+    for item in orderedObjects:
+        parsed = _parseOrderedObject(item)
+        if not parsed:
+            continue
+        orderMapping.setdefault(parsed["order"], parsed)
+
+    skipTargets: List[Dict[str, Any]] = []
+    invalidOrders: List[int] = []
+
+    for item in skippedObjects:
+        parsedSkip = _parseSkippedObject(item)
+        if not parsedSkip:
+            continue
+        orderNumber = parsedSkip["order"]
+        orderedDetails = orderMapping.get(orderNumber)
+        if not orderedDetails:
+            invalidOrders.append(orderNumber)
+            continue
+        merged = dict(orderedDetails)
+        for key in ("identifyId", "plateId", "objectName"):
+            value = parsedSkip.get(key)
+            if value is not None:
+                merged[key] = value
+        skipTargets.append(merged)
+
+    if invalidOrders:
+        invalidSummary = ", ".join(str(order) for order in sorted(set(invalidOrders)))
+        raise ValueError(f"Unknown slicer order number(s): {invalidSummary}")
+
+    return skipTargets
+
+
 def dispatchBambuPrintIfPossible(
     *,
     baseUrl: str,
@@ -555,16 +717,28 @@ def dispatchBambuPrintIfPossible(
 
     reporter = createPrinterStatusReporter(baseUrl, productId, recipientId, statusTemplate, printerDetails)
 
-    reporter({"event": "dispatching", "message": f"Dispatching print job to {options.nickname or options.serialNumber}"})
-
     statusEvents: List[Dict[str, Any]] = []
 
     def capture(event: Dict[str, Any]) -> None:
         statusEvents.append(dict(event))
         reporter(event)
 
+    capture({"event": "dispatching", "message": f"Dispatching print job to {options.nickname or options.serialNumber}"})
+
     try:
-        result = sendBambuPrintJob(filePath=filePath, options=options, statusCallback=capture)
+        skippedTargets = extractSkippedObjectTargets(entryData, statusPayload)
+    except ValueError as error:
+        logging.error("Invalid skipped object metadata for product %s: %s", productId, error)
+        capture({"event": "error", "error": str(error)})
+        return {"success": False, "details": printerDetails, "error": str(error), "events": statusEvents}
+
+    try:
+        result = sendBambuPrintJob(
+            filePath=filePath,
+            options=options,
+            statusCallback=capture,
+            skippedObjects=skippedTargets,
+        )
         capture(
             {
                 "event": "dispatched",
