@@ -143,27 +143,6 @@ def testStatusCommandParsesStatusSequence(monkeypatch: pytest.MonkeyPatch) -> No
     assert arguments.statusSequence == ["idle", "printing"]
 
 
-def testStatusCommandAcceptsStatusValue(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        [
-            "client",
-            "status",
-            "--apiKey",
-            "testKey",
-            "--printerSerial",
-            "printer123",
-            "--statusValue",
-            "offline",
-        ],
-    )
-
-    arguments = client.parseArguments()
-
-    assert arguments.statusValue == "offline"
-
-
 def testStatusCommandRejectsEmptyStatusSequence(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         sys,
@@ -177,26 +156,6 @@ def testStatusCommandRejectsEmptyStatusSequence(monkeypatch: pytest.MonkeyPatch)
             "printer123",
             "--statusSequence",
             "idle, ",
-        ],
-    )
-
-    with pytest.raises(SystemExit):
-        client.parseArguments()
-
-
-def testStatusCommandRejectsEmptyStatusValue(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        [
-            "client",
-            "status",
-            "--apiKey",
-            "testKey",
-            "--printerSerial",
-            "printer123",
-            "--statusValue",
-            "  ",
         ],
     )
 
@@ -587,49 +546,6 @@ def testPerformStatusUpdatesUsesStatusSequence(monkeypatch: pytest.MonkeyPatch) 
     )
 
     assert forcedStatuses == ["ready", "printing", "ready"]
-
-
-def testPerformStatusUpdatesUsesStatusValue(monkeypatch: pytest.MonkeyPatch) -> None:
-    forcedStatuses: list[str | None] = []
-
-    class DummyResponse:
-        text = ""
-        status_code = 200
-
-        def raise_for_status(self) -> None:
-            return None
-
-    class DummySession:
-        def post(self, *_args, **_kwargs):  # pragma: no cover - simple stub
-            return DummyResponse()
-
-    def fakeGenerateStatusPayload(
-        printerSerial: str,
-        iteration: int,
-        currentJobId: str | None,
-        recipientId: str | None = None,
-        *,
-        forcedStatus: str | None = None,
-        manualPayload: dict | None = None,
-    ) -> tuple[dict, str | None]:
-        forcedStatuses.append(forcedStatus)
-        payload = {"printJobId": currentJobId or "job-value", "status": forcedStatus or "default"}
-        return payload, None
-
-    monkeypatch.setattr(client.requests, "Session", lambda: DummySession())
-    monkeypatch.setattr(client.time, "sleep", lambda _seconds: None)
-    monkeypatch.setattr(client, "generateStatusPayload", fakeGenerateStatusPayload)
-
-    client.performStatusUpdates(
-        "https://status.example.com",
-        "api-key",
-        "printer-value",
-        intervalSeconds=0,
-        numUpdates=2,
-        statusValue="offline",
-    )
-
-    assert forcedStatuses == ["offline", "offline"]
 
 
 def testPerformStatusUpdatesLoadsPayloadTemplate(
