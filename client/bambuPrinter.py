@@ -221,25 +221,29 @@ def uploadViaFtps(
                 storageCommand = f"STOR sdcard/{fileName}"
                 remoteDeleteTargets.append(f"sdcard/{fileName}")
 
-        fallbackFileName: Optional[str] = None
+        fallbackActive = False
+
+        def activateFallbackName(generatedName: str) -> None:
+            nonlocal storageCommand, fileName, fallbackActive
+
+            _, remoteStoragePath = storageCommand.split(" ", 1)
+            remoteDirectory, _ = os.path.split(remoteStoragePath)
+            if remoteDirectory:
+                newRemotePath = f"{remoteDirectory}/{generatedName}"
+            else:
+                newRemotePath = generatedName
+            storageCommand = f"STOR {newRemotePath}"
+            fileName = generatedName
+            fallbackActive = True
         for remoteTarget in remoteDeleteTargets:
             try:
                 deleteRemotePath(remoteTarget)
             except error_perm as deleteError:
                 if "550" in str(deleteError):
-                    fallbackFileName = buildFallbackFileName(fileName)
+                    generatedName = buildFallbackFileName(fileName)
+                    activateFallbackName(generatedName)
                     break
                 raise
-
-        if fallbackFileName:
-            remoteStoragePath = storageCommand.split(" ", 1)[1]
-            remoteDirectory, _ = os.path.split(remoteStoragePath)
-            if remoteDirectory:
-                newRemotePath = f"{remoteDirectory}/{fallbackFileName}"
-            else:
-                newRemotePath = fallbackFileName
-            storageCommand = f"STOR {newRemotePath}"
-            fileName = fallbackFileName
 
         def performUpload() -> None:
             with open(localPath, "rb") as handle:
@@ -251,7 +255,17 @@ def uploadViaFtps(
             if "550" not in str(uploadError):
                 raise
             reactivateStor(ftps)
-            performUpload()
+            try:
+                performUpload()
+            except error_perm as secondError:
+                if "550" not in str(secondError):
+                    raise
+                if fallbackActive:
+                    raise
+                generatedName = buildFallbackFileName(fileName)
+                activateFallbackName(generatedName)
+                reactivateStor(ftps)
+                performUpload()
 
         ftps.voidresp()
         return fileName

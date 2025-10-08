@@ -206,6 +206,40 @@ def test_upload_via_ftps_retries_after_reactivating_stor(monkeypatch: pytest.Mon
     assert len(storbinaryCalls) == 2
 
 
+def test_upload_via_ftps_uses_fallback_after_second_failure(
+    monkeypatch: pytest.MonkeyPatch, temp_file: Path
+) -> None:
+    dummy = DummyFtpClient()
+    dummy.storbinaryFailures.extend(
+        [
+            error_perm("550 Permission denied"),
+            error_perm("550 Permission denied"),
+        ]
+    )
+    _install_dummy(monkeypatch, dummy)
+
+    monkeypatch.setattr(bambuPrinter.time, "time", lambda: 1_700_000_000)
+
+    class FixedUuid:
+        hex = "0123456789abcdef0123456789abcdef"
+
+    monkeypatch.setattr(bambuPrinter.uuid, "uuid4", lambda: FixedUuid())
+
+    result = bambuPrinter.uploadViaFtps(
+        ip="192.0.2.10",
+        accessCode="abcd",
+        localPath=temp_file,
+        remoteName="example.3mf",
+    )
+
+    expectedName = "example_1700000000_01234567.3mf"
+    assert result == expectedName
+    storbinaryCalls = [entry for entry in dummy.commands if entry[0] == "storbinary"]
+    assert len(storbinaryCalls) == 3
+    assert storbinaryCalls[-1][1] == (f"STOR {expectedName}",)
+    assert dummy.storageCommand == f"STOR {expectedName}"
+
+
 def test_build_printer_transfer_file_name_trims_prefixes() -> None:
     local_path = Path("/downloads/123e4567-e89b-12d3-a456-426614174000_123e4567-e89b-12d3-a456-426614174000_Drage.3mf")
     result = bambuPrinter.buildPrinterTransferFileName(local_path)
