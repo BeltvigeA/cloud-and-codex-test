@@ -1187,6 +1187,85 @@ def testListPendingFilesReturnsActiveEntries(monkeypatch):
     assert responseBody['skippedFiles'] == ['doc-expired']
 
 
+def testPrinterStatusUpdateStoresRecipientId(monkeypatch):
+    addRecorder = []
+    mockClients = main.ClientBundle(
+        storageClient=MockStorageClient(),
+        firestoreClient=MockFirestoreClient(addRecorder=addRecorder),
+        kmsClient=MockEncryptClient({'sensitive': 'value'}),
+        kmsKeyPath='projects/test/locations/test/keyRings/test/cryptoKeys/test',
+        gcsBucketName='test-bucket',
+    )
+    monkeypatch.setattr(main, 'getClients', lambda: mockClients)
+    monkeypatch.setattr(main, 'validPrinterApiKeys', {'test-key'})
+
+    fakeRequest.headers = {'X-API-Key': 'test-key'}
+    fakeRequest.set_json(
+        {
+            'printerIp': '192.168.1.10',
+            'publicKey': 'public',
+            'accessCode': 'access',
+            'printerSerial': 'printer-1',
+            'objectName': 'object',
+            'useAms': True,
+            'printJobId': 'job-1',
+            'productName': 'product',
+            'platesRequested': 1,
+            'status': 'printing',
+            'jobProgress': 50,
+            'materialLevel': {'filamentA': 10},
+            'recipientId': ' recipient-abc ',
+        }
+    )
+
+    responseBody, statusCode = main.printerStatusUpdate()
+
+    assert statusCode == 200
+    assert responseBody['message'] == 'Printer status updated successfully'
+    assert len(addRecorder) == 1
+    storedPayload = addRecorder[0]
+    assert storedPayload['recipientId'] == 'recipient-abc'
+    assert storedPayload['printerSerial'] == 'printer-1'
+
+
+def testPrinterStatusUpdateRejectsInvalidRecipientId(monkeypatch):
+    addRecorder = []
+    mockClients = main.ClientBundle(
+        storageClient=MockStorageClient(),
+        firestoreClient=MockFirestoreClient(addRecorder=addRecorder),
+        kmsClient=MockEncryptClient({'sensitive': 'value'}),
+        kmsKeyPath='projects/test/locations/test/keyRings/test/cryptoKeys/test',
+        gcsBucketName='test-bucket',
+    )
+    monkeypatch.setattr(main, 'getClients', lambda: mockClients)
+    monkeypatch.setattr(main, 'validPrinterApiKeys', {'test-key'})
+
+    fakeRequest.headers = {'X-API-Key': 'test-key'}
+    fakeRequest.set_json(
+        {
+            'printerIp': '192.168.1.10',
+            'publicKey': 'public',
+            'accessCode': 'access',
+            'printerSerial': 'printer-1',
+            'objectName': 'object',
+            'useAms': True,
+            'printJobId': 'job-1',
+            'productName': 'product',
+            'platesRequested': 1,
+            'status': 'printing',
+            'jobProgress': 50,
+            'materialLevel': {'filamentA': 10},
+            'recipientId': 123,
+        }
+    )
+
+    responseBody, statusCode = main.printerStatusUpdate()
+
+    assert statusCode == 400
+    assert responseBody['error'] == 'recipientId must be a non-empty string'
+    assert not addRecorder
+
+
 def testUploadFileReportsMissingEnvironment(monkeypatch):
     def raiseMissing():
         raise main.MissingEnvironmentError(['GCP_PROJECT_ID'])

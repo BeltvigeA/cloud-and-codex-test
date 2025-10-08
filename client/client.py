@@ -93,6 +93,11 @@ def parseArguments() -> argparse.Namespace:
         default=1,
         help="Number of updates to send (0 for indefinite).",
     )
+    statusParser.add_argument(
+        "--recipientId",
+        default=None,
+        help="Optional recipient identifier to associate with status updates.",
+    )
 
     listenParser = subparsers.add_parser(
         "listen",
@@ -1168,6 +1173,7 @@ def generateStatusPayload(
     printerSerial: str,
     iteration: int,
     currentJobId: Optional[str],
+    recipientId: Optional[str] = None,
 ) -> Tuple[Dict[str, Any], Optional[str]]:
     statuses = ["idle", "printing", "pausing", "error", "finished"]
     status = statuses[iteration % len(statuses)]
@@ -1201,6 +1207,9 @@ def generateStatusPayload(
         "jobProgress": jobProgress,
         "materialLevel": materialLevel,
     }
+
+    if recipientId:
+        payload["recipientId"] = recipientId
 
     if status == "error":
         payload["errorCode"] = "E123"
@@ -1485,6 +1494,7 @@ def performStatusUpdates(
     printerSerial: str,
     intervalSeconds: int,
     numUpdates: int,
+    recipientId: Optional[str] = None,
 ) -> None:
     statusUrl = f"{buildBaseUrl(baseUrl)}/printer-status"
     session = requests.Session()
@@ -1493,7 +1503,12 @@ def performStatusUpdates(
     iteration = 0
     currentJobId: Optional[str] = None
     while True:
-        payload, currentJobId = generateStatusPayload(printerSerial, iteration, currentJobId)
+        payload, currentJobId = generateStatusPayload(
+            printerSerial,
+            iteration,
+            currentJobId,
+            recipientId=recipientId,
+        )
         try:
             response = session.post(statusUrl, headers=headers, json=payload, timeout=30)
             response.raise_for_status()
@@ -1568,6 +1583,7 @@ def main() -> None:
             arguments.printerSerial,
             arguments.interval,
             arguments.numUpdates,
+            arguments.recipientId,
         )
     elif arguments.command == "listen":
         if arguments.mode == "offline":
