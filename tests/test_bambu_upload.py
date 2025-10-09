@@ -5,6 +5,10 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
+import logging
+import socket
+import types
+
 import sys
 
 from ftplib import error_perm
@@ -121,6 +125,31 @@ def test_upload_via_ftps_changes_directory(monkeypatch: pytest.MonkeyPatch, temp
     storbinaryCalls = [entry for entry in dummy.commands if entry[0] == "storbinary"]
     assert storbinaryCalls, "Expected storbinary to be invoked"
     assert storbinaryCalls[0][2]["blocksize"] == 64 * 1024
+
+
+def test_upload_via_ftps_connection_failure_includes_address(
+    monkeypatch: pytest.MonkeyPatch, temp_file: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    class FailingDummy(DummyFtpClient):
+        def connect(self, host: str, port: int, timeout: int | None = None, source_address=None):  # type: ignore[override]
+            raise socket.timeout("timed out")
+
+    dummy = FailingDummy()
+    _install_dummy(monkeypatch, dummy)
+
+    caplog.set_level(logging.ERROR)
+    with pytest.raises(RuntimeError) as errorInfo:
+        bambuPrinter.uploadViaFtps(
+            ip="192.0.2.10",
+            accessCode="abcd",
+            localPath=temp_file,
+            remoteName="example.3mf",
+        )
+
+    message = str(errorInfo.value)
+    assert "192.0.2.10:990" in message
+    assert "timed out" in message
+    assert any("192.0.2.10:990" in record.message for record in caplog.records)
 
 
 def test_upload_via_ftps_falls_back_when_cwd_fails(monkeypatch: pytest.MonkeyPatch, temp_file: Path) -> None:
@@ -314,4 +343,66 @@ def test_build_printer_transfer_file_name_preserves_regular_names() -> None:
     local_path = Path("/downloads/Cool Model.3mf")
     result = bambuPrinter.buildPrinterTransferFileName(local_path)
     assert result == "Cool_Model.3mf"
+
+
+def test_startPrintViaMqtt_connection_failure_includes_context(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    class DummyClient:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            self.args = args
+            self.kwargs = kwargs
+            self.on_connect = None
+            self.on_message = None
+
+        def username_pw_set(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        def tls_set(self, *args: Any, **kwargs: Any) -> None:
+            return None
+
+        def tls_insecure_set(self, _value: bool) -> None:
+            return None
+
+        def connect(self, host: str, port: int, keepalive: int = 60) -> None:
+            raise ConnectionRefusedError("refused")
+
+        def loop_start(self) -> None:
+            return None
+
+        def loop_stop(self) -> None:
+            return None
+
+        def disconnect(self) -> None:
+            return None
+
+        def publish(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        def subscribe(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+    dummyMqtt = types.SimpleNamespace(
+        CallbackAPIVersion=types.SimpleNamespace(VERSION2="v2"),
+        MQTTv311="MQTTv311",
+        Client=DummyClient,
+    )
+
+    monkeypatch.setattr(bambuPrinter, "mqtt", dummyMqtt)
+
+    caplog.set_level(logging.ERROR)
+    with pytest.raises(RuntimeError) as errorInfo:
+        bambuPrinter.startPrintViaMqtt(
+            ip="192.0.2.20",
+            serial="PRINTER123",
+            accessCode="abcd",
+            sdFileName="file.3mf",
+            paramPath=None,
+        )
+
+    message = str(errorInfo.value)
+    assert "192.0.2.20:8883" in message
+    assert "PRINTER123" in message
+    assert "refused" in message
+    assert any("192.0.2.20:8883" in record.message for record in caplog.records)
 
