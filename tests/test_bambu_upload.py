@@ -252,6 +252,24 @@ def test_upload_via_ftps_retries_after_reactivating_stor(monkeypatch: pytest.Mon
     assert len(storbinaryCalls) == 2
 
 
+def test_uploadViaFtpsReentersDirectoryAfterReactivation(
+    monkeypatch: pytest.MonkeyPatch, temp_file: Path
+) -> None:
+    dummy = DummyFtpClient()
+    dummy.storbinaryFailures.append(error_perm("550 Permission denied"))
+    _install_dummy(monkeypatch, dummy)
+
+    bambuPrinter.uploadViaFtps(
+        ip="192.0.2.10",
+        accessCode="abcd",
+        localPath=temp_file,
+        remoteName="example.3mf",
+    )
+
+    assert len(dummy.cwdCalls) >= 2
+    assert dummy.cwdCalls[0] == dummy.cwdCalls[1]
+
+
 def test_upload_via_ftps_uses_fallback_after_second_failure(
     monkeypatch: pytest.MonkeyPatch, temp_file: Path
 ) -> None:
