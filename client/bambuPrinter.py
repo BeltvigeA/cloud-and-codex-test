@@ -32,6 +32,9 @@ except ImportError:  # pragma: no cover - handled gracefully by callers
 import requests
 
 
+logger = logging.getLogger(__name__)
+
+
 def makeTlsContext(insecure: bool = True) -> ssl.SSLContext:
     """Create a TLS context tuned for Bambu printers."""
 
@@ -181,7 +184,13 @@ def uploadViaFtps(
 
     tlsContext = makeTlsContext(insecure=insecureTls)
     ftps = ImplicitFtpTls(context=tlsContext)
-    ftps.connect(ip, 990, timeout=timeout)
+    port = 990
+    try:
+        ftps.connect(ip, port, timeout=timeout)
+    except (OSError, socket.timeout, ssl.SSLError, EOFError) as connectionError:
+        errorMessage = f"Failed to connect to Bambu printer FTPS endpoint {ip}:{port}: {connectionError}"
+        logger.error(errorMessage)
+        raise RuntimeError(errorMessage) from connectionError
     ftps.timeout = timeout
     try:
         ftps.login("bblp", accessCode)
@@ -436,7 +445,15 @@ def startPrintViaMqtt(
 
     client.on_connect = onConnect
     client.on_message = onMessage
-    client.connect(ip, port, keepalive=60)
+    try:
+        client.connect(ip, port, keepalive=60)
+    except (OSError, socket.timeout, ssl.SSLError, EOFError) as connectionError:
+        errorMessage = (
+            f"Failed to connect to Bambu printer MQTT endpoint {ip}:{port} for serial {serial}: "
+            f"{connectionError}"
+        )
+        logger.error(errorMessage)
+        raise RuntimeError(errorMessage) from connectionError
     client.loop_start()
 
     if not connectionReady.wait(timeout=10):

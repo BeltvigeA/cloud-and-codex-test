@@ -748,9 +748,20 @@ def dispatchBambuPrintIfPossible(
         )
         return {"success": True, "details": printerDetails, "result": result, "events": statusEvents}
     except Exception as error:  # noqa: BLE001 - propagate via status
-        logging.exception("Failed to dispatch print job for product %s: %s", productId, error)
-        capture({"event": "error", "error": str(error)})
-        return {"success": False, "details": printerDetails, "error": str(error), "events": statusEvents}
+        printerIdentity = options.nickname or options.serialNumber or "printer"
+        if options.ipAddress and options.ipAddress not in printerIdentity:
+            printerIdentity = f"{printerIdentity} ({options.ipAddress})"
+        elif options.ipAddress and not options.nickname and not options.serialNumber:
+            printerIdentity = options.ipAddress
+        enrichedMessage = f"{printerIdentity}: {error}"
+        logging.exception(
+            "Failed to dispatch print job for product %s to %s: %s",
+            productId,
+            printerIdentity,
+            error,
+        )
+        capture({"event": "error", "error": enrichedMessage})
+        return {"success": False, "details": printerDetails, "error": enrichedMessage, "events": statusEvents}
 
 def validateBaseUrlArgument(baseUrl: Optional[str], commandName: str) -> bool:
     if not isinstance(baseUrl, str) or not baseUrl.strip():
