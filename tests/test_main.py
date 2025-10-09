@@ -470,6 +470,7 @@ def testProductStatusUpdateSuccess(monkeypatch):
         'success': True,
         'fileName': 'print-job.gcode',
         'lastRequestedAt': '2024-01-01T12:00:00Z',
+        'recipientId': '  recipient-007  ',
         'printerDetails': {
             'serialNumber': 'SN-001',
             'ipAddress': '192.168.1.10',
@@ -508,6 +509,47 @@ def testProductStatusUpdateSuccess(monkeypatch):
     assert storedStatus['printerBrand'] == 'Prusa'
     assert storedStatus['statusEvent'] == 'job-complete'
     assert storedStatus['statusMessage'] == 'Completed'
+    assert storedStatus['recipientId'] == 'recipient-007'
+
+
+def testProductStatusUpdateIgnoresNonStringRecipientId(monkeypatch):
+    currentTime = datetime.now(timezone.utc)
+    metadata = {
+        'productId': 'prod-123',
+        'fetchToken': 'token-xyz',
+        'fetchTokenConsumed': False,
+        'timestamp': currentTime,
+    }
+    documentSnapshot = MockDocumentSnapshot('docABC', metadata)
+    statusAddRecorder = []
+    mockClients = main.ClientBundle(
+        storageClient=MockStorageClient(),
+        firestoreClient=MockFirestoreClient(
+            documentSnapshot=documentSnapshot, addRecorder=statusAddRecorder
+        ),
+        kmsClient=MockEncryptClient({'sensitive': 'value'}),
+        kmsKeyPath='projects/test/locations/test/keyRings/test/cryptoKeys/test',
+        gcsBucketName='test-bucket',
+    )
+    monkeypatch.setattr(main, 'getClients', lambda: mockClients)
+
+    statusPayload = {
+        'productId': 'prod-123',
+        'requestedMode': 'metadata',
+        'success': False,
+        'fileName': 'print-job.gcode',
+        'lastRequestedAt': '2024-01-02T12:00:00Z',
+        'recipientId': 987,
+    }
+    fakeRequest.set_json(statusPayload)
+
+    responseBody, statusCode = main.productStatusUpdate('prod-123')
+
+    assert statusCode == 200
+    assert responseBody == {'message': 'Product status recorded'}
+    assert len(statusAddRecorder) == 1
+    storedStatus = statusAddRecorder[0]
+    assert 'recipientId' not in storedStatus
 
 
 def testProductStatusUpdateUsesLatestPrinterEventFromList(monkeypatch):
