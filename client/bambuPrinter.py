@@ -211,16 +211,28 @@ def uploadViaFtps(
             uniquePart = uuid.uuid4().hex[:8]
             return f"{safeBase}_{timestampPart}_{uniquePart}{extension}"
 
+        savedDirectory: Optional[str] = None
+
         try:
             ftps.cwd("/sdcard")
+            savedDirectory = "/sdcard"
             remoteDeleteTargets.append(fileName)
         except Exception:
             try:
                 ftps.cwd("sdcard")
+                savedDirectory = "sdcard"
                 remoteDeleteTargets.append(fileName)
             except Exception:
                 storageCommand = f"STOR sdcard/{fileName}"
                 remoteDeleteTargets.append(f"sdcard/{fileName}")
+
+        def tryReenterSavedDirectory() -> None:
+            if not savedDirectory:
+                return
+            try:
+                ftps.cwd(savedDirectory)
+            except Exception:
+                return
 
         fallbackActive = False
         fallbackSource: Optional[str] = None
@@ -262,6 +274,7 @@ def uploadViaFtps(
             if "550" not in str(uploadError):
                 raise
             reactivateStor(ftps)
+            tryReenterSavedDirectory()
             try:
                 performUpload()
             except error_perm as secondError:
@@ -279,6 +292,7 @@ def uploadViaFtps(
                 generatedName = buildFallbackFileName(fallbackSeedName)
                 activateFallbackName(generatedName, source="stor")
                 reactivateStor(ftps)
+                tryReenterSavedDirectory()
                 try:
                     performUpload()
                 except error_perm as thirdError:
