@@ -510,6 +510,64 @@ def testProductStatusUpdateSuccess(monkeypatch):
     assert storedStatus['statusMessage'] == 'Completed'
 
 
+def testProductStatusUpdateUsesLatestPrinterEventFromList(monkeypatch):
+    currentTime = datetime.now(timezone.utc)
+    metadata = {
+        'productId': 'prod-123',
+        'fetchToken': 'token-111',
+        'fetchTokenConsumed': False,
+        'timestamp': currentTime,
+    }
+    documentSnapshot = MockDocumentSnapshot('doc999', metadata)
+    statusAddRecorder = []
+    mockClients = main.ClientBundle(
+        storageClient=MockStorageClient(),
+        firestoreClient=MockFirestoreClient(
+            documentSnapshot=documentSnapshot, addRecorder=statusAddRecorder
+        ),
+        kmsClient=MockEncryptClient({'sensitive': 'value'}),
+        kmsKeyPath='projects/test/locations/test/keyRings/test/cryptoKeys/test',
+        gcsBucketName='test-bucket',
+    )
+    monkeypatch.setattr(main, 'getClients', lambda: mockClients)
+
+    statusPayload = {
+        'productId': 'prod-123',
+        'requestedMode': 'metadata',
+        'success': True,
+        'fileName': 'print-job.gcode',
+        'lastRequestedAt': '2024-01-03T12:00:00Z',
+        'printerDetails': [
+            {'serialNumber': 'SN-OLD', 'ipAddress': '192.168.1.9'},
+            {
+                'serialNumber': 'SN-NEW',
+                'ipAddress': '192.168.1.11',
+                'nickname': 'Queue',
+                'brand': 'Bambu',
+            },
+        ],
+        'printerEvent': [
+            {'event': 'queued', 'message': 'Queued'},
+            {'status': 'printing', 'detail': 'Working'},
+            {'type': 'job-complete', 'description': 'Finished printing'},
+        ],
+    }
+    fakeRequest.set_json(statusPayload)
+
+    responseBody, statusCode = main.productStatusUpdate('prod-123')
+
+    assert statusCode == 200
+    assert responseBody == {'message': 'Product status recorded'}
+    assert len(statusAddRecorder) == 1
+    storedStatus = statusAddRecorder[0]
+    assert storedStatus['printerSerial'] == 'SN-NEW'
+    assert storedStatus['printerIp'] == '192.168.1.11'
+    assert storedStatus['printerNickname'] == 'Queue'
+    assert storedStatus['printerBrand'] == 'Bambu'
+    assert storedStatus['statusEvent'] == 'job-complete'
+    assert storedStatus['statusMessage'] == 'Finished printing'
+
+
 def testProductStatusUpdateIgnoresNonMappingPrinterDetails(monkeypatch):
     currentTime = datetime.now(timezone.utc)
     metadata = {

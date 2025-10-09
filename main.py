@@ -770,8 +770,17 @@ def productStatusUpdate(productId: str):
             'fetchTokenData': fetchTokenData,
         }
 
-        printerDetails = payload.get('printerDetails')
-        if isinstance(printerDetails, dict):
+        printerDetailsRaw = payload.get('printerDetails')
+        printerDetailsSource: Optional[Dict[str, object]] = None
+        if isinstance(printerDetailsRaw, dict):
+            printerDetailsSource = printerDetailsRaw
+        elif isinstance(printerDetailsRaw, list):
+            for detailCandidate in reversed(printerDetailsRaw):
+                if isinstance(detailCandidate, dict):
+                    printerDetailsSource = detailCandidate
+                    break
+
+        if printerDetailsSource:
             printerDetailFieldMap = {
                 'serialNumber': 'printerSerial',
                 'ipAddress': 'printerIp',
@@ -779,24 +788,37 @@ def productStatusUpdate(productId: str):
                 'brand': 'printerBrand',
             }
             for sourceKey, targetKey in printerDetailFieldMap.items():
-                detailValue = printerDetails.get(sourceKey)
+                detailValue = printerDetailsSource.get(sourceKey)
                 if detailValue is not None:
                     statusRecord[targetKey] = detailValue
 
-        printerEvent = payload.get('printerEvent')
-        if isinstance(printerEvent, dict):
-            eventValue = (
-                printerEvent.get('eventType')
-                or printerEvent.get('event')
-                or printerEvent.get('status')
+        printerEventRaw = payload.get('printerEvent')
+        printerEventSource: Optional[Dict[str, object]] = None
+        if isinstance(printerEventRaw, dict):
+            printerEventSource = printerEventRaw
+        elif isinstance(printerEventRaw, list):
+            for eventCandidate in reversed(printerEventRaw):
+                if isinstance(eventCandidate, dict):
+                    printerEventSource = eventCandidate
+                    break
+
+        if printerEventSource:
+            eventKeyOptions = ('eventType', 'event', 'status', 'type')
+            eventValue = next(
+                (printerEventSource.get(key) for key in eventKeyOptions if printerEventSource.get(key) is not None),
+                None,
             )
             if eventValue is not None:
                 statusRecord['statusEvent'] = eventValue
 
-            messageValue = (
-                printerEvent.get('message')
-                or printerEvent.get('detail')
-                or printerEvent.get('statusMessage')
+            messageKeyOptions = ('message', 'detail', 'statusMessage', 'description', 'info')
+            messageValue = next(
+                (
+                    printerEventSource.get(key)
+                    for key in messageKeyOptions
+                    if printerEventSource.get(key) is not None
+                ),
+                None,
             )
             if messageValue is not None:
                 statusRecord['statusMessage'] = messageValue
