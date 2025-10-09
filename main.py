@@ -731,6 +731,8 @@ def productStatusUpdate(productId: str):
             logging.warning('Invalid lastRequestedAt timestamp in status payload for product %s', productId)
             return jsonify({'error': 'Invalid lastRequestedAt timestamp'}), 400
 
+        recipientId = payload.get('recipientId')
+
         fileQuery = firestoreClient.collection(firestoreCollectionFiles).where('productId', '==', productId)
         documentSnapshots = list(fileQuery.stream())
 
@@ -769,6 +771,11 @@ def productStatusUpdate(productId: str):
             'payload': dict(payload),
             'fetchTokenData': fetchTokenData,
         }
+
+        if isinstance(recipientId, str):
+            sanitizedRecipientId = recipientId.strip()
+            if sanitizedRecipientId:
+                statusRecord['recipientId'] = sanitizedRecipientId
 
         printerDetailsRaw = payload.get('printerDetails')
         printerDetailsSource: Optional[Dict[str, object]] = None
