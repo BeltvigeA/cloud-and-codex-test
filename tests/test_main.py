@@ -470,7 +470,16 @@ def testProductStatusUpdateSuccess(monkeypatch):
         'success': True,
         'fileName': 'print-job.gcode',
         'lastRequestedAt': '2024-01-01T12:00:00Z',
-        'statusMessage': 'Completed',
+        'printerDetails': {
+            'serialNumber': 'SN-001',
+            'ipAddress': '192.168.1.10',
+            'nickname': 'Workhorse',
+            'brand': 'Prusa',
+        },
+        'printerEvent': {
+            'eventType': 'job-complete',
+            'message': 'Completed',
+        },
     }
     fakeRequest.set_json(statusPayload)
 
@@ -493,6 +502,58 @@ def testProductStatusUpdateSuccess(monkeypatch):
     assert fetchTokenData['fetchTokenExpiry'] == fetchTokenExpiry.isoformat()
     assert storedStatus['fileStatus'] == 'available'
     assert storedStatus['fileTimestamp'] == currentTime.isoformat()
+    assert storedStatus['printerSerial'] == 'SN-001'
+    assert storedStatus['printerIp'] == '192.168.1.10'
+    assert storedStatus['printerNickname'] == 'Workhorse'
+    assert storedStatus['printerBrand'] == 'Prusa'
+    assert storedStatus['statusEvent'] == 'job-complete'
+    assert storedStatus['statusMessage'] == 'Completed'
+
+
+def testProductStatusUpdateIgnoresNonMappingPrinterDetails(monkeypatch):
+    currentTime = datetime.now(timezone.utc)
+    metadata = {
+        'productId': 'prod-123',
+        'fetchToken': None,
+        'fetchTokenConsumed': False,
+        'timestamp': currentTime,
+    }
+    documentSnapshot = MockDocumentSnapshot('doc123', metadata)
+    statusAddRecorder = []
+    mockClients = main.ClientBundle(
+        storageClient=MockStorageClient(),
+        firestoreClient=MockFirestoreClient(
+            documentSnapshot=documentSnapshot, addRecorder=statusAddRecorder
+        ),
+        kmsClient=MockEncryptClient({'sensitive': 'value'}),
+        kmsKeyPath='projects/test/locations/test/keyRings/test/cryptoKeys/test',
+        gcsBucketName='test-bucket',
+    )
+    monkeypatch.setattr(main, 'getClients', lambda: mockClients)
+
+    statusPayload = {
+        'productId': 'prod-123',
+        'requestedMode': 'metadata',
+        'success': False,
+        'fileName': 'print-job.gcode',
+        'lastRequestedAt': '2024-01-02T12:00:00Z',
+        'printerDetails': 'unexpected',
+        'printerEvent': 'nope',
+    }
+    fakeRequest.set_json(statusPayload)
+
+    responseBody, statusCode = main.productStatusUpdate('prod-123')
+
+    assert statusCode == 200
+    assert responseBody == {'message': 'Product status recorded'}
+    assert len(statusAddRecorder) == 1
+    storedStatus = statusAddRecorder[0]
+    assert 'printerSerial' not in storedStatus
+    assert 'printerIp' not in storedStatus
+    assert 'printerNickname' not in storedStatus
+    assert 'printerBrand' not in storedStatus
+    assert 'statusEvent' not in storedStatus
+    assert 'statusMessage' not in storedStatus
 
 
 def testProductStatusUpdateMissingFields(monkeypatch):

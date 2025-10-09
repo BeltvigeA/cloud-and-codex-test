@@ -770,6 +770,37 @@ def productStatusUpdate(productId: str):
             'fetchTokenData': fetchTokenData,
         }
 
+        printerDetails = payload.get('printerDetails')
+        if isinstance(printerDetails, dict):
+            printerDetailFieldMap = {
+                'serialNumber': 'printerSerial',
+                'ipAddress': 'printerIp',
+                'nickname': 'printerNickname',
+                'brand': 'printerBrand',
+            }
+            for sourceKey, targetKey in printerDetailFieldMap.items():
+                detailValue = printerDetails.get(sourceKey)
+                if detailValue is not None:
+                    statusRecord[targetKey] = detailValue
+
+        printerEvent = payload.get('printerEvent')
+        if isinstance(printerEvent, dict):
+            eventValue = (
+                printerEvent.get('eventType')
+                or printerEvent.get('event')
+                or printerEvent.get('status')
+            )
+            if eventValue is not None:
+                statusRecord['statusEvent'] = eventValue
+
+            messageValue = (
+                printerEvent.get('message')
+                or printerEvent.get('detail')
+                or printerEvent.get('statusMessage')
+            )
+            if messageValue is not None:
+                statusRecord['statusMessage'] = messageValue
+
         fileTimestamp = normalizeTimestamp(fileMetadata.get('timestamp'))
         if fileTimestamp:
             statusRecord['fileTimestamp'] = fileTimestamp
