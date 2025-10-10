@@ -1399,6 +1399,8 @@ def generateStatusPayload(
         "status": status,
         "jobProgress": jobProgress,
         "materialLevel": materialLevel,
+        "printerSerial": printerSerial,
+        "accessCode": accessCodeValue,
     }
 
     if recipientId:

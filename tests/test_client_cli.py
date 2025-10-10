@@ -37,6 +37,7 @@ installRequestsStub()
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from client import client  # noqa: E402
+from client import gui  # noqa: E402
 
 
 def testParseArgumentsUsesProductionBaseUrlByDefault(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -278,8 +279,18 @@ def testGenerateStatusPayloadIncludesRecipientId() -> None:
     )
 
     assert payload["recipientId"] == "recipient-55"
-    assert "printerSerial" not in payload
-    assert "accessCode" not in payload
+    assert payload["printerSerial"] == "printer-1"
+    assert payload["accessCode"] == "PCODE6789"
+
+
+def testAddPrinterIdentityToPayloadInsertsSerialAndAccessCode() -> None:
+    payload = {"status": "printing"}
+
+    result = gui.addPrinterIdentityToPayload(payload, "SN-001", "AC-002")
+
+    assert result["status"] == "printing"
+    assert result["printerSerial"] == "SN-001"
+    assert result["accessCode"] == "AC-002"
 
 
 def testValidateBaseUrlArgumentLogsErrorForEmptyInput(caplog: pytest.LogCaptureFixture) -> None:

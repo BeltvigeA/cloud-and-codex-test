@@ -18,6 +18,16 @@ from tkinter import filedialog, messagebox, ttk
 
 import requests
 
+
+def addPrinterIdentityToPayload(
+    payload: Dict[str, Any], printerSerial: Optional[str], accessCode: Optional[str]
+) -> Dict[str, Any]:
+    if printerSerial:
+        payload["printerSerial"] = printerSerial
+    if accessCode:
+        payload["accessCode"] = accessCode
+    return payload
+
 from .client import (
     appendJsonLogEntry,
     buildBaseUrl,
@@ -748,6 +758,7 @@ class ListenerGuiApp:
                 "materialLevel": materialLevel,
             }
 
+            payload = addPrinterIdentityToPayload(payload, printerSerial, accessCode)
             if recipientIdValue:
                 payload["recipientId"] = recipientIdValue
             if nozzleTempValue is not None:
