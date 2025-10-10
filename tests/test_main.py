@@ -1402,7 +1402,8 @@ def testPrinterStatusUpdateStoresRecipientId(monkeypatch):
     assert len(addRecorder) == 1
     storedPayload = addRecorder[0]
     assert storedPayload['recipientId'] == 'recipient-abc'
-    assert storedPayload['printerSerial'] == 'printer-1'
+    assert 'printerSerial' not in storedPayload
+    assert 'accessCode' not in storedPayload
 
 
 def testLoadPrinterApiKeysFromEnvironment(monkeypatch):

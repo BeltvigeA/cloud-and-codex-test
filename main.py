@@ -1307,8 +1307,6 @@ def printerStatusUpdate():
         requiredFields = [
             'printerIp',
             'publicKey',
-            'accessCode',
-            'printerSerial',
             'objectName',
             'useAms',
             'printJobId',
@@ -1323,9 +1321,14 @@ def printerStatusUpdate():
                 logging.warning('Missing required field in printer status update: %s', field)
                 return jsonify({'error': f'Missing required field: {field}'}), 400
 
-        statusData['timestamp'] = firestore.SERVER_TIMESTAMP
+        sanitizedStatusData = {
+            key: value
+            for key, value in statusData.items()
+            if key not in {'accessCode', 'printerSerial'}
+        }
+        sanitizedStatusData['timestamp'] = firestore.SERVER_TIMESTAMP
 
-        firestoreClient.collection(firestoreCollectionPrinterStatus).add(statusData)
+        firestoreClient.collection(firestoreCollectionPrinterStatus).add(sanitizedStatusData)
         logging.info(
             'Printer status update received and stored for printerSerial: %s',
             statusData.get('printerSerial'),
