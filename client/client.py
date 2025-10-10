@@ -1694,6 +1694,11 @@ def performStatusUpdates(
             currentJobId,
             recipientId=recipientId,
         )
+        logging.info(
+            "Status payload %d: %s",
+            iteration + 1,
+            json.dumps(payload, ensure_ascii=False),
+        )
         try:
             response = session.post(statusUrl, headers=headers, json=payload, timeout=30)
             response.raise_for_status()
