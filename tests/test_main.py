@@ -1616,6 +1616,48 @@ def testPrinterStatusUpdateAcceptsKeyFromHelper(monkeypatch):
     assert len(addRecorder) == 1
 
 
+def testPrinterStatusUpdateAcceptsInlineSecretManagerKeys(monkeypatch):
+    addRecorder = []
+    mockClients = main.ClientBundle(
+        storageClient=MockStorageClient(),
+        firestoreClient=MockFirestoreClient(addRecorder=addRecorder),
+        kmsClient=MockEncryptClient({'sensitive': 'value'}),
+        kmsKeyPath='projects/test/locations/test/keyRings/test/cryptoKeys/test',
+        gcsBucketName='test-bucket',
+    )
+    monkeypatch.setattr(main, 'getClients', lambda: mockClients)
+
+    monkeypatch.delenv('API_KEYS_PRINTER_STATUS', raising=False)
+    monkeypatch.setenv('SECRET_MANAGER_API_KEYS_PATH', 'inline-one\ninline-two')
+    loadedKeys = main.loadPrinterApiKeys()
+    assert loadedKeys == {'inline-one', 'inline-two'}
+    monkeypatch.setattr(main, 'validPrinterApiKeys', loadedKeys)
+
+    fakeRequest.headers = {'X-API-Key': 'inline-two'}
+    fakeRequest.set_json(
+        {
+            'printerIp': '192.168.1.10',
+            'publicKey': 'public',
+            'accessCode': 'access',
+            'printerSerial': 'printer-1',
+            'objectName': 'object',
+            'useAms': True,
+            'printJobId': 'job-1',
+            'productName': 'product',
+            'platesRequested': 1,
+            'status': 'printing',
+            'jobProgress': 50,
+            'materialLevel': {'filamentA': 10},
+        }
+    )
+
+    responseBody, statusCode = main.printerStatusUpdate()
+
+    assert statusCode == 200
+    assert responseBody['message'] == 'Printer status updated successfully'
+    assert len(addRecorder) == 1
+
+
 def testPrinterStatusUpdateRejectsInvalidRecipientId(monkeypatch):
     addRecorder = []
     mockClients = main.ClientBundle(
