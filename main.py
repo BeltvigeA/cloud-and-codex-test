@@ -97,10 +97,19 @@ def loadPrinterApiKeys(secretManagerClient=None) -> Set[str]:
         logging.info('Loaded printer API keys from API_KEYS_PRINTER_STATUS environment variable.')
         return parsePrinterApiKeyString(environmentValue)
 
-    secretPath = os.environ.get('SECRET_MANAGER_API_KEYS_PATH')
+    secretPath = None
+    secretSource = None
+    for candidateVariable in ('SECRET_MANAGER_API_KEYS_PATH', 'SECRET_MANAGER_API_KEYS'):
+        candidateValue = os.environ.get(candidateVariable)
+        if candidateValue:
+            secretPath = candidateValue
+            secretSource = candidateVariable
+            break
+
     if not secretPath:
         logging.warning(
-            'Printer API keys are not configured. Set API_KEYS_PRINTER_STATUS or SECRET_MANAGER_API_KEYS_PATH.'
+            'Printer API keys are not configured. Set API_KEYS_PRINTER_STATUS, '
+            'SECRET_MANAGER_API_KEYS_PATH, or SECRET_MANAGER_API_KEYS.'
         )
         return set()
 
@@ -110,11 +119,13 @@ def loadPrinterApiKeys(secretManagerClient=None) -> Set[str]:
         inlineKeys = parsePrinterApiKeyString(secretPath)
         if inlineKeys:
             logging.info(
-                'Loaded printer API keys directly from SECRET_MANAGER_API_KEYS_PATH environment value.'
+                'Loaded printer API keys directly from %s environment value.',
+                secretSource,
             )
         else:
             logging.warning(
-                'SECRET_MANAGER_API_KEYS_PATH environment value did not contain any printer API keys.'
+                '%s environment value did not contain any printer API keys.',
+                secretSource,
             )
         return inlineKeys
 
