@@ -1378,11 +1378,15 @@ def generateStatusPayload(
         "filamentB": max(0, 65 - iteration * 3),
     }
 
+    accessCodeValue = "PCODE6789"
+    credentialMetadata = {
+        "printerSerial": printerSerial,
+        "accessCode": accessCodeValue,
+    }
+
     payload: Dict[str, Any] = {
         "printerIp": f"192.168.1.{10 + (iteration % 10)}",
         "publicKey": "ABCDEFG12345",
-        "accessCode": "PCODE6789",
-        "printerSerial": printerSerial,
         "objectName": f"dummy_print_object_v{1 + (iteration % 3)}",
         "useAms": iteration % 2 == 0,
         "printJobId": jobId or str(uuid.uuid4()),
@@ -1405,6 +1409,8 @@ def generateStatusPayload(
     nextJobId = jobId
     if status in {"finished", "error", "idle"}:
         nextJobId = None
+
+    _ = credentialMetadata
 
     return payload, nextJobId
 

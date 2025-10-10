@@ -275,6 +275,8 @@ def testGenerateStatusPayloadIncludesRecipientId() -> None:
     )
 
     assert payload["recipientId"] == "recipient-55"
+    assert "printerSerial" not in payload
+    assert "accessCode" not in payload
 
 
 def testValidateBaseUrlArgumentLogsErrorForEmptyInput(caplog: pytest.LogCaptureFixture) -> None:

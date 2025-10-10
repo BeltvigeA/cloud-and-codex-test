@@ -674,16 +674,12 @@ class ListenerGuiApp:
                 raise ValueError("Printer IP address is required.")
 
             printerSerial = serialVar.get().strip()
-            if not printerSerial:
-                raise ValueError("Printer serial number is required.")
 
             publicKey = publicKeyVar.get().strip()
             if not publicKey:
                 raise ValueError("Public key is required.")
 
             accessCode = accessCodeVar.get().strip()
-            if not accessCode:
-                raise ValueError("Access code is required.")
 
             objectName = objectNameVar.get().strip()
             if not objectName:
@@ -733,8 +729,6 @@ class ListenerGuiApp:
             payload: Dict[str, Any] = {
                 "printerIp": printerIp,
                 "publicKey": publicKey,
-                "accessCode": accessCode,
-                "printerSerial": printerSerial,
                 "objectName": objectName,
                 "useAms": useAms,
                 "printJobId": printJobId,
@@ -785,6 +779,8 @@ class ListenerGuiApp:
                 "jobProgress": jobProgressValue,
                 "nozzleTemp": nozzleTempValue,
                 "bedTemp": bedTempValue,
+                "printerSerial": printerSerial or None,
+                "accessCode": accessCode or None,
             }
 
         def finalizeSend(success: bool, message: str, requestData: Optional[Dict[str, Any]]) -> None:
