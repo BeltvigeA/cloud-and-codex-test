@@ -873,7 +873,7 @@ def productStatusUpdate(productId: str):
         if printerDetailsSource:
             printerDetailFieldMap = {
                 'serialNumber': 'printerSerial',
-                'ipAddress': 'printerIp',
+                'ipAddress': 'printerIpAddress',
                 'nickname': 'printerNickname',
                 'brand': 'printerBrand',
             }
@@ -1305,7 +1305,7 @@ def printerStatusUpdate():
             statusData['recipientId'] = sanitizedRecipientId
 
         requiredFields = [
-            'printerIp',
+            'printerIpAddress',
             'publicKey',
             'objectName',
             'useAms',

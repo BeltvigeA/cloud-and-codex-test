@@ -520,7 +520,7 @@ def testProductStatusUpdateSuccess(monkeypatch):
     assert storedStatus['fileStatus'] == 'available'
     assert storedStatus['fileTimestamp'] == currentTime.isoformat()
     assert storedStatus['printerSerial'] == 'SN-001'
-    assert storedStatus['printerIp'] == '192.168.1.10'
+    assert storedStatus['printerIpAddress'] == '192.168.1.10'
     assert storedStatus['printerNickname'] == 'Workhorse'
     assert storedStatus['printerBrand'] == 'Prusa'
     assert storedStatus['statusEvent'] == 'job-complete'
@@ -619,7 +619,7 @@ def testProductStatusUpdateUsesLatestPrinterEventFromList(monkeypatch):
     assert len(statusAddRecorder) == 1
     storedStatus = statusAddRecorder[0]
     assert storedStatus['printerSerial'] == 'SN-NEW'
-    assert storedStatus['printerIp'] == '192.168.1.11'
+    assert storedStatus['printerIpAddress'] == '192.168.1.11'
     assert storedStatus['printerNickname'] == 'Queue'
     assert storedStatus['printerBrand'] == 'Bambu'
     assert storedStatus['statusEvent'] == 'job-complete'
@@ -665,7 +665,7 @@ def testProductStatusUpdateIgnoresNonMappingPrinterDetails(monkeypatch):
     assert len(statusAddRecorder) == 1
     storedStatus = statusAddRecorder[0]
     assert 'printerSerial' not in storedStatus
-    assert 'printerIp' not in storedStatus
+    assert 'printerIpAddress' not in storedStatus
     assert 'printerNickname' not in storedStatus
     assert 'printerBrand' not in storedStatus
     assert 'statusEvent' not in storedStatus
@@ -1379,7 +1379,7 @@ def testPrinterStatusUpdateStoresRecipientId(monkeypatch):
     fakeRequest.headers = {'X-API-Key': 'test-key'}
     fakeRequest.set_json(
         {
-            'printerIp': '192.168.1.10',
+            'printerIpAddress': '192.168.1.10',
             'publicKey': 'public',
             'accessCode': 'access',
             'printerSerial': 'printer-1',
@@ -1636,7 +1636,7 @@ def testPrinterStatusUpdateAcceptsKeyFromHelper(monkeypatch):
     fakeRequest.headers = {'X-API-Key': 'refreshed-key'}
     fakeRequest.set_json(
         {
-            'printerIp': '192.168.1.10',
+            'printerIpAddress': '192.168.1.10',
             'publicKey': 'public',
             'accessCode': 'access',
             'printerSerial': 'printer-1',
@@ -1680,7 +1680,7 @@ def testPrinterStatusUpdateAcceptsInlineSecretManagerKeys(monkeypatch):
     fakeRequest.headers = {'X-API-Key': 'inline-two'}
     fakeRequest.set_json(
         {
-            'printerIp': '192.168.1.10',
+            'printerIpAddress': '192.168.1.10',
             'publicKey': 'public',
             'accessCode': 'access',
             'printerSerial': 'printer-1',
@@ -1717,7 +1717,7 @@ def testPrinterStatusUpdateRejectsInvalidRecipientId(monkeypatch):
     fakeRequest.headers = {'X-API-Key': 'test-key'}
     fakeRequest.set_json(
         {
-            'printerIp': '192.168.1.10',
+            'printerIpAddress': '192.168.1.10',
             'publicKey': 'public',
             'accessCode': 'access',
             'printerSerial': 'printer-1',

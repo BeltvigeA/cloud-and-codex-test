@@ -278,6 +278,7 @@ def testGenerateStatusPayloadIncludesRecipientId() -> None:
         recipientId="recipient-55",
     )
 
+    assert "printerIpAddress" in payload
     assert payload["recipientId"] == "recipient-55"
     assert payload["printerSerial"] == "printer-1"
     assert payload["accessCode"] == "PCODE6789"
