@@ -84,7 +84,7 @@ cachedClients: Optional[ClientBundle] = None
 def parsePrinterApiKeyString(rawKeys: str) -> Set[str]:
     return {
         apiKey.strip()
-        for apiKey in re.split(r'[\,\r\n]+', rawKeys)
+        for apiKey in re.split(r'[,\r\n]+', rawKeys)
         if apiKey.strip()
     }
 
