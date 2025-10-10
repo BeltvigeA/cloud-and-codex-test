@@ -5,7 +5,7 @@ import secrets
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 from flask import Flask, jsonify, request
 from google.api_core.exceptions import (
@@ -25,6 +25,10 @@ try:  # pragma: no cover - optional dependency handling
 except ImportError:  # pragma: no cover - fallback when google-auth is unavailable in tests
     Request = None  # type: ignore[assignment]
 from google.cloud import firestore, kms_v1, storage
+try:  # pragma: no cover - optional dependency handling
+    from google.cloud import secretmanager
+except ImportError:  # pragma: no cover - fallback when secret manager is unavailable in tests
+    secretmanager = None  # type: ignore[assignment]
 from google.cloud.firestore_v1 import DELETE_FIELD
 from werkzeug.utils import secure_filename
 
@@ -45,8 +49,7 @@ allowedUploadMimeTypes = {
 
 firestoreCollectionFiles = os.environ.get('FIRESTORE_COLLECTION_FILES', 'files')
 firestoreCollectionPrinterStatus = os.environ.get('FIRESTORE_COLLECTION_PRINTER_STATUS', 'printer_status_updates')
-apiKeysPrinterStatusStr = os.environ.get('API_KEYS_PRINTER_STATUS', '')
-validPrinterApiKeys = {apiKey.strip() for apiKey in apiKeysPrinterStatusStr.split(',') if apiKey.strip()}
+validPrinterApiKeys: Set[str] = set()
 port = int(os.environ.get('PORT', '8080'))
 fetchTokenTtlMinutes = int(os.environ.get('FETCH_TOKEN_TTL_MINUTES', '15'))
 
@@ -75,6 +78,48 @@ class ClientBundle:
 
 
 cachedClients: Optional[ClientBundle] = None
+
+
+def parsePrinterApiKeyString(rawKeys: str) -> Set[str]:
+    return {apiKey.strip() for apiKey in rawKeys.split(',') if apiKey.strip()}
+
+
+def loadPrinterApiKeys(secretManagerClient=None) -> Set[str]:
+    environmentValue = os.environ.get('API_KEYS_PRINTER_STATUS')
+    if environmentValue:
+        logging.info('Loaded printer API keys from API_KEYS_PRINTER_STATUS environment variable.')
+        return parsePrinterApiKeyString(environmentValue)
+
+    secretPath = os.environ.get('SECRET_MANAGER_API_KEYS_PATH')
+    if not secretPath:
+        logging.warning(
+            'Printer API keys are not configured. Set API_KEYS_PRINTER_STATUS or SECRET_MANAGER_API_KEYS_PATH.'
+        )
+        return set()
+
+    if secretmanager is None:
+        logging.error(
+            'google.cloud.secretmanager is unavailable. Unable to load printer API keys from %s.',
+            secretPath,
+        )
+        return set()
+
+    try:
+        client = secretManagerClient or secretmanager.SecretManagerServiceClient()
+        secretResponse = client.access_secret_version(name=secretPath)
+        secretPayload = secretResponse.payload.data.decode('utf-8')
+        if not secretPayload.strip():
+            logging.warning('Secret Manager secret %s did not contain any printer API keys.', secretPath)
+            return set()
+
+        logging.info('Loaded printer API keys from Secret Manager path %s.', secretPath)
+        return parsePrinterApiKeyString(secretPayload)
+    except Exception as error:  # pragma: no cover - defensive logging for unexpected client failures
+        logging.error('Failed to load printer API keys from Secret Manager path %s: %s', secretPath, error)
+        return set()
+
+
+validPrinterApiKeys = loadPrinterApiKeys()
 
 
 def tryParseKeyValueObject(rawValue: str) -> Optional[dict]:
