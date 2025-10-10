@@ -24,6 +24,10 @@ defaultBaseUrl = "https://printer-backend-934564650450.europe-west1.run.app"
 defaultFilesDirectory = Path.home() / ".printmaster" / "files"
 
 
+def getPrinterStatusEndpointUrl() -> str:
+    return "https://print-flow-pro-eb683cc6.base44.app/api/apps/68b61486e7c52405eb683cc6/functions/updatePrinterStatus"
+
+
 def configureLogging() -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -1687,7 +1691,7 @@ def performStatusUpdates(
     numUpdates: int,
     recipientId: Optional[str] = None,
 ) -> None:
-    statusUrl = f"{buildBaseUrl(baseUrl)}/printer-status"
+    statusUrl = getPrinterStatusEndpointUrl()
     session = requests.Session()
     headers = {"X-API-Key": apiKey, "Content-Type": "application/json"}
 
