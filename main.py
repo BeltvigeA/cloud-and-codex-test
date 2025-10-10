@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import re
 import secrets
 import uuid
 from dataclasses import dataclass
@@ -81,7 +82,11 @@ cachedClients: Optional[ClientBundle] = None
 
 
 def parsePrinterApiKeyString(rawKeys: str) -> Set[str]:
-    return {apiKey.strip() for apiKey in rawKeys.split(',') if apiKey.strip()}
+    return {
+        apiKey.strip()
+        for apiKey in re.split(r'[\,\r\n]+', rawKeys)
+        if apiKey.strip()
+    }
 
 
 def loadPrinterApiKeys(secretManagerClient=None) -> Set[str]:
