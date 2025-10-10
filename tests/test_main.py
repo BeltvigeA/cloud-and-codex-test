@@ -105,6 +105,20 @@ class DummyKmsClient:
 
 
 kmsModule.KeyManagementServiceClient = DummyKmsClient
+secretmanagerModule = ModuleType('google.cloud.secretmanager')
+
+
+class DummySecretManagerClient:
+    def __init__(self, payload=b''):
+        self.payload = payload
+        self.requestedNames = []
+
+    def access_secret_version(self, name):
+        self.requestedNames.append(name)
+        return SimpleNamespace(payload=SimpleNamespace(data=self.payload))
+
+
+secretmanagerModule.SecretManagerServiceClient = DummySecretManagerClient
 exceptionsModule = ModuleType('google.api_core.exceptions')
 
 
@@ -140,6 +154,7 @@ sys.modules['google.cloud.firestore'] = firestoreModule
 sys.modules['google.cloud.firestore_v1'] = firestoreV1Module
 sys.modules['google.cloud.storage'] = storageModule
 sys.modules['google.cloud.kms_v1'] = kmsModule
+sys.modules['google.cloud.secretmanager'] = secretmanagerModule
 sys.modules['google.api_core'] = apiCoreModule
 sys.modules['google.api_core.exceptions'] = exceptionsModule
 sys.modules['google.auth'] = authModule
@@ -149,6 +164,7 @@ googleModule.cloud = cloudModule
 cloudModule.firestore = firestoreModule
 cloudModule.storage = storageModule
 cloudModule.kms_v1 = kmsModule
+cloudModule.secretmanager = secretmanagerModule
 googleModule.auth = authModule
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -1387,6 +1403,95 @@ def testPrinterStatusUpdateStoresRecipientId(monkeypatch):
     storedPayload = addRecorder[0]
     assert storedPayload['recipientId'] == 'recipient-abc'
     assert storedPayload['printerSerial'] == 'printer-1'
+
+
+def testLoadPrinterApiKeysFromEnvironment(monkeypatch):
+    monkeypatch.setenv('API_KEYS_PRINTER_STATUS', 'alpha , beta,, gamma ')
+    monkeypatch.delenv('SECRET_MANAGER_API_KEYS_PATH', raising=False)
+
+    apiKeys = main.loadPrinterApiKeys()
+
+    assert apiKeys == {'alpha', 'beta', 'gamma'}
+
+
+def testLoadPrinterApiKeysFromSecretManager(monkeypatch):
+    monkeypatch.delenv('API_KEYS_PRINTER_STATUS', raising=False)
+    secretPath = 'projects/test/secrets/printer-keys/versions/latest'
+    monkeypatch.setenv('SECRET_MANAGER_API_KEYS_PATH', secretPath)
+
+    class FakeSecretManagerClient:
+        def __init__(self):
+            self.requestedNames = []
+
+        def access_secret_version(self, name):
+            self.requestedNames.append(name)
+            return SimpleNamespace(payload=SimpleNamespace(data=b'key-one, key-two'))
+
+    fakeClient = FakeSecretManagerClient()
+    monkeypatch.setattr(
+        main.secretmanager, 'SecretManagerServiceClient', lambda: fakeClient
+    )
+
+    apiKeys = main.loadPrinterApiKeys()
+
+    assert apiKeys == {'key-one', 'key-two'}
+    assert fakeClient.requestedNames == [secretPath]
+
+
+def testLoadPrinterApiKeysWithoutConfigurationLogsWarning(monkeypatch, caplog):
+    monkeypatch.delenv('API_KEYS_PRINTER_STATUS', raising=False)
+    monkeypatch.delenv('SECRET_MANAGER_API_KEYS_PATH', raising=False)
+
+    with caplog.at_level(logging.WARNING):
+        apiKeys = main.loadPrinterApiKeys()
+
+    assert apiKeys == set()
+    assert (
+        'Printer API keys are not configured. Set API_KEYS_PRINTER_STATUS or SECRET_MANAGER_API_KEYS_PATH.'
+        in caplog.text
+    )
+
+
+def testPrinterStatusUpdateAcceptsKeyFromHelper(monkeypatch):
+    addRecorder = []
+    mockClients = main.ClientBundle(
+        storageClient=MockStorageClient(),
+        firestoreClient=MockFirestoreClient(addRecorder=addRecorder),
+        kmsClient=MockEncryptClient({'sensitive': 'value'}),
+        kmsKeyPath='projects/test/locations/test/keyRings/test/cryptoKeys/test',
+        gcsBucketName='test-bucket',
+    )
+    monkeypatch.setattr(main, 'getClients', lambda: mockClients)
+
+    monkeypatch.setenv('API_KEYS_PRINTER_STATUS', 'refreshed-key')
+    monkeypatch.delenv('SECRET_MANAGER_API_KEYS_PATH', raising=False)
+    loadedKeys = main.loadPrinterApiKeys()
+    monkeypatch.setattr(main, 'validPrinterApiKeys', loadedKeys)
+
+    fakeRequest.headers = {'X-API-Key': 'refreshed-key'}
+    fakeRequest.set_json(
+        {
+            'printerIp': '192.168.1.10',
+            'publicKey': 'public',
+            'accessCode': 'access',
+            'printerSerial': 'printer-1',
+            'objectName': 'object',
+            'useAms': True,
+            'printJobId': 'job-1',
+            'productName': 'product',
+            'platesRequested': 1,
+            'status': 'printing',
+            'jobProgress': 50,
+            'materialLevel': {'filamentA': 10},
+            'recipientId': ' recipient-abc ',
+        }
+    )
+
+    responseBody, statusCode = main.printerStatusUpdate()
+
+    assert statusCode == 200
+    assert responseBody['message'] == 'Printer status updated successfully'
+    assert len(addRecorder) == 1
 
 
 def testPrinterStatusUpdateRejectsInvalidRecipientId(monkeypatch):
