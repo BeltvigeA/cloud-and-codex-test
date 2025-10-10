@@ -91,6 +91,14 @@ Klienten kjøres nå utelukkende via kommandolinjen. Følgende PowerShell-eksemp
   python -m client.client status --baseUrl http://127.0.0.1:5000 --apiKey <api-nokkel> --printerSerial PRN-001 --interval 60 --numUpdates 5
   ```
 
+- **Manuell statusoppdatering fra GUI**:
+
+  1. Åpne dialogen **Send Test Printer Status** fra fanen «3D Printers».
+  2. Fyll inn **Base URL** for backend-tjenesten (samme adresse som i CLI-eksemplet over).
+  3. Lim inn en gyldig API-nøkkel i feltet **API Key**. Du kan bruke én av nøklene som er listet under «SECRET_MANAGER_API_KEYS_PATH keys» i denne README-filen.
+  4. Hold på standardverdiene for **Public Key** og de øvrige feltene, eller tilpass dem etter behov – backend validerer kun at de finnes, ikke at de matcher en bestemt nøkkel.
+  5. Klikk **Send**. Et svar på «Unauthorized: Invalid API Key» betyr at API-nøkkelen mangler eller er feil.
+
 Klienten bruker `listen`-kommandoen til å velge hvilken mottaker den skal overvåke og laster automatisk ned alle filer som er tildelt den valgte mottakeren.
 
 python -m client.gui
