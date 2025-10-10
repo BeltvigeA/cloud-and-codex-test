@@ -241,7 +241,7 @@ def testValidateRemoteListenAcceptsBareAndQualifiedBaseUrls(
         ("https://status.example.com", "https://status.example.com"),
     ],
 )
-def testStatusCommandBuildsUrlsWithBareAndQualifiedBaseUrls(
+def testStatusCommandUsesFixedEndpointRegardlessOfBaseUrl(
     baseUrl: str, expected: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(
@@ -262,7 +262,10 @@ def testStatusCommandBuildsUrlsWithBareAndQualifiedBaseUrls(
     arguments = client.parseArguments()
 
     assert client.buildBaseUrl(arguments.baseUrl) == expected
-    assert f"{expected}/printer-status" == f"{client.buildBaseUrl(arguments.baseUrl)}/printer-status"
+    assert (
+        client.getPrinterStatusEndpointUrl()
+        == "https://print-flow-pro-eb683cc6.base44.app/api/apps/68b61486e7c52405eb683cc6/functions/updatePrinterStatus"
+    )
     assert arguments.recipientId is None
 
 

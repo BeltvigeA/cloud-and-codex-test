@@ -25,6 +25,7 @@ from .client import (
     defaultBaseUrl,
     defaultFilesDirectory,
     ensureOutputDirectory,
+    getPrinterStatusEndpointUrl,
     listenForFiles,
 )
 
@@ -532,7 +533,12 @@ class ListenerGuiApp:
         dialog.resizable(False, False)
         dialog.columnconfigure(0, weight=1)
 
-        baseUrlDefault = str(printer.get("statusBaseUrl") or self.baseUrlVar.get() or "")
+        baseUrlDefault = str(
+            printer.get("statusBaseUrl")
+            or getPrinterStatusEndpointUrl()
+            or self.baseUrlVar.get()
+            or ""
+        )
         apiKeyDefault = str(printer.get("statusApiKey") or "")
         recipientDefault = (
             printer.get("statusRecipientId")
@@ -660,10 +666,13 @@ class ListenerGuiApp:
             baseUrlRaw = baseUrlVar.get().strip()
             if not baseUrlRaw:
                 raise ValueError("Base URL is required.")
-            try:
-                sanitizedBaseUrl = buildBaseUrl(baseUrlRaw)
-            except ValueError as error:
-                raise ValueError(f"Invalid base URL: {error}") from error
+            statusEndpointUrl = getPrinterStatusEndpointUrl()
+            if baseUrlRaw and baseUrlRaw != statusEndpointUrl:
+                try:
+                    buildBaseUrl(baseUrlRaw)
+                except ValueError as error:
+                    raise ValueError(f"Invalid base URL: {error}") from error
+            baseUrlVar.set(statusEndpointUrl)
 
             apiKey = apiKeyVar.get().strip()
             if not apiKey:
@@ -747,7 +756,7 @@ class ListenerGuiApp:
                 payload["bedTemp"] = bedTempValue
 
             headers = {"X-API-Key": apiKey, "Content-Type": "application/json"}
-            statusUrl = f"{sanitizedBaseUrl}/printer-status"
+            statusUrl = statusEndpointUrl
 
             manualDefaultsUpdate: Dict[str, Any] = {
                 "publicKey": publicKey,
@@ -771,7 +780,7 @@ class ListenerGuiApp:
                 "url": statusUrl,
                 "headers": headers,
                 "payload": payload,
-                "baseUrl": sanitizedBaseUrl,
+                "baseUrl": statusEndpointUrl,
                 "apiKey": apiKey,
                 "recipientId": recipientIdValue,
                 "manualDefaults": manualDefaultsUpdate,
