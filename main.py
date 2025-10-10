@@ -104,25 +104,45 @@ def loadPrinterApiKeys(secretManagerClient=None) -> Set[str]:
         )
         return set()
 
+    secretPathCandidate = secretPath.strip()
+    secretResourcePattern = r'^projects/[^/]+/secrets/[^/]+/versions/[^/]+$'
+    if not re.fullmatch(secretResourcePattern, secretPathCandidate):
+        inlineKeys = parsePrinterApiKeyString(secretPath)
+        if inlineKeys:
+            logging.info(
+                'Loaded printer API keys directly from SECRET_MANAGER_API_KEYS_PATH environment value.'
+            )
+        else:
+            logging.warning(
+                'SECRET_MANAGER_API_KEYS_PATH environment value did not contain any printer API keys.'
+            )
+        return inlineKeys
+
     if secretmanager is None:
         logging.error(
             'google.cloud.secretmanager is unavailable. Unable to load printer API keys from %s.',
-            secretPath,
+            secretPathCandidate,
         )
         return set()
 
     try:
         client = secretManagerClient or secretmanager.SecretManagerServiceClient()
-        secretResponse = client.access_secret_version(name=secretPath)
+        secretResponse = client.access_secret_version(name=secretPathCandidate)
         secretPayload = secretResponse.payload.data.decode('utf-8')
         if not secretPayload.strip():
-            logging.warning('Secret Manager secret %s did not contain any printer API keys.', secretPath)
+            logging.warning(
+                'Secret Manager secret %s did not contain any printer API keys.', secretPathCandidate
+            )
             return set()
 
-        logging.info('Loaded printer API keys from Secret Manager path %s.', secretPath)
+        logging.info('Loaded printer API keys from Secret Manager path %s.', secretPathCandidate)
         return parsePrinterApiKeyString(secretPayload)
     except Exception as error:  # pragma: no cover - defensive logging for unexpected client failures
-        logging.error('Failed to load printer API keys from Secret Manager path %s: %s', secretPath, error)
+        logging.error(
+            'Failed to load printer API keys from Secret Manager path %s: %s',
+            secretPathCandidate,
+            error,
+        )
         return set()
 
 
