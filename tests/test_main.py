@@ -1519,6 +1519,47 @@ def testLoadPrinterApiKeysHandlesNewlineSeparatedEntries(monkeypatch):
     assert fakeClient.requestedNames == [secretPath]
 
 
+def testLoadPrinterApiKeysFromSecretManagerReadmeExample(monkeypatch):
+    monkeypatch.delenv('API_KEYS_PRINTER_STATUS', raising=False)
+    secretPath = 'projects/test/secrets/printer-keys/versions/latest'
+    monkeypatch.setenv('SECRET_MANAGER_API_KEYS_PATH', secretPath)
+
+    readmeSecret = (
+        '1ORJkv4IZtQjYIniGFX8fr340VreiBhK1XNcDZ3GVlaNSPSCkm6EIZy4m6XOJDF0XAPLcELuZSQnEHxvBMqhD9b5q5Klf0QE9fwih9TOgC2K643cOrhOPZJMVwb9BV7i\n'
+        '5Q7R8u8mxPutdWz0RVXP7w\n'
+        '\n'
+        'c3Lr1YyProjUnzf2GeG8MeGYb0UWNt5jnZLd6Svk7DvysymtwkcJatQC4xlsdK9Cy3h4nFkEJmAXBib99tE5N7Ake2OO7rzZGhQSnGcXjhcYu1YOd7rwLKkHecqU8m4b\n'
+        'FBjY9CBztbFRsRT883DFi7\n'
+    )
+
+    class FakeSecretManagerClient:
+        def __init__(self):
+            self.requestedNames = []
+
+        def access_secret_version(self, name):
+            self.requestedNames.append(name)
+            return SimpleNamespace(
+                payload=SimpleNamespace(data=readmeSecret.encode('utf-8'))
+            )
+
+    fakeClient = FakeSecretManagerClient()
+    monkeypatch.setattr(
+        main.secretmanager, 'SecretManagerServiceClient', lambda: fakeClient
+    )
+
+    apiKeys = main.loadPrinterApiKeys()
+
+    expectedKeys = {
+        '1ORJkv4IZtQjYIniGFX8fr340VreiBhK1XNcDZ3GVlaNSPSCkm6EIZy4m6XOJDF0XAPLcELuZSQnEHxvBMqhD9b5q5Klf0QE9fwih9TOgC2K643cOrhOPZJMVwb9BV7i',
+        '5Q7R8u8mxPutdWz0RVXP7w',
+        'c3Lr1YyProjUnzf2GeG8MeGYb0UWNt5jnZLd6Svk7DvysymtwkcJatQC4xlsdK9Cy3h4nFkEJmAXBib99tE5N7Ake2OO7rzZGhQSnGcXjhcYu1YOd7rwLKkHecqU8m4b',
+        'FBjY9CBztbFRsRT883DFi7',
+    }
+
+    assert apiKeys == expectedKeys
+    assert fakeClient.requestedNames == [secretPath]
+
+
 def testLoadPrinterApiKeysWithoutConfigurationLogsWarning(monkeypatch, caplog):
     monkeypatch.delenv('API_KEYS_PRINTER_STATUS', raising=False)
     monkeypatch.delenv('SECRET_MANAGER_API_KEYS_PATH', raising=False)
