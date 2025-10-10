@@ -82,11 +82,13 @@ cachedClients: Optional[ClientBundle] = None
 
 
 def parsePrinterApiKeyString(rawKeys: str) -> Set[str]:
-    return {
+    splitKeys = re.split(r'[,\r\n]+', rawKeys)
+    sanitizedKeys = {
         apiKey.strip()
-        for apiKey in re.split(r'[,\r\n]+', rawKeys)
+        for apiKey in splitKeys
         if apiKey.strip()
     }
+    return sanitizedKeys
 
 
 def loadPrinterApiKeys(secretManagerClient=None) -> Set[str]:

@@ -1465,6 +1465,33 @@ def testLoadPrinterApiKeysFromSecretManagerWithNewlines(monkeypatch):
     assert fakeClient.requestedNames == [secretPath]
 
 
+def testLoadPrinterApiKeysTreatsEachLineAsSeparateKey(monkeypatch):
+    monkeypatch.delenv('API_KEYS_PRINTER_STATUS', raising=False)
+    secretPath = 'projects/test/secrets/printer-keys/versions/latest'
+    monkeypatch.setenv('SECRET_MANAGER_API_KEYS_PATH', secretPath)
+
+    class FakeSecretManagerClient:
+        def __init__(self):
+            self.requestedNames = []
+
+        def access_secret_version(self, name):
+            self.requestedNames.append(name)
+            secretPayload = 'line-key-one\nline-key-two\nline-key-three'
+            return SimpleNamespace(
+                payload=SimpleNamespace(data=secretPayload.encode('utf-8'))
+            )
+
+    fakeClient = FakeSecretManagerClient()
+    monkeypatch.setattr(
+        main.secretmanager, 'SecretManagerServiceClient', lambda: fakeClient
+    )
+
+    apiKeys = main.loadPrinterApiKeys()
+
+    assert apiKeys == {'line-key-one', 'line-key-two', 'line-key-three'}
+    assert fakeClient.requestedNames == [secretPath]
+
+
 def testLoadPrinterApiKeysHandlesNewlineSeparatedEntries(monkeypatch):
     monkeypatch.delenv('API_KEYS_PRINTER_STATUS', raising=False)
     secretPath = 'projects/test/secrets/printer-keys/versions/latest'
