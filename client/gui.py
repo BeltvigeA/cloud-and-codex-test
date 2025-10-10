@@ -688,8 +688,8 @@ class ListenerGuiApp:
             if not apiKey:
                 raise ValueError("API key is required.")
 
-            printerIp = printerIpVar.get().strip()
-            if not printerIp:
+            printerIpAddress = printerIpVar.get().strip()
+            if not printerIpAddress:
                 raise ValueError("Printer IP address is required.")
 
             printerSerial = serialVar.get().strip()
@@ -746,7 +746,7 @@ class ListenerGuiApp:
                 recipientIdValue = recipientId
 
             payload: Dict[str, Any] = {
-                "printerIp": printerIp,
+                "printerIpAddress": printerIpAddress,
                 "publicKey": publicKey,
                 "objectName": objectName,
                 "useAms": useAms,

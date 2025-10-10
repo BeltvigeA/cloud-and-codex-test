@@ -1389,7 +1389,7 @@ def generateStatusPayload(
     }
 
     payload: Dict[str, Any] = {
-        "printerIp": f"192.168.1.{10 + (iteration % 10)}",
+        "printerIpAddress": f"192.168.1.{10 + (iteration % 10)}",
         "publicKey": "ABCDEFG12345",
         "objectName": f"dummy_print_object_v{1 + (iteration % 3)}",
         "useAms": iteration % 2 == 0,
