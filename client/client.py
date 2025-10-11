@@ -294,6 +294,10 @@ def normalizePrinterDetails(details: Dict[str, Any]) -> Dict[str, Any]:
             interpretedInt = interpretInteger(rawValue)
             if interpretedInt is not None:
                 normalized["waitSeconds"] = interpretedInt
+        elif key in {"lanstrategy", "lanmode"}:
+            strategyValue = normalizeTextValue(rawValue)
+            if strategyValue is not None:
+                normalized["lanStrategy"] = strategyValue
     return normalized
 
 
