@@ -256,95 +256,58 @@ def uploadViaFtps(
         def buildStorageCommand(fileName: str) -> str:
             return f"STOR {usePrefix}{fileName}"
 
-        baseRoot, _ = os.path.splitext(sanitizedName)
-        if not baseRoot:
-            baseRoot = "upload"
+        if dataStream is not None:
+            try:
+                dataStream.seek(0)
+            except Exception:
+                pass
+            uploadBytes = dataStream.read()
+        else:
+            uploadBytes = localPath.read_bytes()
+        uploadHandle: BinaryIO = io.BytesIO(uploadBytes)
+
+        def performUpload(command: str, fileName: str) -> str:
+            uploadHandle.seek(0)
+            response = ftps.storbinary(command, uploadHandle, blocksize=64 * 1024)
+            logger.debug("FTPS response: %s", response)
+            if not response or not response.startswith("226"):
+                raise RuntimeError(
+                    f"FTPS transfer did not complete successfully for {fileName}: {response}"
+                )
+            return response
+
+        baseName = Path(sanitizedName).stem or "upload"
         extension = ".3mf"
-        maxRootLength = max(1, 60 - len(extension))
 
         def buildCandidateName(attempt: int) -> str:
             if attempt == 0:
                 return sanitizedName
-            suffix = f"_{attempt}"
-            allowedRootLength = maxRootLength - len(suffix)
-            if allowedRootLength < 1:
-                allowedRootLength = 1
-            truncatedRoot = baseRoot[:allowedRootLength]
-            candidateRoot = f"{truncatedRoot}{suffix}"
-            return sanitizeThreeMfName(f"{candidateRoot}{extension}")
+            candidate = f"{baseName}_{attempt}{extension}"
+            return sanitizeThreeMfName(candidate)
 
-        uploadHandle: BinaryIO
-        closeHandle = False
-        if dataStream is not None:
-            uploadHandle = dataStream
-            if hasattr(uploadHandle, "seek"):
-                try:
-                    uploadHandle.seek(0)
-                except Exception:
-                    dataBytes = uploadHandle.read()
-                    uploadHandle = io.BytesIO(dataBytes)
-            else:
-                dataBytes = uploadHandle.read()
-                uploadHandle = io.BytesIO(dataBytes)
-        else:
-            uploadHandle = open(localPath, "rb")
-            closeHandle = True
-
-        try:
-            attempts = 0
-            maxAttempts = 6
-            lastError: Optional[error_perm] = None
-
-            while attempts < maxAttempts:
-                candidateName = buildCandidateName(attempts)
-                storageCommand = buildStorageCommand(candidateName)
-                logger.debug(
-                    "FTPS STOR command: %s  (fileName=%s)",
-                    storageCommand,
-                    candidateName,
-                )
-
-                try:
-                    uploadHandle.seek(0)
-                except Exception:
-                    dataBytes = uploadHandle.read()
-                    uploadHandle = io.BytesIO(dataBytes)
-                    uploadHandle.seek(0)
-
-                try:
-                    response = ftps.storbinary(
-                        storageCommand,
-                        uploadHandle,
-                        blocksize=64 * 1024,
-                    )
-                except error_perm as uploadError:
-                    lastError = uploadError
-                    if "550" in str(uploadError) and attempts + 1 < maxAttempts:
-                        logger.warning(
-                            "FTPS 550 on %s, retrying with alternative name", candidateName
-                        )
-                        reactivateStor(ftps)
-                        attempts += 1
-                        continue
-                    raise
-
-                logger.debug("FTPS response: %s", response)
-                if not response or not response.startswith("226"):
-                    raise RuntimeError(
-                        f"FTPS transfer did not complete successfully for {candidateName}: {response}"
-                    )
-
+        lastError: Optional[error_perm] = None
+        for attempt in range(6):
+            candidateName = buildCandidateName(attempt)
+            storageCommand = buildStorageCommand(candidateName)
+            logger.debug(
+                "FTPS STOR command: %s  (fileName=%s)", storageCommand, candidateName
+            )
+            try:
+                performUpload(storageCommand, candidateName)
                 return candidateName
-
-            if lastError is not None:
-                raise lastError
-            raise RuntimeError("FTPS upload failed without specific error")
-        finally:
-            if closeHandle:
-                try:
-                    uploadHandle.close()
-                except Exception:
-                    pass
+            except error_perm as uploadError:
+                lastError = uploadError
+                errorText = str(uploadError)
+                if "550" in errorText and attempt < 5:
+                    logger.warning(
+                        "FTPS 550 on %s, retrying with alternative name", candidateName
+                    )
+                    reactivateStor(ftps)
+                    continue
+                raise
+        if lastError is not None:
+            raise lastError
+        raise RuntimeError("FTPS upload failed without specific error")
     finally:
         try:
             ftps.quit()
@@ -398,17 +361,20 @@ def uploadViaBambulabsApi(
         connectMethod()
         cameraStarted = True
 
-    uploadMethod = None
-    for candidate in ("upload_file", "upload_project", "upload"):
-        uploadMethod = getattr(printer, candidate, None)
-        if uploadMethod:
-            break
+    uploadMethod = getattr(printer, "upload_file", None)
+    fallbackMethods = ("upload_project", "upload")
+    if uploadMethod is None:
+        for candidate in fallbackMethods:
+            uploadMethod = getattr(printer, candidate, None)
+            if uploadMethod:
+                break
 
     if uploadMethod is None:
         raise RuntimeError("Unable to locate an upload method on bambulabs_api.Printer")
 
     response: Any = None
 
+    logger.info("Uploading via bambulabs_api as %s", normalizedRemoteName)
     try:
         with open(localPath, "rb") as fileHandle:
             try:
@@ -416,7 +382,7 @@ def uploadViaBambulabsApi(
             except TypeError:
                 fileHandle.seek(0)
                 response = uploadMethod(fileHandle)
-            logger.debug("bambulabs_api upload response: %s", response)
+        logger.info("Upload response: %r", response)
     finally:
         try:
             if cameraStarted:
@@ -660,8 +626,18 @@ def startPrintViaMqtt(
         }
     )
 
-    logger.debug("Publishing project_file: url=%s param=%s", url, paramPath)
+    logger.info(
+        "Publishing project_file: url=%s param=%s use_ams=%s bed_leveling=%s layer_inspect=%s flow_cali=%s vibration_cali=%s",
+        url,
+        paramPath,
+        bool(useAms),
+        bool(bedLeveling),
+        bool(layerInspect),
+        bool(flowCalibration),
+        bool(vibrationCalibration),
+    )
     client.publish(topicRequest, json.dumps(payload), qos=1)
+    logger.info("Startkommando sendt")
 
     timeoutDeadline = time.time() + max(waitSeconds, statusWarmupSeconds, 0)
     while time.time() < timeoutDeadline:
