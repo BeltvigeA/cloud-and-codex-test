@@ -401,6 +401,10 @@ def uploadViaBambulabsApi(
     logger.info(
         "Upload response: %r (type=%s)", response, type(response).__name__
     )
+    uploadResponseText = "" if response is None else str(response)
+    uploadSuccessful = response is True or ("226" in uploadResponseText)
+    if not uploadSuccessful:
+        raise RuntimeError(f"Upload failed: {response}")
 
     try:
         yield BambuApiUploadSession(
@@ -437,6 +441,117 @@ def startViaBambuapiAfterUpload(
     )
     printer.start_print(remoteName, startArgument)
     logger.info("Startkommando sendt")
+
+    startTimeoutSeconds = 60
+    startedSuccessfully, stateValue, progressValue, gcodeStateValue = waitForPrinterStart(
+        printer, timeoutSeconds=startTimeoutSeconds
+    )
+    if startedSuccessfully:
+        statusParts: List[str] = []
+        if stateValue:
+            statusParts.append(f"state={stateValue}")
+        if gcodeStateValue:
+            statusParts.append(f"gcodeState={gcodeStateValue}")
+        if progressValue is not None:
+            statusParts.append(f"progress={progressValue:.1f}%")
+        statusSummary = " ".join(statusParts) or "bekreftet"
+        logger.info("Start-ACK: %s", statusSummary)
+    else:
+        logger.warning(
+            "Ingen start-ACK innen %ds. Vil ikke sende ny start; går over i monitor-only.",
+            startTimeoutSeconds,
+        )
+
+
+def waitForPrinterStart(
+    printer: Any,
+    *,
+    timeoutSeconds: int = 60,
+    pollIntervalSeconds: float = 2.0,
+) -> tuple[bool, Optional[str], Optional[float], Optional[str]]:
+    startTime = time.monotonic()
+    stateAccessor = getattr(printer, "get_state", None)
+    percentageAccessor = getattr(printer, "get_percentage", None)
+    gcodeStateAccessor = getattr(printer, "get_gcode_state", None)
+    statusAccessor = getattr(printer, "get_status", None)
+
+    lastStateValue: Optional[str] = None
+    lastProgressValue: Optional[float] = None
+    lastGcodeStateValue: Optional[str] = None
+
+    if not any((stateAccessor, percentageAccessor, gcodeStateAccessor, statusAccessor)):
+        return False, None, None, None
+
+    def safeInvoke(accessor: Optional[Callable[[], Any]]) -> Any:
+        if accessor is None:
+            return None
+        try:
+            return accessor()
+        except Exception:
+            logger.debug("Failed to query printer state", exc_info=True)
+            return None
+
+    def normalizeState(rawValue: Any) -> Optional[str]:
+        if rawValue is None:
+            return None
+        text = str(rawValue).strip()
+        return text or None
+
+    def normalizeProgress(rawValue: Any) -> Optional[float]:
+        if rawValue is None:
+            return None
+        try:
+            return float(rawValue)
+        except (TypeError, ValueError):
+            return None
+
+    while time.monotonic() - startTime < timeoutSeconds:
+        stateValue = normalizeState(safeInvoke(stateAccessor))
+        gcodeStateValue = normalizeState(safeInvoke(gcodeStateAccessor))
+        progressValue = normalizeProgress(safeInvoke(percentageAccessor))
+
+        statusPayload: Optional[Any] = None
+        if statusAccessor is not None:
+            statusPayload = safeInvoke(statusAccessor)
+
+        if stateValue is None and isinstance(statusPayload, dict):
+            stateValue = normalizeState(statusPayload.get("state")) or normalizeState(
+                statusPayload.get("print")
+            )
+
+        if gcodeStateValue is None and isinstance(statusPayload, dict):
+            gcodeStateValue = normalizeState(statusPayload.get("gcode_state"))
+            if gcodeStateValue is None:
+                printSection = statusPayload.get("print")
+                if isinstance(printSection, dict):
+                    gcodeStateValue = normalizeState(printSection.get("gcode_state"))
+
+        if progressValue is None and isinstance(statusPayload, dict):
+            progressValue = normalizeProgress(statusPayload.get("percentage"))
+            if progressValue is None:
+                printSection = statusPayload.get("print")
+                if isinstance(printSection, dict):
+                    progressValue = normalizeProgress(printSection.get("percentage"))
+
+        if stateValue:
+            lastStateValue = stateValue
+        if progressValue is not None:
+            lastProgressValue = progressValue
+        if gcodeStateValue:
+            lastGcodeStateValue = gcodeStateValue
+
+        stateLower = (stateValue or "").lower()
+        gcodeUpper = (gcodeStateValue or "").upper()
+        hasHeatingState = any(keyword in stateLower for keyword in ("heat", "warm", "run", "print"))
+        hasActiveGcode = gcodeUpper in {"HEATING", "RUNNING", "PRINTING"}
+        hasProgress = (progressValue or 0.0) > 0.0
+
+        if hasHeatingState or hasActiveGcode or hasProgress:
+            return True, stateValue, progressValue, gcodeStateValue
+
+        time.sleep(pollIntervalSeconds)
+
+    return False, lastStateValue, lastProgressValue, lastGcodeStateValue
 
 
 def pickGcodeParamFrom3mf(path: Path, plateIndex: Optional[int]) -> tuple[Optional[str], List[str]]:
@@ -675,7 +790,7 @@ def startPrintViaMqtt(
         client.publish(topicRequest, json.dumps(payload), qos=1)
         logger.info("Startkommando sendt")
     else:
-        logger.info("Monitoring MQTT status without sending start command")
+        logger.info("Monitoring MQTT status etter API-start")
 
     timeoutDeadline = time.time() + max(waitSeconds, statusWarmupSeconds, 0)
     while time.time() < timeoutDeadline:
