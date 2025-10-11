@@ -269,49 +269,67 @@ def uploadViaFtps(
         def performUpload(command: str, fileName: str) -> str:
             uploadHandle.seek(0)
             response = ftps.storbinary(command, uploadHandle, blocksize=64 * 1024)
-            logger.debug("FTPS response: %s", response)
-            if not response or not response.startswith("226"):
+            logger.debug(
+                "FTPS response: %r (type=%s)", response, type(response).__name__
+            )
+            responseText = str(response or "")
+            if not responseText.startswith("226"):
                 raise RuntimeError(
                     f"FTPS transfer did not complete successfully for {fileName}: {response}"
                 )
-            return response
+            return responseText
 
-        sanitizedName = sanitizeThreeMfName(remoteName)
-        baseName = Path(sanitizedName).stem or "upload"
+        sanitizedFileName = sanitizeThreeMfName(remoteName)
+        baseStem = Path(sanitizedFileName).stem or "upload"
         extension = ".3mf"
 
-        def buildCandidateName(attempt: int) -> str:
-            if attempt == 0:
-                return sanitizedName
-            fallbackName = f"{baseName}_{attempt}{extension}"
-            return sanitizeThreeMfName(fallbackName)
+        def buildAlternativeName(index: int) -> str:
+            candidate = f"{baseStem}_{index}{extension}"
+            return sanitizeThreeMfName(candidate)
 
-        lastError: Optional[error_perm] = None
-        for attempt in range(6):
-            candidateName = buildCandidateName(attempt)
-            storageCommand = buildStorageCommand(candidateName)
-            logger.debug(
-                "FTPS STOR command: %s  (fileName=%s,len=%d)",
-                storageCommand,
-                candidateName,
-                len(candidateName),
-            )
-            try:
-                performUpload(storageCommand, candidateName)
-                return candidateName
-            except error_perm as uploadError:
-                lastError = uploadError
-                errorText = str(uploadError)
-                if "550" in errorText and attempt < 5:
-                    logger.warning(
-                        "FTPS 550 on %s, retrying with alternative name", candidateName
-                    )
-                    reactivateStor(ftps)
-                    continue
+        currentFileName = sanitizedFileName
+        storageCommand = buildStorageCommand(currentFileName)
+        logger.debug(
+            "FTPS STOR command: %s  (fileName=%s,len=%d)",
+            storageCommand,
+            currentFileName,
+            len(currentFileName),
+        )
+        try:
+            performUpload(storageCommand, currentFileName)
+            return currentFileName
+        except error_perm as initialError:
+            errorText = str(initialError)
+            if "550" not in errorText:
                 raise
-        if lastError is not None:
-            raise lastError
-        raise RuntimeError("FTPS upload failed without specific error")
+
+            lastError: Optional[error_perm] = initialError
+            for attempt in range(1, 6):
+                alternativeName = buildAlternativeName(attempt)
+                logger.warning(
+                    "FTPS 550 on %s, retrying with alternative name", currentFileName
+                )
+                reactivateStor(ftps)
+                storageCommand = buildStorageCommand(alternativeName)
+                logger.debug(
+                    "FTPS STOR command: %s  (fileName=%s,len=%d)",
+                    storageCommand,
+                    alternativeName,
+                    len(alternativeName),
+                )
+                try:
+                    performUpload(storageCommand, alternativeName)
+                    return alternativeName
+                except error_perm as uploadError:
+                    lastError = uploadError
+                    currentFileName = alternativeName
+                    if "550" in str(uploadError) and attempt < 5:
+                        continue
+                    raise
+
+            if lastError is not None:
+                raise lastError
+            raise RuntimeError("FTPS upload failed without specific error")
     finally:
         try:
             ftps.quit()
@@ -380,7 +398,9 @@ def uploadViaBambulabsApi(
     logger.info("Uploading via bambulabs_api as %s", normalizedRemoteName)
     with open(localPath, "rb") as fileHandle:
         response = uploadMethod(fileHandle, normalizedRemoteName)
-    logger.info("Upload response: %r", response)
+    logger.info(
+        "Upload response: %r (type=%s)", response, type(response).__name__
+    )
 
     try:
         yield BambuApiUploadSession(
@@ -413,7 +433,7 @@ def startViaBambuapiAfterUpload(
     logger.info(
         "Publishing project_file via API: url=file:///sdcard/%s param=%s",
         remoteName,
-        paramPath or startArgument,
+        startArgument,
     )
     printer.start_print(remoteName, startArgument)
     logger.info("Startkommando sendt")
