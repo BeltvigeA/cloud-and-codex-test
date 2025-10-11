@@ -226,146 +226,96 @@ def uploadViaFtps(
     ftps.timeout = timeout
     try:
         ftps.login("bblp", accessCode)
+        try:
+            ftps.sendcmd("OPTS UTF8 ON")
+        except Exception:
+            pass
         ftps.prot_p()
-        ftps.set_pasv(True)
         ftps.voidcmd("TYPE I")
+        ftps.set_pasv(True)
 
-        fileName = os.path.basename(remoteName)
-        fallbackSeedName = fileName
-
-        storageCommand = f"STOR {fileName}"
-        remoteDeleteTargets = []
-
-        def deleteRemotePath(remotePath: str) -> None:
-            try:
-                ftps.delete(remotePath)
-            except Exception as deleteError:  # pragma: no cover - exercised via specific tests
-                errorMessage = str(deleteError).lower()
-                if "not found" in errorMessage or "no such file" in errorMessage:
-                    return
-                raise
-
-        def buildFallbackFileName(originalName: str) -> str:
-            baseName, extension = os.path.splitext(originalName)
-            safeBase = baseName or "upload"
-            timestampPart = str(int(time.time()))
-            uniquePart = uuid.uuid4().hex[:8]
-            return f"{safeBase}_{timestampPart}_{uniquePart}{extension}"
-
-        savedDirectory: Optional[str] = None
-
+        sanitizedName = sanitizeThreeMfName(remoteName)
+        usePrefix = ""
         try:
             ftps.cwd("/sdcard")
-            savedDirectory = "/sdcard"
-            remoteDeleteTargets.append(fileName)
         except Exception:
             try:
                 ftps.cwd("sdcard")
-                savedDirectory = "sdcard"
-                remoteDeleteTargets.append(fileName)
             except Exception:
-                storageCommand = f"STOR sdcard/{fileName}"
-                remoteDeleteTargets.append(f"sdcard/{fileName}")
-
-        def tryReenterSavedDirectory() -> None:
-            if not savedDirectory:
-                return
-            try:
-                ftps.cwd(savedDirectory)
-            except Exception:
-                return
-
-        fallbackActive = False
-        fallbackSource: Optional[str] = None
-        fallbackRetriesAfterDelete = 0
-        maxFallbackRetriesAfterDelete = 1
-
-        def activateFallbackName(generatedName: str, *, source: str) -> None:
-            nonlocal storageCommand, fileName, fallbackActive, fallbackSource, fallbackRetriesAfterDelete
-
-            _, remoteStoragePath = storageCommand.split(" ", 1)
-            remoteDirectory, _ = os.path.split(remoteStoragePath)
-            if remoteDirectory:
-                newRemotePath = f"{remoteDirectory}/{generatedName}"
-            else:
-                newRemotePath = generatedName
-            storageCommand = f"STOR {newRemotePath}"
-            fileName = generatedName
-            fallbackActive = True
-            fallbackSource = source
-            if source == "delete":
-                fallbackRetriesAfterDelete = 0
-        for remoteTarget in remoteDeleteTargets:
-            try:
-                deleteRemotePath(remoteTarget)
-            except error_perm as deleteError:
-                if "550" in str(deleteError):
-                    generatedName = buildFallbackFileName(fallbackSeedName)
-                    activateFallbackName(generatedName, source="delete")
-                    break
-                raise
-
-        def performUpload() -> str:
-            tryReenterSavedDirectory()
-            logger.debug("FTPS STOR command: %s  (fileName=%s)", storageCommand, fileName)
-            if dataStream is not None:
-                try:
-                    dataStream.seek(0)
-                except Exception:
-                    pass
-                response = ftps.storbinary(storageCommand, dataStream, blocksize=64 * 1024)
-            else:
-                with open(localPath, "rb") as handle:
-                    response = ftps.storbinary(storageCommand, handle, blocksize=64 * 1024)
-            if not response or not response.startswith("226"):
-                raise RuntimeError(f"FTPS transfer did not complete successfully for {fileName}: {response}")
-            return response
+                usePrefix = "sdcard/"
 
         try:
-            performUpload()
-        except RuntimeError as incompleteError:
-            logger.error("%s", incompleteError)
-            generatedName = buildFallbackFileName(fallbackSeedName)
-            activateFallbackName(generatedName, source="stor")
-            reactivateStor(ftps)
-            tryReenterSavedDirectory()
-            performUpload()
-        except error_perm as uploadError:
-            if "550" not in str(uploadError):
-                raise
-            reactivateStor(ftps)
-            tryReenterSavedDirectory()
-            try:
-                performUpload()
-            except error_perm as secondError:
-                if "550" not in str(secondError):
-                    raise
-                allowExtraFallback = (
-                    fallbackActive
-                    and fallbackSource == "delete"
-                    and fallbackRetriesAfterDelete < maxFallbackRetriesAfterDelete
-                )
-                if fallbackActive and not allowExtraFallback:
-                    raise
-                if allowExtraFallback:
-                    fallbackRetriesAfterDelete += 1
-                generatedName = buildFallbackFileName(fallbackSeedName)
-                activateFallbackName(generatedName, source="stor")
-                reactivateStor(ftps)
-                tryReenterSavedDirectory()
-                try:
-                    performUpload()
-                except error_perm as thirdError:
-                    if "550" in str(thirdError):
-                        raise
-                    raise
+            currentDirectory = ftps.pwd()
+        except Exception:
+            currentDirectory = "?"
+        logger.debug("FTP PWD: %s", currentDirectory)
 
-        return fileName
+        def buildStorageCommand(fileName: str) -> str:
+            return f"STOR {usePrefix}{fileName}"
+
+        baseRoot, _ = os.path.splitext(sanitizedName)
+        if not baseRoot:
+            baseRoot = "upload"
+        extension = ".3mf"
+        maxRootLength = max(1, 60 - len(extension))
+
+        def buildCandidateName(attempt: int) -> str:
+            if attempt == 0:
+                return sanitizedName
+            suffix = f"_{attempt}"
+            allowedRootLength = maxRootLength - len(suffix)
+            if allowedRootLength < 1:
+                allowedRootLength = 1
+            truncatedRoot = baseRoot[:allowedRootLength]
+            candidateRoot = f"{truncatedRoot}{suffix}"
+            return sanitizeThreeMfName(f"{candidateRoot}{extension}")
+        attempts = 0
+        maxAttempts = 4
+        lastError: Optional[error_perm] = None
+
+        while attempts < maxAttempts:
+            candidateName = buildCandidateName(attempts)
+            storageCommand = buildStorageCommand(candidateName)
+            logger.debug("FTPS STOR command: %s", storageCommand)
+            logger.debug("Remote fileName: %s  (len=%d)", candidateName, len(candidateName))
+
+            try:
+                if dataStream is not None:
+                    try:
+                        dataStream.seek(0)
+                    except Exception:
+                        pass
+                    response = ftps.storbinary(storageCommand, dataStream, blocksize=64 * 1024)
+                else:
+                    with open(localPath, "rb") as handle:
+                        handle.seek(0)
+                        response = ftps.storbinary(storageCommand, handle, blocksize=64 * 1024)
+            except error_perm as uploadError:
+                lastError = uploadError
+                if "550" in str(uploadError) and attempts + 1 < maxAttempts:
+                    reactivateStor(ftps)
+                    attempts += 1
+                    continue
+                raise
+
+            if not response or not response.startswith("226"):
+                raise RuntimeError(
+                    f"FTPS transfer did not complete successfully for {candidateName}: {response}"
+                )
+
+            return candidateName
+
+        if lastError is not None:
+            raise lastError
+        raise RuntimeError("FTPS upload failed without specific error")
     finally:
         try:
             ftps.quit()
         except Exception:
-            pass
+            try:
+                ftps.close()
+            except Exception:
+                pass
 
 
 def uploadViaBambulabsApi(
@@ -420,7 +370,11 @@ def pickGcodeParamFrom3mf(path: Path, plateIndex: Optional[int]) -> tuple[Option
 
     try:
         with zipfile.ZipFile(path, "r") as archive:
-            candidates = [name for name in archive.namelist() if name.lower().endswith(".gcode")]
+            candidates = [
+                name
+                for name in archive.namelist()
+                if name.lower().startswith("metadata/") and name.lower().endswith(".gcode")
+            ]
 
             def plateKey(name: str) -> int:
                 match = re.search(r"plate[_\-]?(\d+)\.gcode$", name, re.IGNORECASE)
@@ -432,24 +386,19 @@ def pickGcodeParamFrom3mf(path: Path, plateIndex: Optional[int]) -> tuple[Option
             if not orderedCandidates:
                 return None, []
 
-            if plateIndex:
+            if plateIndex is not None:
                 requestedIndex = max(1, plateIndex)
-                explicit = [
-                    item
-                    for item in orderedCandidates
-                    if re.search(fr"plate[_\-]?{requestedIndex}\.gcode$", item, re.IGNORECASE)
-                ]
-                if explicit:
-                    chosen = explicit[0]
-                else:
-                    zeroBased = requestedIndex - 1
-                    if zeroBased < len(orderedCandidates):
-                        chosen = orderedCandidates[zeroBased]
-                    else:
-                        chosen = orderedCandidates[0]
-            else:
-                chosen = orderedCandidates[0]
-            return chosen, orderedCandidates
+                expectedName = f"Metadata/plate_{requestedIndex}.gcode"
+                for candidate in orderedCandidates:
+                    if candidate.lower() == expectedName.lower():
+                        return candidate, orderedCandidates
+                return None, orderedCandidates
+
+            preferredName = "Metadata/plate_1.gcode"
+            for candidate in orderedCandidates:
+                if candidate.lower() == preferredName.lower():
+                    return candidate, orderedCandidates
+            return orderedCandidates[0], orderedCandidates
     except zipfile.BadZipFile:
         return None, []
 
@@ -695,15 +644,30 @@ class BambuPrintOptions:
     lanStrategy: str = "legacy"
 
 
-def normalizeRemoteFileName(name: str) -> str:
-    normalized = unicodedata.normalize("NFKD", name)
+def sanitizeThreeMfName(name: str) -> str:
+    normalized = unicodedata.normalize("NFKD", name or "")
     asciiName = normalized.encode("ascii", "ignore").decode("ascii")
-    safeName = re.sub(r"[^A-Za-z0-9._-]+", "_", asciiName)
-    if safeName.lower().endswith(".gcode"):
-        safeName = safeName[: -len(".gcode")]
-    if not safeName.lower().endswith(".3mf"):
-        safeName += ".3mf"
-    return safeName
+    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", asciiName)
+    if not cleaned:
+        cleaned = "upload"
+
+    baseName, extension = os.path.splitext(cleaned)
+    if extension.lower() == ".gcode":
+        cleaned = baseName or "upload"
+    elif extension.lower() != ".3mf":
+        cleaned = cleaned
+
+    root, _ = os.path.splitext(cleaned)
+    root = root or "upload"
+    finalName = f"{root}.3mf"
+    if len(finalName) > 60:
+        maxRootLength = max(1, 60 - len(".3mf"))
+        finalName = f"{root[:maxRootLength]}.3mf"
+    return finalName
+
+
+def normalizeRemoteFileName(name: str) -> str:
+    return sanitizeThreeMfName(name)
 
 
 def buildRemoteFileName(localPath: Path) -> str:
@@ -918,6 +882,12 @@ def sendBambuPrintJob(
                         "3MF-arkivet mangler G-code i Metadata/. Eksporter med innebygd G-code "
                         "eller send .gcode slik at klienten kan pakke det automatisk."
                     )
+                if plateIndex is not None:
+                    requestedIndex = max(1, plateIndex)
+                    expectedParam = f"Metadata/plate_{requestedIndex}.gcode"
+                    raise ValueError(
+                        f"3MF-arkivet mangler {expectedParam}. Tilgjengelige filer: {candidates}"
+                    )
                 paramPath = candidates[0]
 
         if skippedObjects:
@@ -953,13 +923,27 @@ def sendBambuPrintJob(
                 remoteName=remoteName,
             )
         else:
-            uploadedName = uploadViaFtps(
-                ip=options.ipAddress,
-                accessCode=options.accessCode,
-                localPath=workingPath,
-                remoteName=remoteName,
-                insecureTls=not options.secureConnection,
-            )
+            try:
+                uploadedName = uploadViaFtps(
+                    ip=options.ipAddress,
+                    accessCode=options.accessCode,
+                    localPath=workingPath,
+                    remoteName=remoteName,
+                    insecureTls=not options.secureConnection,
+                )
+            except error_perm as ftpsError:
+                if "550" not in str(ftpsError):
+                    raise
+                logger.warning(
+                    "FTPS feilet med 550, forsøker upload via bambulabs_api...", exc_info=True
+                )
+                uploadedName = uploadViaBambulabsApi(
+                    ip=options.ipAddress,
+                    serial=options.serialNumber,
+                    accessCode=options.accessCode,
+                    localPath=workingPath,
+                    remoteName=remoteName,
+                )
 
         if statusCallback:
             statusCallback(
