@@ -17,6 +17,7 @@ import uuid
 import zipfile
 import xml.etree.ElementTree as ET
 import logging
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Event
@@ -237,7 +238,6 @@ def uploadViaFtps(
         except Exception:
             pass
 
-        sanitizedName = sanitizeThreeMfName(remoteName)
         usePrefix = ""
         try:
             ftps.cwd("/sdcard")
@@ -276,21 +276,25 @@ def uploadViaFtps(
                 )
             return response
 
+        sanitizedName = sanitizeThreeMfName(remoteName)
         baseName = Path(sanitizedName).stem or "upload"
         extension = ".3mf"
 
         def buildCandidateName(attempt: int) -> str:
             if attempt == 0:
                 return sanitizedName
-            candidate = f"{baseName}_{attempt}{extension}"
-            return sanitizeThreeMfName(candidate)
+            fallbackName = f"{baseName}_{attempt}{extension}"
+            return sanitizeThreeMfName(fallbackName)
 
         lastError: Optional[error_perm] = None
         for attempt in range(6):
             candidateName = buildCandidateName(attempt)
             storageCommand = buildStorageCommand(candidateName)
             logger.debug(
-                "FTPS STOR command: %s  (fileName=%s)", storageCommand, candidateName
+                "FTPS STOR command: %s  (fileName=%s,len=%d)",
+                storageCommand,
+                candidateName,
+                len(candidateName),
             )
             try:
                 performUpload(storageCommand, candidateName)
@@ -318,6 +322,14 @@ def uploadViaFtps(
                 pass
 
 
+@dataclass
+class BambuApiUploadSession:
+    printer: Any
+    remoteName: str
+    connectCamera: bool
+
+
+@contextmanager
 def uploadViaBambulabsApi(
     *,
     ip: str,
@@ -326,7 +338,7 @@ def uploadViaBambulabsApi(
     localPath: Path,
     remoteName: str,
     connectCamera: bool = False,
-) -> str:
+) -> BambuApiUploadSession:
     """Upload a file using the official bambulabs_api client."""
 
     if bambulabsApi is None:
@@ -349,8 +361,8 @@ def uploadViaBambulabsApi(
     mqttStarted = False
     cameraStarted = False
 
-    mqttStart = getattr(printer, "mqtt_start", None)
     connectMethod = getattr(printer, "connect", None)
+    mqttStart = getattr(printer, "mqtt_start", None)
     if connectCamera and connectMethod:
         connectMethod()
         cameraStarted = True
@@ -362,27 +374,18 @@ def uploadViaBambulabsApi(
         cameraStarted = True
 
     uploadMethod = getattr(printer, "upload_file", None)
-    fallbackMethods = ("upload_project", "upload")
     if uploadMethod is None:
-        for candidate in fallbackMethods:
-            uploadMethod = getattr(printer, candidate, None)
-            if uploadMethod:
-                break
-
-    if uploadMethod is None:
-        raise RuntimeError("Unable to locate an upload method on bambulabs_api.Printer")
-
-    response: Any = None
+        raise RuntimeError("Unable to locate upload_file on bambulabs_api.Printer")
 
     logger.info("Uploading via bambulabs_api as %s", normalizedRemoteName)
+    with open(localPath, "rb") as fileHandle:
+        response = uploadMethod(fileHandle, normalizedRemoteName)
+    logger.info("Upload response: %r", response)
+
     try:
-        with open(localPath, "rb") as fileHandle:
-            try:
-                response = uploadMethod(fileHandle, normalizedRemoteName)
-            except TypeError:
-                fileHandle.seek(0)
-                response = uploadMethod(fileHandle)
-        logger.info("Upload response: %r", response)
+        yield BambuApiUploadSession(
+            printer=printer, remoteName=normalizedRemoteName, connectCamera=cameraStarted
+        )
     finally:
         try:
             if cameraStarted:
@@ -396,15 +399,24 @@ def uploadViaBambulabsApi(
         except Exception:
             pass
 
-    resultName = normalizedRemoteName
-    if isinstance(response, str):
-        candidate = response.strip()
-        if candidate:
-            candidateName = Path(candidate).name
-            if candidateName.lower().endswith(".3mf"):
-                resultName = sanitizeThreeMfName(candidateName)
 
-    return resultName
+def startViaBambuapiAfterUpload(
+    printer: Any,
+    remoteName: str,
+    paramPath: Optional[str],
+    plateIndex: Optional[int],
+) -> None:
+    if paramPath:
+        startArgument: Any = paramPath
+    else:
+        startArgument = int(plateIndex or 1)
+    logger.info(
+        "Publishing project_file via API: url=file:///sdcard/%s param=%s",
+        remoteName,
+        paramPath or startArgument,
+    )
+    printer.start_print(remoteName, startArgument)
+    logger.info("Startkommando sendt")
 
 
 def pickGcodeParamFrom3mf(path: Path, plateIndex: Optional[int]) -> tuple[Optional[str], List[str]]:
@@ -463,6 +475,8 @@ def startPrintViaMqtt(
     insecureTls: bool = True,
     waitSeconds: int = 12,
     statusWarmupSeconds: int = 5,
+    sendStartCommand: bool = True,
+    initialStatus: Optional[Dict[str, Any]] = None,
     statusCallback: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> None:
     """Start a print job via MQTT and stream status messages."""
@@ -595,49 +609,53 @@ def startPrintViaMqtt(
         client.disconnect()
         raise RuntimeError(connectionError)
 
-    sequenceId = uuid.uuid4().hex
     url = f"file:///sdcard/{sdFileName}"
 
-    payload = {
-        "print": {
-            "command": "project_file",
-            "sequence_id": sequenceId,
-            "url": url,
-            "use_ams": bool(useAms),
-            "bed_leveling": bool(bedLeveling),
-            "layer_inspect": bool(layerInspect),
-            "flow_cali": bool(flowCalibration),
-            "vibration_cali": bool(vibrationCalibration),
-        }
+    statusPayload = initialStatus or {
+        "status": "starting",
+        "url": url,
+        "param": paramPath,
+        "useAms": bool(useAms),
+        "bedLeveling": bool(bedLeveling),
+        "layerInspect": bool(layerInspect),
+        "flowCalibration": bool(flowCalibration),
+        "vibrationCalibration": bool(vibrationCalibration),
     }
-    if paramPath:
-        payload["print"]["param"] = paramPath
 
-    emitStatus(
-        {
-            "status": "starting",
-            "url": url,
-            "param": paramPath,
-            "useAms": bool(useAms),
-            "bedLeveling": bool(bedLeveling),
-            "layerInspect": bool(layerInspect),
-            "flowCalibration": bool(flowCalibration),
-            "vibrationCalibration": bool(vibrationCalibration),
+    if statusPayload:
+        emitStatus(dict(statusPayload))
+
+    if sendStartCommand:
+        sequenceId = uuid.uuid4().hex
+        payload = {
+            "print": {
+                "command": "project_file",
+                "sequence_id": sequenceId,
+                "url": url,
+                "use_ams": bool(useAms),
+                "bed_leveling": bool(bedLeveling),
+                "layer_inspect": bool(layerInspect),
+                "flow_cali": bool(flowCalibration),
+                "vibration_cali": bool(vibrationCalibration),
+            }
         }
-    )
+        if paramPath:
+            payload["print"]["param"] = paramPath
 
-    logger.info(
-        "Publishing project_file: url=%s param=%s use_ams=%s bed_leveling=%s layer_inspect=%s flow_cali=%s vibration_cali=%s",
-        url,
-        paramPath,
-        bool(useAms),
-        bool(bedLeveling),
-        bool(layerInspect),
-        bool(flowCalibration),
-        bool(vibrationCalibration),
-    )
-    client.publish(topicRequest, json.dumps(payload), qos=1)
-    logger.info("Startkommando sendt")
+        logger.info(
+            "Publishing project_file: url=%s param=%s use_ams=%s bed_leveling=%s layer_inspect=%s flow_cali=%s vibration_cali=%s",
+            url,
+            paramPath,
+            bool(useAms),
+            bool(bedLeveling),
+            bool(layerInspect),
+            bool(flowCalibration),
+            bool(vibrationCalibration),
+        )
+        client.publish(topicRequest, json.dumps(payload), qos=1)
+        logger.info("Startkommando sendt")
+    else:
+        logger.info("Monitoring MQTT status without sending start command")
 
     timeoutDeadline = time.time() + max(waitSeconds, statusWarmupSeconds, 0)
     while time.time() < timeoutDeadline:
@@ -700,25 +718,24 @@ class BambuPrintOptions:
     lanStrategy: str = "legacy"
 
 
-def sanitizeThreeMfName(name: str) -> str:
-    cleaned = re.sub(r"[^A-Za-z0-9_.-]", "_", (name or "").strip())
-    if not cleaned:
-        cleaned = "upload"
+def sanitizeThreeMfName(name: str, maxLength: int = 60) -> str:
+    base = re.sub(r"[^A-Za-z0-9_.-]", "_", (name or "").strip())
+    if not base:
+        base = "upload"
 
-    lowerName = cleaned.lower()
-    if lowerName.endswith(".gcode"):
-        cleaned = cleaned[: -len(".gcode")]
-        cleaned = cleaned or "upload"
-    if not cleaned.lower().endswith(".3mf"):
-        baseName, _ = os.path.splitext(cleaned)
-        cleaned = f"{baseName or cleaned}.3mf"
+    if base.lower().endswith(".gcode"):
+        base = os.path.splitext(base)[0] or "upload"
 
-    root, extension = os.path.splitext(cleaned)
-    maxLength = 60
-    if len(cleaned) > maxLength:
+    if not base.lower().endswith(".3mf"):
+        root, _ = os.path.splitext(base)
+        base = f"{root or base}.3mf"
+
+    stem, extension = os.path.splitext(base)
+    if len(base) > maxLength:
         allowedRootLength = max(1, maxLength - len(extension))
-        cleaned = f"{root[:allowedRootLength]}{extension}"
-    return cleaned
+        base = f"{stem[:allowedRootLength]}{extension}"
+
+    return base
 
 
 def normalizeRemoteFileName(name: str) -> str:
@@ -906,7 +923,7 @@ def sendBambuPrintJob(
     plateIndex = options.plateIndex
     lanStrategy = (options.lanStrategy or "legacy").lower()
 
-    remoteName = buildRemoteFileName(resolvedPath)
+    remoteName = buildPrinterTransferFileName(resolvedPath)
     assert remoteName.lower().endswith(".3mf"), f"remoteName må være .3mf, fikk: {remoteName}"
     logger.debug("Resolved remote file name for upload: %s", remoteName)
 
@@ -969,36 +986,87 @@ def sendBambuPrintJob(
                 statusCallback({"status": "cloudAccepted", "response": response})
             return {"method": "cloud", "remoteFile": remoteName, "paramPath": paramPath, "response": response}
 
-        if lanStrategy == "bambuapi":
-            uploadedName = uploadViaBambulabsApi(
+        def uploadAndStartViaBambuApi() -> str:
+            initialStatusPayload: Optional[Dict[str, Any]] = None
+            with uploadViaBambulabsApi(
                 ip=options.ipAddress,
                 serial=options.serialNumber,
                 accessCode=options.accessCode,
                 localPath=workingPath,
                 remoteName=remoteName,
+            ) as session:
+                uploaded = session.remoteName
+                if statusCallback:
+                    statusCallback(
+                        {
+                            "status": "uploaded",
+                            "remoteFile": uploaded,
+                            "originalRemoteFile": remoteName,
+                            "param": paramPath,
+                        }
+                    )
+                initialStatusPayload = {
+                    "status": "starting",
+                    "url": f"file:///sdcard/{uploaded}",
+                    "param": paramPath,
+                    "useAms": bool(options.useAms),
+                    "bedLeveling": bool(options.bedLeveling),
+                    "layerInspect": bool(options.layerInspect),
+                    "flowCalibration": bool(options.flowCalibration),
+                    "vibrationCalibration": bool(options.vibrationCalibration),
+                }
+                startViaBambuapiAfterUpload(
+                    session.printer, uploaded, paramPath, plateIndex
+                )
+            startPrintViaMqtt(
+                ip=options.ipAddress,
+                serial=options.serialNumber,
+                accessCode=options.accessCode,
+                sdFileName=uploaded,
+                paramPath=paramPath,
+                useAms=options.useAms,
+                bedLeveling=options.bedLeveling,
+                layerInspect=options.layerInspect,
+                flowCalibration=options.flowCalibration,
+                vibrationCalibration=options.vibrationCalibration,
+                insecureTls=not options.secureConnection,
+                waitSeconds=options.waitSeconds,
+                sendStartCommand=False,
+                initialStatus=initialStatusPayload,
+                statusCallback=statusCallback,
             )
-        else:
-            try:
-                uploadedName = uploadViaFtps(
-                    ip=options.ipAddress,
-                    accessCode=options.accessCode,
-                    localPath=workingPath,
-                    remoteName=remoteName,
-                    insecureTls=not options.secureConnection,
-                )
-            except error_perm as ftpsError:
-                if "550" not in str(ftpsError):
-                    raise
-                logger.warning(
-                    "FTPS feilet med 550, forsøker upload via bambulabs_api...", exc_info=True
-                )
-                uploadedName = uploadViaBambulabsApi(
-                    ip=options.ipAddress,
-                    serial=options.serialNumber,
-                    accessCode=options.accessCode,
-                    localPath=workingPath,
-                    remoteName=remoteName,
-                )
+            return uploaded
+
+        if lanStrategy == "bambuapi":
+            uploadedName = uploadAndStartViaBambuApi()
+            return {
+                "method": "lan",  # LAN fallback via bambulabs_api
+                "remoteFile": uploadedName,
+                "originalRemoteFile": remoteName,
+                "paramPath": paramPath,
+            }
+
+        try:
+            uploadedName = uploadViaFtps(
+                ip=options.ipAddress,
+                accessCode=options.accessCode,
+                localPath=workingPath,
+                remoteName=remoteName,
+                insecureTls=not options.secureConnection,
+            )
+        except error_perm as ftpsError:
+            if "550" not in str(ftpsError):
+                raise
+            logger.warning(
+                "FTPS feilet med 550, forsøker upload via bambulabs_api...", exc_info=True
+            )
+            uploadedName = uploadAndStartViaBambuApi()
+            return {
+                "method": "lan",
+                "remoteFile": uploadedName,
+                "originalRemoteFile": remoteName,
+                "paramPath": paramPath,
+            }
 
         if statusCallback:
             statusCallback(
@@ -1052,6 +1120,9 @@ __all__ = [
     "applySkippedObjectsToArchive",
     "pickGcodeParamFrom3mf",
     "postStatus",
+    "BambuApiUploadSession",
+    "uploadViaBambulabsApi",
+    "startViaBambuapiAfterUpload",
     "sendBambuPrintJob",
     "sendPrintJobViaCloud",
     "startPrintViaMqtt",

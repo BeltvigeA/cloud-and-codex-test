@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import sys
 import zipfile
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -190,6 +191,7 @@ def test_dispatchBambuPrintUsesBambulabsApiWhenConfigured(
 
     uploadCapture: dict[str, Any] = {}
 
+    @contextmanager
     def fakeUploadViaBambulabsApi(
         *,
         ip: str,
@@ -198,13 +200,25 @@ def test_dispatchBambuPrintUsesBambulabsApiWhenConfigured(
         localPath: Path,
         remoteName: str,
         connectCamera: bool = False,
-    ) -> str:
+    ):
         uploadCapture["ip"] = ip
         uploadCapture["serial"] = serial
         uploadCapture["accessCode"] = accessCode
         uploadCapture["localPathSuffix"] = Path(localPath).suffix
         uploadCapture["remoteName"] = remoteName
-        return "uploaded.3mf"
+
+        class FakePrinter:
+            def __init__(self) -> None:
+                self.startArgs = None
+
+            def start_print(self, name: str, startArg: Any) -> None:
+                self.startArgs = (name, startArg)
+                uploadCapture["startArgs"] = self.startArgs
+
+        printer = FakePrinter()
+        yield bambuPrinter.BambuApiUploadSession(
+            printer=printer, remoteName="uploaded.3mf", connectCamera=False
+        )
 
     def failUploadViaFtps(**_kwargs: Any) -> str:
         raise AssertionError("uploadViaFtps should not be used when lanStrategy=bambuApi")
@@ -231,3 +245,4 @@ def test_dispatchBambuPrintUsesBambulabsApiWhenConfigured(
     assert uploadCapture["accessCode"] == "ACCESS"
     assert uploadCapture["localPathSuffix"] == ".3mf"
     assert uploadCapture["remoteName"].endswith(".3mf")
+    assert uploadCapture.get("startArgs") is not None
