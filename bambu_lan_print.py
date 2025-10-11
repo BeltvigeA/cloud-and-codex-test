@@ -83,39 +83,113 @@ class BambuLANClient:
                 pass
 
     @staticmethod
-    def _zip_gcode_to_3mf_bytes(gcode_text: str, plate_path: str = "Metadata/plate_1.gcode") -> io.BytesIO:
+    def _zipGcodeTo3mfBytes(gcodeText: str, platePath: str = "Metadata/plate_1.gcode") -> io.BytesIO:
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-            zf.writestr(plate_path, gcode_text)
+            zf.writestr(platePath, gcodeText)
         buf.seek(0)
         return buf
 
-    def upload_and_start(self, input_path: Path, upload_name: str, plate: Optional[int] = 1, gcode_inside_path: Optional[str] = None) -> None:
+    def _publishProjectFileSpool(self, uploadName: str, param: str | int) -> None:
+        """Start utskrift fra ekstern spole ved å sende rå MQTT project_file."""
+
+        if not self.printer:
+            raise RuntimeError("Ikke tilkoblet")
+
+        if mqtt is None:
+            raise RuntimeError("paho-mqtt mangler. Kjør: pip install paho-mqtt")
+
+        topic = f"device/{self.serial}/request"
+
+        if isinstance(param, int):
+            paramValue = f"Metadata/plate_{param}.gcode"
+        else:
+            paramValue = param
+
+        payload = {
+            "print": {
+                "sequence_id": str(int(time.time() * 1000) % 10_000_000),
+                "command": "project_file",
+                "url": f"file:///sdcard/{uploadName}",
+                "param": paramValue,
+                "use_ams": False,
+                "bed_levelling": True,
+                "flow_cali": True,
+                "vibration_cali": False,
+                "layer_inspect": True,
+                "timelapse": True,
+                "bed_type": "auto",
+                "project_id": "0",
+                "profile_id": "0",
+                "task_id": "0",
+                "subtask_id": "0",
+                "subtask_name": uploadName,
+                "md5": "",
+            }
+        }
+
+        client = mqtt.Client()
+        client.tls_set(cert_reqs=ssl.CERT_NONE)
+        client.tls_insecure_set(True)
+        client.username_pw_set("bblp", self.access_code)
+        client.connect(self.ip, 8883, keepalive=60)
+        client.loop_start()
+        time.sleep(0.3)
+        publishInfo = client.publish(topic, json.dumps(payload), qos=1)
+        publishInfo.wait_for_publish()
+        time.sleep(0.3)
+        client.loop_stop()
+        client.disconnect()
+
+    def upload_and_start(self, input_path: Path, upload_name: str, plate: Optional[int] = 1, gcode_inside_path: Optional[str] = None, spool: bool = False) -> None:
         if not self.printer:
             raise RuntimeError("Ikke tilkoblet. Kall connect() først.")
         suffix = input_path.suffix.lower()
         if suffix == ".3mf":
             data: io.BufferedReader | io.BytesIO = open(input_path, "rb")
-            start_arg = plate if plate is not None else 1
+            plateIndex = plate or 1
+            spoolParam = f"Metadata/plate_{plateIndex}.gcode"
+            startParam = plateIndex if plate is not None else spoolParam
         elif suffix == ".gcode":
-            gcode_text = input_path.read_text(encoding="utf-8")
-            plate_path = gcode_inside_path or "Metadata/plate_1.gcode"
-            data = self._zip_gcode_to_3mf_bytes(gcode_text, plate_path)
-            # Når start_print brukes med path-argument for gcode i .3mf, må vi sende stien i containeren
-            start_arg = plate if plate is not None else plate_path
+            gcodeText = input_path.read_text(encoding="utf-8")
+            platePath = gcode_inside_path or "Metadata/plate_1.gcode"
+            data = self._zipGcodeTo3mfBytes(gcodeText, platePath)
+            spoolParam = platePath
+            startParam = plate if plate is not None else platePath
         else:
             raise ValueError("Støtter kun .3mf eller .gcode")
 
         rprint(f"[cyan]Laster opp '{upload_name}' til skriver...[/cyan]")
         result = self.printer.upload_file(data, upload_name)
         # FTPS 226 = Transfer complete
-        if "226" not in str(result):
+        if "226" not in str(result) and result is not True:
             raise RuntimeError(f"Opplasting feilet (FTP-respons: {result})")
         rprint("[green]Opplasting OK.[/green]")
 
         rprint("[cyan]Sender start-kommando...[/cyan]")
-        self.printer.start_print(upload_name, start_arg)
-        rprint("[green]Start-kommando sendt.[/green]")
+        startArgument = spoolParam if spool else startParam
+        if spool:
+            self._publishProjectFileSpool(upload_name, startArgument)
+        else:
+            self.printer.start_print(upload_name, startArgument)
+
+        t0 = time.time()
+        acked = False
+        while time.time() - t0 < 60:
+            try:
+                state = (self.printer.get_state() or "").lower()
+                percentage = (self.printer.get_percentage() or 0) or 0
+                if any(keyword in state for keyword in ("heat", "warm", "run", "print")) or percentage > 0:
+                    acked = True
+                    break
+            except Exception:
+                pass
+            time.sleep(1.5)
+
+        if acked:
+            rprint("[green]Start-kommando bekreftet av skriver (heating/running).[/green]")
+        else:
+            rprint("[yellow]Fikk ikke eksplisitt start-ACK innen 60s – følger videre i monitor.[/yellow]")
 
     def monitor(self, interval: float = 5.0) -> None:
         if not self.printer:
@@ -235,6 +309,11 @@ def main() -> None:
     p.add_argument("--monitor", action="store_true", help="Kjør en enkel sanntidsmonitor etter start")
     p.add_argument("--raw-report", action="store_true", help="Kjør rå MQTT-abonnement i stedet for bibliotekets monitor")
     p.add_argument("--use-bambu-connect", action="store_true", help="Bruk Bambu Connect (åpner app via URL-skjema). Krever .3mf.")
+    p.add_argument(
+        "--spool",
+        action="store_true",
+        help="Start fra ekstern spole (bruker rå MQTT og deaktiverer AMS i startkommandoen)",
+    )
 
     args = p.parse_args()
 
@@ -257,7 +336,13 @@ def main() -> None:
 
     try:
         client.connect()
-        client.upload_and_start(file_path, upload_name, plate=args.plate, gcode_inside_path=args.gcode_path)
+        client.upload_and_start(
+            file_path,
+            upload_name,
+            plate=args.plate,
+            gcode_inside_path=args.gcode_path,
+            spool=args.spool,
+        )
         if args.monitor:
             if args.raw_report:
                 subscribe_report_raw(args.ip, args.serial, args.access_code)
