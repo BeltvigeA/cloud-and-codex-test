@@ -232,6 +232,10 @@ def uploadViaFtps(
         ftps.prot_p()
         ftps.voidcmd("TYPE I")
         ftps.set_pasv(True)
+        try:
+            logger.debug("FTP FEAT: %s", ftps.sendcmd("FEAT"))
+        except Exception:
+            pass
 
         sanitizedName = sanitizeThreeMfName(remoteName)
         usePrefix = ""
@@ -294,8 +298,11 @@ def uploadViaFtps(
             while attempts < maxAttempts:
                 candidateName = buildCandidateName(attempts)
                 storageCommand = buildStorageCommand(candidateName)
-                logger.debug("FTPS STOR command: %s", storageCommand)
-                logger.debug("Remote fileName: %s  (len=%d)", candidateName, len(candidateName))
+                logger.debug(
+                    "FTPS STOR command: %s  (fileName=%s)",
+                    storageCommand,
+                    candidateName,
+                )
 
                 try:
                     uploadHandle.seek(0)
@@ -305,7 +312,11 @@ def uploadViaFtps(
                     uploadHandle.seek(0)
 
                 try:
-                    response = ftps.storbinary(storageCommand, uploadHandle, blocksize=64 * 1024)
+                    response = ftps.storbinary(
+                        storageCommand,
+                        uploadHandle,
+                        blocksize=64 * 1024,
+                    )
                 except error_perm as uploadError:
                     lastError = uploadError
                     if "550" in str(uploadError) and attempts + 1 < maxAttempts:
@@ -317,6 +328,7 @@ def uploadViaFtps(
                         continue
                     raise
 
+                logger.debug("FTPS response: %s", response)
                 if not response or not response.startswith("226"):
                     raise RuntimeError(
                         f"FTPS transfer did not complete successfully for {candidateName}: {response}"
@@ -363,6 +375,14 @@ def uploadViaBambulabsApi(
 
     printer = printerClass(ip, accessCode, serial)
 
+    normalizedRemoteName = sanitizeThreeMfName(remoteName)
+    if normalizedRemoteName != remoteName:
+        logger.debug(
+            "Normalized remote name for bambulabs_api upload: %s -> %s",
+            remoteName,
+            normalizedRemoteName,
+        )
+
     mqttStarted = False
     cameraStarted = False
 
@@ -387,13 +407,16 @@ def uploadViaBambulabsApi(
     if uploadMethod is None:
         raise RuntimeError("Unable to locate an upload method on bambulabs_api.Printer")
 
+    response: Any = None
+
     try:
         with open(localPath, "rb") as fileHandle:
             try:
-                uploadMethod(fileHandle, remoteName)
+                response = uploadMethod(fileHandle, normalizedRemoteName)
             except TypeError:
                 fileHandle.seek(0)
-                uploadMethod(fileHandle)
+                response = uploadMethod(fileHandle)
+            logger.debug("bambulabs_api upload response: %s", response)
     finally:
         try:
             if cameraStarted:
@@ -407,7 +430,15 @@ def uploadViaBambulabsApi(
         except Exception:
             pass
 
-    return remoteName
+    resultName = normalizedRemoteName
+    if isinstance(response, str):
+        candidate = response.strip()
+        if candidate:
+            candidateName = Path(candidate).name
+            if candidateName.lower().endswith(".3mf"):
+                resultName = sanitizeThreeMfName(candidateName)
+
+    return resultName
 
 
 def pickGcodeParamFrom3mf(path: Path, plateIndex: Optional[int]) -> tuple[Optional[str], List[str]]:
