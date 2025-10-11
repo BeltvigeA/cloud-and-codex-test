@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import importlib
+import io
 import json
 import os
 import re
@@ -12,6 +13,7 @@ import socket
 import ssl
 import tempfile
 import time
+import unicodedata
 import uuid
 import zipfile
 import xml.etree.ElementTree as ET
@@ -19,7 +21,7 @@ import logging
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Event
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
+from typing import Any, BinaryIO, Callable, Dict, Iterable, List, Optional, Sequence
 
 from urllib.parse import urljoin
 
@@ -100,15 +102,24 @@ def encodeFileToBase64(filePath: Path) -> str:
         return base64.b64encode(handle.read()).decode("ascii")
 
 
+def packageGcodeToThreeMfBytes(gcodeText: str, platePath: str = "Metadata/plate_1.gcode") -> io.BytesIO:
+    """Create a minimal 3MF archive containing the provided G-code text."""
+
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(platePath, gcodeText)
+    buffer.seek(0)
+    return buffer
+
+
 def packageGcodeToThreeMf(sourcePath: Path, *, destinationPath: Optional[Path] = None) -> Path:
-    """Wrap a raw G-code file in a minimal 3MF container."""
+    """Wrap a raw G-code file in a minimal 3MF container on disk."""
 
     targetPath = destinationPath or sourcePath.with_suffix(".3mf")
     targetPath.parent.mkdir(parents=True, exist_ok=True)
-    gcodeBytes = sourcePath.read_bytes()
-    with zipfile.ZipFile(targetPath, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        archive.writestr("Metadata/metadata.json", "{}")
-        archive.writestr("Metadata/plate_1.gcode", gcodeBytes)
+    gcodeText = sourcePath.read_text(encoding="utf-8", errors="ignore")
+    buffer = packageGcodeToThreeMfBytes(gcodeText)
+    targetPath.write_bytes(buffer.getvalue())
     return targetPath
 
 
@@ -199,6 +210,7 @@ def uploadViaFtps(
     remoteName: str,
     insecureTls: bool = True,
     timeout: int = 120,
+    dataStream: Optional[BinaryIO] = None,
 ) -> str:
     """Upload a file to the printer SD card using FTPS."""
 
@@ -293,11 +305,28 @@ def uploadViaFtps(
                     break
                 raise
 
-        def performUpload() -> None:
-            with open(localPath, "rb") as handle:
-                ftps.storbinary(storageCommand, handle, blocksize=64 * 1024)
+        def performUpload() -> str:
+            if dataStream is not None:
+                try:
+                    dataStream.seek(0)
+                except Exception:
+                    pass
+                response = ftps.storbinary(storageCommand, dataStream, blocksize=64 * 1024)
+            else:
+                with open(localPath, "rb") as handle:
+                    response = ftps.storbinary(storageCommand, handle, blocksize=64 * 1024)
+            if not response or not response.startswith("226"):
+                raise RuntimeError(f"FTPS transfer did not complete successfully for {fileName}: {response}")
+            return response
 
         try:
+            performUpload()
+        except RuntimeError as incompleteError:
+            logger.error("%s", incompleteError)
+            generatedName = buildFallbackFileName(fallbackSeedName)
+            activateFallbackName(generatedName, source="stor")
+            reactivateStor(ftps)
+            tryReenterSavedDirectory()
             performUpload()
         except error_perm as uploadError:
             if "550" not in str(uploadError):
@@ -329,7 +358,6 @@ def uploadViaFtps(
                         raise
                     raise
 
-        ftps.voidresp()
         return fileName
     finally:
         try:
@@ -450,35 +478,70 @@ def startPrintViaMqtt(
     topicReport = f"device/{serial}/report"
     topicRequest = f"device/{serial}/request"
 
-    lastStatus: Dict[str, Any] = {}
-
     connectionReady = Event()
     connectionError: Optional[str] = None
-    initialStatus = Event()
+    lastStatus: Dict[str, Any] = {}
+    hmsWarningIssued = False
 
-    def handleStatus(statusPayload: Dict[str, Any]) -> None:
+    def emitStatus(payload: Dict[str, Any]) -> None:
+        if not statusCallback:
+            return
+        try:
+            statusCallback(dict(payload))
+        except Exception:  # pragma: no cover - callback exceptions should not stop MQTT loop
+            logger.exception("Status callback failed for MQTT payload")
+
+    def handleProgress(statusPayload: Dict[str, Any]) -> None:
         nonlocal lastStatus
-        filteredKeys = ("mc_percent", "gcode_state", "mc_remaining_time", "nozzle_temper", "bed_temper")
-        statusSnapshot = {key: statusPayload.get(key) for key in filteredKeys if statusPayload.get(key) is not None}
-        if statusSnapshot and statusSnapshot != lastStatus:
-            lastStatus = statusSnapshot
-            if statusCallback:
-                statusCallback({"event": "progress", "status": statusSnapshot})
-            initialStatus.set()
+        trackedKeys = ("mc_percent", "gcode_state", "mc_remaining_time", "nozzle_temper", "bed_temper")
+        snapshot = {key: statusPayload.get(key) for key in trackedKeys if statusPayload.get(key) is not None}
+        if not snapshot or snapshot == lastStatus:
+            return
+        lastStatus = snapshot
+        emitStatus({"status": "progress", **snapshot})
 
-    def onConnect(client: mqtt.Client, _userdata, _flags, reasonCode, _properties):  # type: ignore[no-redef]
+    def onConnect(client: mqtt.Client, *args, **_kwargs):  # type: ignore[no-redef]
         nonlocal connectionError
-        if getattr(reasonCode, "is_failure", False):
-            connectionError = f"MQTT connection failed: {reasonCode}"
+        rc: Optional[int] = None
+        reasonCode: Any = None
+        if len(args) >= 3:
+            third = args[2]
+            if isinstance(third, int):
+                rc = third
+            else:
+                reasonCode = third
+        if rc is not None:
+            ok = rc == 0
+        elif reasonCode is not None:
+            ok = not getattr(reasonCode, "is_failure", False)
         else:
+            ok = True
+        if ok:
             client.subscribe(topicReport, qos=1)
+        else:
+            description = getattr(reasonCode, "value", reasonCode)
+            connectionError = f"MQTT connection failed: rc={rc or 'n/a'} reason={description}"
         connectionReady.set()
 
     def onMessage(_client: mqtt.Client, _userdata, message):  # type: ignore[no-redef]
+        nonlocal hmsWarningIssued
         try:
             payload = json.loads(message.payload.decode("utf-8"))
         except Exception:
             return
+
+        serialized = json.dumps(payload, ensure_ascii=False)
+        if not hmsWarningIssued and "HMS_07FF-2000-0002-0004" in serialized:
+            hmsWarningIssued = True
+            emitStatus(
+                {
+                    "status": "error",
+                    "error": (
+                        "Fullfør Unload/trekk ut filament fra verktøyhodet før AMS-jobben – "
+                        "deretter prøver vi igjen"
+                    ),
+                }
+            )
 
         def findKey(obj: Any, key: str) -> Any:
             if isinstance(obj, dict):
@@ -495,10 +558,13 @@ def startPrintViaMqtt(
                         return result
             return None
 
-        statusMap = {key: findKey(payload, key) for key in ("mc_percent", "gcode_state", "mc_remaining_time", "nozzle_temper", "bed_temper")}
-        handleStatus(statusMap)
+        statusMap = {
+            key: findKey(payload, key)
+            for key in ("mc_percent", "gcode_state", "mc_remaining_time", "nozzle_temper", "bed_temper")
+        }
+        handleProgress(statusMap)
 
-    client = mqtt.Client(callback_api_version=mqtt.CallbackAPIVersion.VERSION2, protocol=mqtt.MQTTv311)
+    client = mqtt.Client(protocol=mqtt.MQTTv311)
     client.username_pw_set("bblp", accessCode)
 
     if insecureTls:
@@ -506,41 +572,37 @@ def startPrintViaMqtt(
         client.tls_insecure_set(True)
     else:
         client.tls_set()
+        client.tls_insecure_set(False)
 
     client.on_connect = onConnect
     client.on_message = onMessage
+
     try:
         client.connect(ip, port, keepalive=60)
-    except (OSError, socket.timeout, ssl.SSLError, EOFError) as connectionError:
+    except (OSError, socket.timeout, ssl.SSLError, EOFError) as connectionProblem:
         errorMessage = (
             f"Failed to connect to Bambu printer MQTT endpoint {ip}:{port} for serial {serial}: "
-            f"{connectionError}"
+            f"{connectionProblem}"
         )
         logger.error(errorMessage)
-        raise RuntimeError(errorMessage) from connectionError
+        raise RuntimeError(errorMessage) from connectionProblem
+
     client.loop_start()
 
     if not connectionReady.wait(timeout=10):
         client.loop_stop()
         client.disconnect()
-        raise TimeoutError("Timed out waiting for MQTT connection")
+        raise RuntimeError(f"Timed out waiting for MQTT connection to {serial}")
 
     if connectionError:
         client.loop_stop()
         client.disconnect()
         raise RuntimeError(connectionError)
 
-    sequenceBase = str(int(time.time()))
-    statusSequenceId = f"{sequenceBase}-status"
-    statusRequestPayload = {"pushing": {"command": "pushall", "sequence_id": statusSequenceId}}
-    client.publish(topicRequest, json.dumps(statusRequestPayload), qos=1)
-
-    if not initialStatus.wait(timeout=max(0, statusWarmupSeconds)) and statusCallback:
-        statusCallback({"event": "statusWarmupTimeout"})
-
-    sequenceId = f"{sequenceBase}-print"
+    sequenceId = uuid.uuid4().hex
     url = f"file:///sdcard/{sdFileName}"
-    payload: Dict[str, Any] = {
+
+    payload = {
         "print": {
             "command": "project_file",
             "sequence_id": sequenceId,
@@ -550,36 +612,64 @@ def startPrintViaMqtt(
             "layer_inspect": bool(layerInspect),
             "flow_cali": bool(flowCalibration),
             "vibration_cali": bool(vibrationCalibration),
-            "subtask_id": "0",
         }
     }
     if paramPath:
         payload["print"]["param"] = paramPath
 
-    if statusCallback:
-        statusCallback(
-            {
-                "event": "starting",
-                "status": {
-                    "url": url,
-                    "param": paramPath,
-                    "useAms": bool(useAms),
-                    "bedLeveling": bool(bedLeveling),
-                    "layerInspect": bool(layerInspect),
-                    "flowCalibration": bool(flowCalibration),
-                    "vibrationCalibration": bool(vibrationCalibration),
-                },
-            }
-        )
+    emitStatus(
+        {
+            "status": "starting",
+            "url": url,
+            "param": paramPath,
+            "useAms": bool(useAms),
+            "bedLeveling": bool(bedLeveling),
+            "layerInspect": bool(layerInspect),
+            "flowCalibration": bool(flowCalibration),
+            "vibrationCalibration": bool(vibrationCalibration),
+        }
+    )
 
     client.publish(topicRequest, json.dumps(payload), qos=1)
 
-    timeout = time.time() + waitSeconds
-    while time.time() < timeout:
+    timeoutDeadline = time.time() + max(waitSeconds, statusWarmupSeconds, 0)
+    while time.time() < timeoutDeadline:
         time.sleep(0.5)
 
     client.loop_stop()
     client.disconnect()
+
+
+
+def postStatus(status: Dict[str, Any], printerConfig: Dict[str, Any]) -> None:
+    """Send the latest printer status to the configured remote endpoint."""
+
+    url = printerConfig.get("statusBaseUrl")
+    apiKey = printerConfig.get("statusApiKey")
+    recipientId = printerConfig.get("statusRecipientId")
+    if not url or not apiKey:
+        return
+
+    payload = {
+        "apiKey": apiKey,
+        "recipientId": recipientId,
+        "serialNumber": printerConfig.get("serialNumber"),
+        "ipAddress": printerConfig.get("ipAddress"),
+        "status": status.get("status") or status.get("state"),
+        "nozzleTemp": status.get("nozzle_temper") or status.get("nozzleTemp"),
+        "bedTemp": status.get("bed_temper") or status.get("bedTemp"),
+        "progressPercent": status.get("mc_percent")
+        or status.get("progress")
+        or status.get("progressPercent"),
+        "remainingTimeSeconds": status.get("mc_remaining_time")
+        or status.get("remainingTimeSeconds"),
+        "gcodeState": status.get("gcode_state") or status.get("gcodeState"),
+    }
+
+    try:
+        requests.post(url, json=payload, timeout=5)
+    except Exception:  # pragma: no cover - logging optional
+        logger.debug("Failed to post status update", exc_info=True)
 
 
 @dataclass(frozen=True)
@@ -592,19 +682,21 @@ class BambuPrintOptions:
     useCloud: bool = False
     cloudUrl: Optional[str] = None
     cloudTimeout: int = 180
-    useAms: bool = False
+    useAms: bool = True
     bedLeveling: bool = True
     layerInspect: bool = True
     flowCalibration: bool = False
     vibrationCalibration: bool = False
     secureConnection: bool = False
     plateIndex: Optional[int] = None
-    waitSeconds: int = 12
+    waitSeconds: int = 8
     lanStrategy: str = "legacy"
 
 
 def normalizeRemoteFileName(name: str) -> str:
-    safeName = re.sub(r"[^A-Za-z0-9._-]+", "_", name)
+    normalized = unicodedata.normalize("NFKD", name)
+    asciiName = normalized.encode("ascii", "ignore").decode("ascii")
+    safeName = re.sub(r"[^A-Za-z0-9._-]+", "_", asciiName)
     if safeName.lower().endswith(".gcode"):
         safeName = safeName[: -len(".gcode")]
     if not safeName.lower().endswith(".3mf"):
@@ -786,32 +878,44 @@ def sendBambuPrintJob(
     if not resolvedPath.exists():
         raise FileNotFoundError(resolvedPath)
 
-    remoteName = buildRemoteFileName(resolvedPath)
-    printerFileName = buildPrinterTransferFileName(resolvedPath)
+    plateIndex = options.plateIndex
+    lanStrategy = (options.lanStrategy or "legacy").lower()
 
     with tempfile.TemporaryDirectory() as temporaryDirectory:
-        temporaryPath = Path(temporaryDirectory) / resolvedPath.name
-        shutil.copy2(resolvedPath, temporaryPath)
+        paramPath: Optional[str] = None
+        tempDir = Path(temporaryDirectory)
 
-        workingPath = temporaryPath
-        if workingPath.suffix.lower() == ".gcode":
-            packagedPath = packageGcodeToThreeMf(workingPath)
+        if resolvedPath.suffix.lower() == ".gcode":
+            targetPlate = max(1, plateIndex or 1)
+            platePath = f"Metadata/plate_{targetPlate}.gcode"
+            gcodeText = resolvedPath.read_text(encoding="utf-8", errors="ignore")
+            buffer = packageGcodeToThreeMfBytes(gcodeText, platePath=platePath)
+            workingPath = tempDir / f"{resolvedPath.stem}.3mf"
+            workingPath.write_bytes(buffer.getvalue())
+            paramPath = platePath
+        else:
+            workingPath = tempDir / resolvedPath.name
+            shutil.copy2(resolvedPath, workingPath)
             try:
-                workingPath.unlink()
-            except FileNotFoundError:
-                pass
-            workingPath = packagedPath
-        elif workingPath.suffix.lower().endswith(".3mf"):
-            try:
-                with zipfile.ZipFile(workingPath, "a"):
+                with zipfile.ZipFile(workingPath, "r"):
                     pass
             except zipfile.BadZipFile as zipError:
                 raise ValueError(f"{resolvedPath} is not a valid 3MF archive") from zipError
-        temporaryPath = workingPath
 
-        applySkippedObjectsToArchive(temporaryPath, skippedObjects or [])
+            paramPath, candidates = pickGcodeParamFrom3mf(workingPath, plateIndex)
+            if paramPath is None:
+                if not candidates:
+                    raise ValueError(
+                        "3MF-arkivet mangler G-code i Metadata/. Eksporter med innebygd G-code "
+                        "eller send .gcode slik at klienten kan pakke det automatisk."
+                    )
+                paramPath = candidates[0]
 
-        paramPath, _ = pickGcodeParamFrom3mf(temporaryPath, options.plateIndex)
+        remoteName = buildRemoteFileName(workingPath)
+        printerFileName = buildPrinterTransferFileName(workingPath)
+
+        if skippedObjects:
+            applySkippedObjectsToArchive(workingPath, skippedObjects)
 
         if options.useCloud and options.cloudUrl:
             payload = buildCloudJobPayload(
@@ -820,43 +924,44 @@ def sendBambuPrintJob(
                 accessCode=options.accessCode,
                 safeName=remoteName,
                 paramPath=paramPath,
-                plateIndex=options.plateIndex,
+                plateIndex=plateIndex,
                 useAms=options.useAms,
                 bedLeveling=options.bedLeveling,
                 layerInspect=options.layerInspect,
                 flowCalibration=options.flowCalibration,
                 vibrationCalibration=options.vibrationCalibration,
                 secureConnection=options.secureConnection,
-                localPath=temporaryPath,
+                localPath=workingPath,
             )
             response = sendPrintJobViaCloud(options.cloudUrl, payload, timeoutSeconds=options.cloudTimeout)
             if statusCallback:
-                statusCallback({"event": "cloudAccepted", "response": response})
+                statusCallback({"status": "cloudAccepted", "response": response})
             return {"method": "cloud", "remoteFile": remoteName, "paramPath": paramPath, "response": response}
 
-        if options.lanStrategy.lower() == "bambuapi":
+        if lanStrategy == "bambuapi":
             uploadedName = uploadViaBambulabsApi(
                 ip=options.ipAddress,
                 serial=options.serialNumber,
                 accessCode=options.accessCode,
-                localPath=temporaryPath,
+                localPath=workingPath,
                 remoteName=printerFileName,
             )
         else:
             uploadedName = uploadViaFtps(
                 ip=options.ipAddress,
                 accessCode=options.accessCode,
-                localPath=temporaryPath,
+                localPath=workingPath,
                 remoteName=printerFileName,
                 insecureTls=not options.secureConnection,
             )
+
         if statusCallback:
             statusCallback(
                 {
-                    "event": "uploadComplete",
+                    "status": "uploaded",
                     "remoteFile": uploadedName,
                     "originalRemoteFile": remoteName,
-                    "paramPath": paramPath,
+                    "param": paramPath,
                 }
             )
 
@@ -875,12 +980,14 @@ def sendBambuPrintJob(
             waitSeconds=options.waitSeconds,
             statusCallback=statusCallback,
         )
+
         return {
             "method": "lan",
             "remoteFile": uploadedName,
             "originalRemoteFile": remoteName,
             "paramPath": paramPath,
         }
+
 
 
 def summarizeStatusMessages(events: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -899,6 +1006,7 @@ __all__ = [
     "makeTlsContext",
     "applySkippedObjectsToArchive",
     "pickGcodeParamFrom3mf",
+    "postStatus",
     "sendBambuPrintJob",
     "sendPrintJobViaCloud",
     "startPrintViaMqtt",

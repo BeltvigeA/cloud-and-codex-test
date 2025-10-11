@@ -17,7 +17,7 @@ import requests
 
 from .database import LocalDatabase
 from .persistence import storePrintSummary
-from .bambuPrinter import BambuPrintOptions, sendBambuPrintJob
+from .bambuPrinter import BambuPrintOptions, postStatus, sendBambuPrintJob
 
 
 defaultBaseUrl = "https://printer-backend-934564650450.europe-west1.run.app"
@@ -433,23 +433,31 @@ def createPrinterStatusReporter(
         message = event.get("message")
         eventType = event.get("event")
         if not message:
-            if eventType == "uploadComplete":
+            if eventType in {"uploadComplete", "uploaded"}:
                 remoteFile = event.get("remoteFile")
-                message = f"Uploaded to printer storage as {remoteFile}" if remoteFile else "Uploaded to printer"
+                message = (
+                    f"Uploaded to printer storage as {remoteFile}"
+                    if remoteFile
+                    else "Uploaded to printer"
+                )
             elif eventType == "cloudAccepted":
                 message = "Print job accepted by Bambu Cloud"
             elif eventType == "starting":
                 message = "Starting print on printer"
             elif eventType == "progress":
-                status = event.get("status") or {}
+                statusPayload = event.get("status")
+                if isinstance(statusPayload, dict):
+                    statusData = statusPayload
+                else:
+                    statusData = event
                 segments: List[str] = []
-                percent = status.get("mc_percent")
+                percent = statusData.get("mc_percent")
                 if percent is not None:
                     segments.append(f"{percent}%")
-                state = status.get("gcode_state")
+                state = statusData.get("gcode_state")
                 if state:
                     segments.append(str(state))
-                remaining = status.get("mc_remaining_time")
+                remaining = statusData.get("mc_remaining_time")
                 if remaining is not None:
                     segments.append(f"ETA {remaining}s")
                 message = " | ".join(segments) if segments else "Printer status update"
@@ -682,23 +690,43 @@ def dispatchBambuPrintIfPossible(
         logging.warning("Downloaded file missing for printer dispatch: %s", filePath)
         return None
 
+    def resolveBool(key: str, default: bool) -> bool:
+        value = resolvedDetails.get(key)
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        interpreted = interpretBoolean(value)
+        if interpreted is None:
+            return bool(value)
+        return interpreted
+
+    def resolveInt(key: str, default: Optional[int]) -> Optional[int]:
+        value = resolvedDetails.get(key)
+        if value is None:
+            return default
+        if isinstance(value, int):
+            return value
+        interpreted = interpretInteger(value)
+        return interpreted if interpreted is not None else default
+
     options = BambuPrintOptions(
         ipAddress=str(ipAddress),
         serialNumber=str(serialNumber),
         accessCode=str(accessCode),
         brand=brand or "Bambu Lab",
         nickname=resolvedDetails.get("nickname") or resolvedDetails.get("printerName"),
-        useCloud=bool(resolvedDetails.get("useCloud", False)),
+        useCloud=resolveBool("useCloud", False),
         cloudUrl=resolvedDetails.get("cloudUrl"),
-        cloudTimeout=resolvedDetails.get("cloudTimeout", 180),
-        useAms=bool(resolvedDetails.get("useAms", False)),
-        bedLeveling=resolvedDetails.get("bedLeveling", True),
-        layerInspect=resolvedDetails.get("layerInspect", True),
-        flowCalibration=resolvedDetails.get("flowCalibration", False),
-        vibrationCalibration=resolvedDetails.get("vibrationCalibration", False),
-        secureConnection=bool(resolvedDetails.get("secureConnection", False)),
-        plateIndex=resolvedDetails.get("plateIndex"),
-        waitSeconds=resolvedDetails.get("waitSeconds", 12),
+        cloudTimeout=resolveInt("cloudTimeout", 180) or 180,
+        useAms=resolveBool("useAms", True),
+        bedLeveling=resolveBool("bedLeveling", True),
+        layerInspect=resolveBool("layerInspect", True),
+        flowCalibration=resolveBool("flowCalibration", False),
+        vibrationCalibration=resolveBool("vibrationCalibration", False),
+        secureConnection=resolveBool("secureConnection", False),
+        plateIndex=resolveInt("plateIndex", None),
+        waitSeconds=resolveInt("waitSeconds", 8) or 8,
         lanStrategy=str(resolvedDetails.get("lanStrategy") or "legacy"),
     )
 
@@ -729,8 +757,12 @@ def dispatchBambuPrintIfPossible(
     statusEvents: List[Dict[str, Any]] = []
 
     def capture(event: Dict[str, Any]) -> None:
-        statusEvents.append(dict(event))
-        reporter(event)
+        normalized = dict(event)
+        if "event" not in normalized and normalized.get("status"):
+            normalized.setdefault("event", normalized["status"])
+        statusEvents.append(normalized)
+        reporter(normalized)
+        postStatus(normalized, resolvedDetails)
 
     capture({"event": "dispatching", "message": f"Dispatching print job to {options.nickname or options.serialNumber}"})
 

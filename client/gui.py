@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import os
 import socket
 import ssl
 import threading
@@ -29,6 +30,7 @@ def addPrinterIdentityToPayload(
         payload["accessCode"] = accessCode
     return payload
 
+from .bambuPrinter import BambuPrintOptions, postStatus, sendBambuPrintJob
 from .client import (
     appendJsonLogEntry,
     buildBaseUrl,
@@ -37,6 +39,8 @@ from .client import (
     defaultFilesDirectory,
     ensureOutputDirectory,
     getPrinterStatusEndpointUrl,
+    interpretBoolean,
+    interpretInteger,
     listenForFiles,
 )
 
@@ -44,6 +48,43 @@ try:  # pragma: no cover - optional dependency in some test environments
     import paho.mqtt.client as mqtt  # type: ignore
 except ImportError:  # pragma: no cover - gracefully handled when MQTT is unavailable
     mqtt = None  # type: ignore
+
+
+def loadPrinters() -> list[Dict[str, Any]]:
+    path = os.path.expanduser("~/.printmaster/printers.json")
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return []
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        return [data]
+    return []
+
+
+def pickPrinter(metadata: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    printers = loadPrinters()
+    if not printers:
+        return None
+    serialNumber = (metadata or {}).get("serialNumber")
+    nickname = (metadata or {}).get("nickname")
+    if isinstance(serialNumber, str) and serialNumber.strip():
+        normalizedSerial = serialNumber.strip()
+        for printer in printers:
+            if str(printer.get("serialNumber", "")).strip() == normalizedSerial:
+                return printer
+    if isinstance(nickname, str) and nickname.strip():
+        normalizedNickname = nickname.strip().lower()
+        for printer in printers:
+            printerNickname = str(printer.get("nickname") or "").strip().lower()
+            if printerNickname == normalizedNickname:
+                return printer
+    return printers[0]
+
 
 
 class ListenerGuiApp:
@@ -72,6 +113,9 @@ class ListenerGuiApp:
         self.root.after(200, self._processLogQueue)
         self.root.after(200, self._processPrinterStatusUpdates)
         self._scheduleStatusRefresh(0)
+
+    def log(self, message: str) -> None:
+        self.logQueue.put(str(message))
 
     def _buildLayout(self) -> None:
         paddingOptions = {"padx": 8, "pady": 4}
@@ -1603,6 +1647,83 @@ class ListenerGuiApp:
         finally:
             self.logQueue.put("__LISTENER_STOPPED__")
 
+    def onFileDownloaded(self, path: Path, metadata: Dict[str, Any]) -> None:
+        printerConfig = pickPrinter(metadata)
+        if not printerConfig:
+            self.log("Ingen printer i printers.json – kan ikke sende.")
+            return
+
+        def resolveText(key: str) -> Optional[str]:
+            for source in (metadata, printerConfig):
+                value = source.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+            return None
+
+        def resolveBool(key: str, default: bool) -> bool:
+            for source in (metadata, printerConfig):
+                if key in source:
+                    interpreted = interpretBoolean(source[key])
+                    if interpreted is not None:
+                        return interpreted
+            return default
+
+        def resolveInt(key: str, default: Optional[int]) -> Optional[int]:
+            for source in (metadata, printerConfig):
+                if key in source:
+                    interpreted = interpretInteger(source[key])
+                    if interpreted is not None:
+                        return interpreted
+            return default
+
+        ipAddressValue = resolveText("ipAddress") or printerConfig.get("ipAddress")
+        serialValue = resolveText("serialNumber") or printerConfig.get("serialNumber")
+        accessCodeValue = resolveText("accessCode") or printerConfig.get("accessCode")
+
+        if not ipAddressValue or not accessCodeValue or not serialValue:
+            self.log("Mangler LAN-informasjon for valgt printer – hopper over sending.")
+            return
+
+        lanStrategyValue = resolveText("lanStrategy") or str(printerConfig.get("lanStrategy") or "legacy")
+        plateIndexValue = resolveInt("plateIndex", None)
+        if plateIndexValue is None:
+            plateIndexValue = 1
+        waitSecondsValue = resolveInt("waitSeconds", None)
+        if waitSecondsValue is None:
+            waitSecondsValue = 8
+
+        options = BambuPrintOptions(
+            ipAddress=str(ipAddressValue),
+            serialNumber=str(serialValue),
+            accessCode=str(accessCodeValue),
+            useAms=resolveBool("useAms", True),
+            bedLeveling=resolveBool("bedLeveling", True),
+            layerInspect=resolveBool("layerInspect", True),
+            flowCalibration=resolveBool("flowCalibration", False),
+            vibrationCalibration=resolveBool("vibrationCalibration", False),
+            secureConnection=resolveBool("secureConnection", False),
+            lanStrategy=lanStrategyValue,
+            plateIndex=plateIndexValue,
+            waitSeconds=waitSecondsValue,
+        )
+
+        def worker() -> None:
+            try:
+                self.log(f"Sender til Bambu: {path}")
+                sendBambuPrintJob(
+                    filePath=path,
+                    options=options,
+                    statusCallback=lambda status: (
+                        self.log(json.dumps(status)),
+                        postStatus(status, printerConfig),
+                    ),
+                )
+                self.log("Startkommando sendt.")
+            except Exception as error:  # noqa: BLE001 - surface errors to log
+                self.log(f"Feil ved sending: {error}")
+
+        threading.Thread(target=worker, daemon=True).start()
+
     def _handleFetchedData(self, details: Dict[str, object]) -> None:
         savedFile = details.get("savedFile") or details.get("fileName") or "metadata"
         logMessage = f"Fetched file: {savedFile}"
@@ -1623,6 +1744,18 @@ class ListenerGuiApp:
                 logging.exception("Failed to append JSON log: %s", error)
                 logMessage += f" | Failed to write log: {error}"
         self.logQueue.put(logMessage)
+
+        savedPathValue = details.get("savedFile")
+        if isinstance(savedPathValue, (str, Path)):
+            combinedMetadata: Dict[str, Any] = {}
+            for key in ("metadata", "unencryptedData", "decryptedData"):
+                source = details.get(key)
+                if isinstance(source, dict):
+                    combinedMetadata.update(source)
+            for key in ("serialNumber", "nickname", "ipAddress", "accessCode"):
+                if key not in combinedMetadata and key in details:
+                    combinedMetadata[key] = details[key]
+            self.onFileDownloaded(Path(savedPathValue), combinedMetadata)
 
     def _appendLogLine(self, message: str) -> None:
         self.logText.configure(state=tk.NORMAL)

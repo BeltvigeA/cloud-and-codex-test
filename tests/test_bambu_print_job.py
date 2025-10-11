@@ -16,7 +16,7 @@ from client import bambuPrinter
 def createSampleThreeMf(targetPath: Path) -> None:
     with zipfile.ZipFile(targetPath, "w") as archive:
         archive.writestr("Metadata/metadata.json", "{}")
-        archive.writestr("plate_1.gcode", "G1 X0 Y0\n")
+        archive.writestr("Metadata/plate_1.gcode", "G1 X0 Y0\n")
 
 
 def createSampleThreeMfWithSliceInfo(targetPath: Path) -> None:
@@ -72,7 +72,7 @@ def test_sendBambuPrintJobUsesTemporaryCopy(
     assert uploadCapture["bytesDuringUpload"] == originalBytes
     assert result["remoteFile"] == "uploaded.3mf"
     assert result["originalRemoteFile"] == bambuPrinter.buildRemoteFileName(originalPath)
-    assert startCapture["paramPath"] == "plate_1.gcode"
+    assert startCapture["paramPath"] == "Metadata/plate_1.gcode"
     assert startCapture["sdFileName"] == "uploaded.3mf"
 
 

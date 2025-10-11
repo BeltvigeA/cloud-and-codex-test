@@ -61,13 +61,14 @@ class DummyFtpClient:
         if self.failCwd:
             raise RuntimeError("CWD failed")
 
-    def storbinary(self, command: str, handle, blocksize: int = 8192) -> None:  # noqa: ANN001 - signature matches ftplib
+    def storbinary(self, command: str, handle, blocksize: int = 8192) -> str:  # noqa: ANN001 - signature matches ftplib
         self.commands.append(("storbinary", (command,), {"blocksize": blocksize}))
         if self.storbinaryFailures:
             failure = self.storbinaryFailures.pop(0)
             raise failure
         self.storageCommand = command
         self.storedData = handle.read()
+        return "226 Transfer complete"
 
     def delete(self, path: str) -> None:
         self.deletedPaths.append(path)
