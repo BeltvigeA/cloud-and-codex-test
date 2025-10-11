@@ -9,6 +9,7 @@ import socket
 import ssl
 import threading
 import uuid
+from datetime import datetime
 from pathlib import Path
 from queue import Empty, Queue
 from typing import Any, Callable, Dict, Optional
@@ -575,6 +576,11 @@ class ListenerGuiApp:
         nozzleTempVar = tk.StringVar(value=self._formatOptionalNumber(manualDefaults.get("nozzleTemp")))
         bedTempVar = tk.StringVar(value=self._formatOptionalNumber(manualDefaults.get("bedTemp")))
         materialLevelVar = tk.StringVar(value=self._formatMaterialLevelForEntry(manualDefaults.get("materialLevel")))
+        lastUpdateTimestampDefault = str(
+            manualDefaults.get("lastUpdateTimestamp")
+            or datetime.utcnow().isoformat(timespec="seconds") + "Z"
+        )
+        lastUpdateTimestampVar = tk.StringVar(value=lastUpdateTimestampDefault)
         statusMessageVar = tk.StringVar(value="")
 
         if not publicKeyVar.get():
@@ -656,17 +662,23 @@ class ListenerGuiApp:
         ttk.Label(telemetryFrame, text="Status:").grid(row=0, column=0, sticky=tk.W, padx=6, pady=4)
         statusCombo = ttk.Combobox(telemetryFrame, textvariable=statusVar, values=statusOptions)
         statusCombo.grid(row=0, column=1, sticky=tk.W, padx=6, pady=4)
-        ttk.Label(telemetryFrame, text="Job Progress (%):").grid(row=1, column=0, sticky=tk.W, padx=6, pady=4)
-        ttk.Entry(telemetryFrame, textvariable=jobProgressVar, width=10).grid(
+        ttk.Label(telemetryFrame, text="Last Update Timestamp:").grid(
+            row=1, column=0, sticky=tk.W, padx=6, pady=4
+        )
+        ttk.Entry(telemetryFrame, textvariable=lastUpdateTimestampVar, width=24).grid(
             row=1, column=1, sticky=tk.W, padx=6, pady=4
         )
-        ttk.Label(telemetryFrame, text="Nozzle Temp (°C):").grid(row=2, column=0, sticky=tk.W, padx=6, pady=4)
-        ttk.Entry(telemetryFrame, textvariable=nozzleTempVar, width=10).grid(
+        ttk.Label(telemetryFrame, text="Job Progress (%):").grid(row=2, column=0, sticky=tk.W, padx=6, pady=4)
+        ttk.Entry(telemetryFrame, textvariable=jobProgressVar, width=10).grid(
             row=2, column=1, sticky=tk.W, padx=6, pady=4
         )
-        ttk.Label(telemetryFrame, text="Bed Temp (°C):").grid(row=3, column=0, sticky=tk.W, padx=6, pady=4)
-        ttk.Entry(telemetryFrame, textvariable=bedTempVar, width=10).grid(
+        ttk.Label(telemetryFrame, text="Nozzle Temp (°C):").grid(row=3, column=0, sticky=tk.W, padx=6, pady=4)
+        ttk.Entry(telemetryFrame, textvariable=nozzleTempVar, width=10).grid(
             row=3, column=1, sticky=tk.W, padx=6, pady=4
+        )
+        ttk.Label(telemetryFrame, text="Bed Temp (°C):").grid(row=4, column=0, sticky=tk.W, padx=6, pady=4)
+        ttk.Entry(telemetryFrame, textvariable=bedTempVar, width=10).grid(
+            row=4, column=1, sticky=tk.W, padx=6, pady=4
         )
 
         buttonFrame = ttk.Frame(dialog)
@@ -736,6 +748,18 @@ class ListenerGuiApp:
                 raise ValueError("Job progress must be a non-negative number.")
             jobProgressValue = float(jobProgress)
 
+            lastUpdateTimestamp = lastUpdateTimestampVar.get().strip()
+            if not lastUpdateTimestamp:
+                lastUpdateTimestamp = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+                lastUpdateTimestampVar.set(lastUpdateTimestamp)
+            else:
+                try:
+                    datetime.strptime(lastUpdateTimestamp, "%Y-%m-%dT%H:%M:%SZ")
+                except ValueError as error:
+                    raise ValueError(
+                        "Last update timestamp must be in ISO 8601 format (YYYY-MM-DDTHH:MM:SSZ)."
+                    ) from error
+
             nozzleTempValue = self._parseOptionalFloat(nozzleTempVar.get())
             bedTempValue = self._parseOptionalFloat(bedTempVar.get())
 
@@ -756,6 +780,7 @@ class ListenerGuiApp:
                 "status": statusValue,
                 "jobProgress": jobProgressValue,
                 "materialLevel": materialLevel,
+                "lastUpdateTimestamp": lastUpdateTimestamp,
             }
 
             payload = addPrinterIdentityToPayload(payload, printerSerial, accessCode)
@@ -779,6 +804,7 @@ class ListenerGuiApp:
                 "materialLevel": materialLevel,
                 "status": statusValue,
                 "jobProgress": jobProgressValue,
+                "lastUpdateTimestamp": lastUpdateTimestamp,
             }
             if nozzleTempValue is not None:
                 manualDefaultsUpdate["nozzleTemp"] = nozzleTempValue

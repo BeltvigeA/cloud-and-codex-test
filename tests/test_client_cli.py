@@ -2,6 +2,7 @@ import logging
 import time
 import sys
 import types
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -282,6 +283,10 @@ def testGenerateStatusPayloadIncludesRecipientId() -> None:
     assert payload["recipientId"] == "recipient-55"
     assert payload["printerSerial"] == "printer-1"
     assert payload["accessCode"] == "PCODE6789"
+    timestampValue = payload["lastUpdateTimestamp"]
+    assert timestampValue.endswith("Z")
+    parsedTimestamp = datetime.strptime(timestampValue, "%Y-%m-%dT%H:%M:%SZ")
+    assert parsedTimestamp.tzinfo is None
 
 
 def testAddPrinterIdentityToPayloadInsertsSerialAndAccessCode() -> None:
