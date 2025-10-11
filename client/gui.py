@@ -65,6 +65,9 @@ class ListenerGuiApp:
         self.statusRefreshIntervalMs = 60_000
         self.pendingImmediateStatusRefresh = False
 
+        self.listenerRecipientId = ""
+        self.listenerStatusApiKey = ""
+
         self._buildLayout()
         self.root.after(200, self._processLogQueue)
         self.root.after(200, self._processPrinterStatusUpdates)
@@ -95,47 +98,57 @@ class ListenerGuiApp:
             row=1, column=0, sticky=tk.W, **paddingOptions
         )
         self.recipientVar = tk.StringVar()
+        self.recipientVar.trace_add("write", lambda *_: self._updateListenerRecipient())
         ttk.Entry(parent, textvariable=self.recipientVar, width=30).grid(
             row=1, column=1, sticky=tk.EW, **paddingOptions
         )
+        self._updateListenerRecipient()
 
-        ttk.Label(parent, text="Output Directory:").grid(row=2, column=0, sticky=tk.W, **paddingOptions)
+        ttk.Label(parent, text="Status API Key:").grid(row=2, column=0, sticky=tk.W, **paddingOptions)
+        self.statusApiKeyVar = tk.StringVar()
+        self.statusApiKeyVar.trace_add("write", lambda *_: self._updateListenerStatusApiKey())
+        ttk.Entry(parent, textvariable=self.statusApiKeyVar, width=30, show="*").grid(
+            row=2, column=1, sticky=tk.EW, **paddingOptions
+        )
+        self._updateListenerStatusApiKey()
+
+        ttk.Label(parent, text="Output Directory:").grid(row=3, column=0, sticky=tk.W, **paddingOptions)
         self.outputDirVar = tk.StringVar(value=str(defaultFilesDirectory))
         outputDirFrame = ttk.Frame(parent)
-        outputDirFrame.grid(row=2, column=1, sticky=tk.EW, **paddingOptions)
+        outputDirFrame.grid(row=3, column=1, sticky=tk.EW, **paddingOptions)
         outputDirEntry = ttk.Entry(outputDirFrame, textvariable=self.outputDirVar, width=40)
         outputDirEntry.pack(side=tk.LEFT, fill=tk.X, expand=True)
         ttk.Button(outputDirFrame, text="Browse", command=self._chooseOutputDir).pack(side=tk.LEFT, padx=4)
 
-        ttk.Label(parent, text="JSON Log File:").grid(row=3, column=0, sticky=tk.W, **paddingOptions)
+        ttk.Label(parent, text="JSON Log File:").grid(row=4, column=0, sticky=tk.W, **paddingOptions)
         self.logFileVar = tk.StringVar(
             value=str(Path.home() / ".printmaster" / "listener-log.json")
         )
         logFileFrame = ttk.Frame(parent)
-        logFileFrame.grid(row=3, column=1, sticky=tk.EW, **paddingOptions)
+        logFileFrame.grid(row=4, column=1, sticky=tk.EW, **paddingOptions)
         logFileEntry = ttk.Entry(logFileFrame, textvariable=self.logFileVar, width=40)
         logFileEntry.pack(side=tk.LEFT, fill=tk.X, expand=True)
         ttk.Button(logFileFrame, text="Browse", command=self._chooseLogFile).pack(side=tk.LEFT, padx=4)
 
-        ttk.Label(parent, text="Poll Interval (seconds):").grid(row=4, column=0, sticky=tk.W, **paddingOptions)
+        ttk.Label(parent, text="Poll Interval (seconds):").grid(row=5, column=0, sticky=tk.W, **paddingOptions)
         self.pollIntervalVar = tk.IntVar(value=30)
         ttk.Spinbox(parent, from_=5, to=3600, textvariable=self.pollIntervalVar).grid(
-            row=4, column=1, sticky=tk.W, **paddingOptions
+            row=5, column=1, sticky=tk.W, **paddingOptions
         )
 
         buttonFrame = ttk.Frame(parent)
-        buttonFrame.grid(row=5, column=0, columnspan=2, pady=12)
+        buttonFrame.grid(row=6, column=0, columnspan=2, pady=12)
         self.startButton = ttk.Button(buttonFrame, text="Start Listening", command=self.startListening)
         self.startButton.pack(side=tk.LEFT, padx=6)
         self.stopButton = ttk.Button(buttonFrame, text="Stop", command=self.stopListening, state=tk.DISABLED)
         self.stopButton.pack(side=tk.LEFT, padx=6)
 
-        ttk.Label(parent, text="Event Log:").grid(row=6, column=0, sticky=tk.W, **paddingOptions)
+        ttk.Label(parent, text="Event Log:").grid(row=7, column=0, sticky=tk.W, **paddingOptions)
         self.logText = tk.Text(parent, height=10, state=tk.DISABLED)
-        self.logText.grid(row=6, column=1, sticky=tk.NSEW, **paddingOptions)
+        self.logText.grid(row=7, column=1, sticky=tk.NSEW, **paddingOptions)
 
         parent.columnconfigure(1, weight=1)
-        parent.rowconfigure(6, weight=1)
+        parent.rowconfigure(7, weight=1)
 
     def _buildPrintersTab(self, parent: ttk.Frame) -> None:
         self.printerSearchVar = tk.StringVar()
@@ -505,6 +518,14 @@ class ListenerGuiApp:
                 ),
             )
         self._onPrinterSelection(None)
+
+    def _updateListenerRecipient(self, *_args: Any) -> None:
+        self.listenerRecipientId = self.recipientVar.get().strip() if hasattr(self, "recipientVar") else ""
+
+    def _updateListenerStatusApiKey(self, *_args: Any) -> None:
+        self.listenerStatusApiKey = (
+            self.statusApiKeyVar.get().strip() if hasattr(self, "statusApiKeyVar") else ""
+        )
 
     def _clearPrinterSearch(self) -> None:
         self.printerSearchVar.set("")
@@ -1115,6 +1136,13 @@ class ListenerGuiApp:
                         currentDetails.get("status", "Unknown"),
                         pendingChanges["status"],
                     )
+                    if pendingChanges.get("status") == "Online":
+                        try:
+                            self._sendAutomaticPrinterStatus(index, currentDetails, telemetry)
+                        except Exception:  # noqa: BLE001 - ensure telemetry thread continues running
+                            logging.exception(
+                                "Failed to send automatic Online status for printer %s", ipAddress
+                            )
                 updates.append({"index": index, "changes": pendingChanges})
         if updates:
             self.printerStatusQueue.put(("updates", updates))
@@ -1148,6 +1176,134 @@ class ListenerGuiApp:
                 logging.debug("Unable to fetch Bambu telemetry from %s: %s", ipAddress, error)
 
         return telemetry
+
+    def _sendAutomaticPrinterStatus(
+        self,
+        printerIndex: int,
+        currentDetails: Dict[str, Any],
+        telemetry: Dict[str, Any],
+    ) -> None:
+        manualDefaults = currentDetails.get("manualStatusDefaults")
+        if not isinstance(manualDefaults, dict) or not manualDefaults:
+            logging.debug(
+                "Skipping automatic status update for %s because manual defaults are missing.",
+                currentDetails.get("nickname") or currentDetails.get("ipAddress") or printerIndex,
+            )
+            return
+
+        statusUrlCandidate = self._parseOptionalString(currentDetails.get("statusBaseUrl"))
+        statusUrl = statusUrlCandidate or getPrinterStatusEndpointUrl()
+
+        apiKeyCandidate = self._parseOptionalString(currentDetails.get("statusApiKey")) or ""
+        if not apiKeyCandidate:
+            apiKeyCandidate = getattr(self, "listenerStatusApiKey", "")
+        if not apiKeyCandidate:
+            logging.warning(
+                "Skipping automatic status update for %s because the API key is missing.",
+                currentDetails.get("nickname") or currentDetails.get("ipAddress") or printerIndex,
+            )
+            return
+
+        printerIpAddress = self._parseOptionalString(currentDetails.get("ipAddress")) or ""
+        if not printerIpAddress:
+            logging.warning(
+                "Unable to send automatic status update for printer index %s due to missing IP address.",
+                printerIndex,
+            )
+            return
+
+        payload = dict(manualDefaults)
+        payload["printerIpAddress"] = printerIpAddress
+        payload["status"] = "Online"
+
+        jobProgressCandidate: Any = telemetry.get("progressPercent")
+        if jobProgressCandidate is None:
+            jobProgressCandidate = manualDefaults.get("jobProgress")
+        jobProgressValue = self._parseOptionalFloat(jobProgressCandidate)
+        if jobProgressValue is not None and jobProgressValue >= 0:
+            payload["jobProgress"] = float(jobProgressValue)
+
+        nozzleTempValue = self._parseOptionalFloat(telemetry.get("nozzleTemp"))
+        if nozzleTempValue is not None:
+            payload["nozzleTemp"] = nozzleTempValue
+        elif payload.get("nozzleTemp") is None:
+            payload.pop("nozzleTemp", None)
+
+        bedTempValue = self._parseOptionalFloat(telemetry.get("bedTemp"))
+        if bedTempValue is not None:
+            payload["bedTemp"] = bedTempValue
+        elif payload.get("bedTemp") is None:
+            payload.pop("bedTemp", None)
+
+        remainingSecondsValue = self._parseOptionalInt(telemetry.get("remainingTimeSeconds"))
+        if remainingSecondsValue is not None and remainingSecondsValue >= 0:
+            payload["remainingTimeSeconds"] = remainingSecondsValue
+
+        gcodeStateValue = self._parseOptionalString(telemetry.get("gcodeState"))
+        if gcodeStateValue:
+            payload["gcodeState"] = gcodeStateValue
+
+        if not isinstance(payload.get("materialLevel"), dict):
+            payload["materialLevel"] = {}
+
+        payload["lastUpdateTimestamp"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+
+        recipientCandidate = getattr(self, "listenerRecipientId", "") or ""
+        if not recipientCandidate:
+            recipientCandidate = self._parseOptionalString(currentDetails.get("statusRecipientId")) or ""
+        if recipientCandidate:
+            payload["recipientId"] = recipientCandidate
+
+        payload = addPrinterIdentityToPayload(
+            payload,
+            self._parseOptionalString(currentDetails.get("serialNumber")),
+            self._parseOptionalString(currentDetails.get("accessCode")),
+        )
+
+        headers = {"X-API-Key": apiKeyCandidate, "Content-Type": "application/json"}
+        try:
+            response = requests.post(statusUrl, headers=headers, json=payload, timeout=15)
+            response.raise_for_status()
+        except requests.RequestException as error:
+            logging.warning(
+                "Automatic Online status update failed for %s: %s",
+                currentDetails.get("nickname") or printerIpAddress,
+                error,
+            )
+            return
+
+        logging.info(
+            "Automatic Online status update sent for %s: %s",
+            currentDetails.get("nickname") or printerIpAddress,
+            response.status_code,
+        )
+
+        manualDefaultsUpdate = dict(manualDefaults)
+        manualDefaultsUpdate["status"] = "Online"
+        manualDefaultsUpdate["lastUpdateTimestamp"] = payload["lastUpdateTimestamp"]
+        if jobProgressValue is not None and jobProgressValue >= 0:
+            manualDefaultsUpdate["jobProgress"] = float(jobProgressValue)
+        if nozzleTempValue is not None:
+            manualDefaultsUpdate["nozzleTemp"] = nozzleTempValue
+        if bedTempValue is not None:
+            manualDefaultsUpdate["bedTemp"] = bedTempValue
+
+        sanitizedDefaults = self._sanitizeManualStatusDefaults(manualDefaultsUpdate)
+
+        updates: Dict[str, Any] = {
+            "manualStatusDefaults": sanitizedDefaults,
+            "statusBaseUrl": statusUrl,
+        }
+        if not currentDetails.get("statusApiKey"):
+            updates["statusApiKey"] = apiKeyCandidate
+        if recipientCandidate:
+            updates["statusRecipientId"] = recipientCandidate
+
+        self.printerStatusQueue.put(("updates", [{"index": printerIndex, "changes": updates}]))
+
+        printerName = currentDetails.get("nickname") or printerIpAddress
+        logMessage = f"Sent automatic Online status for {printerName}."
+        self.logQueue.put(logMessage)
 
     def _fetchBambuTelemetry(
         self,
