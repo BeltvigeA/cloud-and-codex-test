@@ -695,6 +695,7 @@ def dispatchBambuPrintIfPossible(
         secureConnection=bool(resolvedDetails.get("secureConnection", False)),
         plateIndex=resolvedDetails.get("plateIndex"),
         waitSeconds=resolvedDetails.get("waitSeconds", 12),
+        lanStrategy=str(resolvedDetails.get("lanStrategy") or "legacy"),
     )
 
     printerDetails = {
