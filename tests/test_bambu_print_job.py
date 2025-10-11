@@ -139,6 +139,51 @@ def test_sendBambuPrintJobMarksSkippedObjects(
     assert skippedOrders == {"2"}
 
 
+def test_sendBambuPrintJobWrapsGcodeInThreeMf(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gcodePath = tmp_path / "model.gcode"
+    gcodeContent = "G1 X5 Y5\nM400\n"
+    gcodePath.write_text(gcodeContent)
+
+    uploadCapture: dict[str, object] = {}
+
+    def fakeUploadViaFtps(
+        *, ip: str, accessCode: str, localPath: Path, remoteName: str, insecureTls: bool
+    ) -> str:
+        uploadCapture["remoteName"] = remoteName
+        uploadCapture["localPath"] = localPath
+        with zipfile.ZipFile(localPath, "r") as archive:
+            with archive.open("Metadata/plate_1.gcode") as handle:
+                uploadCapture["gcodeBytes"] = handle.read()
+        return "model.3mf"
+
+    monkeypatch.setattr(bambuPrinter, "uploadViaFtps", fakeUploadViaFtps)
+
+    def fakeStartPrint(**kwargs) -> None:
+        return None
+
+    monkeypatch.setattr(bambuPrinter, "startPrintViaMqtt", fakeStartPrint)
+
+    options = bambuPrinter.BambuPrintOptions(
+        ipAddress="192.168.1.5",
+        serialNumber="SERIAL-GCODE",
+        accessCode="ACCESS",
+        useCloud=False,
+        waitSeconds=0,
+    )
+
+    bambuPrinter.sendBambuPrintJob(filePath=gcodePath, options=options)
+
+    capturedRemote = uploadCapture.get("remoteName")
+    assert capturedRemote == "model.3mf"
+    localPath = uploadCapture.get("localPath")
+    assert isinstance(localPath, Path)
+    assert localPath.suffix == ".3mf"
+    capturedBytes = uploadCapture.get("gcodeBytes")
+    assert capturedBytes == gcodeContent.encode("utf-8")
+
+
 def test_applySkippedObjectsToArchiveRejectsUnknownOrder(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:

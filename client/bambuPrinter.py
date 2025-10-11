@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import importlib
 import json
 import os
 import re
@@ -30,6 +31,13 @@ except ImportError:  # pragma: no cover - handled gracefully by callers
     mqtt = None  # type: ignore
 
 import requests
+
+
+_bambulabsApiModule = importlib.util.find_spec("bambulabs_api")
+if _bambulabsApiModule is not None:
+    bambulabsApi = importlib.import_module("bambulabs_api")
+else:
+    bambulabsApi = None
 
 
 logger = logging.getLogger(__name__)
@@ -90,6 +98,18 @@ def encodeFileToBase64(filePath: Path) -> str:
 
     with open(filePath, "rb") as handle:
         return base64.b64encode(handle.read()).decode("ascii")
+
+
+def packageGcodeToThreeMf(sourcePath: Path, *, destinationPath: Optional[Path] = None) -> Path:
+    """Wrap a raw G-code file in a minimal 3MF container."""
+
+    targetPath = destinationPath or sourcePath.with_suffix(".3mf")
+    targetPath.parent.mkdir(parents=True, exist_ok=True)
+    gcodeBytes = sourcePath.read_bytes()
+    with zipfile.ZipFile(targetPath, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("Metadata/metadata.json", "{}")
+        archive.writestr("Metadata/plate_1.gcode", gcodeBytes)
+    return targetPath
 
 
 def buildCloudJobPayload(
@@ -318,6 +338,50 @@ def uploadViaFtps(
             pass
 
 
+def uploadViaBambulabsApi(
+    *,
+    ip: str,
+    serial: str,
+    accessCode: str,
+    localPath: Path,
+    remoteName: str,
+) -> str:
+    """Upload a file using the official bambulabs_api client."""
+
+    if bambulabsApi is None:
+        raise RuntimeError("bambulabs_api is required for this upload strategy")
+
+    printerClass = getattr(bambulabsApi, "Printer", None)
+    if printerClass is None:
+        raise RuntimeError("bambulabs_api.Printer is not available")
+
+    printer = printerClass(ip, accessCode, serial)
+    connectionMethod = getattr(printer, "mqtt_start", None) or getattr(printer, "connect", None)
+    if connectionMethod:
+        connectionMethod()
+
+    uploadMethod = None
+    for candidate in ("upload_file", "upload_project", "upload"):
+        uploadMethod = getattr(printer, candidate, None)
+        if uploadMethod:
+            break
+
+    if uploadMethod is None:
+        raise RuntimeError("Unable to locate an upload method on bambulabs_api.Printer")
+
+    try:
+        try:
+            uploadMethod(str(localPath), remoteName)
+        except TypeError:
+            uploadMethod(str(localPath))
+    finally:
+        disconnectMethod = getattr(printer, "disconnect", None)
+        if disconnectMethod:
+            disconnectMethod()
+
+    return remoteName
+
+
 def pickGcodeParamFrom3mf(path: Path, plateIndex: Optional[int]) -> tuple[Optional[str], List[str]]:
     """Inspect a .3mf archive and determine the gcode metadata path."""
 
@@ -536,10 +600,13 @@ class BambuPrintOptions:
     secureConnection: bool = False
     plateIndex: Optional[int] = None
     waitSeconds: int = 12
+    lanStrategy: str = "legacy"
 
 
 def normalizeRemoteFileName(name: str) -> str:
     safeName = re.sub(r"[^A-Za-z0-9._-]+", "_", name)
+    if safeName.lower().endswith(".gcode"):
+        safeName = safeName[: -len(".gcode")]
     if not safeName.lower().endswith(".3mf"):
         safeName += ".3mf"
     return safeName
@@ -726,12 +793,21 @@ def sendBambuPrintJob(
         temporaryPath = Path(temporaryDirectory) / resolvedPath.name
         shutil.copy2(resolvedPath, temporaryPath)
 
-        if temporaryPath.suffix.lower().endswith(".3mf"):
+        workingPath = temporaryPath
+        if workingPath.suffix.lower() == ".gcode":
+            packagedPath = packageGcodeToThreeMf(workingPath)
             try:
-                with zipfile.ZipFile(temporaryPath, "a"):
+                workingPath.unlink()
+            except FileNotFoundError:
+                pass
+            workingPath = packagedPath
+        elif workingPath.suffix.lower().endswith(".3mf"):
+            try:
+                with zipfile.ZipFile(workingPath, "a"):
                     pass
             except zipfile.BadZipFile as zipError:
                 raise ValueError(f"{resolvedPath} is not a valid 3MF archive") from zipError
+        temporaryPath = workingPath
 
         applySkippedObjectsToArchive(temporaryPath, skippedObjects or [])
 
@@ -758,13 +834,22 @@ def sendBambuPrintJob(
                 statusCallback({"event": "cloudAccepted", "response": response})
             return {"method": "cloud", "remoteFile": remoteName, "paramPath": paramPath, "response": response}
 
-        uploadedName = uploadViaFtps(
-            ip=options.ipAddress,
-            accessCode=options.accessCode,
-            localPath=temporaryPath,
-            remoteName=printerFileName,
-            insecureTls=not options.secureConnection,
-        )
+        if options.lanStrategy.lower() == "bambuapi":
+            uploadedName = uploadViaBambulabsApi(
+                ip=options.ipAddress,
+                serial=options.serialNumber,
+                accessCode=options.accessCode,
+                localPath=temporaryPath,
+                remoteName=printerFileName,
+            )
+        else:
+            uploadedName = uploadViaFtps(
+                ip=options.ipAddress,
+                accessCode=options.accessCode,
+                localPath=temporaryPath,
+                remoteName=printerFileName,
+                insecureTls=not options.secureConnection,
+            )
         if statusCallback:
             statusCallback(
                 {
