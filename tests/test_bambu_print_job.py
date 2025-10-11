@@ -71,7 +71,9 @@ def test_sendBambuPrintJobUsesTemporaryCopy(
     assert Path(uploadCapture["localPath"]).parent != originalPath.parent
     assert uploadCapture["bytesDuringUpload"] == originalBytes
     assert result["remoteFile"] == "uploaded.3mf"
-    assert result["originalRemoteFile"] == bambuPrinter.buildRemoteFileName(originalPath)
+    assert result["originalRemoteFile"] == bambuPrinter.buildPrinterTransferFileName(
+        originalPath
+    )
     assert startCapture["paramPath"] == "Metadata/plate_1.gcode"
     assert startCapture["sdFileName"] == "uploaded.3mf"
 
