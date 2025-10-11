@@ -191,7 +191,13 @@ def test_dispatchBambuPrintUsesBambulabsApiWhenConfigured(
     uploadCapture: dict[str, Any] = {}
 
     def fakeUploadViaBambulabsApi(
-        *, ip: str, serial: str, accessCode: str, localPath: Path, remoteName: str
+        *,
+        ip: str,
+        serial: str,
+        accessCode: str,
+        localPath: Path,
+        remoteName: str,
+        connectCamera: bool = False,
     ) -> str:
         uploadCapture["ip"] = ip
         uploadCapture["serial"] = serial
