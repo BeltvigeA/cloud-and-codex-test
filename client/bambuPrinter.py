@@ -466,13 +466,31 @@ def startPrintViaMqtt(
                 statusCallback({"event": "progress", "status": statusSnapshot})
             initialStatus.set()
 
-    def onConnect(client: mqtt.Client, _userdata, _flags, reasonCode, _properties):  # type: ignore[no-redef]
-        nonlocal connectionError
-        if getattr(reasonCode, "is_failure", False):
-            connectionError = f"MQTT connection failed: {reasonCode}"
+    def onConnect(client, *args, **kwargs):  # compatible with paho-mqtt v1/v2
+    nonlocal connectionError
+    # paho v1: (client, userdata, flags, rc)
+    # paho v2: (client, userdata, flags, reasonCode, properties)
+    rc = None
+    reasonCode = None
+    # args: (userdata, flags, rc?) or (userdata, flags, reasonCode, properties)
+    if len(args) >= 3:
+        third = args[2]
+        if isinstance(third, int):
+            rc = third
         else:
-            client.subscribe(topicReport, qos=1)
-        connectionReady.set()
+            reasonCode = third
+    ok = None
+    if rc is not None:
+        ok = (rc == 0)
+    elif reasonCode is not None:
+        ok = not getattr(reasonCode, "is_failure", False)
+    else:
+        ok = True
+    if ok:
+        client.subscribe(topicReport, qos=1)
+    else:
+        connectionError = f"MQTT connection failed: rc={rc or 'n/a'} reason={getattr(reasonCode, 'value', reasonCode)}"
+    connectionReady.set()
 
     def onMessage(_client: mqtt.Client, _userdata, message):  # type: ignore[no-redef]
         try:
@@ -498,7 +516,7 @@ def startPrintViaMqtt(
         statusMap = {key: findKey(payload, key) for key in ("mc_percent", "gcode_state", "mc_remaining_time", "nozzle_temper", "bed_temper")}
         handleStatus(statusMap)
 
-    client = mqtt.Client(callback_api_version=mqtt.CallbackAPIVersion.VERSION2, protocol=mqtt.MQTTv311)
+    client = mqtt.Client(protocol=mqtt.MQTTv311)
     client.username_pw_set("bblp", accessCode)
 
     if insecureTls:
