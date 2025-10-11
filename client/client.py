@@ -422,6 +422,33 @@ def resolvePrinterDetails(
     return resolved or None
 
 
+def findConfiguredPrinterMatch(
+    resolved: Dict[str, Any], configuredPrinters: List[Dict[str, Any]]
+) -> Optional[Dict[str, Any]]:
+    serialCandidate = resolved.get("serialNumber")
+    if serialCandidate:
+        loweredSerial = str(serialCandidate).lower()
+        for printer in configuredPrinters:
+            if str(printer.get("serialNumber", "")).lower() == loweredSerial:
+                return printer
+
+    nicknameCandidate = resolved.get("nickname")
+    if nicknameCandidate:
+        loweredNickname = str(nicknameCandidate).lower()
+        for printer in configuredPrinters:
+            if str(printer.get("nickname", "")).lower() == loweredNickname:
+                return printer
+
+    ipCandidate = resolved.get("ipAddress")
+    if ipCandidate:
+        loweredIp = str(ipCandidate).lower()
+        for printer in configuredPrinters:
+            if str(printer.get("ipAddress", "")).lower() == loweredIp:
+                return printer
+
+    return None
+
+
 def createPrinterStatusReporter(
     baseUrl: str,
     productId: str,
@@ -662,14 +689,20 @@ def dispatchBambuPrintIfPossible(
         logging.info("No matching printer configuration for product %s", productId)
         return None
 
+    matchedPrinter = findConfiguredPrinterMatch(resolvedDetails, printers)
+    if matchedPrinter is None:
+        logging.info("Could not match printer assignment to configured printer for product %s", productId)
+        return None
+
     brand = str(resolvedDetails.get("brand", "")).strip()
     if brand and "bambu" not in brand.lower():
         logging.info("Skipping printer dispatch for non-Bambu brand %s", brand)
         return None
 
-    ipAddress = resolvedDetails.get("ipAddress")
-    accessCode = resolvedDetails.get("accessCode")
-    serialNumber = resolvedDetails.get("serialNumber")
+    ipAddress = matchedPrinter.get("ipAddress") or resolvedDetails.get("ipAddress")
+    accessCode = matchedPrinter.get("accessCode") or resolvedDetails.get("accessCode")
+    serialNumber = matchedPrinter.get("serialNumber") or resolvedDetails.get("serialNumber")
+    configuredNickname = matchedPrinter.get("nickname") or matchedPrinter.get("printerName")
 
     if not ipAddress or not accessCode or not serialNumber:
         logging.warning(
@@ -696,14 +729,16 @@ def dispatchBambuPrintIfPossible(
         return {
             "success": False,
             "details": {
-                "serialNumber": resolvedDetails.get("serialNumber"),
-                "ipAddress": resolvedDetails.get("ipAddress"),
+                "serialNumber": serialNumber,
+                "ipAddress": ipAddress,
                 "brand": brand or resolvedDetails.get("brand"),
-                "nickname": resolvedDetails.get("nickname") or resolvedDetails.get("printerName"),
+                "nickname": configuredNickname,
             },
             "error": message,
             "events": [],
         }
+
+    assert filePath.suffix.lower() in {".3mf", ".gcode"}, f"Ugyldig inputtype: {filePath}"
 
     def resolveBool(key: str, default: bool) -> bool:
         value = resolvedDetails.get(key)
@@ -730,7 +765,7 @@ def dispatchBambuPrintIfPossible(
         serialNumber=str(serialNumber),
         accessCode=str(accessCode),
         brand=brand or "Bambu Lab",
-        nickname=resolvedDetails.get("nickname") or resolvedDetails.get("printerName"),
+        nickname=(configuredNickname if configuredNickname else None),
         useCloud=resolveBool("useCloud", False),
         cloudUrl=resolvedDetails.get("cloudUrl"),
         cloudTimeout=resolveInt("cloudTimeout", 180) or 180,
