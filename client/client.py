@@ -1388,6 +1388,8 @@ def generateStatusPayload(
         "accessCode": accessCodeValue,
     }
 
+    lastUpdateTimestamp = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+
     payload: Dict[str, Any] = {
         "printerIpAddress": f"192.168.1.{10 + (iteration % 10)}",
         "publicKey": "ABCDEFG12345",
@@ -1401,6 +1403,7 @@ def generateStatusPayload(
         "materialLevel": materialLevel,
         "printerSerial": printerSerial,
         "accessCode": accessCodeValue,
+        "lastUpdateTimestamp": lastUpdateTimestamp,
     }
 
     if recipientId:
