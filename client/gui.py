@@ -1692,10 +1692,21 @@ class ListenerGuiApp:
         if waitSecondsValue is None:
             waitSecondsValue = 8
 
+        if path.suffix.lower() not in {".3mf", ".gcode"}:
+            self.log(f"Kan ikke sende fil med ugyldig format: {path.name}")
+            return
+
+        assert path.suffix.lower() in {".3mf", ".gcode"}, f"Ugyldig inputtype: {path}"
+
         options = BambuPrintOptions(
             ipAddress=str(ipAddressValue),
             serialNumber=str(serialValue),
             accessCode=str(accessCodeValue),
+            nickname=(
+                (printerConfig.get("nickname") or printerConfig.get("printerName"))
+                if isinstance(printerConfig, dict)
+                else None
+            ),
             useAms=resolveBool("useAms", True),
             bedLeveling=resolveBool("bedLeveling", True),
             layerInspect=resolveBool("layerInspect", True),

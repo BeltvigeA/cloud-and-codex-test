@@ -306,6 +306,8 @@ def uploadViaFtps(
                 raise
 
         def performUpload() -> str:
+            tryReenterSavedDirectory()
+            logger.debug("FTPS STOR command: %s  (fileName=%s)", storageCommand, fileName)
             if dataStream is not None:
                 try:
                     dataStream.seek(0)
@@ -886,6 +888,8 @@ def sendBambuPrintJob(
     lanStrategy = (options.lanStrategy or "legacy").lower()
 
     remoteName = buildRemoteFileName(resolvedPath)
+    assert remoteName.lower().endswith(".3mf"), f"remoteName må være .3mf, fikk: {remoteName}"
+    logger.debug("Resolved remote file name for upload: %s", remoteName)
 
     with tempfile.TemporaryDirectory() as temporaryDirectory:
         paramPath: Optional[str] = None
