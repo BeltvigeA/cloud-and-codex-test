@@ -690,6 +690,21 @@ def dispatchBambuPrintIfPossible(
         logging.warning("Downloaded file missing for printer dispatch: %s", filePath)
         return None
 
+    if filePath.suffix.lower() not in {".3mf", ".gcode"}:
+        message = f"Kan ikke sende fil med ugyldig format: {filePath.name}"
+        logging.error(message)
+        return {
+            "success": False,
+            "details": {
+                "serialNumber": resolvedDetails.get("serialNumber"),
+                "ipAddress": resolvedDetails.get("ipAddress"),
+                "brand": brand or resolvedDetails.get("brand"),
+                "nickname": resolvedDetails.get("nickname") or resolvedDetails.get("printerName"),
+            },
+            "error": message,
+            "events": [],
+        }
+
     def resolveBool(key: str, default: bool) -> bool:
         value = resolvedDetails.get(key)
         if value is None:

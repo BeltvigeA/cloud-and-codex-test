@@ -878,23 +878,28 @@ def sendBambuPrintJob(
     if not resolvedPath.exists():
         raise FileNotFoundError(resolvedPath)
 
+    normalizedSuffix = resolvedPath.suffix.lower()
+    if normalizedSuffix not in {".gcode", ".3mf"}:
+        raise ValueError("Støtter kun .3mf eller .gcode for utskrift")
+
     plateIndex = options.plateIndex
     lanStrategy = (options.lanStrategy or "legacy").lower()
+
+    remoteName = buildRemoteFileName(resolvedPath)
 
     with tempfile.TemporaryDirectory() as temporaryDirectory:
         paramPath: Optional[str] = None
         tempDir = Path(temporaryDirectory)
+        workingPath = tempDir / remoteName
 
         if resolvedPath.suffix.lower() == ".gcode":
             targetPlate = max(1, plateIndex or 1)
             platePath = f"Metadata/plate_{targetPlate}.gcode"
             gcodeText = resolvedPath.read_text(encoding="utf-8", errors="ignore")
             buffer = packageGcodeToThreeMfBytes(gcodeText, platePath=platePath)
-            workingPath = tempDir / f"{resolvedPath.stem}.3mf"
             workingPath.write_bytes(buffer.getvalue())
             paramPath = platePath
         else:
-            workingPath = tempDir / resolvedPath.name
             shutil.copy2(resolvedPath, workingPath)
             try:
                 with zipfile.ZipFile(workingPath, "r"):
@@ -910,9 +915,6 @@ def sendBambuPrintJob(
                         "eller send .gcode slik at klienten kan pakke det automatisk."
                     )
                 paramPath = candidates[0]
-
-        remoteName = buildRemoteFileName(workingPath)
-        printerFileName = buildPrinterTransferFileName(workingPath)
 
         if skippedObjects:
             applySkippedObjectsToArchive(workingPath, skippedObjects)
@@ -944,14 +946,14 @@ def sendBambuPrintJob(
                 serial=options.serialNumber,
                 accessCode=options.accessCode,
                 localPath=workingPath,
-                remoteName=printerFileName,
+                remoteName=remoteName,
             )
         else:
             uploadedName = uploadViaFtps(
                 ip=options.ipAddress,
                 accessCode=options.accessCode,
                 localPath=workingPath,
-                remoteName=printerFileName,
+                remoteName=remoteName,
                 insecureTls=not options.secureConnection,
             )
 
