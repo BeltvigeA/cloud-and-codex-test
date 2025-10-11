@@ -13,7 +13,6 @@ import socket
 import ssl
 import tempfile
 import time
-import unicodedata
 import uuid
 import zipfile
 import xml.etree.ElementTree as ET
@@ -269,45 +268,71 @@ def uploadViaFtps(
             truncatedRoot = baseRoot[:allowedRootLength]
             candidateRoot = f"{truncatedRoot}{suffix}"
             return sanitizeThreeMfName(f"{candidateRoot}{extension}")
-        attempts = 0
-        maxAttempts = 4
-        lastError: Optional[error_perm] = None
 
-        while attempts < maxAttempts:
-            candidateName = buildCandidateName(attempts)
-            storageCommand = buildStorageCommand(candidateName)
-            logger.debug("FTPS STOR command: %s", storageCommand)
-            logger.debug("Remote fileName: %s  (len=%d)", candidateName, len(candidateName))
+        uploadHandle: BinaryIO
+        closeHandle = False
+        if dataStream is not None:
+            uploadHandle = dataStream
+            if hasattr(uploadHandle, "seek"):
+                try:
+                    uploadHandle.seek(0)
+                except Exception:
+                    dataBytes = uploadHandle.read()
+                    uploadHandle = io.BytesIO(dataBytes)
+            else:
+                dataBytes = uploadHandle.read()
+                uploadHandle = io.BytesIO(dataBytes)
+        else:
+            uploadHandle = open(localPath, "rb")
+            closeHandle = True
 
-            try:
-                if dataStream is not None:
-                    try:
-                        dataStream.seek(0)
-                    except Exception:
-                        pass
-                    response = ftps.storbinary(storageCommand, dataStream, blocksize=64 * 1024)
-                else:
-                    with open(localPath, "rb") as handle:
-                        handle.seek(0)
-                        response = ftps.storbinary(storageCommand, handle, blocksize=64 * 1024)
-            except error_perm as uploadError:
-                lastError = uploadError
-                if "550" in str(uploadError) and attempts + 1 < maxAttempts:
-                    reactivateStor(ftps)
-                    attempts += 1
-                    continue
-                raise
+        try:
+            attempts = 0
+            maxAttempts = 6
+            lastError: Optional[error_perm] = None
 
-            if not response or not response.startswith("226"):
-                raise RuntimeError(
-                    f"FTPS transfer did not complete successfully for {candidateName}: {response}"
-                )
+            while attempts < maxAttempts:
+                candidateName = buildCandidateName(attempts)
+                storageCommand = buildStorageCommand(candidateName)
+                logger.debug("FTPS STOR command: %s", storageCommand)
+                logger.debug("Remote fileName: %s  (len=%d)", candidateName, len(candidateName))
 
-            return candidateName
+                try:
+                    uploadHandle.seek(0)
+                except Exception:
+                    dataBytes = uploadHandle.read()
+                    uploadHandle = io.BytesIO(dataBytes)
+                    uploadHandle.seek(0)
 
-        if lastError is not None:
-            raise lastError
-        raise RuntimeError("FTPS upload failed without specific error")
+                try:
+                    response = ftps.storbinary(storageCommand, uploadHandle, blocksize=64 * 1024)
+                except error_perm as uploadError:
+                    lastError = uploadError
+                    if "550" in str(uploadError) and attempts + 1 < maxAttempts:
+                        logger.warning(
+                            "FTPS 550 on %s, retrying with alternative name", candidateName
+                        )
+                        reactivateStor(ftps)
+                        attempts += 1
+                        continue
+                    raise
+
+                if not response or not response.startswith("226"):
+                    raise RuntimeError(
+                        f"FTPS transfer did not complete successfully for {candidateName}: {response}"
+                    )
+
+                return candidateName
+
+            if lastError is not None:
+                raise lastError
+            raise RuntimeError("FTPS upload failed without specific error")
+        finally:
+            if closeHandle:
+                try:
+                    uploadHandle.close()
+                except Exception:
+                    pass
     finally:
         try:
             ftps.quit()
@@ -325,6 +350,7 @@ def uploadViaBambulabsApi(
     accessCode: str,
     localPath: Path,
     remoteName: str,
+    connectCamera: bool = False,
 ) -> str:
     """Upload a file using the official bambulabs_api client."""
 
@@ -336,9 +362,21 @@ def uploadViaBambulabsApi(
         raise RuntimeError("bambulabs_api.Printer is not available")
 
     printer = printerClass(ip, accessCode, serial)
-    connectionMethod = getattr(printer, "mqtt_start", None) or getattr(printer, "connect", None)
-    if connectionMethod:
-        connectionMethod()
+
+    mqttStarted = False
+    cameraStarted = False
+
+    mqttStart = getattr(printer, "mqtt_start", None)
+    connectMethod = getattr(printer, "connect", None)
+    if connectCamera and connectMethod:
+        connectMethod()
+        cameraStarted = True
+    elif mqttStart:
+        mqttStart()
+        mqttStarted = True
+    elif connectMethod:
+        connectMethod()
+        cameraStarted = True
 
     uploadMethod = None
     for candidate in ("upload_file", "upload_project", "upload"):
@@ -350,14 +388,24 @@ def uploadViaBambulabsApi(
         raise RuntimeError("Unable to locate an upload method on bambulabs_api.Printer")
 
     try:
-        try:
-            uploadMethod(str(localPath), remoteName)
-        except TypeError:
-            uploadMethod(str(localPath))
+        with open(localPath, "rb") as fileHandle:
+            try:
+                uploadMethod(fileHandle, remoteName)
+            except TypeError:
+                fileHandle.seek(0)
+                uploadMethod(fileHandle)
     finally:
-        disconnectMethod = getattr(printer, "disconnect", None)
-        if disconnectMethod:
-            disconnectMethod()
+        try:
+            if cameraStarted:
+                disconnectMethod = getattr(printer, "disconnect", None)
+                if disconnectMethod:
+                    disconnectMethod()
+            elif mqttStarted:
+                mqttStop = getattr(printer, "mqtt_stop", None)
+                if mqttStop:
+                    mqttStop()
+        except Exception:
+            pass
 
     return remoteName
 
@@ -581,6 +629,7 @@ def startPrintViaMqtt(
         }
     )
 
+    logger.debug("Publishing project_file: url=%s param=%s", url, paramPath)
     client.publish(topicRequest, json.dumps(payload), qos=1)
 
     timeoutDeadline = time.time() + max(waitSeconds, statusWarmupSeconds, 0)
@@ -645,25 +694,24 @@ class BambuPrintOptions:
 
 
 def sanitizeThreeMfName(name: str) -> str:
-    normalized = unicodedata.normalize("NFKD", name or "")
-    asciiName = normalized.encode("ascii", "ignore").decode("ascii")
-    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", asciiName)
+    cleaned = re.sub(r"[^A-Za-z0-9_.-]", "_", (name or "").strip())
     if not cleaned:
         cleaned = "upload"
 
-    baseName, extension = os.path.splitext(cleaned)
-    if extension.lower() == ".gcode":
-        cleaned = baseName or "upload"
-    elif extension.lower() != ".3mf":
-        cleaned = cleaned
+    lowerName = cleaned.lower()
+    if lowerName.endswith(".gcode"):
+        cleaned = cleaned[: -len(".gcode")]
+        cleaned = cleaned or "upload"
+    if not cleaned.lower().endswith(".3mf"):
+        baseName, _ = os.path.splitext(cleaned)
+        cleaned = f"{baseName or cleaned}.3mf"
 
-    root, _ = os.path.splitext(cleaned)
-    root = root or "upload"
-    finalName = f"{root}.3mf"
-    if len(finalName) > 60:
-        maxRootLength = max(1, 60 - len(".3mf"))
-        finalName = f"{root[:maxRootLength]}.3mf"
-    return finalName
+    root, extension = os.path.splitext(cleaned)
+    maxLength = 60
+    if len(cleaned) > maxLength:
+        allowedRootLength = max(1, maxLength - len(extension))
+        cleaned = f"{root[:allowedRootLength]}{extension}"
+    return cleaned
 
 
 def normalizeRemoteFileName(name: str) -> str:
