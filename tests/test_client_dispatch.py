@@ -70,6 +70,7 @@ def test_dispatchBambuPrintExtractsSkippedObjects(tmp_path: Path, monkeypatch: p
 
     monkeypatch.setattr(client, "sendBambuPrintJob", fakeSendBambuPrintJob)
     monkeypatch.setattr(client, "sendProductStatusUpdate", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(bambuPrinter.requests, "post", lambda *_args, **_kwargs: None)
 
     result = client.dispatchBambuPrintIfPossible(
         baseUrl="https://example.com",
@@ -127,6 +128,7 @@ def test_dispatchBambuPrintIncludesPrinterDetailsInErrors(
 
     monkeypatch.setattr(client, "sendBambuPrintJob", fakeSendBambuPrintJob)
     monkeypatch.setattr(client, "sendProductStatusUpdate", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(bambuPrinter.requests, "post", lambda *_args, **_kwargs: None)
 
     caplog.set_level(logging.ERROR)
 
@@ -205,6 +207,7 @@ def test_dispatchBambuPrintUsesBambulabsApiWhenConfigured(
     monkeypatch.setattr(bambuPrinter, "uploadViaFtps", failUploadViaFtps)
     monkeypatch.setattr(bambuPrinter, "startPrintViaMqtt", lambda **_kwargs: None)
     monkeypatch.setattr(client, "sendProductStatusUpdate", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(bambuPrinter.requests, "post", lambda *_args, **_kwargs: None)
 
     result = client.dispatchBambuPrintIfPossible(
         baseUrl="https://example.com",
