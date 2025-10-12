@@ -21,7 +21,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Event
-from typing import Any, BinaryIO, Callable, Dict, Iterable, List, Optional, Sequence
+from typing import Any, BinaryIO, Callable, Dict, Iterable, List, Optional, Sequence, Union
 
 from urllib.parse import urljoin
 
@@ -347,6 +347,129 @@ class BambuApiUploadSession:
     connectCamera: bool
 
 
+def waitForMqttReady(printer: Any, *, timeoutSeconds: float = 10.0, pollIntervalSeconds: float = 0.3) -> None:
+    """Block until the bambulabs_api printer reports ready MQTT state."""
+
+    logger.info("Venter på at MQTT skal bli klar ...")
+    stateAccessor = getattr(printer, "get_state", None)
+    statusAccessor = getattr(printer, "get_status", None)
+    startTime = time.monotonic()
+    lastError: Optional[Exception] = None
+
+    while time.monotonic() - startTime < timeoutSeconds:
+        try:
+            if stateAccessor is not None:
+                stateAccessor()
+            elif statusAccessor is not None:
+                statusAccessor()
+            logger.info("MQTT ready")
+            return
+        except Exception as error:  # pragma: no cover - depends on printer timing
+            lastError = error
+            time.sleep(pollIntervalSeconds)
+            continue
+
+        time.sleep(pollIntervalSeconds)
+
+    errorMessage = "MQTT ble ikke klar i tide"
+    logger.error(errorMessage)
+    if lastError is not None:
+        raise RuntimeError(errorMessage) from lastError
+    raise RuntimeError(errorMessage)
+
+
+def publishSpoolStart(
+    *,
+    printer: Any,
+    ip: str,
+    accessCode: str,
+    serial: str,
+    uploadName: str,
+    paramPathOrPlate: Union[str, int, None],
+) -> None:
+    """Send a project_file command for external spool printing."""
+
+    if mqtt is None:  # pragma: no cover - exercised when dependency missing
+        raise RuntimeError("paho-mqtt is required for spool start publishing")
+
+    logger.debug("Benytter printer-objekt id=%s for spool-start", id(printer))
+
+    if isinstance(paramPathOrPlate, int):
+        plateNumber = max(1, paramPathOrPlate)
+        paramValue = f"Metadata/plate_{plateNumber}.gcode"
+    elif paramPathOrPlate:
+        paramValue = str(paramPathOrPlate)
+    else:
+        paramValue = "Metadata/plate_1.gcode"
+
+    payload = {
+        "print": {
+            "sequence_id": str(int(time.time() * 1000) % 10_000_000),
+            "command": "project_file",
+            "url": f"file:///sdcard/{uploadName}",
+            "param": paramValue,
+            "use_ams": False,
+            "bed_levelling": True,
+            "flow_cali": True,
+            "vibration_cali": False,
+            "layer_inspect": True,
+            "timelapse": True,
+            "bed_type": "auto",
+            "project_id": "0",
+            "profile_id": "0",
+            "task_id": "0",
+            "subtask_id": "0",
+            "subtask_name": uploadName,
+            "md5": "",
+        }
+    }
+
+    logger.info(
+        "Publishing project_file via API: url=file:///sdcard/%s param=%s use_ams=False",
+        uploadName,
+        paramValue,
+    )
+
+    client = mqtt.Client()
+    client.tls_set(cert_reqs=ssl.CERT_NONE)
+    client.tls_insecure_set(True)
+    client.username_pw_set("bblp", accessCode)
+    client.connect(ip, 8883, keepalive=60)
+    client.loop_start()
+    time.sleep(0.3)
+    publishInfo = client.publish(f"device/{serial}/request", json.dumps(payload), qos=1)
+    publishInfo.wait_for_publish()
+    time.sleep(0.3)
+    client.loop_stop()
+    client.disconnect()
+
+
+def waitForStartAck(printer: Any, *, timeoutSeconds: int = 60) -> bool:
+    """Wait until the printer transitions into an active printing state."""
+
+    startedSuccessfully, stateValue, progressValue, gcodeStateValue = waitForPrinterStart(
+        printer, timeoutSeconds=timeoutSeconds
+    )
+
+    if startedSuccessfully:
+        statusParts: List[str] = []
+        if stateValue:
+            statusParts.append(f"state={stateValue}")
+        if gcodeStateValue:
+            statusParts.append(f"gcodeState={gcodeStateValue}")
+        if progressValue is not None:
+            statusParts.append(f"progress={progressValue:.1f}%")
+        statusSummary = " ".join(statusParts) or "bekreftet"
+        logger.info("Start-ACK: %s", statusSummary)
+    else:
+        logger.warning(
+            "Ingen start-ACK innen %ds. Vil ikke sende ny start; går over i monitor-only.",
+            timeoutSeconds,
+        )
+
+    return startedSuccessfully
+
+
 @contextmanager
 def uploadViaBambulabsApi(
     *,
@@ -429,38 +552,42 @@ def startViaBambuapiAfterUpload(
     remoteName: str,
     paramPath: Optional[str],
     plateIndex: Optional[int],
-) -> None:
-    if paramPath:
-        startArgument: Any = paramPath
-    else:
-        startArgument = int(plateIndex or 1)
-    logger.info(
-        "Publishing project_file via API: url=file:///sdcard/%s param=%s",
-        remoteName,
-        startArgument,
-    )
-    printer.start_print(remoteName, startArgument)
-    logger.info("Startkommando sendt")
+    *,
+    useAms: bool,
+    ip: str,
+    accessCode: str,
+    serial: str,
+) -> bool:
+    waitForMqttReady(printer)
 
-    startTimeoutSeconds = 60
-    startedSuccessfully, stateValue, progressValue, gcodeStateValue = waitForPrinterStart(
-        printer, timeoutSeconds=startTimeoutSeconds
-    )
-    if startedSuccessfully:
-        statusParts: List[str] = []
-        if stateValue:
-            statusParts.append(f"state={stateValue}")
-        if gcodeStateValue:
-            statusParts.append(f"gcodeState={gcodeStateValue}")
-        if progressValue is not None:
-            statusParts.append(f"progress={progressValue:.1f}%")
-        statusSummary = " ".join(statusParts) or "bekreftet"
-        logger.info("Start-ACK: %s", statusSummary)
-    else:
-        logger.warning(
-            "Ingen start-ACK innen %ds. Vil ikke sende ny start; går over i monitor-only.",
-            startTimeoutSeconds,
+    if useAms:
+        if paramPath:
+            startArgument: Any = paramPath
+        else:
+            startArgument = int(plateIndex or 1)
+        logger.info(
+            "Publishing project_file via API: url=file:///sdcard/%s param=%s use_ams=True",
+            remoteName,
+            startArgument,
         )
+        printer.start_print(remoteName, startArgument)
+        logger.info("Startkommando sendt")
+    else:
+        spoolParam: Union[str, int, None]
+        if paramPath:
+            spoolParam = paramPath
+        else:
+            spoolParam = f"Metadata/plate_{max(1, int(plateIndex or 1))}.gcode"
+        publishSpoolStart(
+            printer=printer,
+            ip=ip,
+            accessCode=accessCode,
+            serial=serial,
+            uploadName=remoteName,
+            paramPathOrPlate=spoolParam,
+        )
+
+    return waitForStartAck(printer)
 
 
 def waitForPrinterStart(
@@ -1151,7 +1278,14 @@ def sendBambuPrintJob(
                     "vibrationCalibration": bool(options.vibrationCalibration),
                 }
                 startViaBambuapiAfterUpload(
-                    session.printer, uploaded, paramPath, plateIndex
+                    session.printer,
+                    uploaded,
+                    paramPath,
+                    plateIndex,
+                    useAms=bool(options.useAms),
+                    ip=options.ipAddress,
+                    accessCode=options.accessCode,
+                    serial=options.serialNumber,
                 )
             startPrintViaMqtt(
                 ip=options.ipAddress,
@@ -1256,6 +1390,7 @@ __all__ = [
     "pickGcodeParamFrom3mf",
     "postStatus",
     "BambuApiUploadSession",
+    "publishSpoolStart",
     "uploadViaBambulabsApi",
     "startViaBambuapiAfterUpload",
     "sendBambuPrintJob",
@@ -1263,5 +1398,7 @@ __all__ = [
     "startPrintViaMqtt",
     "summarizeStatusMessages",
     "uploadViaFtps",
+    "waitForMqttReady",
+    "waitForStartAck",
 ]
 
