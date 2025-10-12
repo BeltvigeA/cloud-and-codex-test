@@ -17,7 +17,6 @@ import uuid
 import zipfile
 import xml.etree.ElementTree as ET
 import logging
-from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Event
@@ -345,6 +344,26 @@ class BambuApiUploadSession:
     printer: Any
     remoteName: str
     connectCamera: bool
+    mqttStarted: bool
+
+    def close(self) -> None:
+        try:
+            if self.connectCamera:
+                disconnectMethod = getattr(self.printer, "disconnect", None)
+                if disconnectMethod:
+                    disconnectMethod()
+            elif self.mqttStarted:
+                mqttStop = getattr(self.printer, "mqtt_stop", None)
+                if mqttStop:
+                    mqttStop()
+        except Exception:
+            pass
+
+    def __enter__(self) -> "BambuApiUploadSession":
+        return self
+
+    def __exit__(self, *_exc: Any) -> None:
+        self.close()
 
 
 def waitForMqttReady(printer: Any, *, timeoutSeconds: float = 10.0, pollIntervalSeconds: float = 0.3) -> None:
@@ -425,9 +444,10 @@ def publishSpoolStart(
     }
 
     logger.info(
-        "Publishing project_file via API: url=file:///sdcard/%s param=%s use_ams=False",
+        "Publishing project_file via API: url=file:///sdcard/%s param=%s use_ams=%s",
         uploadName,
         paramValue,
+        False,
     )
 
     client = mqtt.Client()
@@ -470,7 +490,6 @@ def waitForStartAck(printer: Any, *, timeoutSeconds: int = 60) -> bool:
     return startedSuccessfully
 
 
-@contextmanager
 def uploadViaBambulabsApi(
     *,
     ip: str,
@@ -479,7 +498,8 @@ def uploadViaBambulabsApi(
     localPath: Path,
     remoteName: str,
     connectCamera: bool = False,
-) -> BambuApiUploadSession:
+    returnPrinter: bool = False,
+) -> Union[BambuApiUploadSession, str]:
     """Upload a file using the official bambulabs_api client."""
 
     if bambulabsApi is None:
@@ -529,22 +549,20 @@ def uploadViaBambulabsApi(
     if not uploadSuccessful:
         raise RuntimeError(f"Upload failed: {response}")
 
+    session = BambuApiUploadSession(
+        printer=printer,
+        remoteName=normalizedRemoteName,
+        connectCamera=cameraStarted,
+        mqttStarted=mqttStarted,
+    )
+
+    if returnPrinter:
+        return session
+
     try:
-        yield BambuApiUploadSession(
-            printer=printer, remoteName=normalizedRemoteName, connectCamera=cameraStarted
-        )
+        return session.remoteName
     finally:
-        try:
-            if cameraStarted:
-                disconnectMethod = getattr(printer, "disconnect", None)
-                if disconnectMethod:
-                    disconnectMethod()
-            elif mqttStarted:
-                mqttStop = getattr(printer, "mqtt_stop", None)
-                if mqttStop:
-                    mqttStop()
-        except Exception:
-            pass
+        session.close()
 
 
 def startViaBambuapiAfterUpload(
@@ -566,9 +584,10 @@ def startViaBambuapiAfterUpload(
         else:
             startArgument = int(plateIndex or 1)
         logger.info(
-            "Publishing project_file via API: url=file:///sdcard/%s param=%s use_ams=True",
+            "Publishing project_file via API: url=file:///sdcard/%s param=%s use_ams=%s",
             remoteName,
             startArgument,
+            bool(useAms),
         )
         printer.start_print(remoteName, startArgument)
         logger.info("Startkommando sendt")
@@ -1250,13 +1269,15 @@ def sendBambuPrintJob(
 
         def uploadAndStartViaBambuApi() -> str:
             initialStatusPayload: Optional[Dict[str, Any]] = None
-            with uploadViaBambulabsApi(
+            session = uploadViaBambulabsApi(
                 ip=options.ipAddress,
                 serial=options.serialNumber,
                 accessCode=options.accessCode,
                 localPath=workingPath,
                 remoteName=remoteName,
-            ) as session:
+                returnPrinter=True,
+            )
+            try:
                 uploaded = session.remoteName
                 if statusCallback:
                     statusCallback(
@@ -1287,6 +1308,9 @@ def sendBambuPrintJob(
                     accessCode=options.accessCode,
                     serial=options.serialNumber,
                 )
+            finally:
+                session.close()
+
             startPrintViaMqtt(
                 ip=options.ipAddress,
                 serial=options.serialNumber,
