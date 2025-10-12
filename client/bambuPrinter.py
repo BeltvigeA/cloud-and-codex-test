@@ -366,7 +366,21 @@ class BambuApiUploadSession:
         self.close()
 
 
-def waitForMqttReady(printer: Any, *, timeoutSeconds: float = 10.0, pollIntervalSeconds: float = 0.3) -> None:
+def _extractPrinterState(candidate: Any) -> Optional[str]:
+    if candidate is None:
+        return None
+    if isinstance(candidate, dict):
+        return _extractPrinterState(candidate.get("state") or candidate.get("print"))
+    text = str(candidate).strip()
+    return text or None
+
+
+def waitForMqttReady(
+    printer: Any,
+    *,
+    timeoutSeconds: float = 10.0,
+    pollIntervalSeconds: float = 0.3,
+) -> bool:
     """Block until the bambulabs_api printer reports ready MQTT state."""
 
     logger.info("Venter på at MQTT skal bli klar ...")
@@ -377,24 +391,74 @@ def waitForMqttReady(printer: Any, *, timeoutSeconds: float = 10.0, pollInterval
 
     while time.monotonic() - startTime < timeoutSeconds:
         try:
+            rawState: Any = None
             if stateAccessor is not None:
-                stateAccessor()
+                rawState = stateAccessor()
             elif statusAccessor is not None:
-                statusAccessor()
-            logger.info("MQTT ready")
-            return
+                rawState = statusAccessor()
+
+            normalizedState = _extractPrinterState(rawState)
+            if normalizedState and normalizedState.upper() != "UNKNOWN":
+                logger.info("MQTT ready")
+                return True
         except Exception as error:  # pragma: no cover - depends on printer timing
             lastError = error
-            time.sleep(pollIntervalSeconds)
-            continue
 
         time.sleep(pollIntervalSeconds)
 
-    errorMessage = "MQTT ble ikke klar i tide"
-    logger.error(errorMessage)
     if lastError is not None:
-        raise RuntimeError(errorMessage) from lastError
-    raise RuntimeError(errorMessage)
+        logger.debug("MQTT forble utilgjengelig i ventetiden", exc_info=lastError)
+    return False
+
+
+def ensureMqttConnected(
+    printer: Any,
+    *,
+    timeoutSeconds: float = 25.0,
+    pollIntervalSeconds: float = 0.5,
+    retryDelaySeconds: float = 1.0,
+) -> bool:
+    """Ensure that the printer MQTT session is connected, restarting on failure."""
+
+    stateAccessor = getattr(printer, "get_state", None)
+    if stateAccessor is None:
+        return True
+
+    try:
+        stateValue = _extractPrinterState(stateAccessor())
+        if stateValue and stateValue.upper() != "UNKNOWN":
+            return True
+    except Exception as error:
+        errorText = str(error)
+        if "10054" in errorText:
+            logger.warning("MQTT-tilkoblingen ble lukket av verten, forsøker på nytt")
+        else:
+            logger.debug("Kunne ikke hente MQTT-tilstand", exc_info=error)
+
+    mqttStop = getattr(printer, "mqtt_stop", None)
+    if mqttStop is not None:
+        try:
+            mqttStop()
+        except Exception:
+            logger.debug("Stopp av eksisterende MQTT-tilkobling feilet", exc_info=True)
+
+    time.sleep(max(0.0, retryDelaySeconds))
+
+    mqttStart = getattr(printer, "mqtt_start", None)
+    connectMethod = getattr(printer, "connect", None)
+    if mqttStart is not None:
+        mqttStart()
+    elif connectMethod is not None:
+        connectMethod()
+    else:
+        logger.error("Fant ingen metode for å starte MQTT-tilkobling på printerobjektet")
+        return False
+
+    return waitForMqttReady(
+        printer,
+        timeoutSeconds=timeoutSeconds,
+        pollIntervalSeconds=pollIntervalSeconds,
+    )
 
 
 def publishSpoolStart(
@@ -576,7 +640,9 @@ def startViaBambuapiAfterUpload(
     accessCode: str,
     serial: str,
 ) -> bool:
-    waitForMqttReady(printer)
+    mqttReady = ensureMqttConnected(printer)
+    if not mqttReady:
+        logger.warning("MQTT ble ikke klar innen tidsfristen, prøver likevel start.")
 
     if useAms:
         if paramPath:
@@ -606,7 +672,10 @@ def startViaBambuapiAfterUpload(
             paramPathOrPlate=spoolParam,
         )
 
-    return waitForStartAck(printer)
+    started = waitForStartAck(printer)
+    if not started:
+        ensureMqttConnected(printer)
+    return started
 
 
 def waitForPrinterStart(
@@ -1202,7 +1271,6 @@ def sendBambuPrintJob(
         raise ValueError("Støtter kun .3mf eller .gcode for utskrift")
 
     plateIndex = options.plateIndex
-    lanStrategy = (options.lanStrategy or "legacy").lower()
 
     remoteName = buildPrinterTransferFileName(resolvedPath)
     assert remoteName.lower().endswith(".3mf"), f"remoteName må være .3mf, fikk: {remoteName}"
@@ -1330,63 +1398,7 @@ def sendBambuPrintJob(
             )
             return uploaded
 
-        if lanStrategy == "bambuapi":
-            uploadedName = uploadAndStartViaBambuApi()
-            return {
-                "method": "lan",  # LAN fallback via bambulabs_api
-                "remoteFile": uploadedName,
-                "originalRemoteFile": remoteName,
-                "paramPath": paramPath,
-            }
-
-        try:
-            uploadedName = uploadViaFtps(
-                ip=options.ipAddress,
-                accessCode=options.accessCode,
-                localPath=workingPath,
-                remoteName=remoteName,
-                insecureTls=not options.secureConnection,
-            )
-        except error_perm as ftpsError:
-            if "550" not in str(ftpsError):
-                raise
-            logger.warning(
-                "FTPS feilet med 550, forsøker upload via bambulabs_api...", exc_info=True
-            )
-            uploadedName = uploadAndStartViaBambuApi()
-            return {
-                "method": "lan",
-                "remoteFile": uploadedName,
-                "originalRemoteFile": remoteName,
-                "paramPath": paramPath,
-            }
-
-        if statusCallback:
-            statusCallback(
-                {
-                    "status": "uploaded",
-                    "remoteFile": uploadedName,
-                    "originalRemoteFile": remoteName,
-                    "param": paramPath,
-                }
-            )
-
-        startPrintViaMqtt(
-            ip=options.ipAddress,
-            serial=options.serialNumber,
-            accessCode=options.accessCode,
-            sdFileName=uploadedName,
-            paramPath=paramPath,
-            useAms=options.useAms,
-            bedLeveling=options.bedLeveling,
-            layerInspect=options.layerInspect,
-            flowCalibration=options.flowCalibration,
-            vibrationCalibration=options.vibrationCalibration,
-            insecureTls=not options.secureConnection,
-            waitSeconds=options.waitSeconds,
-            statusCallback=statusCallback,
-        )
-
+        uploadedName = uploadAndStartViaBambuApi()
         return {
             "method": "lan",
             "remoteFile": uploadedName,
@@ -1423,6 +1435,7 @@ __all__ = [
     "summarizeStatusMessages",
     "uploadViaFtps",
     "waitForMqttReady",
+    "ensureMqttConnected",
     "waitForStartAck",
 ]
 

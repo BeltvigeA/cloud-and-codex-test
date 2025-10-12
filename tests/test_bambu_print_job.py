@@ -36,23 +36,55 @@ def test_sendBambuPrintJobUsesTemporaryCopy(
 
     uploadCapture: dict[str, object] = {}
 
-    def fakeUploadViaFtps(
-        *, ip: str, accessCode: str, localPath: Path, remoteName: str, insecureTls: bool
-    ) -> str:
+    def fakeUploadViaBambulabsApi(
+        *,
+        ip: str,
+        serial: str,
+        accessCode: str,
+        localPath: Path,
+        remoteName: str,
+        returnPrinter: bool,
+        **_kwargs: object,
+    ):
         temporaryLocalPath = Path(localPath)
         uploadCapture["localPath"] = temporaryLocalPath
         uploadCapture["remoteName"] = remoteName
         uploadCapture["temporaryExistsDuringUpload"] = temporaryLocalPath.exists()
         uploadCapture["bytesDuringUpload"] = temporaryLocalPath.read_bytes()
-        return "uploaded.3mf"
+        session = bambuPrinter.BambuApiUploadSession(
+            printer=object(),
+            remoteName="uploaded.3mf",
+            connectCamera=False,
+            mqttStarted=True,
+        )
+        if returnPrinter:
+            return session
+        return session.remoteName
 
-    monkeypatch.setattr(bambuPrinter, "uploadViaFtps", fakeUploadViaFtps)
+    monkeypatch.setattr(bambuPrinter, "uploadViaBambulabsApi", fakeUploadViaBambulabsApi)
 
     startCapture: dict[str, object] = {}
+
+    def fakeStartViaBambuapi(
+        printer: object,
+        remoteName: str,
+        paramPath: str | None,
+        plateIndex: int | None,
+        **kwargs: object,
+    ) -> bool:
+        startCapture["startArgs"] = (
+            printer,
+            remoteName,
+            paramPath,
+            plateIndex,
+            kwargs,
+        )
+        return True
 
     def fakeStartPrint(**kwargs) -> None:
         startCapture.update(kwargs)
 
+    monkeypatch.setattr(bambuPrinter, "startViaBambuapiAfterUpload", fakeStartViaBambuapi)
     monkeypatch.setattr(bambuPrinter, "startPrintViaMqtt", fakeStartPrint)
 
     options = bambuPrinter.BambuPrintOptions(
@@ -86,20 +118,38 @@ def test_sendBambuPrintJobMarksSkippedObjects(
 
     uploadCapture: dict[str, object] = {}
 
-    def fakeUploadViaFtps(
-        *, ip: str, accessCode: str, localPath: Path, remoteName: str, insecureTls: bool
-    ) -> str:
+    def fakeUploadViaBambulabsApi(
+        *,
+        ip: str,
+        serial: str,
+        accessCode: str,
+        localPath: Path,
+        remoteName: str,
+        returnPrinter: bool,
+        **_kwargs: object,
+    ):
         with zipfile.ZipFile(localPath, "r") as archive:
             uploadCapture["sliceInfo"] = archive.read("Metadata/slice_info.config")
         uploadCapture["remoteName"] = remoteName
-        return "uploaded.3mf"
+        session = bambuPrinter.BambuApiUploadSession(
+            printer=object(),
+            remoteName="uploaded.3mf",
+            connectCamera=False,
+            mqttStarted=True,
+        )
+        if returnPrinter:
+            return session
+        return session.remoteName
 
-    monkeypatch.setattr(bambuPrinter, "uploadViaFtps", fakeUploadViaFtps)
+    monkeypatch.setattr(bambuPrinter, "uploadViaBambulabsApi", fakeUploadViaBambulabsApi)
 
-    def fakeStartPrint(**kwargs) -> None:
-        return None
+    monkeypatch.setattr(
+        bambuPrinter,
+        "startViaBambuapiAfterUpload",
+        lambda *_args, **_kwargs: True,
+    )
 
-    monkeypatch.setattr(bambuPrinter, "startPrintViaMqtt", fakeStartPrint)
+    monkeypatch.setattr(bambuPrinter, "startPrintViaMqtt", lambda **_kwargs: None)
 
     options = bambuPrinter.BambuPrintOptions(
         ipAddress="192.168.0.5",
@@ -150,22 +200,36 @@ def test_sendBambuPrintJobWrapsGcodeInThreeMf(
 
     uploadCapture: dict[str, object] = {}
 
-    def fakeUploadViaFtps(
-        *, ip: str, accessCode: str, localPath: Path, remoteName: str, insecureTls: bool
-    ) -> str:
+    def fakeUploadViaBambulabsApi(
+        *,
+        ip: str,
+        serial: str,
+        accessCode: str,
+        localPath: Path,
+        remoteName: str,
+        returnPrinter: bool,
+        **_kwargs: object,
+    ):
         uploadCapture["remoteName"] = remoteName
         uploadCapture["localPath"] = localPath
         with zipfile.ZipFile(localPath, "r") as archive:
             with archive.open("Metadata/plate_1.gcode") as handle:
                 uploadCapture["gcodeBytes"] = handle.read()
-        return "model.3mf"
+        session = bambuPrinter.BambuApiUploadSession(
+            printer=object(),
+            remoteName="model.3mf",
+            connectCamera=False,
+            mqttStarted=True,
+        )
+        if returnPrinter:
+            return session
+        return session.remoteName
 
-    monkeypatch.setattr(bambuPrinter, "uploadViaFtps", fakeUploadViaFtps)
+    monkeypatch.setattr(bambuPrinter, "uploadViaBambulabsApi", fakeUploadViaBambulabsApi)
 
-    def fakeStartPrint(**kwargs) -> None:
-        return None
+    monkeypatch.setattr(bambuPrinter, "startViaBambuapiAfterUpload", lambda *_args, **_kwargs: True)
 
-    monkeypatch.setattr(bambuPrinter, "startPrintViaMqtt", fakeStartPrint)
+    monkeypatch.setattr(bambuPrinter, "startPrintViaMqtt", lambda **_kwargs: None)
 
     options = bambuPrinter.BambuPrintOptions(
         ipAddress="192.168.1.5",
