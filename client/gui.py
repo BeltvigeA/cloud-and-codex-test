@@ -30,7 +30,7 @@ def addPrinterIdentityToPayload(
         payload["accessCode"] = accessCode
     return payload
 
-from .bambuPrinter import BambuPrintOptions, postStatus, sendBambuPrintJob
+from .bambuPrinter import BambuPrintOptions, postStatus, sendBambuPrintJob, waitForMqttReady
 from .client import (
     appendJsonLogEntry,
     buildBaseUrl,
@@ -49,6 +49,11 @@ try:  # pragma: no cover - optional dependency in some test environments
 except ImportError:  # pragma: no cover - gracefully handled when MQTT is unavailable
     mqtt = None  # type: ignore
 
+
+try:  # pragma: no cover - optional dependency in GUI environments
+    import bambulabs_api as bambuApi  # type: ignore
+except ImportError:  # pragma: no cover - handled when Developer Mode packages missing
+    bambuApi = None  # type: ignore
 
 def loadPrinters() -> list[Dict[str, Any]]:
     path = os.path.expanduser("~/.printmaster/printers.json")
@@ -1195,22 +1200,84 @@ class ListenerGuiApp:
     def _collectPrinterTelemetry(self, printer: Dict[str, Any]) -> Dict[str, Any]:
         ipAddress = str(printer.get("ipAddress", "")).strip()
         availabilityStatus = self._probePrinterAvailability(ipAddress) if ipAddress else "Offline"
+        fallbackStatus = "Unknown" if availabilityStatus != "Offline" else "Offline"
         telemetry: Dict[str, Any] = {
-            "status": availabilityStatus,
+            "status": fallbackStatus,
             "nozzleTemp": None,
             "bedTemp": None,
             "progressPercent": None,
             "remainingTimeSeconds": None,
             "gcodeState": None,
         }
-        if availabilityStatus == "Offline":
+        if not ipAddress:
             return telemetry
 
         serialNumber = self._parseOptionalString(printer.get("serialNumber"))
         accessCode = self._parseOptionalString(printer.get("accessCode"))
         brand = self._parseOptionalString(printer.get("brand"))
-
         looksLikeBambu = brand is None or "bambu" in brand.lower()
+
+        if bambuApi is not None and serialNumber and accessCode and looksLikeBambu:
+            bambuPrinter = None
+
+            def safePrinterCall(methodName: str) -> Any:
+                if bambuPrinter is None:
+                    return None
+                method = getattr(bambuPrinter, methodName, None)
+                if method is None:
+                    return None
+                try:
+                    return method()
+                except Exception:
+                    return None
+
+            try:
+                bambuPrinter = bambuApi.Printer(ipAddress, accessCode, serialNumber)
+                mqttStart = getattr(bambuPrinter, "mqtt_start", None)
+                connectMethod = getattr(bambuPrinter, "connect", None)
+                if mqttStart:
+                    mqttStart()
+                elif connectMethod:
+                    connectMethod()
+                waitForMqttReady(bambuPrinter)
+
+                telemetry["status"] = "Online"
+
+                progressValue = self._parseOptionalFloat(safePrinterCall("get_percentage"))
+                if progressValue is not None:
+                    telemetry["progressPercent"] = progressValue
+
+                remainingValue = safePrinterCall("get_time")
+                remainingSeconds = self._parseOptionalInt(remainingValue)
+                if remainingSeconds is not None:
+                    telemetry["remainingTimeSeconds"] = remainingSeconds
+
+                nozzleValue = self._parseOptionalFloat(safePrinterCall("get_nozzle_temperature"))
+                if nozzleValue is not None:
+                    telemetry["nozzleTemp"] = nozzleValue
+
+                bedValue = self._parseOptionalFloat(safePrinterCall("get_bed_temperature"))
+                if bedValue is not None:
+                    telemetry["bedTemp"] = bedValue
+
+                gcodeState = self._parseOptionalString(safePrinterCall("get_gcode_state"))
+                if not gcodeState:
+                    gcodeState = self._parseOptionalString(safePrinterCall("get_state"))
+                if gcodeState:
+                    telemetry["gcodeState"] = gcodeState
+
+                return telemetry
+            except Exception as error:  # noqa: BLE001 - telemetry is best-effort
+                logging.debug("Unable to collect Bambu telemetry via API from %s: %s", ipAddress, error)
+            finally:
+                if bambuPrinter is not None:
+                    stopMethod = getattr(bambuPrinter, "mqtt_stop", None)
+                    if stopMethod is None:
+                        stopMethod = getattr(bambuPrinter, "disconnect", None)
+                    with contextlib.suppress(Exception):
+                        if stopMethod:
+                            stopMethod()
+
         if serialNumber and accessCode and mqtt is not None and looksLikeBambu:
             try:
                 bambuTelemetry = self._fetchBambuTelemetry(ipAddress, serialNumber, accessCode)

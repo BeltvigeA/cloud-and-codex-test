@@ -3,7 +3,6 @@ from __future__ import annotations
 import logging
 import sys
 import zipfile
-from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -191,7 +190,6 @@ def test_dispatchBambuPrintUsesBambulabsApiWhenConfigured(
 
     uploadCapture: dict[str, Any] = {}
 
-    @contextmanager
     def fakeUploadViaBambulabsApi(
         *,
         ip: str,
@@ -200,6 +198,7 @@ def test_dispatchBambuPrintUsesBambulabsApiWhenConfigured(
         localPath: Path,
         remoteName: str,
         connectCamera: bool = False,
+        returnPrinter: bool = False,
     ):
         uploadCapture["ip"] = ip
         uploadCapture["serial"] = serial
@@ -216,9 +215,16 @@ def test_dispatchBambuPrintUsesBambulabsApiWhenConfigured(
                 uploadCapture["startArgs"] = self.startArgs
 
         printer = FakePrinter()
-        yield bambuPrinter.BambuApiUploadSession(
-            printer=printer, remoteName="uploaded.3mf", connectCamera=False
+        session = bambuPrinter.BambuApiUploadSession(
+            printer=printer,
+            remoteName="uploaded.3mf",
+            connectCamera=False,
+            mqttStarted=True,
         )
+        if returnPrinter:
+            return session
+        session.close()
+        return session.remoteName
 
     def failUploadViaFtps(**_kwargs: Any) -> str:
         raise AssertionError("uploadViaFtps should not be used when lanStrategy=bambuApi")
