@@ -50,6 +50,25 @@ _statusHeartbeatLock = Lock()
 _statusHeartbeatEvents: Dict[str, Event] = {}
 
 
+def portOpen(ip: str, port: int, timeoutSeconds: float = 3.0) -> bool:
+    """Check whether a TCP port is reachable on the specified host."""
+
+    try:
+        with socket.create_connection((ip, port), timeout=timeoutSeconds):
+            return True
+    except OSError:
+        return False
+
+
+def ensurePrinterPortsReachable(ip: str, *, timeoutSeconds: float = 3.0) -> None:
+    """Validate that the critical FTPS and MQTT ports are reachable."""
+
+    if not portOpen(ip, 990, timeoutSeconds=timeoutSeconds):
+        raise RuntimeError(f"FTPS (990) utilgjengelig mot {ip}")
+    if not portOpen(ip, 8883, timeoutSeconds=timeoutSeconds):
+        raise RuntimeError(f"MQTT (8883) utilgjengelig mot {ip}")
+
+
 def makeTlsContext(insecure: bool = True) -> ssl.SSLContext:
     """Create a TLS context tuned for Bambu printers."""
 
@@ -483,6 +502,32 @@ def _extractPrinterState(candidate: Any) -> Optional[str]:
     return text or None
 
 
+def _extractSerialFromPayload(payload: Any) -> Optional[str]:
+    """Best-effort extraction of a serial number from printer metadata."""
+
+    if payload is None:
+        return None
+    if isinstance(payload, dict):
+        for key in ("serial", "serialNumber", "serial_number", "sn"):
+            if key in payload and payload[key] is not None:
+                text = str(payload[key]).strip()
+                if text:
+                    return text
+        for value in payload.values():
+            serialCandidate = _extractSerialFromPayload(value)
+            if serialCandidate:
+                return serialCandidate
+        return None
+    if isinstance(payload, (list, tuple, set)):
+        for item in payload:
+            serialCandidate = _extractSerialFromPayload(item)
+            if serialCandidate:
+                return serialCandidate
+        return None
+    text = str(payload).strip()
+    return text or None
+
+
 def waitForMqttReady(
     printer: Any,
     *,
@@ -578,6 +623,91 @@ def ensureMqttConnected(
         timeoutSeconds=timeoutSeconds,
         pollIntervalSeconds=pollIntervalSeconds,
     )
+
+
+def printerIsMqttReady(printer: Any) -> bool:
+    """Determine whether the printer MQTT session is connected and ready."""
+
+    connectedFlag = getattr(printer, "mqtt_connected", None)
+    if isinstance(connectedFlag, bool):
+        return connectedFlag
+    if callable(connectedFlag):
+        try:
+            result = connectedFlag()
+            if isinstance(result, bool):
+                return result
+        except Exception:
+            logger.debug("Kunne ikke sjekke mqtt_connected", exc_info=True)
+
+    stateAccessor = getattr(printer, "get_state", None)
+    if stateAccessor is None:
+        return True
+
+    try:
+        stateValue = _extractPrinterState(stateAccessor())
+    except Exception:
+        return False
+
+    if not stateValue:
+        return False
+
+    return stateValue.upper() != "UNKNOWN"
+
+
+def startWithLibrary(
+    printer: Any,
+    uploadName: str,
+    startParam: Union[str, int, None],
+    *,
+    expectedSerial: Optional[str] = None,
+    handshakeTimeoutSeconds: float = 15.0,
+) -> None:
+    """Start a print job using bambulabs_api's MQTT session."""
+
+    mqttStart = getattr(printer, "mqtt_start", None)
+    if mqttStart is not None:
+        try:
+            mqttStart()
+        except Exception:
+            logger.debug("mqtt_start mislyktes (muligens allerede aktiv)", exc_info=True)
+
+    stateAccessor = getattr(printer, "get_state", None)
+    statePayload: Any = None
+    if stateAccessor is not None:
+        startTime = time.time()
+        while True:
+            try:
+                statePayload = stateAccessor()
+                break
+            except Exception as handshakeError:
+                if time.time() - startTime > handshakeTimeoutSeconds:
+                    raise TimeoutError("MQTT handshake tok for lang tid") from handshakeError
+                time.sleep(0.5)
+
+    normalizedExpected = str(expectedSerial).strip() if expectedSerial else None
+    resolvedSerial = _extractSerialFromPayload(statePayload)
+    if not resolvedSerial:
+        resolvedSerial = str(getattr(printer, "serial", "")).strip() or str(
+            getattr(printer, "serialNumber", "")
+        ).strip()
+
+    if normalizedExpected:
+        logger.info(
+            "Connected to serial=%s (expected %s)",
+            resolvedSerial or "<ukjent>",
+            normalizedExpected,
+        )
+        if resolvedSerial and resolvedSerial.strip() and resolvedSerial.lower() != normalizedExpected.lower():
+            raise RuntimeError("Connected to feil printer – avbryter")
+
+    startMethod = getattr(printer, "start_print", None)
+    if startMethod is None:
+        raise RuntimeError("Printerobjektet mangler start_print")
+
+    if startParam is None:
+        startMethod(uploadName)
+    else:
+        startMethod(uploadName, startParam)
 
 
 def publishSpoolStart(
@@ -759,37 +889,54 @@ def startViaBambuapiAfterUpload(
     accessCode: str,
     serial: str,
 ) -> bool:
+    """Start a print using the official bambulabs_api MQTT session."""
+
+    if os.getenv("CHECK_PRINTER_PORTS") == "1":
+        ensurePrinterPortsReachable(ip)
+
     mqttReady = ensureMqttConnected(printer)
     if not mqttReady:
         logger.warning("MQTT ble ikke klar innen tidsfristen, prøver likevel start.")
 
+    startArgument: Union[str, int, None]
     if useAms:
-        if paramPath:
-            startArgument: Any = paramPath
-        else:
-            startArgument = int(plateIndex or 1)
-        logger.info(
-            "Publishing project_file via API: url=file:///sdcard/%s param=%s use_ams=%s",
+        startArgument = paramPath if paramPath else int(plateIndex or 1)
+    else:
+        startArgument = paramPath or f"Metadata/plate_{max(1, int(plateIndex or 1))}.gcode"
+
+    logger.info(
+        "Publishing project_file via API: url=file:///sdcard/%s param=%s use_ams=%s",
+        remoteName,
+        startArgument,
+        bool(useAms),
+    )
+
+    fallbackEnabled = os.getenv("RAW_MQTT_FALLBACK") == "1"
+
+    try:
+        startWithLibrary(
+            printer,
             remoteName,
             startArgument,
-            bool(useAms),
+            expectedSerial=serial,
         )
-        printer.start_print(remoteName, startArgument)
-        logger.info("Startkommando sendt")
-    else:
-        spoolParam: Union[str, int, None]
-        if paramPath:
-            spoolParam = paramPath
+        logger.info("Startkommando sendt via bambulabs_api")
+    except Exception as startError:
+        if not useAms and fallbackEnabled:
+            logger.warning(
+                "Start via bambulabs_api feilet (%s). Faller tilbake til rå MQTT-spool.",
+                startError,
+            )
+            publishSpoolStart(
+                printer=printer,
+                ip=ip,
+                accessCode=accessCode,
+                serial=serial,
+                uploadName=remoteName,
+                paramPathOrPlate=startArgument,
+            )
         else:
-            spoolParam = f"Metadata/plate_{max(1, int(plateIndex or 1))}.gcode"
-        publishSpoolStart(
-            printer=printer,
-            ip=ip,
-            accessCode=accessCode,
-            serial=serial,
-            uploadName=remoteName,
-            paramPathOrPlate=spoolParam,
-        )
+            raise
 
     started = waitForStartAck(printer)
     if not started:
@@ -1229,19 +1376,6 @@ def buildStatusPayload(printer: Any) -> Dict[str, Any]:
         except (TypeError, ValueError):
             return None
 
-    stateValue = normalizeText(safeCall("get_state")) or normalizeText(getattr(printer, "state", None))
-    gcodeStateValue = normalizeText(safeCall("get_gcode_state")) or normalizeText(getattr(printer, "gcode_state", None))
-    progressValue = normalizeFloat(safeCall("get_percentage"))
-    if progressValue is None:
-        progressValue = normalizeFloat(getattr(printer, "percentage", None))
-    nozzleValue = normalizeFloat(safeCall("get_nozzle_temperature"))
-    if nozzleValue is None:
-        nozzleValue = normalizeFloat(getattr(printer, "nozzle_temperature", None))
-    bedValue = normalizeFloat(safeCall("get_bed_temperature"))
-    if bedValue is None:
-        bedValue = normalizeFloat(getattr(printer, "bed_temperature", None))
-    remainingValue = normalizeInt(safeCall("get_remaining_time"))
-
     ipValue = (
         normalizeText(getattr(printer, "ip", None))
         or normalizeText(getattr(printer, "ipAddress", None))
@@ -1258,6 +1392,35 @@ def buildStatusPayload(printer: Any) -> Dict[str, Any]:
     )
 
     lastSeen = datetime.now(timezone.utc).isoformat()
+
+    if not printerIsMqttReady(printer):
+        return {
+            "status": "Offline",
+            "gcodeState": None,
+            "progress": None,
+            "nozzleTemp": None,
+            "bedTemp": None,
+            "remainingTimeSeconds": None,
+            "ip": ipValue,
+            "serial": serialValue,
+            "access_code": accessCodeValue,
+            "online": False,
+            "lastSeen": lastSeen,
+        }
+
+    stateValue = normalizeText(safeCall("get_state")) or normalizeText(getattr(printer, "state", None))
+    gcodeStateValue = normalizeText(safeCall("get_gcode_state")) or normalizeText(getattr(printer, "gcode_state", None))
+    progressValue = normalizeFloat(safeCall("get_percentage"))
+    if progressValue is None:
+        progressValue = normalizeFloat(getattr(printer, "percentage", None))
+    nozzleValue = normalizeFloat(safeCall("get_nozzle_temperature"))
+    if nozzleValue is None:
+        nozzleValue = normalizeFloat(getattr(printer, "nozzle_temperature", None))
+    bedValue = normalizeFloat(safeCall("get_bed_temperature"))
+    if bedValue is None:
+        bedValue = normalizeFloat(getattr(printer, "bed_temperature", None))
+    remainingValue = normalizeInt(safeCall("get_remaining_time"))
+
     statusText = stateValue or ("Printing" if (progressValue or 0.0) > 0.0 else "Online")
 
     return {
@@ -1843,6 +2006,8 @@ __all__ = [
     "buildStatusPayload",
     "encodeFileToBase64",
     "makeTlsContext",
+    "portOpen",
+    "ensurePrinterPortsReachable",
     "applySkippedObjectsToArchive",
     "pickGcodeParamFrom3mf",
     "postStatus",
@@ -1851,6 +2016,7 @@ __all__ = [
     "startStatusHeartbeat",
     "BambuApiUploadSession",
     "publishSpoolStart",
+    "startWithLibrary",
     "uploadViaBambulabsApi",
     "startViaBambuapiAfterUpload",
     "sendBambuPrintJob",
@@ -1860,6 +2026,7 @@ __all__ = [
     "uploadViaFtps",
     "waitForMqttReady",
     "ensureMqttConnected",
+    "printerIsMqttReady",
     "waitForStartAck",
     "upsertPrinterFromJobMetadata",
 ]
