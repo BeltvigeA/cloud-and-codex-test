@@ -13,6 +13,7 @@ from threading import Event
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 from urllib.parse import urlparse
 
+import os
 import requests
 
 from .database import LocalDatabase
@@ -688,6 +689,24 @@ def dispatchBambuPrintIfPossible(
     if not printerAssignment:
         return None
 
+    allowFailover = os.getenv("ALLOW_PRINTER_FAILOVER") == "1"
+
+    targetSerialRaw = printerAssignment.get("serialNumber")
+    targetIpRaw = printerAssignment.get("ipAddress")
+    targetAccessRaw = printerAssignment.get("accessCode")
+
+    def normalizeCandidate(value: Any, *, lower: bool = False) -> Optional[str]:
+        if value is None:
+            return None
+        text = str(value).strip()
+        if not text:
+            return None
+        return text.lower() if lower else text
+
+    normalizedSerial = normalizeCandidate(targetSerialRaw, lower=True)
+    normalizedIp = normalizeCandidate(targetIpRaw, lower=True)
+    normalizedAccess = normalizeCandidate(targetAccessRaw, lower=False)
+
     metadataForUpdate: Optional[Dict[str, Any]] = None
     unencryptedData = entryData.get("unencryptedData")
     if isinstance(unencryptedData, dict):
@@ -717,12 +736,34 @@ def dispatchBambuPrintIfPossible(
         mergePrinterRecord(printers, upsertedPrinter)
     if configuredPrinters is None and upsertedPrinter:
         printers = loadConfiguredPrinters()
-    resolvedDetails = resolvePrinterDetails(printerAssignment, printers)
+
+    candidatePrinters = list(printers)
+    explicitTargetProvided = any((normalizedSerial, normalizedIp, normalizedAccess))
+    if explicitTargetProvided and not allowFailover:
+        filteredPrinters: List[Dict[str, Any]] = []
+        for printerRecord in candidatePrinters:
+            recordSerial = normalizeCandidate(printerRecord.get("serialNumber"), lower=True)
+            recordIp = normalizeCandidate(printerRecord.get("ipAddress"), lower=True)
+            recordAccess = normalizeCandidate(printerRecord.get("accessCode"), lower=False)
+            if normalizedSerial and recordSerial != normalizedSerial:
+                continue
+            if normalizedIp and recordIp != normalizedIp:
+                continue
+            if normalizedAccess and recordAccess != normalizedAccess:
+                continue
+            filteredPrinters.append(printerRecord)
+        if filteredPrinters:
+            candidatePrinters = filteredPrinters
+        else:
+            fallbackRecord = dict(printerAssignment)
+            candidatePrinters = [fallbackRecord]
+
+    resolvedDetails = resolvePrinterDetails(printerAssignment, candidatePrinters)
     if not resolvedDetails:
         logging.info("No matching printer configuration for product %s", productId)
         return None
 
-    matchedPrinter = findConfiguredPrinterMatch(resolvedDetails, printers)
+    matchedPrinter = findConfiguredPrinterMatch(resolvedDetails, candidatePrinters)
     if matchedPrinter is None:
         logging.info("Could not match printer assignment to configured printer for product %s", productId)
         return None
@@ -887,6 +928,8 @@ def dispatchBambuPrintIfPossible(
             error,
         )
         capture({"event": "error", "error": enrichedMessage})
+        if not allowFailover:
+            capture({"event": "blocked", "error": enrichedMessage})
         return {"success": False, "details": printerDetails, "error": enrichedMessage, "events": statusEvents}
 
 def validateBaseUrlArgument(baseUrl: Optional[str], commandName: str) -> bool:
