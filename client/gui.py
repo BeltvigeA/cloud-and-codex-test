@@ -20,6 +20,8 @@ from tkinter import filedialog, messagebox, ttk
 
 import requests
 
+from .base44Status import Base44Reporter, getDefaultPrinterApiToken
+
 
 def addPrinterIdentityToPayload(
     payload: Dict[str, Any], printerSerial: Optional[str], accessCode: Optional[str]
@@ -122,6 +124,13 @@ class ListenerGuiApp:
 
         self.listenerRecipientId = ""
         self.listenerStatusApiKey = ""
+
+        self.base44Reporter = Base44Reporter(
+            getActiveRecipientId=self._getActiveRecipientIdForBase44,
+            listConnectedPrinters=self._listPrintersForBase44,
+            snapshotFunc=self._buildBase44Snapshot,
+            getApiKey=self._getBase44ApiKey,
+        )
 
         self._buildLayout()
         self.root.after(200, self._processLogQueue)
@@ -602,6 +611,93 @@ class ListenerGuiApp:
         self.listenerStatusApiKey = (
             self.statusApiKeyVar.get().strip() if hasattr(self, "statusApiKeyVar") else ""
         )
+
+    def _getActiveRecipientIdForBase44(self) -> str:
+        return self.listenerRecipientId.strip()
+
+    def _listPrintersForBase44(self) -> list[Dict[str, Any]]:
+        printersSnapshot: list[Dict[str, Any]] = []
+        for printer in list(self.printers):
+            if not isinstance(printer, dict):
+                continue
+            ipAddress = self._parseOptionalString(printer.get("ipAddress"))
+            serialNumber = self._parseOptionalString(printer.get("serialNumber"))
+            if not ipAddress and not serialNumber:
+                continue
+            printersSnapshot.append(dict(printer))
+        return printersSnapshot
+
+    def _buildBase44Snapshot(self, printer: Dict[str, Any]) -> Dict[str, Any]:
+        record = dict(printer) if isinstance(printer, dict) else {}
+        ipAddress = self._parseOptionalString(record.get("ipAddress"))
+        serialNumber = self._parseOptionalString(record.get("serialNumber"))
+        statusValue = self._parseOptionalString(record.get("status")) or "Offline"
+        normalizedStatus = statusValue.strip() or "Offline"
+
+        explicitOnline = record.get("online")
+        if isinstance(explicitOnline, bool):
+            onlineFlag = explicitOnline
+        else:
+            mqttFlag = record.get("mqttConnected")
+            onlineFlag = bool(mqttFlag) if isinstance(mqttFlag, bool) else normalizedStatus.lower() not in {
+                "", "offline", "unknown"
+            }
+
+        progressCandidate = record.get("progress")
+        if progressCandidate is None:
+            progressCandidate = record.get("progressPercent")
+        progressValue = self._parseOptionalFloat(progressCandidate)
+
+        bedTemp = self._parseOptionalFloat(record.get("bedTemp"))
+        nozzleTemp = self._parseOptionalFloat(record.get("nozzleTemp"))
+        remainingCandidate = record.get("remainingTimeSeconds") or record.get("timeRemaining")
+        remainingSeconds = self._parseOptionalInt(remainingCandidate)
+        fanSpeed = self._parseOptionalInt(record.get("fanSpeed"))
+        printSpeed = self._parseOptionalInt(record.get("printSpeed"))
+
+        filamentUsed = record.get("filamentUsed")
+        if isinstance(filamentUsed, str):
+            stripped = filamentUsed.strip()
+            try:
+                filamentUsed = float(stripped)
+            except ValueError:
+                filamentUsed = stripped or None
+
+        errorMessage = self._parseOptionalString(record.get("errorMessage")) or self._parseOptionalString(
+            record.get("error")
+        )
+        firmwareVersion = self._parseOptionalString(record.get("firmwareVersion")) or self._parseOptionalString(
+            record.get("firmware")
+        )
+        base44PrinterId = self._parseOptionalString(record.get("base44PrinterId")) or self._parseOptionalString(
+            record.get("printerId")
+        )
+        currentJobId = self._parseOptionalString(record.get("currentJobId"))
+
+        snapshot: Dict[str, Any] = {
+            "ip": ipAddress,
+            "serial": serialNumber,
+            "status": normalizedStatus,
+            "online": onlineFlag,
+            "progress": progressValue,
+            "currentJobId": currentJobId,
+            "bedTemp": bedTemp,
+            "nozzleTemp": nozzleTemp,
+            "fanSpeed": fanSpeed,
+            "printSpeed": printSpeed,
+            "filamentUsed": filamentUsed,
+            "timeRemainingSec": remainingSeconds,
+            "error": errorMessage,
+            "firmware": firmwareVersion,
+            "base44PrinterId": base44PrinterId,
+        }
+
+        return snapshot
+
+    def _getBase44ApiKey(self) -> str:
+        if self.listenerStatusApiKey:
+            return self.listenerStatusApiKey
+        return getDefaultPrinterApiToken()
 
     def _clearPrinterSearch(self) -> None:
         self.printerSearchVar.set("")
@@ -1762,11 +1858,13 @@ class ListenerGuiApp:
             daemon=True,
         )
         self.listenerThread.start()
+        self.base44Reporter.start()
         self._appendLogLine("Started listening...")
         self.startButton.config(state=tk.DISABLED)
         self.stopButton.config(state=tk.NORMAL)
 
     def stopListening(self) -> None:
+        self.base44Reporter.stop()
         if self.stopEvent:
             self.stopEvent.set()
         if self.listenerThread and self.listenerThread.is_alive() and threading.current_thread() != self.listenerThread:
@@ -1945,6 +2043,7 @@ class ListenerGuiApp:
                     self.stopEvent = None
                     self.startButton.config(state=tk.NORMAL)
                     self.stopButton.config(state=tk.DISABLED)
+                    self.base44Reporter.stop()
                     self._appendLogLine("Listener stopped.")
                 else:
                     self._appendLogLine(message)
