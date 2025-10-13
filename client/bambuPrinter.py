@@ -184,6 +184,115 @@ def sendPrintJobViaCloud(baseUrl: str, jobPayload: Dict[str, Any], timeoutSecond
     return {}
 
 
+def _isTruthy(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        return False
+    return False
+
+
+def _gatherMetadataSources(jobMetadata: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    sources: List[Dict[str, Any]] = []
+    if isinstance(jobMetadata, dict):
+        sources.append(jobMetadata)
+        for key in ("unencryptedData", "unencrypted_data", "decryptedData"):
+            nested = jobMetadata.get(key)
+            if isinstance(nested, dict):
+                sources.append(nested)
+    return sources
+
+
+def _hasValidAmsSlots(slots: Any) -> bool:
+    if isinstance(slots, dict):
+        iterable = slots.values()
+    elif isinstance(slots, (list, tuple, set)):
+        iterable = slots
+    else:
+        return False
+
+    for slot in iterable:
+        if isinstance(slot, str):
+            if slot.strip():
+                return True
+            continue
+        if isinstance(slot, dict):
+            if any(entry is not None for entry in slot.values()):
+                return True
+            continue
+        if _isTruthy(slot):
+            return True
+        if bool(slot):
+            return True
+    return False
+
+
+def _decideUseAms(
+    jobMetadata: Optional[Dict[str, Any]],
+    *,
+    fallbackPreference: bool = False,
+    forceSpool: bool = False,
+) -> bool:
+    if forceSpool:
+        logger.info(
+            "AMS decision: forced spool requested -> use_ams=False",
+        )
+        return False
+
+    metadataSources = _gatherMetadataSources(jobMetadata)
+
+    amsConfiguration: Any = None
+    amsConfigurationProvided = False
+    for source in metadataSources:
+        if "ams_configuration" in source:
+            amsConfiguration = source.get("ams_configuration")
+            amsConfigurationProvided = True
+            break
+        if "amsConfiguration" in source:
+            amsConfiguration = source.get("amsConfiguration")
+            amsConfigurationProvided = True
+            break
+
+    useAms = False
+    if isinstance(amsConfiguration, dict):
+        enabled = _isTruthy(amsConfiguration.get("enabled", False))
+        slots = amsConfiguration.get("slots", [])
+        useAms = bool(enabled and _hasValidAmsSlots(slots))
+    elif amsConfigurationProvided:
+        useAms = False
+    else:
+        useAms = bool(fallbackPreference)
+
+    quickPrintRaw: Any = None
+    for source in metadataSources:
+        for key in ("is_quick_print", "isQuickPrint", "quickPrint"):
+            if key in source:
+                quickPrintRaw = source.get(key)
+                break
+        if quickPrintRaw is not None:
+            break
+
+    if _isTruthy(quickPrintRaw):
+        useAms = False
+
+    logger.info(
+        "AMS decision: ams_configuration=%r, is_quick_print=%r, forceSpool=%r, fallbackPreference=%s -> use_ams=%s",
+        amsConfiguration,
+        quickPrintRaw,
+        forceSpool,
+        bool(fallbackPreference),
+        useAms,
+    )
+    return useAms
+
+
 def _parseReactivateStorCommands() -> List[str]:
     envValue = os.environ.get("BAMBU_FTPS_REACTIVATE_STOR_COMMANDS")
     if not envValue:
@@ -1579,27 +1688,11 @@ def sendBambuPrintJob(
     assert remoteName.lower().endswith(".3mf"), f"remoteName må være .3mf, fikk: {remoteName}"
     logger.debug("Resolved remote file name for upload: %s", remoteName)
 
-    metadataSources: List[Dict[str, Any]] = []
-    if isinstance(jobMetadata, dict):
-        metadataSources.append(jobMetadata)
-        unencrypted = jobMetadata.get("unencryptedData")
-        if isinstance(unencrypted, dict):
-            metadataSources.append(unencrypted)
-
-    def extractMetadataFlag(keys: Sequence[str]) -> Optional[Any]:
-        for source in metadataSources:
-            for key in keys:
-                if key in source:
-                    return source.get(key)
-        return None
-
-    amsConfiguration = extractMetadataFlag(["ams_configuration", "amsConfiguration"])
-    amsExplicitFlag = extractMetadataFlag(["useAms", "use_ams"])
-    resolvedUseAms = bool(options.useAms)
-    if amsConfiguration is not None:
-        resolvedUseAms = bool(amsConfiguration)
-    elif amsExplicitFlag is not None:
-        resolvedUseAms = bool(amsExplicitFlag)
+    resolvedUseAms = _decideUseAms(
+        jobMetadata,
+        fallbackPreference=bool(options.useAms),
+        forceSpool=not bool(options.useAms),
+    )
 
     with tempfile.TemporaryDirectory() as temporaryDirectory:
         paramPath: Optional[str] = None
