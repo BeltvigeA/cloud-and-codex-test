@@ -389,17 +389,8 @@ def testListenRequestsFreshDownloadWhenCachedFileMissing(
             "decryptedData": {},
         }
 
-    def fakeSendProductStatusUpdate(
-        _baseUrl: str,
-        _productId: str,
-        _recipientId: str,
-        _payload: dict[str, object],
-    ) -> bool:
-        return True
-
     monkeypatch.setattr(client, "fetchPendingFiles", fakeFetchPendingFiles)
     monkeypatch.setattr(client, "performFetch", fakePerformFetch)
-    monkeypatch.setattr(client, "sendProductStatusUpdate", fakeSendProductStatusUpdate)
 
     logFilePath = tmp_path / "listener-log.json"
     client.listenForFiles(

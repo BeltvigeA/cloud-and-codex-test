@@ -69,7 +69,6 @@ def test_dispatchBambuPrintExtractsSkippedObjects(tmp_path: Path, monkeypatch: p
         return {"remoteFile": "uploaded.3mf", "method": "lan"}
 
     monkeypatch.setattr(client, "sendBambuPrintJob", fakeSendBambuPrintJob)
-    monkeypatch.setattr(client, "sendProductStatusUpdate", lambda *_args, **_kwargs: True)
     monkeypatch.setattr(bambuPrinter.requests, "post", lambda *_args, **_kwargs: None)
 
     result = client.dispatchBambuPrintIfPossible(
@@ -127,7 +126,6 @@ def test_dispatchBambuPrintIncludesPrinterDetailsInErrors(
         raise RuntimeError("Connection failed for endpoint 192.168.0.8:990")
 
     monkeypatch.setattr(client, "sendBambuPrintJob", fakeSendBambuPrintJob)
-    monkeypatch.setattr(client, "sendProductStatusUpdate", lambda *_args, **_kwargs: True)
     monkeypatch.setattr(bambuPrinter.requests, "post", lambda *_args, **_kwargs: None)
 
     caplog.set_level(logging.ERROR)
@@ -232,7 +230,6 @@ def test_dispatchBambuPrintUsesBambulabsApiWhenConfigured(
     monkeypatch.setattr(bambuPrinter, "uploadViaBambulabsApi", fakeUploadViaBambulabsApi)
     monkeypatch.setattr(bambuPrinter, "uploadViaFtps", failUploadViaFtps)
     monkeypatch.setattr(bambuPrinter, "startPrintViaMqtt", lambda **_kwargs: None)
-    monkeypatch.setattr(client, "sendProductStatusUpdate", lambda *_args, **_kwargs: True)
     monkeypatch.setattr(bambuPrinter.requests, "post", lambda *_args, **_kwargs: None)
 
     result = client.dispatchBambuPrintIfPossible(

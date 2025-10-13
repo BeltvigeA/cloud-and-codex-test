@@ -1289,44 +1289,20 @@ def startPrintViaMqtt(
 
 
 def postStatus(status: Dict[str, Any], printerConfig: Dict[str, Any]) -> None:
-    """Send the latest printer status to the configured remote endpoint."""
-
-    statusUrl = (
-        printerConfig.get("statusBaseUrl")
-        or os.getenv("BASE44_STATUS_URL")
-    )
-    apiKey = (
-        printerConfig.get("statusApiKey")
-        or os.getenv("PRINTER_API_TOKEN")
-    )
-    if not statusUrl or not apiKey:
-        return
+    """Log the latest printer status; Base44 reporter handles network posting."""
 
     resolvedPayload = buildBase44StatusPayload(status, printerConfig)
     if not resolvedPayload:
         return
 
-    headers = {"Content-Type": "application/json", "X-API-Key": apiKey}
-    logLine = (
-        f"[POST] {statusUrl} "
-        f"recipientId={resolvedPayload.get('recipientId')} "
-        f"ip={resolvedPayload.get('printerIpAddress')} "
-        f"status={resolvedPayload.get('status')} "
-        f"bed={resolvedPayload.get('bedTemp')} "
-        f"nozzle={resolvedPayload.get('nozzleTemp')}"
+    logger.debug(
+        "Status ready for Base44 reporter: recipientId=%s ip=%s status=%s bed=%s nozzle=%s",
+        resolvedPayload.get("recipientId"),
+        resolvedPayload.get("printerIpAddress"),
+        resolvedPayload.get("status"),
+        resolvedPayload.get("bedTemp"),
+        resolvedPayload.get("nozzleTemp"),
     )
-    logger.info(logLine)
-
-    try:
-        response = requests.post(statusUrl, headers=headers, json=resolvedPayload, timeout=8)
-        responseText = (response.text or "").strip()
-        logger.info(
-            "[POST][resp] code=%s body=%s",
-            response.status_code,
-            responseText[:200],
-        )
-    except Exception as error:  # pragma: no cover - network interaction best-effort
-        logger.warning("[POST][error] %s", error)
 
 
 def buildStatusPayload(printer: Any) -> Dict[str, Any]:
@@ -1562,7 +1538,6 @@ def buildBase44StatusPayload(status: Dict[str, Any], printerConfig: Dict[str, An
     recipientId = (
         resolveStatusValue(status, printerConfig, ["recipientId"], ["statusRecipientId"])
         or os.getenv("RECIPIENT_ID")
-        or "user-123"
     )
 
     printerIpAddress = resolveStatusValue(
