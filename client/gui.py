@@ -10,7 +10,7 @@ import socket
 import ssl
 import threading
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from queue import Empty, Queue
 from typing import Any, Callable, Dict, Optional
@@ -30,7 +30,14 @@ def addPrinterIdentityToPayload(
         payload["accessCode"] = accessCode
     return payload
 
-from .bambuPrinter import BambuPrintOptions, postStatus, sendBambuPrintJob, waitForMqttReady
+from .bambuPrinter import (
+    BambuPrintOptions,
+    postStatus,
+    sendBambuPrintJob,
+    startStatusHeartbeat,
+    upsertPrinterFromJobMetadata,
+    waitForMqttReady,
+)
 from .client import (
     appendJsonLogEntry,
     buildBaseUrl,
@@ -108,8 +115,10 @@ class ListenerGuiApp:
         self.printers: list[Dict[str, Any]] = self._loadPrinters()
         self.printerStatusQueue: "Queue[tuple[str, Any]]" = Queue()
         self.statusRefreshThread: Optional[threading.Thread] = None
-        self.statusRefreshIntervalMs = 60_000
+        self.statusRefreshIntervalMs = 30_000
         self.pendingImmediateStatusRefresh = False
+
+        self.statusHeartbeatEvents: Dict[str, threading.Event] = {}
 
         self.listenerRecipientId = ""
         self.listenerStatusApiKey = ""
@@ -415,6 +424,24 @@ class ListenerGuiApp:
             printerDetails.get("manualStatusDefaults")
         )
         return printerDetails
+
+    def _applyUpsertedPrinterRecord(self, printerRecord: Dict[str, Any]) -> None:
+        serialCandidate = self._parseOptionalString(printerRecord.get("serialNumber"))
+        if not serialCandidate:
+            return
+        loweredSerial = serialCandidate.lower()
+        for index, existing in enumerate(self.printers):
+            existingSerial = self._parseOptionalString(existing.get("serialNumber"))
+            if existingSerial and existingSerial.lower() == loweredSerial:
+                merged = dict(existing)
+                merged.update(printerRecord)
+                self.printers[index] = self._applyTelemetryDefaults(merged)
+                self._savePrinters()
+                self._refreshPrinterList()
+                return
+        self.printers.append(self._applyTelemetryDefaults(dict(printerRecord)))
+        self._savePrinters()
+        self._refreshPrinterList()
 
     def _sanitizeManualStatusDefaults(self, value: Any) -> Dict[str, Any]:
         sanitized: Dict[str, Any] = {}
@@ -1174,6 +1201,66 @@ class ListenerGuiApp:
                 continue
             pendingChanges: Dict[str, Any] = {}
             currentDetails = self.printers[index] if 0 <= index < len(self.printers) else {}
+
+            statusPayload = {
+                "status": telemetry.get("status") or currentDetails.get("status"),
+                "progress": self._parseOptionalFloat(telemetry.get("progressPercent")),
+                "nozzleTemp": self._parseOptionalFloat(telemetry.get("nozzleTemp")),
+                "bedTemp": self._parseOptionalFloat(telemetry.get("bedTemp")),
+                "remainingTimeSeconds": self._parseOptionalInt(telemetry.get("remainingTimeSeconds")),
+                "gcodeState": self._parseOptionalString(telemetry.get("gcodeState")),
+                "ip": self._parseOptionalString(printer.get("ipAddress")),
+                "serial": self._parseOptionalString(printer.get("serialNumber")),
+                "access_code": self._parseOptionalString(printer.get("accessCode")),
+                "lastSeen": datetime.now(timezone.utc).isoformat(),
+            }
+            try:
+                postStatus(statusPayload, currentDetails)
+            except Exception:  # noqa: BLE001 - heartbeat should not stop refresh loop
+                logging.debug(
+                    "Failed to push status heartbeat for %s", statusPayload.get("serial") or ipAddress, exc_info=True
+                )
+
+            serialCandidate = statusPayload.get("serial")
+            normalizedSerial = serialCandidate.lower() if isinstance(serialCandidate, str) else None
+            statusText = str(statusPayload.get("status") or "").strip().lower()
+            if normalizedSerial:
+                if statusText and statusText not in {"offline", "unknown"}:
+                    if normalizedSerial not in self.statusHeartbeatEvents:
+                        def heartbeatSupplier(serialKey: str = normalizedSerial) -> Dict[str, Any]:
+                            latest = next(
+                                (
+                                    record
+                                    for record in self.printers
+                                    if self._parseOptionalString(record.get("serialNumber"))
+                                    and self._parseOptionalString(record.get("serialNumber")).lower() == serialKey
+                                ),
+                                currentDetails,
+                            )
+                            return {
+                                "status": latest.get("status"),
+                                "progress": self._parseOptionalFloat(latest.get("progressPercent")),
+                                "nozzleTemp": self._parseOptionalFloat(latest.get("nozzleTemp")),
+                                "bedTemp": self._parseOptionalFloat(latest.get("bedTemp")),
+                                "remainingTimeSeconds": self._parseOptionalInt(latest.get("remainingTimeSeconds")),
+                                "gcodeState": self._parseOptionalString(latest.get("gcodeState")),
+                                "ip": self._parseOptionalString(latest.get("ipAddress")),
+                                "serial": self._parseOptionalString(latest.get("serialNumber")),
+                                "access_code": self._parseOptionalString(latest.get("accessCode")),
+                                "lastSeen": datetime.now(timezone.utc).isoformat(),
+                            }
+
+                        stopEvent = startStatusHeartbeat(
+                            currentDetails,
+                            currentDetails,
+                            intervalSeconds=30.0,
+                            statusSupplier=heartbeatSupplier,
+                        )
+                        self.statusHeartbeatEvents[normalizedSerial] = stopEvent
+                elif normalizedSerial in self.statusHeartbeatEvents:
+                    stopEvent = self.statusHeartbeatEvents.pop(normalizedSerial)
+                    stopEvent.set()
+
             for key, value in telemetry.items():
                 if currentDetails.get(key) != value:
                     pendingChanges[key] = value
@@ -1720,6 +1807,12 @@ class ListenerGuiApp:
             self.log("Ingen printer i printers.json – kan ikke sende.")
             return
 
+        metadataForUpsert = metadata.get("unencryptedData") if isinstance(metadata.get("unencryptedData"), dict) else metadata
+        upsertedRecord = upsertPrinterFromJobMetadata(metadataForUpsert)
+        if upsertedRecord:
+            printerConfig.update({key: value for key, value in upsertedRecord.items() if value not in (None, "")})
+            self._applyUpsertedPrinterRecord(upsertedRecord)
+
         def resolveText(key: str) -> Optional[str]:
             for source in (metadata, printerConfig):
                 value = source.get(key)
@@ -1791,6 +1884,8 @@ class ListenerGuiApp:
                 sendBambuPrintJob(
                     filePath=path,
                     options=options,
+                    statusConfig=printerConfig,
+                    jobMetadata=metadata,
                     statusCallback=lambda status: (
                         self.log(json.dumps(status)),
                         postStatus(status, printerConfig),

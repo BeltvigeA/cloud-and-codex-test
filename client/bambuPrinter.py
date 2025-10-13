@@ -17,9 +17,10 @@ import uuid
 import zipfile
 import xml.etree.ElementTree as ET
 import logging
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
-from threading import Event
+from threading import Event, Lock, Thread
 from typing import Any, BinaryIO, Callable, Dict, Iterable, List, Optional, Sequence, Union
 
 from urllib.parse import urljoin
@@ -42,6 +43,11 @@ else:
 
 
 logger = logging.getLogger(__name__)
+
+_defaultPrinterStoragePath = Path.home() / ".printmaster" / "printers.json"
+_printerStorageLock = Lock()
+_statusHeartbeatLock = Lock()
+_statusHeartbeatEvents: Dict[str, Event] = {}
 
 
 def makeTlsContext(insecure: bool = True) -> ssl.SSLContext:
@@ -302,33 +308,26 @@ def uploadViaFtps(
             if "550" not in errorText:
                 raise
 
-            lastError: Optional[error_perm] = initialError
-            for attempt in range(1, 6):
-                alternativeName = buildAlternativeName(attempt)
-                logger.warning(
-                    "FTPS 550 on %s, retrying with alternative name", currentFileName
-                )
-                reactivateStor(ftps)
-                storageCommand = buildStorageCommand(alternativeName)
-                logger.debug(
-                    "FTPS STOR command: %s  (fileName=%s,len=%d)",
-                    storageCommand,
-                    alternativeName,
-                    len(alternativeName),
-                )
-                try:
-                    performUpload(storageCommand, alternativeName)
-                    return alternativeName
-                except error_perm as uploadError:
-                    lastError = uploadError
-                    currentFileName = alternativeName
-                    if "550" in str(uploadError) and attempt < 5:
-                        continue
-                    raise
-
-            if lastError is not None:
-                raise lastError
-            raise RuntimeError("FTPS upload failed without specific error")
+            alternativeName = buildAlternativeName(1)
+            logger.warning(
+                "FTPS 550 på %s – prøver alternativt navn før vi faller tilbake til API.",
+                currentFileName,
+            )
+            reactivateStor(ftps)
+            storageCommand = buildStorageCommand(alternativeName)
+            logger.debug(
+                "FTPS STOR command: %s  (fileName=%s,len=%d)",
+                storageCommand,
+                alternativeName,
+                len(alternativeName),
+            )
+            try:
+                performUpload(storageCommand, alternativeName)
+                return alternativeName
+            except error_perm as retryError:
+                if "550" in str(retryError):
+                    raise retryError
+                raise
     finally:
         try:
             ftps.quit()
@@ -378,8 +377,9 @@ def _extractPrinterState(candidate: Any) -> Optional[str]:
 def waitForMqttReady(
     printer: Any,
     *,
-    timeoutSeconds: float = 10.0,
-    pollIntervalSeconds: float = 0.3,
+    timeoutSeconds: float = 25.0,
+    pollIntervalSeconds: float = 0.5,
+    logCooldownSeconds: float = 5.0,
 ) -> bool:
     """Block until the bambulabs_api printer reports ready MQTT state."""
 
@@ -388,6 +388,7 @@ def waitForMqttReady(
     statusAccessor = getattr(printer, "get_status", None)
     startTime = time.monotonic()
     lastError: Optional[Exception] = None
+    lastLogTime = 0.0
 
     while time.monotonic() - startTime < timeoutSeconds:
         try:
@@ -403,11 +404,20 @@ def waitForMqttReady(
                 return True
         except Exception as error:  # pragma: no cover - depends on printer timing
             lastError = error
+            now = time.monotonic()
+            if now - lastLogTime >= logCooldownSeconds:
+                errorText = str(error).strip()
+                if errorText:
+                    logger.debug("MQTT ikke klar ennå: %s", errorText)
+                else:
+                    logger.debug("MQTT ikke klar ennå")
+                lastLogTime = now
 
         time.sleep(pollIntervalSeconds)
 
     if lastError is not None:
         logger.debug("MQTT forble utilgjengelig i ventetiden", exc_info=lastError)
+    logger.error("MQTT ble ikke klar innen %.1fs – fortsetter med forsiktig start/monitor.", timeoutSeconds)
     return False
 
 
@@ -1021,30 +1031,321 @@ def postStatus(status: Dict[str, Any], printerConfig: Dict[str, Any]) -> None:
 
     url = printerConfig.get("statusBaseUrl")
     apiKey = printerConfig.get("statusApiKey")
-    recipientId = printerConfig.get("statusRecipientId")
     if not url or not apiKey:
         return
+
+    recipientId = printerConfig.get("statusRecipientId")
+
+    def pick(keys: Sequence[str], fallback: Any = None) -> Any:
+        for key in keys:
+            if key in status and status.get(key) is not None:
+                return status.get(key)
+        return fallback
+
+    nowIso = datetime.now(timezone.utc).isoformat()
+    serialValue = pick(["serial", "serialNumber"], printerConfig.get("serialNumber"))
+    ipValue = pick(["ip", "ipAddress"], printerConfig.get("ipAddress"))
+    accessCodeValue = pick(["access_code", "accessCode"], printerConfig.get("accessCode"))
+    progressValue = pick(["progress", "progressPercent", "mc_percent"])
+    remainingValue = pick(["remainingTimeSeconds", "mc_remaining_time"])
+    nozzleValue = pick(["nozzle_temp", "nozzleTemp", "nozzle_temper"])
+    bedValue = pick(["bed_temp", "bedTemp", "bed_temper"])
+    gcodeStateValue = pick(["gcodeState", "gcode_state"])
+    statusValue = pick(["status", "state"]) or ("Online" if progressValue else None)
 
     payload = {
         "apiKey": apiKey,
         "recipientId": recipientId,
-        "serialNumber": printerConfig.get("serialNumber"),
-        "ipAddress": printerConfig.get("ipAddress"),
-        "status": status.get("status") or status.get("state"),
-        "nozzleTemp": status.get("nozzle_temper") or status.get("nozzleTemp"),
-        "bedTemp": status.get("bed_temper") or status.get("bedTemp"),
-        "progressPercent": status.get("mc_percent")
-        or status.get("progress")
-        or status.get("progressPercent"),
-        "remainingTimeSeconds": status.get("mc_remaining_time")
-        or status.get("remainingTimeSeconds"),
-        "gcodeState": status.get("gcode_state") or status.get("gcodeState"),
+        "serialNumber": serialValue,
+        "ipAddress": ipValue,
+        "accessCode": accessCodeValue,
+        "status": statusValue,
+        "nozzleTemp": nozzleValue,
+        "bedTemp": bedValue,
+        "progressPercent": float(progressValue) if progressValue is not None else None,
+        "remainingTimeSeconds": int(remainingValue) if remainingValue not in (None, "") else None,
+        "gcodeState": gcodeStateValue,
+        "lastSeen": pick(["lastSeen"], nowIso) or nowIso,
     }
 
-    try:
-        requests.post(url, json=payload, timeout=5)
-    except Exception:  # pragma: no cover - logging optional
-        logger.debug("Failed to post status update", exc_info=True)
+    normalizedStatus = (payload.get("status") or "").strip().lower()
+    payload["online"] = normalizedStatus not in {"", "offline", "unknown"}
+
+    backoff = 1.0
+    maxAttempts = 3
+    for attempt in range(1, maxAttempts + 1):
+        try:
+            response = requests.post(url, json=payload, timeout=8)
+            response.raise_for_status()
+            return
+        except Exception as error:  # pragma: no cover - network interaction best-effort
+            if attempt >= maxAttempts:
+                logger.debug("Failed to post status update", exc_info=error)
+                return
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 30.0)
+
+
+def buildStatusPayload(printer: Any) -> Dict[str, Any]:
+    """Construct a status payload from a printer-like object."""
+
+    def safeCall(name: str) -> Any:
+        method = getattr(printer, name, None)
+        if method is None or not callable(method):
+            return None
+        try:
+            return method()
+        except Exception:
+            return None
+
+    def normalizeText(value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
+
+    def normalizeFloat(value: Any) -> Optional[float]:
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def normalizeInt(value: Any) -> Optional[int]:
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    stateValue = normalizeText(safeCall("get_state")) or normalizeText(getattr(printer, "state", None))
+    gcodeStateValue = normalizeText(safeCall("get_gcode_state")) or normalizeText(getattr(printer, "gcode_state", None))
+    progressValue = normalizeFloat(safeCall("get_percentage"))
+    if progressValue is None:
+        progressValue = normalizeFloat(getattr(printer, "percentage", None))
+    nozzleValue = normalizeFloat(safeCall("get_nozzle_temperature"))
+    if nozzleValue is None:
+        nozzleValue = normalizeFloat(getattr(printer, "nozzle_temperature", None))
+    bedValue = normalizeFloat(safeCall("get_bed_temperature"))
+    if bedValue is None:
+        bedValue = normalizeFloat(getattr(printer, "bed_temperature", None))
+    remainingValue = normalizeInt(safeCall("get_remaining_time"))
+
+    ipValue = (
+        normalizeText(getattr(printer, "ip", None))
+        or normalizeText(getattr(printer, "ipAddress", None))
+        or normalizeText(getattr(printer, "host", None))
+    )
+    serialValue = (
+        normalizeText(getattr(printer, "serial", None))
+        or normalizeText(getattr(printer, "serialNumber", None))
+        or normalizeText(getattr(printer, "sn", None))
+    )
+    accessCodeValue = (
+        normalizeText(getattr(printer, "access_code", None))
+        or normalizeText(getattr(printer, "accessCode", None))
+    )
+
+    lastSeen = datetime.now(timezone.utc).isoformat()
+    statusText = stateValue or ("Printing" if (progressValue or 0.0) > 0.0 else "Online")
+
+    return {
+        "status": statusText,
+        "gcodeState": gcodeStateValue,
+        "progress": progressValue,
+        "nozzleTemp": nozzleValue,
+        "bedTemp": bedValue,
+        "remainingTimeSeconds": remainingValue,
+        "ip": ipValue,
+        "serial": serialValue,
+        "access_code": accessCodeValue,
+        "online": bool(statusText and statusText.lower() not in {"offline", "unknown"}),
+        "lastSeen": lastSeen,
+    }
+
+
+def startStatusHeartbeat(
+    printer: Any,
+    printerConfig: Dict[str, Any],
+    *,
+    intervalSeconds: float = 30.0,
+    statusSupplier: Optional[Callable[[], Dict[str, Any]]] = None,
+) -> Event:
+    """Start a background heartbeat thread that posts printer status periodically."""
+
+    heartbeatKey = (
+        str(printerConfig.get("serialNumber") or "")
+        or normalizeRemoteFileName(str(getattr(printer, "serial", getattr(printer, "serialNumber", "")) or "heartbeat"))
+    )
+
+    with _statusHeartbeatLock:
+        existing = _statusHeartbeatEvents.get(heartbeatKey)
+        if existing and not existing.is_set():
+            return existing
+        stopEvent = Event()
+        _statusHeartbeatEvents[heartbeatKey] = stopEvent
+
+    intervalSeconds = max(5.0, float(intervalSeconds))
+
+    def runHeartbeat() -> None:
+        try:
+            while not stopEvent.is_set():
+                try:
+                    snapshot = statusSupplier() if statusSupplier else buildStatusPayload(printer)
+                except Exception as error:  # pragma: no cover - defensive logging
+                    logger.debug("Heartbeat snapshot failed", exc_info=error)
+                    snapshot = {}
+                if not isinstance(snapshot, dict):
+                    snapshot = {}
+                snapshot.setdefault("lastSeen", datetime.now(timezone.utc).isoformat())
+                try:
+                    postStatus(snapshot, printerConfig)
+                except Exception:  # pragma: no cover - status posting best-effort
+                    logger.debug("Heartbeat post failed", exc_info=True)
+                stopEvent.wait(intervalSeconds)
+        finally:
+            with _statusHeartbeatLock:
+                current = _statusHeartbeatEvents.get(heartbeatKey)
+                if current is stopEvent:
+                    _statusHeartbeatEvents.pop(heartbeatKey, None)
+
+    threadName = f"status-hb-{heartbeatKey}"[-60:]
+    Thread(target=runHeartbeat, name=threadName, daemon=True).start()
+    return stopEvent
+
+
+def loadLocalPrinters(storagePath: Optional[Union[str, Path]] = None) -> List[Dict[str, Any]]:
+    """Load the locally persisted printer configuration."""
+
+    path = Path(storagePath) if storagePath else _defaultPrinterStoragePath
+    if not path.exists():
+        return []
+
+    with _printerStorageLock:
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except (OSError, json.JSONDecodeError) as error:
+            logger.warning("Unable to load printers from %s: %s", path, error)
+            return []
+
+    if not isinstance(payload, list):
+        return []
+    printers: List[Dict[str, Any]] = []
+    for entry in payload:
+        if isinstance(entry, dict):
+            printers.append(dict(entry))
+    return printers
+
+
+def saveLocalPrinters(
+    printers: Sequence[Dict[str, Any]],
+    storagePath: Optional[Union[str, Path]] = None,
+) -> Path:
+    """Persist the provided printer configuration to disk."""
+
+    path = Path(storagePath) if storagePath else _defaultPrinterStoragePath
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with _printerStorageLock:
+        with path.open("w", encoding="utf-8") as handle:
+            json.dump(list(printers), handle, ensure_ascii=False, indent=2)
+    return path
+
+
+def upsertPrinterFromJobMetadata(
+    jobMetadata: Optional[Dict[str, Any]],
+    *,
+    storagePath: Optional[Union[str, Path]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Update or insert a printer configuration entry based on job metadata."""
+
+    if not isinstance(jobMetadata, dict):
+        return None
+
+    metadataSources: List[Dict[str, Any]] = [jobMetadata]
+    unencryptedData = jobMetadata.get("unencryptedData")
+    if isinstance(unencryptedData, dict):
+        metadataSources.append(unencryptedData)
+
+    def extract(keys: Sequence[str]) -> Optional[str]:
+        for source in metadataSources:
+            for key in keys:
+                if key in source:
+                    value = source.get(key)
+                    if value is not None and str(value).strip():
+                        return str(value).strip()
+        return None
+
+    serialNumber = extract(
+        [
+            "serial_number",
+            "serialNumber",
+            "serial",
+            "printer_serial",
+            "printerSerial",
+        ]
+    )
+    ipAddress = extract(["ip_address", "ipAddress", "lan_ip", "ip"])
+    accessCode = extract(["access_code", "accessCode", "lan_access_code", "lanCode"])
+    nickname = extract(["printer_name", "printerName", "nickname"]) or serialNumber
+
+    if not serialNumber or (ipAddress is None and accessCode is None):
+        return None
+
+    storage = storagePath or _defaultPrinterStoragePath
+    printers = loadLocalPrinters(storage)
+
+    serialLower = serialNumber.lower()
+    updatedRecord: Optional[Dict[str, Any]] = None
+    for index, entry in enumerate(printers):
+        existingSerial = str(entry.get("serialNumber") or "").strip().lower()
+        if existingSerial != serialLower:
+            continue
+        updated = dict(entry)
+        changed = False
+        if ipAddress and updated.get("ipAddress") != ipAddress:
+            updated["ipAddress"] = ipAddress
+            changed = True
+        if accessCode is not None and str(updated.get("accessCode")) != str(accessCode):
+            updated["accessCode"] = str(accessCode)
+            changed = True
+        if nickname and updated.get("nickname") != nickname:
+            updated["nickname"] = nickname
+            changed = True
+        if changed:
+            printers[index] = updated
+            saveLocalPrinters(printers, storage)
+            logger.info(
+                "Oppdaterte lokal printer '%s' (%s) med IP=%s og AccessCode=%s fra jobben.",
+                updated.get("nickname") or updated.get("ipAddress") or serialNumber,
+                serialNumber,
+                ipAddress,
+                accessCode,
+            )
+        updatedRecord = updated
+        break
+
+    if updatedRecord is None:
+        newEntry = {
+            "nickname": nickname or serialNumber,
+            "ipAddress": ipAddress or "",
+            "accessCode": str(accessCode) if accessCode is not None else "",
+            "serialNumber": serialNumber,
+            "brand": "Bambu Lab",
+        }
+        printers.append(newEntry)
+        saveLocalPrinters(printers, storage)
+        logger.info(
+            "La til ny skriver fra jobben: serial=%s ip=%s access=%s",
+            serialNumber,
+            ipAddress,
+            accessCode,
+        )
+        updatedRecord = newEntry
+
+    return updatedRecord
 
 
 @dataclass(frozen=True)
@@ -1257,6 +1558,8 @@ def sendBambuPrintJob(
     *,
     filePath: Path,
     options: BambuPrintOptions,
+    statusConfig: Optional[Dict[str, Any]] = None,
+    jobMetadata: Optional[Dict[str, Any]] = None,
     statusCallback: Optional[Callable[[Dict[str, Any]], None]] = None,
     skippedObjects: Optional[Sequence[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
@@ -1275,6 +1578,28 @@ def sendBambuPrintJob(
     remoteName = buildPrinterTransferFileName(resolvedPath)
     assert remoteName.lower().endswith(".3mf"), f"remoteName må være .3mf, fikk: {remoteName}"
     logger.debug("Resolved remote file name for upload: %s", remoteName)
+
+    metadataSources: List[Dict[str, Any]] = []
+    if isinstance(jobMetadata, dict):
+        metadataSources.append(jobMetadata)
+        unencrypted = jobMetadata.get("unencryptedData")
+        if isinstance(unencrypted, dict):
+            metadataSources.append(unencrypted)
+
+    def extractMetadataFlag(keys: Sequence[str]) -> Optional[Any]:
+        for source in metadataSources:
+            for key in keys:
+                if key in source:
+                    return source.get(key)
+        return None
+
+    amsConfiguration = extractMetadataFlag(["ams_configuration", "amsConfiguration"])
+    amsExplicitFlag = extractMetadataFlag(["useAms", "use_ams"])
+    resolvedUseAms = bool(options.useAms)
+    if amsConfiguration is not None:
+        resolvedUseAms = bool(amsConfiguration)
+    elif amsExplicitFlag is not None:
+        resolvedUseAms = bool(amsExplicitFlag)
 
     with tempfile.TemporaryDirectory() as temporaryDirectory:
         paramPath: Optional[str] = None
@@ -1322,7 +1647,7 @@ def sendBambuPrintJob(
                 safeName=remoteName,
                 paramPath=paramPath,
                 plateIndex=plateIndex,
-                useAms=options.useAms,
+                useAms=resolvedUseAms,
                 bedLeveling=options.bedLeveling,
                 layerInspect=options.layerInspect,
                 flowCalibration=options.flowCalibration,
@@ -1360,18 +1685,20 @@ def sendBambuPrintJob(
                     "status": "starting",
                     "url": f"file:///sdcard/{uploaded}",
                     "param": paramPath,
-                    "useAms": bool(options.useAms),
+                    "useAms": bool(resolvedUseAms),
                     "bedLeveling": bool(options.bedLeveling),
                     "layerInspect": bool(options.layerInspect),
                     "flowCalibration": bool(options.flowCalibration),
                     "vibrationCalibration": bool(options.vibrationCalibration),
                 }
+                if statusConfig:
+                    postStatus(initialStatusPayload, statusConfig)
                 startViaBambuapiAfterUpload(
                     session.printer,
                     uploaded,
                     paramPath,
                     plateIndex,
-                    useAms=bool(options.useAms),
+                    useAms=bool(resolvedUseAms),
                     ip=options.ipAddress,
                     accessCode=options.accessCode,
                     serial=options.serialNumber,
@@ -1385,7 +1712,7 @@ def sendBambuPrintJob(
                 accessCode=options.accessCode,
                 sdFileName=uploaded,
                 paramPath=paramPath,
-                useAms=options.useAms,
+                useAms=resolvedUseAms,
                 bedLeveling=options.bedLeveling,
                 layerInspect=options.layerInspect,
                 flowCalibration=options.flowCalibration,
@@ -1420,11 +1747,15 @@ __all__ = [
     "buildCloudJobPayload",
     "buildRemoteFileName",
     "buildPrinterTransferFileName",
+    "buildStatusPayload",
     "encodeFileToBase64",
     "makeTlsContext",
     "applySkippedObjectsToArchive",
     "pickGcodeParamFrom3mf",
     "postStatus",
+    "loadLocalPrinters",
+    "saveLocalPrinters",
+    "startStatusHeartbeat",
     "BambuApiUploadSession",
     "publishSpoolStart",
     "uploadViaBambulabsApi",
@@ -1437,5 +1768,6 @@ __all__ = [
     "waitForMqttReady",
     "ensureMqttConnected",
     "waitForStartAck",
+    "upsertPrinterFromJobMetadata",
 ]
 
