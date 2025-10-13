@@ -20,7 +20,7 @@ from tkinter import filedialog, messagebox, ttk
 
 import requests
 
-from .base44Status import Base44Reporter, getDefaultPrinterApiToken
+from .base44_status import Base44StatusReporter, getDefaultPrinterApiToken
 
 
 def addPrinterIdentityToPayload(
@@ -125,11 +125,12 @@ class ListenerGuiApp:
         self.listenerRecipientId = ""
         self.listenerStatusApiKey = ""
 
-        self.base44Reporter = Base44Reporter(
-            getActiveRecipientId=self._getActiveRecipientIdForBase44,
-            listConnectedPrinters=self._listPrintersForBase44,
-            snapshotFunc=self._buildBase44Snapshot,
+        self.base44Reporter = Base44StatusReporter(
+            getRecipientId=self._getActiveRecipientIdForBase44,
             getApiKey=self._getBase44ApiKey,
+            listConnectedPrinters=self._listPrintersForBase44,
+            buildSnapshot=self._buildBase44Snapshot,
+            intervalSeconds=5.0,
         )
 
         self._buildLayout()
