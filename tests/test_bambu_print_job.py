@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import sys
+import copy
 import xml.etree.ElementTree as ET
 import zipfile
 from pathlib import Path
+from typing import Any, Dict
 
 import pytest
 
@@ -248,6 +250,136 @@ def test_sendBambuPrintJobWrapsGcodeInThreeMf(
     assert localPath.suffix == ".3mf"
     capturedBytes = uploadCapture.get("gcodeBytes")
     assert capturedBytes == gcodeContent.encode("utf-8")
+
+
+@pytest.mark.parametrize(
+    (
+        "metadataInput",
+        "optionsUseAms",
+        "expectedUseAms",
+    ),
+    [
+        pytest.param(
+            {"unencryptedData": {"ams_configuration": None}},
+            True,
+            False,
+            id="null-config",
+        ),
+        pytest.param(
+            {
+                "unencryptedData": {
+                    "ams_configuration": {
+                        "enabled": True,
+                        "slots": [{"slot": 1}],
+                    }
+                }
+            },
+            True,
+            True,
+            id="enabled-with-slots",
+        ),
+        pytest.param(
+            {
+                "unencryptedData": {
+                    "ams_configuration": {
+                        "enabled": True,
+                        "slots": [{"slot": 1}],
+                    },
+                    "is_quick_print": "true",
+                }
+            },
+            True,
+            False,
+            id="quick-print",
+        ),
+        pytest.param(
+            {
+                "unencryptedData": {
+                    "ams_configuration": {
+                        "enabled": True,
+                        "slots": [{"slot": 1}],
+                    }
+                }
+            },
+            False,
+            False,
+            id="forced-spool",
+        ),
+    ],
+)
+def test_sendBambuPrintJobDecidesUseAmsBasedOnMetadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    metadataInput: Dict[str, Any],
+    optionsUseAms: bool,
+    expectedUseAms: bool,
+) -> None:
+    samplePath = tmp_path / "metadata.3mf"
+    createSampleThreeMf(samplePath)
+
+    def fakeUploadViaBambulabsApi(
+        *,
+        ip: str,
+        serial: str,
+        accessCode: str,
+        localPath: Path,
+        remoteName: str,
+        returnPrinter: bool,
+        **_kwargs: object,
+    ):
+        session = bambuPrinter.BambuApiUploadSession(
+            printer=object(),
+            remoteName="uploaded.3mf",
+            connectCamera=False,
+            mqttStarted=True,
+        )
+        if returnPrinter:
+            return session
+        return session.remoteName
+
+    startRecorder: Dict[str, Any] = {}
+
+    def fakeStartViaBambuapi(
+        printer: object,
+        remoteName: str,
+        paramPath: str | None,
+        plateIndex: int | None,
+        **kwargs: object,
+    ) -> bool:
+        startRecorder["apiUseAms"] = kwargs.get("useAms")
+        return True
+
+    def fakeStartPrint(**kwargs: object) -> None:
+        startRecorder["mqtt"] = kwargs
+
+    monkeypatch.setattr(bambuPrinter, "uploadViaBambulabsApi", fakeUploadViaBambulabsApi)
+    monkeypatch.setattr(bambuPrinter, "startViaBambuapiAfterUpload", fakeStartViaBambuapi)
+    monkeypatch.setattr(bambuPrinter, "startPrintViaMqtt", fakeStartPrint)
+
+    options = bambuPrinter.BambuPrintOptions(
+        ipAddress="192.168.0.10",
+        serialNumber="SERIAL-META",
+        accessCode="ACCESS",
+        useCloud=False,
+        waitSeconds=0,
+        useAms=optionsUseAms,
+    )
+
+    metadata = copy.deepcopy(metadataInput)
+
+    bambuPrinter.sendBambuPrintJob(
+        filePath=samplePath,
+        options=options,
+        jobMetadata=metadata,
+    )
+
+    assert startRecorder.get("apiUseAms") is expectedUseAms
+    mqttPayload = startRecorder.get("mqtt")
+    assert isinstance(mqttPayload, dict)
+    assert mqttPayload.get("useAms") is expectedUseAms
+    initialStatus = mqttPayload.get("initialStatus")
+    assert isinstance(initialStatus, dict)
+    assert initialStatus.get("useAms") is expectedUseAms
 
 
 def test_applySkippedObjectsToArchiveRejectsUnknownOrder(
