@@ -524,6 +524,13 @@ def runCli() -> None:
             rprint(f"[red]Filen finnes ikke: {filePath}[/red]")
             sys.exit(1)
 
+        if args.useBambuConnect:
+            if filePath.suffix.lower() != ".3mf":
+                rprint("[red]Bambu Connect-import krever .3mf. Lagre/eksporter som .3mf først.[/red]")
+                sys.exit(2)
+            openInBambuConnect(filePath)
+            sys.exit(0)
+
         jobMetadata: Dict[str, Any] = {}
         if args.jobMetadata:
             jobMetadata = json.loads(Path(args.jobMetadata).read_text(encoding="utf-8"))
@@ -536,13 +543,6 @@ def runCli() -> None:
         except Exception as error:
             rprint(f"[bold red]{error}[/bold red]")
             sys.exit(2)
-
-        if args.useBambuConnect:
-            if filePath.suffix.lower() != ".3mf":
-                rprint("[red]Bambu Connect-import krever .3mf. Lagre/eksporter som .3mf først.[/red]")
-                sys.exit(2)
-            openInBambuConnect(filePath)
-            sys.exit(0)
 
         uploadName = sanitizeUploadName(args.uploadName or (filePath.stem + ".3mf"))
         useAmsValue = parseUseAms(args.useAms)
