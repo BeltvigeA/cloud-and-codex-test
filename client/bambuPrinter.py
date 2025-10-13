@@ -50,6 +50,12 @@ _statusHeartbeatLock = Lock()
 _statusHeartbeatEvents: Dict[str, Event] = {}
 
 
+def isoNow() -> str:
+    """Return the current UTC timestamp formatted for Base44 payloads."""
+
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
 def portOpen(ip: str, port: int, timeoutSeconds: float = 3.0) -> bool:
     """Check whether a TCP port is reachable on the specified host."""
 
@@ -1285,61 +1291,42 @@ def startPrintViaMqtt(
 def postStatus(status: Dict[str, Any], printerConfig: Dict[str, Any]) -> None:
     """Send the latest printer status to the configured remote endpoint."""
 
-    url = printerConfig.get("statusBaseUrl")
-    apiKey = printerConfig.get("statusApiKey")
-    if not url or not apiKey:
+    statusUrl = (
+        printerConfig.get("statusBaseUrl")
+        or os.getenv("BASE44_STATUS_URL")
+    )
+    apiKey = (
+        printerConfig.get("statusApiKey")
+        or os.getenv("PRINTER_API_TOKEN")
+    )
+    if not statusUrl or not apiKey:
         return
 
-    recipientId = printerConfig.get("statusRecipientId")
+    resolvedPayload = buildBase44StatusPayload(status, printerConfig)
+    if not resolvedPayload:
+        return
 
-    def pick(keys: Sequence[str], fallback: Any = None) -> Any:
-        for key in keys:
-            if key in status and status.get(key) is not None:
-                return status.get(key)
-        return fallback
+    headers = {"Content-Type": "application/json", "X-API-Key": apiKey}
+    logLine = (
+        f"[POST] {statusUrl} "
+        f"recipientId={resolvedPayload.get('recipientId')} "
+        f"ip={resolvedPayload.get('printerIpAddress')} "
+        f"status={resolvedPayload.get('status')} "
+        f"bed={resolvedPayload.get('bedTemp')} "
+        f"nozzle={resolvedPayload.get('nozzleTemp')}"
+    )
+    logger.info(logLine)
 
-    nowIso = datetime.now(timezone.utc).isoformat()
-    serialValue = pick(["serial", "serialNumber"], printerConfig.get("serialNumber"))
-    ipValue = pick(["ip", "ipAddress"], printerConfig.get("ipAddress"))
-    accessCodeValue = pick(["access_code", "accessCode"], printerConfig.get("accessCode"))
-    progressValue = pick(["progress", "progressPercent", "mc_percent"])
-    remainingValue = pick(["remainingTimeSeconds", "mc_remaining_time"])
-    nozzleValue = pick(["nozzle_temp", "nozzleTemp", "nozzle_temper"])
-    bedValue = pick(["bed_temp", "bedTemp", "bed_temper"])
-    gcodeStateValue = pick(["gcodeState", "gcode_state"])
-    statusValue = pick(["status", "state"]) or ("Online" if progressValue else None)
-
-    payload = {
-        "apiKey": apiKey,
-        "recipientId": recipientId,
-        "serialNumber": serialValue,
-        "ipAddress": ipValue,
-        "accessCode": accessCodeValue,
-        "status": statusValue,
-        "nozzleTemp": nozzleValue,
-        "bedTemp": bedValue,
-        "progressPercent": float(progressValue) if progressValue is not None else None,
-        "remainingTimeSeconds": int(remainingValue) if remainingValue not in (None, "") else None,
-        "gcodeState": gcodeStateValue,
-        "lastSeen": pick(["lastSeen"], nowIso) or nowIso,
-    }
-
-    normalizedStatus = (payload.get("status") or "").strip().lower()
-    payload["online"] = normalizedStatus not in {"", "offline", "unknown"}
-
-    backoff = 1.0
-    maxAttempts = 3
-    for attempt in range(1, maxAttempts + 1):
-        try:
-            response = requests.post(url, json=payload, timeout=8)
-            response.raise_for_status()
-            return
-        except Exception as error:  # pragma: no cover - network interaction best-effort
-            if attempt >= maxAttempts:
-                logger.debug("Failed to post status update", exc_info=error)
-                return
-            time.sleep(backoff)
-            backoff = min(backoff * 2, 30.0)
+    try:
+        response = requests.post(statusUrl, headers=headers, json=resolvedPayload, timeout=8)
+        responseText = (response.text or "").strip()
+        logger.info(
+            "[POST][resp] code=%s body=%s",
+            response.status_code,
+            responseText[:200],
+        )
+    except Exception as error:  # pragma: no cover - network interaction best-effort
+        logger.warning("[POST][error] %s", error)
 
 
 def buildStatusPayload(printer: Any) -> Dict[str, Any]:
@@ -1420,6 +1407,20 @@ def buildStatusPayload(printer: Any) -> Dict[str, Any]:
     if bedValue is None:
         bedValue = normalizeFloat(getattr(printer, "bed_temperature", None))
     remainingValue = normalizeInt(safeCall("get_remaining_time"))
+    fanValue = normalizeFloat(safeCall("get_fan_speed"))
+    if fanValue is None:
+        fanValue = normalizeFloat(getattr(printer, "fan_speed", None))
+    printSpeedValue = normalizeFloat(safeCall("get_print_speed"))
+    if printSpeedValue is None:
+        printSpeedValue = normalizeFloat(getattr(printer, "print_speed", None))
+    filamentValue = normalizeFloat(safeCall("get_filament_used"))
+    if filamentValue is None:
+        filamentValue = normalizeFloat(getattr(printer, "filament_used", None))
+    firmwareValue = normalizeText(safeCall("get_firmware_version"))
+    if firmwareValue is None:
+        firmwareValue = normalizeText(getattr(printer, "firmware_version", None))
+    if firmwareValue is None:
+        firmwareValue = normalizeText(getattr(printer, "firmware", None))
 
     statusText = stateValue or ("Printing" if (progressValue or 0.0) > 0.0 else "Online")
 
@@ -1430,19 +1431,241 @@ def buildStatusPayload(printer: Any) -> Dict[str, Any]:
         "nozzleTemp": nozzleValue,
         "bedTemp": bedValue,
         "remainingTimeSeconds": remainingValue,
+        "fanSpeed": fanValue,
+        "printSpeed": printSpeedValue,
+        "filamentUsed": filamentValue,
         "ip": ipValue,
         "serial": serialValue,
         "access_code": accessCodeValue,
         "online": bool(statusText and statusText.lower() not in {"offline", "unknown"}),
         "lastSeen": lastSeen,
+        "firmware": firmwareValue,
     }
+
+
+def coerceFloatValue(value: Any) -> Optional[float]:
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def coerceIntValue(value: Any) -> Optional[int]:
+    if value in (None, ""):
+        return None
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def coerceBoolValue(value: Any) -> Optional[bool]:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "y"}:
+            return True
+        if normalized in {"false", "0", "no", "n"}:
+            return False
+    if isinstance(value, (int, float)):
+        if value == 1:
+            return True
+        if value == 0:
+            return False
+    return None
+
+
+def resolveStatusValue(
+    status: Dict[str, Any],
+    printerConfig: Dict[str, Any],
+    statusKeys: Sequence[str],
+    configKeys: Sequence[str] = (),
+) -> Any:
+    for key in statusKeys:
+        if key in status:
+            candidate = status.get(key)
+            if candidate not in (None, ""):
+                return candidate
+    for key in configKeys:
+        if key in printerConfig:
+            candidate = printerConfig.get(key)
+            if candidate not in (None, ""):
+                return candidate
+    return None
+
+
+def normalizePrinterStatusValue(
+    statusValue: Any,
+    progressValue: Optional[float],
+    onlineFlag: Optional[bool],
+    errorMessage: Optional[str],
+) -> str:
+    mapping = {
+        "printing": "printing",
+        "print": "printing",
+        "progress": "printing",
+        "running": "printing",
+        "busy": "printing",
+        "heating": "printing",
+        "warming": "printing",
+        "starting": "printing",
+        "preparing": "printing",
+        "uploading": "printing",
+        "dispatching": "printing",
+        "dispatched": "printing",
+        "cloudaccepted": "printing",
+        "paused": "paused",
+        "pausing": "paused",
+        "stopped": "paused",
+        "stopping": "paused",
+        "idle": "idle",
+        "ready": "idle",
+        "online": "idle",
+        "completed": "idle",
+        "finished": "idle",
+        "success": "idle",
+        "done": "idle",
+        "standby": "idle",
+        "error": "error",
+        "failed": "error",
+        "fault": "error",
+        "alarm": "error",
+        "fatal": "error",
+        "blocked": "error",
+        "offline": "offline",
+        "disconnected": "offline",
+        "unknown": "offline",
+        "lost": "offline",
+    }
+
+    normalized = str(statusValue or "").strip().lower()
+    mapped = mapping.get(normalized)
+    if mapped:
+        return mapped
+
+    if onlineFlag is False:
+        return "offline"
+    if normalized.startswith("error") or errorMessage:
+        return "error"
+    if progressValue and progressValue > 0:
+        return "printing"
+    return "idle"
+
+
+def buildBase44StatusPayload(status: Dict[str, Any], printerConfig: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if not isinstance(status, dict):
+        return None
+
+    recipientId = (
+        resolveStatusValue(status, printerConfig, ["recipientId"], ["statusRecipientId"])
+        or os.getenv("RECIPIENT_ID")
+        or "user-123"
+    )
+
+    printerIpAddress = resolveStatusValue(
+        status,
+        printerConfig,
+        ["printerIpAddress", "ip", "ipAddress", "host"],
+        ["ipAddress", "ip"],
+    )
+    printerId = resolveStatusValue(
+        status,
+        printerConfig,
+        ["printerId", "base44PrinterId"],
+        ["printerId", "base44PrinterId"],
+    )
+    currentJobId = resolveStatusValue(
+        status,
+        printerConfig,
+        ["currentJobId", "jobId", "printJobId"],
+    )
+
+    progressValue = coerceFloatValue(
+        resolveStatusValue(
+            status,
+            printerConfig,
+            ["jobProgress", "progress", "progressPercent", "percentage", "mc_percent"],
+        )
+    )
+    bedTempValue = coerceFloatValue(
+        resolveStatusValue(status, printerConfig, ["bedTemp", "bed_temp", "bedTemperature", "bed_temper"])
+    )
+    nozzleTempValue = coerceFloatValue(
+        resolveStatusValue(status, printerConfig, ["nozzleTemp", "nozzle_temp", "nozzleTemperature", "nozzle_temper"])
+    )
+    fanSpeedValue = coerceFloatValue(
+        resolveStatusValue(status, printerConfig, ["fanSpeed", "fan_speed", "fan"])
+    )
+    printSpeedValue = coerceFloatValue(
+        resolveStatusValue(status, printerConfig, ["printSpeed", "speed", "print_speed"])
+    )
+    filamentUsedValue = coerceFloatValue(
+        resolveStatusValue(status, printerConfig, ["filamentUsed", "filament_used", "filament", "filament_grams"])
+    )
+    timeRemainingValue = coerceIntValue(
+        resolveStatusValue(
+            status,
+            printerConfig,
+            ["timeRemaining", "remainingTimeSeconds", "timeRemainingSeconds", "mc_remaining_time"],
+        )
+    )
+    onlineFlag = coerceBoolValue(resolveStatusValue(status, printerConfig, ["online"]))
+    errorMessage = resolveStatusValue(
+        status,
+        printerConfig,
+        ["errorMessage", "error", "message", "statusDetail", "statusMessage"],
+    )
+
+    firmwareVersion = resolveStatusValue(
+        status,
+        printerConfig,
+        ["firmwareVersion", "firmware", "fwVersion", "firmware_version"],
+    )
+
+    normalizedStatus = normalizePrinterStatusValue(
+        resolveStatusValue(status, printerConfig, ["status", "state", "gcodeState", "gcode_state"]),
+        progressValue,
+        onlineFlag,
+        str(errorMessage).strip() if errorMessage else None,
+    )
+
+    jobProgress = 0
+    if progressValue is not None:
+        jobProgress = int(max(0, min(100, round(progressValue))))
+
+    payload = {
+        "recipientId": recipientId,
+        "printerIpAddress": printerIpAddress,
+        "printerId": printerId,
+        "status": normalizedStatus,
+        "jobProgress": jobProgress,
+        "currentJobId": currentJobId,
+        "bedTemp": int(bedTempValue) if bedTempValue is not None else 0,
+        "nozzleTemp": int(nozzleTempValue) if nozzleTempValue is not None else 0,
+        "fanSpeed": fanSpeedValue,
+        "printSpeed": printSpeedValue,
+        "filamentUsed": filamentUsedValue,
+        "timeRemaining": timeRemainingValue,
+        "errorMessage": str(errorMessage) if errorMessage not in (None, "") else None,
+        "lastUpdateTimestamp": isoNow(),
+        "firmwareVersion": str(firmwareVersion) if firmwareVersion not in (None, "") else None,
+    }
+
+    currentJobIdValue = payload.get("currentJobId")
+    if currentJobIdValue in (None, ""):
+        payload["currentJobId"] = None
+
+    return payload
 
 
 def startStatusHeartbeat(
     printer: Any,
     printerConfig: Dict[str, Any],
     *,
-    intervalSeconds: float = 30.0,
+    intervalSeconds: float = 7.0,
     statusSupplier: Optional[Callable[[], Dict[str, Any]]] = None,
 ) -> Event:
     """Start a background heartbeat thread that posts printer status periodically."""
@@ -1461,21 +1684,62 @@ def startStatusHeartbeat(
 
     intervalSeconds = max(5.0, float(intervalSeconds))
 
+    freshnessSeconds = 15.0
+    offlineIntervalSeconds = 30.0
+
     def runHeartbeat() -> None:
+        lastSnapshot: Dict[str, Any] = {}
+        lastSnapshotAt: float = 0.0
+        lastOfflinePostAt: float = 0.0
         try:
             while not stopEvent.is_set():
+                now = time.time()
                 try:
-                    snapshot = statusSupplier() if statusSupplier else buildStatusPayload(printer)
+                    snapshotCandidate = statusSupplier() if statusSupplier else buildStatusPayload(printer)
                 except Exception as error:  # pragma: no cover - defensive logging
                     logger.debug("Heartbeat snapshot failed", exc_info=error)
-                    snapshot = {}
-                if not isinstance(snapshot, dict):
-                    snapshot = {}
-                snapshot.setdefault("lastSeen", datetime.now(timezone.utc).isoformat())
+                    snapshotCandidate = {}
+
+                if isinstance(snapshotCandidate, dict) and snapshotCandidate:
+                    lastSnapshot = dict(snapshotCandidate)
+                    lastSnapshot.setdefault("lastSeen", isoNow())
+                    lastSnapshotAt = now
+
                 try:
-                    postStatus(snapshot, printerConfig)
-                except Exception:  # pragma: no cover - status posting best-effort
-                    logger.debug("Heartbeat post failed", exc_info=True)
+                    mqttReady = printerIsMqttReady(printer)
+                except Exception as error:  # pragma: no cover - defensive logging
+                    logger.debug("Heartbeat readiness check failed", exc_info=error)
+                    mqttReady = False
+
+                hasFreshSnapshot = bool(lastSnapshot) and (
+                    mqttReady or (lastSnapshotAt and (now - lastSnapshotAt) <= freshnessSeconds)
+                )
+
+                if hasFreshSnapshot:
+                    payloadToSend = dict(lastSnapshot)
+                    try:
+                        postStatus(payloadToSend, printerConfig)
+                    except Exception:  # pragma: no cover - status posting best-effort
+                        logger.debug("Heartbeat post failed", exc_info=True)
+                    stopEvent.wait(intervalSeconds)
+                    continue
+
+                if now - lastOfflinePostAt >= offlineIntervalSeconds:
+                    resolvedIp = printerConfig.get("ipAddress") or (lastSnapshot.get("ip") if lastSnapshot else None)
+                    offlinePayload = {
+                        "status": "Offline",
+                        "ip": resolvedIp,
+                        "printerIpAddress": resolvedIp,
+                        "nozzleTemp": 0,
+                        "bedTemp": 0,
+                        "lastSeen": isoNow(),
+                    }
+                    try:
+                        postStatus(offlinePayload, printerConfig)
+                    except Exception:  # pragma: no cover - status posting best-effort
+                        logger.debug("Heartbeat offline post failed", exc_info=True)
+                    lastOfflinePostAt = now
+
                 stopEvent.wait(intervalSeconds)
         finally:
             with _statusHeartbeatLock:
@@ -2003,6 +2267,7 @@ __all__ = [
     "buildCloudJobPayload",
     "buildRemoteFileName",
     "buildPrinterTransferFileName",
+    "buildBase44StatusPayload",
     "buildStatusPayload",
     "encodeFileToBase64",
     "makeTlsContext",
