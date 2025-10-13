@@ -52,18 +52,13 @@ def testBuildBase44StatusPayloadMapsFields(monkeypatch: pytest.MonkeyPatch) -> N
     assert payload["lastUpdateTimestamp"].endswith("Z")
 
 
-def testPostStatusSendsRequestWithHeaders(
+def testPostStatusLogsPayloadForReporter(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    captured: Dict[str, Any] = {}
+    def failPost(*_args: Any, **_kwargs: Any) -> DummyResponse:
+        raise AssertionError("requests.post should not be invoked")
 
-    def fakePost(url: str, headers: Dict[str, str], json: Dict[str, Any], timeout: int) -> DummyResponse:
-        captured["url"] = url
-        captured["headers"] = headers
-        captured["json"] = json
-        return DummyResponse(statusCode=202, text="accepted")
-
-    monkeypatch.setattr(bambuPrinter.requests, "post", fakePost)
+    monkeypatch.setattr(bambuPrinter.requests, "post", failPost)
 
     status = {"status": "idle", "ip": "10.0.0.12"}
     printerConfig = {
@@ -72,34 +67,22 @@ def testPostStatusSendsRequestWithHeaders(
         "statusRecipientId": "recipient-2",
     }
 
-    caplog.set_level(logging.INFO)
+    caplog.set_level(logging.DEBUG)
     bambuPrinter.postStatus(status, printerConfig)
 
-    assert captured["url"] == "https://example.com/status"
-    assert captured["headers"]["X-API-Key"] == "secret-token"
-    assert captured["json"]["recipientId"] == "recipient-2"
-    assert captured["json"]["status"] == "idle"
-    assert captured["json"]["printerIpAddress"] == "10.0.0.12"
-    assert any("[POST]" in record.message for record in caplog.records)
+    assert any("Status ready for Base44 reporter" in record.message for record in caplog.records)
 
 
-def testPostStatusFallsBackToEnvironment(monkeypatch: pytest.MonkeyPatch) -> None:
-    captured: Dict[str, Any] = {}
+def testPostStatusFallsBackToEnvironment(monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+    def failPost(*_args: Any, **_kwargs: Any) -> DummyResponse:
+        raise AssertionError("requests.post should not be invoked")
 
-    def fakePost(url: str, headers: Dict[str, str], json: Dict[str, Any], timeout: int) -> DummyResponse:
-        captured["url"] = url
-        captured["headers"] = headers
-        captured["json"] = json
-        return DummyResponse()
-
-    monkeypatch.setattr(bambuPrinter.requests, "post", fakePost)
+    monkeypatch.setattr(bambuPrinter.requests, "post", failPost)
     monkeypatch.setenv("BASE44_STATUS_URL", "https://env.example.com/status")
     monkeypatch.setenv("PRINTER_API_TOKEN", "env-token")
     monkeypatch.setenv("RECIPIENT_ID", "env-recipient")
 
+    caplog.set_level(logging.DEBUG)
     bambuPrinter.postStatus({}, {})
 
-    assert captured["url"] == "https://env.example.com/status"
-    assert captured["headers"]["X-API-Key"] == "env-token"
-    assert captured["json"]["recipientId"] == "env-recipient"
-    assert captured["json"]["status"] == "idle"
+    assert any("Status ready for Base44 reporter" in record.message for record in caplog.records)

@@ -17,7 +17,7 @@ from typing import Any, Callable, Dict, Optional
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-from .base44_status import Base44StatusReporter, getDefaultPrinterApiToken
+from .base44Status import Base44StatusReporter
 
 from .bambuPrinter import (
     BambuPrintOptions,
@@ -120,13 +120,13 @@ class ListenerGuiApp:
 
         self.listenerRecipientId = ""
         self.listenerStatusApiKey = ""
+        self.listenerActive = False
+        self.listenerReady = False
+        self.base44ReporterActive = False
 
         self.base44Reporter = Base44StatusReporter(
-            getRecipientId=self._getActiveRecipientIdForBase44,
-            getApiKey=self._getBase44ApiKey,
-            listConnectedPrinters=self._listPrintersForBase44,
-            buildSnapshot=self._buildBase44Snapshot,
-            intervalSeconds=5.0,
+            getPrintersSnapshotCallable=self._snapshotPrintersForBase44,
+            intervalSec=5,
         )
 
         self._buildLayout()
@@ -260,13 +260,6 @@ class ListenerGuiApp:
             state=tk.DISABLED,
         )
         self.editPrinterButton.pack(side=tk.LEFT, padx=(8, 0))
-        self.connectPrintersButton = ttk.Button(
-            actionFrame,
-            text="Connect Printers",
-            command=self.refreshPrintersNow,
-            state=tk.NORMAL,
-        )
-        self.connectPrintersButton.pack(side=tk.LEFT, padx=8)
         actionFrame.columnconfigure(0, weight=1)
 
         treeFrame = ttk.Frame(parent)
@@ -433,10 +426,12 @@ class ListenerGuiApp:
                 self.printers[index] = self._applyTelemetryDefaults(merged)
                 self._savePrinters()
                 self._refreshPrinterList()
+                self._updateStatusReporterState()
                 return
         self.printers.append(self._applyTelemetryDefaults(dict(printerRecord)))
         self._savePrinters()
         self._refreshPrinterList()
+        self._updateStatusReporterState()
 
     def _formatTemperature(self, value: Optional[float]) -> str:
         if value is None:
@@ -522,31 +517,40 @@ class ListenerGuiApp:
 
     def _updateListenerRecipient(self, *_args: Any) -> None:
         self.listenerRecipientId = self.recipientVar.get().strip() if hasattr(self, "recipientVar") else ""
+        self._updateStatusReporterState()
 
     def _updateListenerStatusApiKey(self, *_args: Any) -> None:
         self.listenerStatusApiKey = (
             self.statusApiKeyVar.get().strip() if hasattr(self, "statusApiKeyVar") else ""
         )
+        self._updateStatusReporterState()
 
-    def _getActiveRecipientIdForBase44(self) -> str:
-        return self.listenerRecipientId.strip()
+    def _resolveStatusApiKey(self) -> str:
+        if self.listenerStatusApiKey:
+            return self.listenerStatusApiKey
+        return os.getenv("PRINTER_API_TOKEN", "").strip()
 
-    def _listPrintersForBase44(self) -> list[Dict[str, Any]]:
-        printersSnapshot: list[Dict[str, Any]] = []
+    def _snapshotPrintersForBase44(self) -> list[Dict[str, Any]]:
+        snapshots: list[Dict[str, Any]] = []
         for printer in list(self.printers):
             if not isinstance(printer, dict):
                 continue
-            ipAddress = self._parseOptionalString(printer.get("ipAddress"))
-            serialNumber = self._parseOptionalString(printer.get("serialNumber"))
-            if not ipAddress and not serialNumber:
+            try:
+                snapshot = self._buildPrinterSnapshotForBase44(printer)
+            except Exception:  # noqa: BLE001 - logging ensures visibility while continuing
+                logging.exception("Failed to build Base44 snapshot for printer %s", printer)
                 continue
-            printersSnapshot.append(dict(printer))
-        return printersSnapshot
+            if snapshot:
+                snapshots.append(snapshot)
+        return snapshots
 
-    def _buildBase44Snapshot(self, printer: Dict[str, Any]) -> Dict[str, Any]:
-        record = dict(printer) if isinstance(printer, dict) else {}
+    def _buildPrinterSnapshotForBase44(self, printer: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        record = dict(printer)
         ipAddress = self._parseOptionalString(record.get("ipAddress"))
         serialNumber = self._parseOptionalString(record.get("serialNumber"))
+        if not ipAddress and not serialNumber:
+            return None
+
         statusValue = self._parseOptionalString(record.get("status")) or "Offline"
         normalizedStatus = statusValue.strip() or "Offline"
 
@@ -555,9 +559,10 @@ class ListenerGuiApp:
             onlineFlag = explicitOnline
         else:
             mqttFlag = record.get("mqttConnected")
-            onlineFlag = bool(mqttFlag) if isinstance(mqttFlag, bool) else normalizedStatus.lower() not in {
-                "", "offline", "unknown"
-            }
+            if isinstance(mqttFlag, bool):
+                onlineFlag = mqttFlag
+            else:
+                onlineFlag = normalizedStatus.lower() not in {"", "offline", "unknown"}
 
         progressCandidate = record.get("progress")
         if progressCandidate is None:
@@ -585,9 +590,6 @@ class ListenerGuiApp:
         firmwareVersion = self._parseOptionalString(record.get("firmwareVersion")) or self._parseOptionalString(
             record.get("firmware")
         )
-        base44PrinterId = self._parseOptionalString(record.get("base44PrinterId")) or self._parseOptionalString(
-            record.get("printerId")
-        )
         currentJobId = self._parseOptionalString(record.get("currentJobId"))
 
         snapshot: Dict[str, Any] = {
@@ -597,23 +599,39 @@ class ListenerGuiApp:
             "online": onlineFlag,
             "progress": progressValue,
             "currentJobId": currentJobId,
-            "bedTemp": bedTemp,
-            "nozzleTemp": nozzleTemp,
-            "fanSpeed": fanSpeed,
-            "printSpeed": printSpeed,
+            "bed": bedTemp,
+            "nozzle": nozzleTemp,
+            "fan": fanSpeed,
+            "speed": printSpeed,
             "filamentUsed": filamentUsed,
-            "timeRemainingSec": remainingSeconds,
+            "timeRemaining": remainingSeconds,
             "error": errorMessage,
             "firmware": firmwareVersion,
-            "base44PrinterId": base44PrinterId,
         }
 
         return snapshot
 
-    def _getBase44ApiKey(self) -> str:
-        if self.listenerStatusApiKey:
-            return self.listenerStatusApiKey
-        return getDefaultPrinterApiToken()
+    def _updateStatusReporterState(self, *, allowReadyUpdate: bool = False) -> None:
+        snapshots = self._snapshotPrintersForBase44()
+        hasOnlinePrinter = any(snapshot.get("online") for snapshot in snapshots)
+        if allowReadyUpdate and self.listenerActive and hasOnlinePrinter:
+            self.listenerReady = True
+
+        apiKey = self._resolveStatusApiKey()
+        shouldRun = (
+            self.listenerActive
+            and self.listenerReady
+            and bool(self.listenerRecipientId)
+            and bool(apiKey)
+            and bool(snapshots)
+        )
+
+        if shouldRun and not self.base44ReporterActive:
+            self.base44Reporter.start(self.listenerRecipientId, apiKey)
+            self.base44ReporterActive = True
+        elif not shouldRun and self.base44ReporterActive:
+            self.base44Reporter.stop()
+            self.base44ReporterActive = False
 
     def _clearPrinterSearch(self) -> None:
         self.printerSearchVar.set("")
@@ -771,6 +789,7 @@ class ListenerGuiApp:
         self._savePrinters()
         self._refreshPrinterList()
         self._scheduleStatusRefresh(0)
+        self._updateStatusReporterState()
 
     def _handleUpdatePrinter(self, index: int, printerDetails: Dict[str, Any]) -> None:
         existing = dict(self.printers[index]) if 0 <= index < len(self.printers) else {}
@@ -779,18 +798,11 @@ class ListenerGuiApp:
         self._savePrinters()
         self._refreshPrinterList()
         self._scheduleStatusRefresh(0)
+        self._updateStatusReporterState()
 
     def _onPrinterSelection(self, event: object) -> None:  # noqa: ARG002 - required by Tk callback
         state = tk.NORMAL if self._getSelectedPrinterIndex() is not None else tk.DISABLED
         self.editPrinterButton.config(state=state)
-
-    def refreshPrintersNow(self) -> None:
-        if self.statusRefreshThread and self.statusRefreshThread.is_alive():
-            self.pendingImmediateStatusRefresh = True
-            return
-        if hasattr(self, "connectPrintersButton"):
-            self.connectPrintersButton.config(state=tk.DISABLED)
-        self._scheduleStatusRefresh(0)
 
     def _getSelectedPrinterIndex(self) -> Optional[int]:
         selection = self.printerTree.selection() if hasattr(self, "printerTree") else ()
@@ -1174,6 +1186,7 @@ class ListenerGuiApp:
         return "Offline"
 
     def _processPrinterStatusUpdates(self) -> None:
+        statusChanged = False
         try:
             while True:
                 messageType, payload = self.printerStatusQueue.get_nowait()
@@ -1202,14 +1215,23 @@ class ListenerGuiApp:
                     if hasChanges:
                         self._savePrinters()
                         self._refreshPrinterList()
+                        statusChanged = True
                 elif messageType == "complete":
                     self.statusRefreshThread = None
-                    if hasattr(self, "connectPrintersButton"):
-                        self.connectPrintersButton.config(state=tk.NORMAL)
                     delay = 0 if self.pendingImmediateStatusRefresh else self.statusRefreshIntervalMs
                     self._scheduleStatusRefresh(delay)
+                    statusChanged = True
+                elif messageType == "remove":
+                    indexCandidate = payload if isinstance(payload, int) else None
+                    if indexCandidate is not None and 0 <= indexCandidate < len(self.printers):
+                        self.printers.pop(indexCandidate)
+                        self._savePrinters()
+                        self._refreshPrinterList()
+                        statusChanged = True
         except Empty:
             pass
+        if statusChanged:
+            self._updateStatusReporterState(allowReadyUpdate=True)
         self.root.after(500, self._processPrinterStatusUpdates)
 
     def _chooseOutputDir(self) -> None:
@@ -1255,13 +1277,17 @@ class ListenerGuiApp:
             daemon=True,
         )
         self.listenerThread.start()
-        self.base44Reporter.start()
+        self.listenerActive = True
+        self.listenerReady = False
+        self._updateStatusReporterState()
         self._appendLogLine("Started listening...")
         self.startButton.config(state=tk.DISABLED)
         self.stopButton.config(state=tk.NORMAL)
 
     def stopListening(self) -> None:
-        self.base44Reporter.stop()
+        self.listenerActive = False
+        self.listenerReady = False
+        self._updateStatusReporterState()
         if self.stopEvent:
             self.stopEvent.set()
         if self.listenerThread and self.listenerThread.is_alive() and threading.current_thread() != self.listenerThread:
@@ -1440,7 +1466,9 @@ class ListenerGuiApp:
                     self.stopEvent = None
                     self.startButton.config(state=tk.NORMAL)
                     self.stopButton.config(state=tk.DISABLED)
-                    self.base44Reporter.stop()
+                    self.listenerActive = False
+                    self.listenerReady = False
+                    self._updateStatusReporterState()
                     self._appendLogLine("Listener stopped.")
                 else:
                     self._appendLogLine(message)

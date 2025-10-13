@@ -455,61 +455,6 @@ def findConfiguredPrinterMatch(
     return None
 
 
-def createPrinterStatusReporter(
-    baseUrl: str,
-    productId: str,
-    recipientId: str,
-    statusTemplate: Dict[str, Any],
-    printerDetails: Dict[str, Any],
-) -> Callable[[Dict[str, Any]], None]:
-    def reporter(event: Dict[str, Any]) -> None:
-        message = event.get("message")
-        eventType = event.get("event")
-        if not message:
-            if eventType in {"uploadComplete", "uploaded"}:
-                remoteFile = event.get("remoteFile")
-                message = (
-                    f"Uploaded to printer storage as {remoteFile}"
-                    if remoteFile
-                    else "Uploaded to printer"
-                )
-            elif eventType == "cloudAccepted":
-                message = "Print job accepted by Bambu Cloud"
-            elif eventType == "starting":
-                message = "Starting print on printer"
-            elif eventType == "progress":
-                statusPayload = event.get("status")
-                if isinstance(statusPayload, dict):
-                    statusData = statusPayload
-                else:
-                    statusData = event
-                segments: List[str] = []
-                percent = statusData.get("mc_percent")
-                if percent is not None:
-                    segments.append(f"{percent}%")
-                state = statusData.get("gcode_state")
-                if state:
-                    segments.append(str(state))
-                remaining = statusData.get("mc_remaining_time")
-                if remaining is not None:
-                    segments.append(f"ETA {remaining}s")
-                message = " | ".join(segments) if segments else "Printer status update"
-            elif eventType == "error":
-                message = f"Printer error: {event.get('error')}"
-            else:
-                message = f"Printer event: {eventType}" if eventType else "Printer update"
-
-        payload = dict(statusTemplate)
-        payload["message"] = message
-        payload["printerDetails"] = printerDetails
-        payload["printerEvent"] = event
-        payload.setdefault("success", statusTemplate.get("success", True))
-        payload.setdefault("recipientId", recipientId)
-        sendProductStatusUpdate(baseUrl, productId, recipientId, payload)
-
-    return reporter
-
-
 def _normalizeMetadataKey(name: str) -> str:
     return "".join(character for character in name.lower() if character.isalnum())
 
@@ -778,6 +723,15 @@ def dispatchBambuPrintIfPossible(
     serialNumber = matchedPrinter.get("serialNumber") or resolvedDetails.get("serialNumber")
     configuredNickname = matchedPrinter.get("nickname") or matchedPrinter.get("printerName")
 
+    if normalizedSerial and normalizeCandidate(serialNumber, lower=True) != normalizedSerial:
+        logging.error(
+            "Printer serial mismatch for product %s: expected %s but resolved %s",
+            productId,
+            normalizedSerial,
+            normalizeCandidate(serialNumber, lower=True),
+        )
+        return None
+
     if not ipAddress or not accessCode or not serialNumber:
         logging.warning(
             "Incomplete printer credentials for product %s (ip=%s, accessCode=%s, serial=%s)",
@@ -876,8 +830,6 @@ def dispatchBambuPrintIfPossible(
             )
             return None
 
-    reporter = createPrinterStatusReporter(baseUrl, productId, recipientId, statusTemplate, printerDetails)
-
     statusEvents: List[Dict[str, Any]] = []
 
     def capture(event: Dict[str, Any]) -> None:
@@ -885,7 +837,6 @@ def dispatchBambuPrintIfPossible(
         if "event" not in normalized and normalized.get("status"):
             normalized.setdefault("event", normalized["status"])
         statusEvents.append(normalized)
-        reporter(normalized)
         postStatus(normalized, resolvedDetails)
 
     capture({"event": "dispatching", "message": f"Dispatching print job to {options.nickname or options.serialNumber}"})
@@ -1434,31 +1385,6 @@ def appendJsonLogEntry(logFilePath: Union[str, Path], entry: Dict[str, Any]) -> 
     return logPath
 
 
-def sendProductStatusUpdate(
-    baseUrl: str,
-    productId: str,
-    recipientId: str,
-    statusPayload: Dict[str, Any],
-) -> bool:
-    statusUrl = f"{buildBaseUrl(baseUrl)}/products/{productId}/status"
-    payloadToSend = dict(statusPayload)
-    if "recipientId" not in payloadToSend or not payloadToSend.get("recipientId"):
-        payloadToSend["recipientId"] = recipientId
-    try:
-        response = requests.post(statusUrl, json=payloadToSend, timeout=30)
-        response.raise_for_status()
-    except requests.RequestException as error:
-        logging.error("Failed to send product status update for %s: %s", productId, error)
-        return False
-
-    logging.info(
-        "Sent product status update for %s: %s",
-        productId,
-        response.text.strip() or response.status_code,
-    )
-    return True
-
-
 def sendHandshakeResponse(
     baseUrl: str,
     productId: str,
@@ -1786,13 +1712,7 @@ def listenForFiles(
                         "printJobId": resolvedPrintJobId,
                         "message": statusMessage,
                     }
-                    statusSent = sendProductStatusUpdate(
-                        baseUrl,
-                        productId,
-                        handshakeRecipientId,
-                        statusPayload,
-                    )
-                    statusPayload["sent"] = statusSent
+                    statusPayload["sent"] = False
 
                     if fetchResult is not None:
                         entryData: Dict[str, Any] = dict(fetchResult)

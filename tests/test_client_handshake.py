@@ -88,27 +88,10 @@ def test_listenForFiles_performs_fetch_when_handshake_requires_download(
 
     monkeypatch.setattr(client, "performFetch", fakePerformFetch)
 
-    statusCalls: List[Dict[str, Any]] = []
-
-    def fakeSendStatus(
-        _baseUrl: str,
-        productId: str,
-        recipientId: str,
-        payload: Dict[str, Any],
-    ) -> bool:
-        statusCalls.append(
-            {
-                "productId": productId,
-                "recipientId": recipientId,
-                "payload": json.loads(json.dumps(payload)),
-            }
-        )
-        return True
-
-    monkeypatch.setattr(client, "sendProductStatusUpdate", fakeSendStatus)
-
     outputDir = tmp_path / "output"
     outputDir.mkdir()
+
+    capturedEntries: List[Dict[str, Any]] = []
 
     client.listenForFiles(
         "https://example.com",
@@ -117,6 +100,7 @@ def test_listenForFiles_performs_fetch_when_handshake_requires_download(
         pollInterval=0,
         maxIterations=1,
         database=database,
+        onFileFetched=lambda entry: capturedEntries.append(dict(entry)),
     )
 
     database.close()
@@ -132,14 +116,13 @@ def test_listenForFiles_performs_fetch_when_handshake_requires_download(
     ]
     assert fetchCalls and fetchCalls[0]["requestMode"] == "full"
     assert fetchCalls[0]["productId"] == "product-positive"
-    assert statusCalls
-    statusPayload = statusCalls[0]["payload"]
-    assert statusCalls[0]["productId"] == "product-positive"
-    assert statusCalls[0]["recipientId"] == "recipient-positive"
+    assert capturedEntries
+    statusPayload = capturedEntries[0]["productStatus"]
     assert statusPayload["recipientId"] == "recipient-positive"
     assert statusPayload["requestedMode"] == "full"
     assert statusPayload["printJobId"] == "job-positive"
     assert statusPayload["message"] == "success"
+    assert statusPayload["sent"] is False
 
 
 def test_listenForFiles_skips_fetch_when_handshake_opts_out(
@@ -200,21 +183,10 @@ def test_listenForFiles_skips_fetch_when_handshake_opts_out(
 
     monkeypatch.setattr(client, "performFetch", fakePerformFetch)
 
-    statusCalls: List[Dict[str, Any]] = []
-
-    def fakeSendStatus(
-        _baseUrl: str,
-        _productId: str,
-        _recipientId: str,
-        payload: Dict[str, Any],
-    ) -> bool:
-        statusCalls.append(payload)
-        return True
-
-    monkeypatch.setattr(client, "sendProductStatusUpdate", fakeSendStatus)
-
     outputDir = tmp_path / "negative-output"
     outputDir.mkdir()
+
+    capturedEntries: List[Dict[str, Any]] = []
 
     client.listenForFiles(
         "https://example.com",
@@ -223,6 +195,7 @@ def test_listenForFiles_skips_fetch_when_handshake_opts_out(
         pollInterval=0,
         maxIterations=1,
         database=database,
+        onFileFetched=lambda entry: capturedEntries.append(dict(entry)),
     )
 
     database.close()
@@ -236,7 +209,7 @@ def test_listenForFiles_skips_fetch_when_handshake_opts_out(
             "jobExists": True,
         }
     ]
-    assert statusCalls == []
+    assert capturedEntries == []
 
 
 def test_listenForFiles_reports_fetch_errors_with_message(
@@ -263,27 +236,9 @@ def test_listenForFiles_reports_fetch_errors_with_message(
 
     monkeypatch.setattr(client, "performFetch", fakePerformFetch)
 
-    statusCalls: List[Dict[str, Any]] = []
-
-    def fakeSendStatus(
-        _baseUrl: str,
-        productId: str,
-        recipientId: str,
-        payload: Dict[str, Any],
-    ) -> bool:
-        statusCalls.append(
-            {
-                "productId": productId,
-                "recipientId": recipientId,
-                "payload": json.loads(json.dumps(payload)),
-            }
-        )
-        return False
-
-    monkeypatch.setattr(client, "sendProductStatusUpdate", fakeSendStatus)
-
     outputDir = tmp_path / "error-output"
     outputDir.mkdir()
+    logFilePath = tmp_path / "error-log.json"
 
     client.listenForFiles(
         "https://example.com",
@@ -292,18 +247,20 @@ def test_listenForFiles_reports_fetch_errors_with_message(
         pollInterval=0,
         maxIterations=1,
         database=database,
+        logFilePath=str(logFilePath),
     )
 
     database.close()
 
-    assert statusCalls
-    statusPayload = statusCalls[0]["payload"]
-    assert statusCalls[0]["productId"] == "product-error"
-    assert statusCalls[0]["recipientId"] == "recipient-error"
+    assert logFilePath.exists()
+    logEntries = json.loads(logFilePath.read_text())
+    assert logEntries
+    statusPayload = logEntries[-1]["productStatus"]
     assert statusPayload["recipientId"] == "recipient-error"
     assert statusPayload["success"] is False
     assert statusPayload["message"] == "simulated transfer failure"
     assert statusPayload["printJobId"] == "job-error"
+    assert statusPayload["sent"] is False
 
 
 def testListenForFilesStoresMetadataSummary(
@@ -365,7 +322,6 @@ def testListenForFilesStoresMetadataSummary(
     monkeypatch.setattr(client, "performFetch", fakePerformFetch)
 
     monkeypatch.setattr(client, "sendHandshakeResponse", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(client, "sendProductStatusUpdate", lambda *_args, **_kwargs: True)
 
     outputDir = tmp_path / "metadata-output"
     outputDir.mkdir()
