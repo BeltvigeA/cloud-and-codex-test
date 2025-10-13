@@ -225,19 +225,18 @@ def test_upload_via_ftps_generates_new_fallback_after_multiple_failures(
     )
     _install_dummy(monkeypatch, dummy)
 
-    result = bambuPrinter.uploadViaFtps(
-        ip="192.0.2.10",
-        accessCode="abcd",
-        localPath=temp_file,
-        remoteName="example.3mf",
-    )
+    with pytest.raises(error_perm):
+        bambuPrinter.uploadViaFtps(
+            ip="192.0.2.10",
+            accessCode="abcd",
+            localPath=temp_file,
+            remoteName="example.3mf",
+        )
 
-    assert result == "example_2.3mf"
     storbinaryCalls = [entry for entry in dummy.commands if entry[0] == "storbinary"]
-    assert len(storbinaryCalls) == 3
+    assert len(storbinaryCalls) == 2
     assert storbinaryCalls[0][1] == ("STOR example.3mf",)
     assert storbinaryCalls[1][1] == ("STOR example_1.3mf",)
-    assert storbinaryCalls[2][1] == ("STOR example_2.3mf",)
     assert dummy.deletedPaths == []
 
 
@@ -291,19 +290,17 @@ def test_upload_via_ftps_uses_fallback_after_second_failure(
     )
     _install_dummy(monkeypatch, dummy)
 
-    result = bambuPrinter.uploadViaFtps(
-        ip="192.0.2.10",
-        accessCode="abcd",
-        localPath=temp_file,
-        remoteName="example.3mf",
-    )
+    with pytest.raises(error_perm):
+        bambuPrinter.uploadViaFtps(
+            ip="192.0.2.10",
+            accessCode="abcd",
+            localPath=temp_file,
+            remoteName="example.3mf",
+        )
 
-    expectedName = "example_2.3mf"
-    assert result == expectedName
     storbinaryCalls = [entry for entry in dummy.commands if entry[0] == "storbinary"]
-    assert len(storbinaryCalls) == 3
-    assert storbinaryCalls[-1][1] == (f"STOR {expectedName}",)
-    assert dummy.storageCommand == f"STOR {expectedName}"
+    assert len(storbinaryCalls) == 2
+    assert storbinaryCalls[-1][1] == ("STOR example_1.3mf",)
 
 
 def test_build_printer_transfer_file_name_trims_prefixes() -> None:

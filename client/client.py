@@ -17,7 +17,12 @@ import requests
 
 from .database import LocalDatabase
 from .persistence import storePrintSummary
-from .bambuPrinter import BambuPrintOptions, postStatus, sendBambuPrintJob
+from .bambuPrinter import (
+    BambuPrintOptions,
+    postStatus,
+    sendBambuPrintJob,
+    upsertPrinterFromJobMetadata,
+)
 
 
 defaultBaseUrl = "https://printer-backend-934564650450.europe-west1.run.app"
@@ -683,7 +688,35 @@ def dispatchBambuPrintIfPossible(
     if not printerAssignment:
         return None
 
+    metadataForUpdate: Optional[Dict[str, Any]] = None
+    unencryptedData = entryData.get("unencryptedData")
+    if isinstance(unencryptedData, dict):
+        metadataForUpdate = {"unencryptedData": dict(unencryptedData)}
+    elif isinstance(entryData, dict):
+        metadataForUpdate = dict(entryData)
+
+    upsertedPrinter = upsertPrinterFromJobMetadata(metadataForUpdate)
+
+    def mergePrinterRecord(target: List[Dict[str, Any]], record: Dict[str, Any]) -> None:
+        serialCandidate = str(record.get("serialNumber") or "").strip().lower()
+        if not serialCandidate:
+            return
+        for index, existing in enumerate(target):
+            existingSerial = str(existing.get("serialNumber") or "").strip().lower()
+            if existingSerial == serialCandidate:
+                merged = dict(existing)
+                for key, value in record.items():
+                    if value not in (None, ""):
+                        merged[key] = value
+                target[index] = merged
+                return
+        target.append(dict(record))
+
     printers = configuredPrinters if configuredPrinters is not None else loadConfiguredPrinters()
+    if configuredPrinters is not None and upsertedPrinter:
+        mergePrinterRecord(printers, upsertedPrinter)
+    if configuredPrinters is None and upsertedPrinter:
+        printers = loadConfiguredPrinters()
     resolvedDetails = resolvePrinterDetails(printerAssignment, printers)
     if not resolvedDetails:
         logging.info("No matching printer configuration for product %s", productId)
@@ -827,6 +860,8 @@ def dispatchBambuPrintIfPossible(
         result = sendBambuPrintJob(
             filePath=filePath,
             options=options,
+            statusConfig=resolvedDetails,
+            jobMetadata=entryData,
             statusCallback=capture,
             skippedObjects=skippedTargets,
         )
