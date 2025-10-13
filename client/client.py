@@ -26,7 +26,7 @@ from .bambuPrinter import (
 )
 
 
-defaultBaseUrl = "https://printer-backend-934564650450.europe-west1.run.app"
+defaultBaseUrl = "https://print-flow-pro-eb683cc6.base44.app"
 defaultFilesDirectory = Path.home() / ".printmaster" / "files"
 
 

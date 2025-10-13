@@ -18,7 +18,7 @@ import zipfile
 import xml.etree.ElementTree as ET
 import logging
 from datetime import datetime, timezone
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Event, Lock, Thread
 from typing import Any, BinaryIO, Callable, Dict, Iterable, List, Optional, Sequence, Union
@@ -48,6 +48,9 @@ _defaultPrinterStoragePath = Path.home() / ".printmaster" / "printers.json"
 _printerStorageLock = Lock()
 _statusHeartbeatLock = Lock()
 _statusHeartbeatEvents: Dict[str, Event] = {}
+
+printerSessionsLock = Lock()
+printerSessionsMap: Dict[tuple[str, str], "PrinterSession"] = {}
 
 
 def isoNow() -> str:
@@ -478,8 +481,11 @@ class BambuApiUploadSession:
     remoteName: str
     connectCamera: bool
     mqttStarted: bool
+    session: "PrinterSession | None" = None
 
     def close(self) -> None:
+        if self.session is not None:
+            return
         try:
             if self.connectCamera:
                 disconnectMethod = getattr(self.printer, "disconnect", None)
@@ -818,6 +824,7 @@ def uploadViaBambulabsApi(
     remoteName: str,
     connectCamera: bool = False,
     returnPrinter: bool = False,
+    session: "PrinterSession | None" = None,
 ) -> Union[BambuApiUploadSession, str]:
     """Upload a file using the official bambulabs_api client."""
 
@@ -828,7 +835,10 @@ def uploadViaBambulabsApi(
     if printerClass is None:
         raise RuntimeError("bambulabs_api.Printer is not available")
 
-    printer = printerClass(ip, accessCode, serial)
+    if session is not None:
+        printer = session.acquireClient()
+    else:
+        printer = printerClass(ip, accessCode, serial)
 
     normalizedRemoteName = sanitizeThreeMfName(remoteName)
     if normalizedRemoteName != remoteName:
@@ -868,20 +878,21 @@ def uploadViaBambulabsApi(
     if not uploadSuccessful:
         raise RuntimeError(f"Upload failed: {response}")
 
-    session = BambuApiUploadSession(
+    uploadSession = BambuApiUploadSession(
         printer=printer,
         remoteName=normalizedRemoteName,
         connectCamera=cameraStarted,
         mqttStarted=mqttStarted,
+        session=session,
     )
 
     if returnPrinter:
-        return session
+        return uploadSession
 
     try:
-        return session.remoteName
+        return uploadSession.remoteName
     finally:
-        session.close()
+        uploadSession.close()
 
 
 def startViaBambuapiAfterUpload(
@@ -2096,6 +2107,18 @@ def sendBambuPrintJob(
         forceSpool=not bool(options.useAms),
     )
 
+    printerSession: PrinterSession | None = None
+    if bambulabsApi is not None:
+        try:
+            printerSession = getOrCreatePrinterSession(
+                options.ipAddress,
+                options.serialNumber,
+                options.accessCode,
+            )
+        except Exception:
+            logger.debug("Kunne ikke initialisere delt printersesjon", exc_info=True)
+            printerSession = None
+
     with tempfile.TemporaryDirectory() as temporaryDirectory:
         paramPath: Optional[str] = None
         tempDir = Path(temporaryDirectory)
@@ -2157,49 +2180,115 @@ def sendBambuPrintJob(
 
         def uploadAndStartViaBambuApi() -> str:
             initialStatusPayload: Optional[Dict[str, Any]] = None
-            session = uploadViaBambulabsApi(
-                ip=options.ipAddress,
-                serial=options.serialNumber,
-                accessCode=options.accessCode,
-                localPath=workingPath,
-                remoteName=remoteName,
-                returnPrinter=True,
-            )
-            try:
-                uploaded = session.remoteName
-                if statusCallback:
-                    statusCallback(
-                        {
-                            "status": "uploaded",
-                            "remoteFile": uploaded,
-                            "originalRemoteFile": remoteName,
-                            "param": paramPath,
-                        }
-                    )
-                initialStatusPayload = {
-                    "status": "starting",
-                    "url": f"file:///sdcard/{uploaded}",
-                    "param": paramPath,
-                    "useAms": bool(resolvedUseAms),
-                    "bedLeveling": bool(options.bedLeveling),
-                    "layerInspect": bool(options.layerInspect),
-                    "flowCalibration": bool(options.flowCalibration),
-                    "vibrationCalibration": bool(options.vibrationCalibration),
-                }
-                if statusConfig:
-                    postStatus(initialStatusPayload, statusConfig)
-                startViaBambuapiAfterUpload(
-                    session.printer,
-                    uploaded,
-                    paramPath,
-                    plateIndex,
-                    useAms=bool(resolvedUseAms),
+            if printerSession is None:
+                uploadSession = uploadViaBambulabsApi(
                     ip=options.ipAddress,
-                    accessCode=options.accessCode,
                     serial=options.serialNumber,
+                    accessCode=options.accessCode,
+                    localPath=workingPath,
+                    remoteName=remoteName,
+                    returnPrinter=True,
                 )
-            finally:
-                session.close()
+                try:
+                    uploaded = uploadSession.remoteName
+                    if statusCallback:
+                        statusCallback(
+                            {
+                                "status": "uploaded",
+                                "remoteFile": uploaded,
+                                "originalRemoteFile": remoteName,
+                                "param": paramPath,
+                            }
+                        )
+                    initialStatusPayload = {
+                        "status": "starting",
+                        "url": f"file:///sdcard/{uploaded}",
+                        "param": paramPath,
+                        "useAms": bool(resolvedUseAms),
+                        "bedLeveling": bool(options.bedLeveling),
+                        "layerInspect": bool(options.layerInspect),
+                        "flowCalibration": bool(options.flowCalibration),
+                        "vibrationCalibration": bool(options.vibrationCalibration),
+                    }
+                    if statusConfig:
+                        postStatus(initialStatusPayload, statusConfig)
+                    startViaBambuapiAfterUpload(
+                        uploadSession.printer,
+                        uploaded,
+                        paramPath,
+                        plateIndex,
+                        useAms=bool(resolvedUseAms),
+                        ip=options.ipAddress,
+                        accessCode=options.accessCode,
+                        serial=options.serialNumber,
+                    )
+                finally:
+                    uploadSession.close()
+            else:
+                with printerSession.lock:
+                    try:
+                        uploadSession = uploadViaBambulabsApi(
+                            ip=options.ipAddress,
+                            serial=options.serialNumber,
+                            accessCode=options.accessCode,
+                            localPath=workingPath,
+                            remoteName=remoteName,
+                            returnPrinter=True,
+                            session=printerSession,
+                        )
+                    except TypeError as uploadError:
+                        if "session" not in str(uploadError):
+                            raise
+                        uploadSession = uploadViaBambulabsApi(
+                            ip=options.ipAddress,
+                            serial=options.serialNumber,
+                            accessCode=options.accessCode,
+                            localPath=workingPath,
+                            remoteName=remoteName,
+                            returnPrinter=True,
+                        )
+                    try:
+                        uploaded = uploadSession.remoteName
+                        if statusCallback:
+                            statusCallback(
+                                {
+                                    "status": "uploaded",
+                                    "remoteFile": uploaded,
+                                    "originalRemoteFile": remoteName,
+                                    "param": paramPath,
+                                }
+                            )
+                        initialStatusPayload = {
+                            "status": "starting",
+                            "url": f"file:///sdcard/{uploaded}",
+                            "param": paramPath,
+                            "useAms": bool(resolvedUseAms),
+                            "bedLeveling": bool(options.bedLeveling),
+                            "layerInspect": bool(options.layerInspect),
+                            "flowCalibration": bool(options.flowCalibration),
+                            "vibrationCalibration": bool(options.vibrationCalibration),
+                        }
+                        if statusConfig:
+                            postStatus(initialStatusPayload, statusConfig)
+                        if isinstance(uploadSession.session, PrinterSession):
+                            printerClient = ensurePrinterSessionReady(printerSession)
+                        else:
+                            printerClient = uploadSession.printer
+                        startViaBambuapiAfterUpload(
+                            printerClient,
+                            uploaded,
+                            paramPath,
+                            plateIndex,
+                            useAms=bool(resolvedUseAms),
+                            ip=options.ipAddress,
+                            accessCode=options.accessCode,
+                            serial=options.serialNumber,
+                        )
+                    except Exception:
+                        resetPrinterSession(printerSession)
+                        raise
+                    finally:
+                        uploadSession.close()
 
             startPrintViaMqtt(
                 ip=options.ipAddress,
@@ -2269,5 +2358,119 @@ __all__ = [
     "printerIsMqttReady",
     "waitForStartAck",
     "upsertPrinterFromJobMetadata",
+    "PrinterSession",
+    "getOrCreatePrinterSession",
+    "resetPrinterSession",
+    "ensurePrinterSessionReady",
 ]
 
+@dataclass
+class PrinterSession:
+    ipAddress: str
+    serialNumber: str
+    accessCode: str
+    client: Any | None = None
+    lock: Lock = field(default_factory=Lock)
+    mqttReady: bool = False
+
+    def acquireClient(self) -> Any:
+        if bambulabsApi is None:
+            raise RuntimeError("bambulabs_api is required for session operations")
+        if self.client is None:
+            printerClass = getattr(bambulabsApi, "Printer", None)
+            if printerClass is None:
+                raise RuntimeError("bambulabs_api.Printer is not available")
+            self.client = printerClass(self.ipAddress, self.accessCode, self.serialNumber)
+        return self.client
+
+
+def getOrCreatePrinterSession(ipAddress: str, serialNumber: str, accessCode: str) -> PrinterSession:
+    normalizedSerial = (serialNumber or "").strip().lower()
+    normalizedIp = (ipAddress or "").strip()
+    key = (normalizedSerial, normalizedIp)
+    with printerSessionsLock:
+        session = printerSessionsMap.get(key)
+        if session is None:
+            session = PrinterSession(
+                ipAddress=ipAddress,
+                serialNumber=serialNumber,
+                accessCode=accessCode,
+            )
+            printerSessionsMap[key] = session
+            return session
+        if session.ipAddress != ipAddress or session.accessCode != accessCode:
+            resetPrinterSession(session)
+            session.ipAddress = ipAddress
+            session.accessCode = accessCode
+        return session
+
+
+def resetPrinterSession(session: PrinterSession) -> None:
+    client = session.client
+    session.mqttReady = False
+    session.client = None
+    if client is None:
+        return
+    disconnectMethod = getattr(client, "disconnect", None)
+    if disconnectMethod:
+        try:
+            disconnectMethod()
+        except Exception:
+            pass
+    mqttStop = getattr(client, "mqtt_stop", None)
+    if mqttStop:
+        try:
+            mqttStop()
+        except Exception:
+            pass
+
+
+def _extractSerialFromPrinter(printer: Any) -> Optional[str]:
+    infoMethod = getattr(printer, "get_printer_info", None)
+    if callable(infoMethod):
+        try:
+            infoPayload = infoMethod()
+            serialCandidate = _extractSerialFromPayload(infoPayload)
+            if serialCandidate:
+                return serialCandidate
+        except Exception:
+            logger.debug("Unable to resolve serial via get_printer_info", exc_info=True)
+    stateMethod = getattr(printer, "get_state", None)
+    if callable(stateMethod):
+        try:
+            statePayload = stateMethod()
+            serialCandidate = _extractSerialFromPayload(statePayload)
+            if serialCandidate:
+                return serialCandidate
+        except Exception:
+            logger.debug("Unable to resolve serial via get_state", exc_info=True)
+    serialAttribute = getattr(printer, "serial", None) or getattr(printer, "serialNumber", None)
+    if serialAttribute:
+        text = str(serialAttribute).strip()
+        if text:
+            return text
+    return None
+
+
+def ensurePrinterSessionReady(session: PrinterSession, *, timeoutSeconds: float = 25.0) -> Any:
+    expectedSerial = (session.serialNumber or "").strip().lower()
+    attempts = 0
+    printer = session.acquireClient()
+    while attempts < 2:
+        attempts += 1
+        ready = ensureMqttConnected(printer, timeoutSeconds=timeoutSeconds)
+        session.mqttReady = ready
+        actualSerial = _extractSerialFromPrinter(printer)
+        if expectedSerial and actualSerial and actualSerial.strip().lower() != expectedSerial:
+            logger.warning(
+                "Printer session mismatch for %s: expected %s, got %s. Reconnecting.",
+                session.ipAddress,
+                session.serialNumber,
+                actualSerial,
+            )
+            resetPrinterSession(session)
+            printer = session.acquireClient()
+            continue
+        return printer
+    resetPrinterSession(session)
+    raise RuntimeError("Connected to feil printer – avbryter")
