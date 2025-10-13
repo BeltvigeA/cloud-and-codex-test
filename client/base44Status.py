@@ -3,25 +3,26 @@
 from __future__ import annotations
 
 import datetime as dt
-import json
 import logging
+import os
 import threading
+import time
 from typing import Any, Callable, Iterable
 
 import requests
 
 LOG = logging.getLogger(__name__)
 
-BASE44_STATUS_URL = (
+STATUS_UPDATES_URL = (
     "https://print-flow-pro-eb683cc6.base44.app/api/apps/68b61486e7c52405eb683cc6/functions/updatePrinterStatus"
 )
 
+BASE44_STATUS_URL = STATUS_UPDATES_URL
 
-def _buildHeaders(apiKey: str) -> dict[str, str]:
-    return {
-        "Content-Type": "application/json",
-        "X-API-Key": apiKey,
-    }
+HEADERS = {
+    "Content-Type": "application/json",
+    "X-API-Key": (os.getenv("PRINTER_API_TOKEN") or "").strip(),
+}
 
 
 def _isoUtcNow() -> str:
@@ -45,6 +46,31 @@ def _coerceInt(value: Any) -> int:
     return 0
 
 
+def _sanitizeStatus(snapshot: dict[str, Any]) -> tuple[str, bool]:
+    onlineFlag = bool(snapshot.get("online"))
+    statusValue = str(snapshot.get("status") or "").strip()
+    if not statusValue:
+        statusValue = "idle" if onlineFlag else "offline"
+    return statusValue, onlineFlag
+
+
+def _resolveHeaders(apiKeyOverride: str | None) -> dict[str, str]:
+    headers = {"Content-Type": "application/json"}
+    token = (apiKeyOverride or "").strip() or HEADERS.get("X-API-Key", "")
+    if not token:
+        token = (os.getenv("PRINTER_API_TOKEN") or "").strip()
+    if token:
+        headers["X-API-Key"] = token
+    return headers
+
+
+def _isZeroLike(value: Any) -> bool:
+    try:
+        return float(value) == 0.0
+    except (TypeError, ValueError):
+        return False
+
+
 class Base44StatusReporter:
     """Periodically pushes printer snapshots to Base44 while running."""
 
@@ -54,17 +80,23 @@ class Base44StatusReporter:
         self._thread: threading.Thread | None = None
         self._stopEvent = threading.Event()
         self._recipientId = ""
-        self._apiKey = ""
+        self._apiKeyOverride = ""
+        self._lastSnapshotByPrinter: dict[tuple[str, str], dict[str, Any]] = {}
+        self._mqttOfflineSince: dict[tuple[str, str], float] = {}
 
-    def start(self, recipientId: str, apiKey: str) -> None:
+    def start(self, recipientId: str, apiKey: str | None = None) -> None:
         self._recipientId = recipientId.strip()
-        self._apiKey = apiKey.strip()
+        self._apiKeyOverride = (apiKey or "").strip()
         self._stopEvent.clear()
         if self._thread and self._thread.is_alive():
             return
         self._thread = threading.Thread(target=self._runLoop, name="base44-status", daemon=True)
         self._thread.start()
-        LOG.info("Base44StatusReporter started (recipientId=%s, every=%ss)", self._recipientId, self._intervalSec)
+        LOG.info(
+            "Base44StatusReporter started (recipientId=%s, every=%ss)",
+            self._recipientId,
+            self._intervalSec,
+        )
 
     def stop(self) -> None:
         self._stopEvent.set()
@@ -73,36 +105,80 @@ class Base44StatusReporter:
         self._thread = None
         LOG.info("Base44StatusReporter stopped")
 
+    def _buildPayload(self, snapshot: dict[str, Any]) -> dict[str, Any]:
+        statusValue, onlineFlag = _sanitizeStatus(snapshot)
+        serialKey = str(snapshot.get("serial") or "").strip().lower()
+        ipKey = str(snapshot.get("ip") or "").strip()
+        key = (serialKey, ipKey)
+
+        previous = self._lastSnapshotByPrinter.get(key, {})
+        lastTemps = {
+            "bedTemp": previous.get("bedTemp"),
+            "nozzleTemp": previous.get("nozzleTemp"),
+            "timestamp": previous.get("timestamp", 0.0),
+        }
+
+        currentBed = snapshot.get("bed")
+        currentNozzle = snapshot.get("nozzle")
+
+        if onlineFlag and statusValue.lower() not in {"offline", "unknown"}:
+            if _isZeroLike(currentBed) and lastTemps["bedTemp"] not in (None, ""):
+                currentBed = lastTemps["bedTemp"]
+            if _isZeroLike(currentNozzle) and lastTemps["nozzleTemp"] not in (None, ""):
+                currentNozzle = lastTemps["nozzleTemp"]
+
+        progressValue = _coerceInt(snapshot.get("progress"))
+
+        mqttReady = snapshot.get("mqttReady")
+        if mqttReady is False:
+            offlineSince = self._mqttOfflineSince.get(key)
+            if offlineSince is None:
+                self._mqttOfflineSince[key] = time.time()
+            elif time.time() - offlineSince > 30:
+                onlineFlag = False
+        else:
+            self._mqttOfflineSince.pop(key, None)
+
+        payload = {
+            "recipientId": self._recipientId,
+            "printerIpAddress": snapshot.get("ip"),
+            "serialNumber": snapshot.get("serial"),
+            "status": statusValue,
+            "online": onlineFlag,
+            "jobProgress": progressValue,
+            "currentJobId": snapshot.get("currentJobId"),
+            "bedTemp": currentBed,
+            "nozzleTemp": currentNozzle,
+            "fanSpeed": snapshot.get("fan"),
+            "printSpeed": snapshot.get("speed"),
+            "filamentUsed": snapshot.get("filamentUsed"),
+            "timeRemaining": _coerceInt(snapshot.get("timeRemaining")),
+            "errorMessage": snapshot.get("error"),
+            "lastUpdateTimestamp": _isoUtcNow(),
+            "firmwareVersion": snapshot.get("firmware"),
+        }
+
+        self._lastSnapshotByPrinter[key] = {
+            "bedTemp": payload.get("bedTemp"),
+            "nozzleTemp": payload.get("nozzleTemp"),
+            "timestamp": time.time(),
+        }
+
+        return payload
+
     def _runLoop(self) -> None:
         while not self._stopEvent.is_set():
             try:
-                if not self._recipientId or not self._apiKey:
-                    LOG.debug("Skipping Base44 post: missing recipient or API key")
+                if not self._recipientId:
+                    LOG.debug("Skipping Base44 post: missing recipient")
                 else:
                     snapshots = list(self._getPrintersSnapshotCallable() or [])
                     for snapshot in snapshots:
-                        payload = {
-                            "recipientId": self._recipientId,
-                            "printerIpAddress": snapshot.get("ip"),
-                            "serialNumber": snapshot.get("serial"),
-                            "status": snapshot.get("status") or "offline",
-                            "online": bool(snapshot.get("online")),
-                            "jobProgress": _coerceInt(snapshot.get("progress")),
-                            "currentJobId": snapshot.get("currentJobId"),
-                            "bedTemp": snapshot.get("bed"),
-                            "nozzleTemp": snapshot.get("nozzle"),
-                            "fanSpeed": snapshot.get("fan"),
-                            "printSpeed": snapshot.get("speed"),
-                            "filamentUsed": snapshot.get("filamentUsed"),
-                            "timeRemaining": _coerceInt(snapshot.get("timeRemaining")),
-                            "errorMessage": snapshot.get("error"),
-                            "lastUpdateTimestamp": _isoUtcNow(),
-                            "firmwareVersion": snapshot.get("firmware"),
-                        }
+                        payload = self._buildPayload(snapshot)
 
                         LOG.info(
                             "[POST] %s recipientId=%s ip=%s status=%s bed=%s nozzle=%s",
-                            BASE44_STATUS_URL,
+                            STATUS_UPDATES_URL,
                             payload["recipientId"],
                             payload["printerIpAddress"],
                             payload["status"],
@@ -111,9 +187,9 @@ class Base44StatusReporter:
                         )
 
                         response = requests.post(
-                            BASE44_STATUS_URL,
-                            headers=_buildHeaders(self._apiKey),
-                            data=json.dumps(payload),
+                            STATUS_UPDATES_URL,
+                            headers=_resolveHeaders(self._apiKeyOverride),
+                            json=payload,
                             timeout=10,
                         )
 
@@ -124,4 +200,4 @@ class Base44StatusReporter:
             self._stopEvent.wait(self._intervalSec)
 
 
-__all__ = ["Base44StatusReporter", "BASE44_STATUS_URL"]
+__all__ = ["Base44StatusReporter", "STATUS_UPDATES_URL", "BASE44_STATUS_URL", "HEADERS"]
