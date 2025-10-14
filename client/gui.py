@@ -23,7 +23,6 @@ from .bambuPrinter import (
     BambuPrintOptions,
     postStatus,
     sendBambuPrintJob,
-    startStatusHeartbeat,
     upsertPrinterFromJobMetadata,
     waitForMqttReady,
 )
@@ -115,8 +114,6 @@ class ListenerGuiApp:
         self.statusRefreshThread: Optional[threading.Thread] = None
         self.statusRefreshIntervalMs = 30_000
         self.pendingImmediateStatusRefresh = False
-
-        self.statusHeartbeatEvents: Dict[str, threading.Event] = {}
 
         self.listenerRecipientId = ""
         self.listenerStatusApiKey = ""
@@ -558,18 +555,11 @@ class ListenerGuiApp:
         if isinstance(explicitOnline, bool):
             onlineFlag = explicitOnline
         else:
-            mqttFlag = record.get("mqttConnected")
-            if isinstance(mqttFlag, bool):
-                onlineFlag = mqttFlag
-            else:
-                onlineFlag = normalizedStatus.lower() not in {"", "offline", "unknown"}
+            onlineFlag = False
 
         mqttReadyFlag = record.get("mqttReady")
-        if isinstance(mqttReadyFlag, bool):
-            if not mqttReadyFlag:
-                onlineFlag = False
-        else:
-            mqttReadyFlag = onlineFlag
+        if isinstance(mqttReadyFlag, bool) and not mqttReadyFlag:
+            onlineFlag = False
 
         progressCandidate = record.get("progress")
         if progressCandidate is None:
@@ -879,44 +869,6 @@ class ListenerGuiApp:
             serialCandidate = statusPayload.get("serial")
             normalizedSerial = serialCandidate.lower() if isinstance(serialCandidate, str) else None
             statusText = str(statusPayload.get("status") or "").strip().lower()
-            if normalizedSerial:
-                if statusText and statusText not in {"offline", "unknown"}:
-                    if normalizedSerial not in self.statusHeartbeatEvents:
-                        def heartbeatSupplier(serialKey: str = normalizedSerial) -> Dict[str, Any]:
-                            latest = next(
-                                (
-                                    record
-                                    for record in self.printers
-                                    if self._parseOptionalString(record.get("serialNumber"))
-                                    and self._parseOptionalString(record.get("serialNumber")).lower() == serialKey
-                                ),
-                                currentDetails,
-                            )
-                            return {
-                                "status": latest.get("status"),
-                                "progress": self._parseOptionalFloat(latest.get("progressPercent")),
-                                "nozzleTemp": self._parseOptionalFloat(latest.get("nozzleTemp")),
-                                "bedTemp": self._parseOptionalFloat(latest.get("bedTemp")),
-                                "remainingTimeSeconds": self._parseOptionalInt(latest.get("remainingTimeSeconds")),
-                                "gcodeState": self._parseOptionalString(latest.get("gcodeState")),
-                                "ip": self._parseOptionalString(latest.get("ipAddress")),
-                                "serial": self._parseOptionalString(latest.get("serialNumber")),
-                                "access_code": self._parseOptionalString(latest.get("accessCode")),
-                                "lastSeen": datetime.now(timezone.utc).isoformat(),
-                                "recipientId": self.listenerRecipientId,
-                            }
-
-                        stopEvent = startStatusHeartbeat(
-                            currentDetails,
-                            currentDetails,
-                            intervalSeconds=30.0,
-                            statusSupplier=heartbeatSupplier,
-                        )
-                        self.statusHeartbeatEvents[normalizedSerial] = stopEvent
-                elif normalizedSerial in self.statusHeartbeatEvents:
-                    stopEvent = self.statusHeartbeatEvents.pop(normalizedSerial)
-                    stopEvent.set()
-
             for key, value in telemetry.items():
                 if currentDetails.get(key) != value:
                     pendingChanges[key] = value
@@ -977,7 +929,7 @@ class ListenerGuiApp:
                     connectMethod()
                 waitForMqttReady(bambuPrinter)
 
-                telemetry["status"] = "Online"
+                telemetry["status"] = "Idle"
 
                 progressValue = self._parseOptionalFloat(safePrinterCall("get_percentage"))
                 if progressValue is not None:
