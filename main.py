@@ -76,6 +76,10 @@ readyToClaimStatuses: Set[str] = {'uploaded', 'queued'}
 
 firestoreCollectionFiles = os.environ.get('FIRESTORE_COLLECTION_FILES', 'files')
 firestoreCollectionPrinterStatus = os.environ.get('FIRESTORE_COLLECTION_PRINTER_STATUS', 'printer_status_updates')
+firestoreCollectionPrinterCommands = os.environ.get(
+    'FIRESTORE_COLLECTION_PRINTER_COMMANDS',
+    'printer_commands',
+)
 validPrinterApiKeys: Set[str] = set()
 port = int(os.environ.get('PORT', '8080'))
 fetchTokenTtlMinutes = int(os.environ.get('FETCH_TOKEN_TTL_MINUTES', '15'))
@@ -241,6 +245,31 @@ def requireSanitizedStringField(
     return value.strip(), None
 
 
+def sanitizeOptionalStringField(
+    payload: dict,
+    fieldName: str,
+    *,
+    allowEmpty: bool = False,
+) -> Tuple[Optional[str], Optional[Tuple[dict, int]]]:
+    if fieldName not in payload:
+        return None, None
+
+    value = payload.get(fieldName)
+    if value is None:
+        return None, None
+
+    if not isinstance(value, str):
+        logging.warning('Invalid %s type. Expected string, received %s.', fieldName, type(value).__name__)
+        return None, makeErrorResponse(400, 'ValidationError', f'{fieldName} must be a string')
+
+    sanitizedValue = value.strip()
+    if not sanitizedValue and not allowEmpty:
+        logging.warning('Empty value provided for %s.', fieldName)
+        return None, makeErrorResponse(400, 'ValidationError', f'{fieldName} must be a non-empty string')
+
+    return sanitizedValue if sanitizedValue or allowEmpty else None, None
+
+
 def tryParseKeyValueObject(rawValue: str) -> Optional[dict]:
     sanitizedValue = rawValue.strip()
     if not sanitizedValue:
@@ -385,6 +414,28 @@ def parseJsonObjectField(rawValue: str, fieldName: str) -> Tuple[Optional[dict],
         logging.warning('Invalid JSON for field %s.', fieldName)
 
     return None, ({'error': 'Invalid JSON format for associated data'}, 400)
+
+
+def parseCommandMetadata(
+    rawMetadata: object,
+) -> Tuple[Optional[dict], Optional[Tuple[dict, int]]]:
+    if rawMetadata is None:
+        return {}, None
+
+    if isinstance(rawMetadata, dict):
+        return rawMetadata, None
+
+    if isinstance(rawMetadata, str):
+        parsedMetadata, errorResponse = parseJsonObjectField(rawMetadata, 'metadata')
+        if errorResponse:
+            return None, errorResponse
+        return parsedMetadata or {}, None
+
+    logging.warning(
+        'Invalid metadata type provided for control command: %s',
+        type(rawMetadata).__name__,
+    )
+    return None, makeErrorResponse(400, 'ValidationError', 'metadata must be an object or JSON string')
 
 
 def getClients() -> ClientBundle:
@@ -1517,6 +1568,141 @@ def listPendingFiles(recipientId: str):
     except Exception:  # pylint: disable=broad-except
         logging.exception('An unexpected error occurred while listing pending files.')
         return jsonify({'error': 'Internal server error'}), 500
+
+
+@app.route('/control', methods=['POST'])
+def queuePrinterControlCommand():
+    logging.info('Received request to /control')
+
+    apiKeyError = ensureValidApiKey()
+    if apiKeyError:
+        return apiKeyError
+
+    payload, payloadError = getJsonPayload()
+    if payloadError:
+        return payloadError
+
+    commandType, commandTypeError = requireSanitizedStringField(payload, 'commandType')
+    if commandTypeError:
+        return commandTypeError
+
+    metadata, metadataError = parseCommandMetadata(payload.get('metadata'))
+    if metadataError:
+        return metadataError
+
+    recipientId, recipientError = sanitizeOptionalStringField(payload, 'recipientId')
+    if recipientError:
+        return recipientError
+
+    printerIpAddress, printerIpError = sanitizeOptionalStringField(payload, 'printerIpAddress')
+    if printerIpError:
+        return printerIpError
+
+    printerSerial, printerSerialError = sanitizeOptionalStringField(payload, 'printerSerial')
+    if printerSerialError:
+        return printerSerialError
+
+    printerId, printerIdError = sanitizeOptionalStringField(payload, 'printerId')
+    if printerIdError:
+        return printerIdError
+
+    requestedBy, requestedByError = sanitizeOptionalStringField(payload, 'requestedBy')
+    if requestedByError:
+        return requestedByError
+
+    requestId, requestIdError = sanitizeOptionalStringField(payload, 'requestId')
+    if requestIdError:
+        return requestIdError
+
+    commandId, commandIdError = sanitizeOptionalStringField(payload, 'commandId')
+    if commandIdError:
+        return commandIdError
+    if not commandId:
+        commandId = str(uuid.uuid4())
+
+    if not printerIpAddress and not printerSerial:
+        logging.warning(
+            'Control command is missing printerIpAddress and printerSerial identifiers.'
+        )
+        return makeErrorResponse(
+            400,
+            'ValidationError',
+            'printerIpAddress or printerSerial must be provided',
+        )
+
+    expiresAtValue = payload.get('expiresAt')
+    expiresAtTimestamp: Optional[datetime] = None
+    if expiresAtValue is not None:
+        if isinstance(expiresAtValue, str):
+            expiresAtTimestamp = parseIso8601Timestamp(expiresAtValue)
+            if expiresAtTimestamp is None:
+                logging.warning('Invalid expiresAt value provided: %s', expiresAtValue)
+                return makeErrorResponse(
+                    400,
+                    'ValidationError',
+                    'expiresAt must be an ISO8601 timestamp string',
+                )
+        else:
+            logging.warning(
+                'Invalid expiresAt type provided: %s', type(expiresAtValue).__name__
+            )
+            return makeErrorResponse(
+                400,
+                'ValidationError',
+                'expiresAt must be an ISO8601 timestamp string',
+            )
+
+    clients, clientError = _loadClientsOrError()
+    if clientError:
+        return clientError
+
+    firestoreClient = clients.firestoreClient
+    commandCollection = firestoreClient.collection(firestoreCollectionPrinterCommands)
+    commandDocument = commandCollection.document(commandId)
+
+    commandRecord = {
+        'commandId': commandId,
+        'commandType': commandType,
+        'status': 'pending',
+        'createdAt': firestore.SERVER_TIMESTAMP,
+    }
+
+    if metadata is not None:
+        commandRecord['metadata'] = metadata
+
+    optionalFields = {
+        'recipientId': recipientId,
+        'printerIpAddress': printerIpAddress,
+        'printerSerial': printerSerial,
+        'printerId': printerId,
+        'requestedBy': requestedBy,
+        'requestId': requestId,
+    }
+    for key, value in optionalFields.items():
+        if value is not None:
+            commandRecord[key] = value
+
+    if expiresAtTimestamp is not None:
+        commandRecord['expiresAt'] = expiresAtTimestamp
+
+    try:
+        commandDocument.set(commandRecord)
+    except Exception as error:  # pylint: disable=broad-except
+        logging.exception('Failed to store printer control command %s.', commandId)
+        return makeErrorResponse(
+            500,
+            'ServerError',
+            'Failed to queue printer control command',
+            str(error),
+        )
+
+    responsePayload = {
+        'ok': True,
+        'status': 'queued',
+        'commandId': commandId,
+    }
+
+    return makeJsonResponse(responsePayload, 202)
 
 
 def _handlePrinterStatusUpdate(appId: Optional[str]):
