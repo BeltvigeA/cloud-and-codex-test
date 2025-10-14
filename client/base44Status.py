@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 import logging
 import os
 import threading
 import time
 from typing import Any, Callable, Iterable
 
-from .base44 import callFunction, getDefaultApiKey, getStatusFunctionName
+from .base44 import callFunction, getBaseUrl, getDefaultApiKey, getStatusFunctionName
 from .commands import completeCommand, listPendingCommands
 from .pending import requestPendingPollTrigger
 from .health import HealthGate, HealthState
@@ -378,15 +379,13 @@ class Base44StatusReporter:
         if not payload:
             return
 
-        LOG.info(
-            "[POST] %s recipientId=%s ip=%s status=%s bed=%s nozzle=%s",
-            self._statusFunctionName,
-            payload.get("recipientId"),
-            payload.get("printerIpAddress"),
-            payload.get("status"),
-            payload.get("bedTemp"),
-            payload.get("nozzleTemp"),
-        )
+        statusUrl = f"{getBaseUrl().rstrip('/')}/{self._statusFunctionName}".rstrip("/")
+        try:
+            serializedPayload = json.dumps(payload, sort_keys=True, default=str)
+        except TypeError:
+            serializedPayload = repr(payload)
+
+        LOG.info("[POST] Base44 status url=%s payload=%s", statusUrl, serializedPayload)
 
         callFunction(
             self._statusFunctionName,
