@@ -4,6 +4,7 @@ import sys
 import types
 from datetime import datetime
 from pathlib import Path
+from typing import Any, Dict, List
 
 import pytest
 
@@ -198,6 +199,42 @@ def testValidateRemoteFetchAcceptsBareAndQualifiedBaseUrls(
         client.buildFetchUrl(arguments.baseUrl, "tokenValue")
         == f"{expected}/fetch/tokenValue"
     )
+
+
+def testFetchPendingFilesForwardsBaseUrl(monkeypatch: pytest.MonkeyPatch) -> None:
+    capturedCalls: Dict[str, Any] = {}
+
+    def fakeBuildPendingUrl(baseUrl: str, recipientId: str) -> str:
+        capturedCalls["builtUrl"] = (baseUrl, recipientId)
+        return "https://example.com/recipients/recipient-xyz/pending"
+
+    def fakeListPending(
+        recipientId: str,
+        *,
+        baseUrl: str,
+        apiKey: str | None = None,
+    ) -> List[Dict[str, Any]]:
+        capturedCalls["listPending"] = {
+            "recipientId": recipientId,
+            "baseUrl": baseUrl,
+            "apiKey": apiKey,
+        }
+        return [{"jobId": "job-1"}]
+
+    monkeypatch.setattr(client, "buildPendingUrl", fakeBuildPendingUrl)
+    monkeypatch.setattr(client, "listPending", fakeListPending)
+
+    result = client.fetchPendingFiles("https://example.com", " recipient-xyz ", statusApiKey="secret")
+
+    assert result == [{"jobId": "job-1"}]
+    assert capturedCalls == {
+        "builtUrl": ("https://example.com", "recipient-xyz"),
+        "listPending": {
+            "recipientId": "recipient-xyz",
+            "baseUrl": "https://example.com",
+            "apiKey": "secret",
+        },
+    }
 
 
 @pytest.mark.parametrize(
