@@ -721,20 +721,22 @@ def startWithLibrary(
                     raise TimeoutError("MQTT handshake tok for lang tid") from handshakeError
                 time.sleep(0.5)
 
-    normalizedExpected = _normalizeSerialCandidate(expectedSerial)
+    expectedNormalized = _normalizeSerialCandidate(expectedSerial)
+    expectedKey = expectedNormalized.casefold() if expectedNormalized else None
     resolvedSerial = _extractSerialFromPayload(statePayload)
-    if not resolvedSerial:
-        resolvedSerial = _normalizeSerialCandidate(getattr(printer, "serial", "")) or _normalizeSerialCandidate(
+    normalizedResolved = _normalizeSerialCandidate(resolvedSerial)
+    if not normalizedResolved:
+        normalizedResolved = _normalizeSerialCandidate(getattr(printer, "serial", "")) or _normalizeSerialCandidate(
             getattr(printer, "serialNumber", "")
         )
 
-    if normalizedExpected:
+    if expectedNormalized:
         logger.info(
             "Connected to serial=%s (expected %s)",
-            resolvedSerial or "<ukjent>",
-            normalizedExpected,
+            normalizedResolved or "<ukjent>",
+            expectedNormalized,
         )
-        if resolvedSerial and resolvedSerial.lower() != normalizedExpected.lower():
+        if normalizedResolved and expectedKey and normalizedResolved.casefold() != expectedKey:
             raise RuntimeError("Connected to feil printer – avbryter")
 
     startMethod = getattr(printer, "start_print", None)
@@ -2527,16 +2529,16 @@ def _extractSerialFromPrinter(printer: Any) -> Optional[str]:
                 return serialCandidate
         except Exception:
             logger.debug("Unable to resolve serial via get_state", exc_info=True)
-    serialAttribute = getattr(printer, "serial", None) or getattr(printer, "serialNumber", None)
-    normalizedAttribute = _normalizeSerialCandidate(serialAttribute)
-    if normalizedAttribute:
-        return normalizedAttribute
+    for attributeName in ("serial", "serialNumber"):
+        normalizedAttribute = _normalizeSerialCandidate(getattr(printer, attributeName, None))
+        if normalizedAttribute:
+            return normalizedAttribute
     return None
 
 
 def ensurePrinterSessionReady(session: PrinterSession, *, timeoutSeconds: float = 25.0) -> Any:
     expectedSerial = _normalizeSerialCandidate(session.serialNumber)
-    normalizedExpected = expectedSerial.lower() if expectedSerial else None
+    normalizedExpected = expectedSerial.casefold() if expectedSerial else None
     attempts = 0
     printer = session.acquireClient()
     while attempts < 2:
@@ -2544,7 +2546,7 @@ def ensurePrinterSessionReady(session: PrinterSession, *, timeoutSeconds: float 
         ready = ensureMqttConnected(printer, timeoutSeconds=timeoutSeconds)
         session.mqttReady = ready
         actualSerial = _extractSerialFromPrinter(printer)
-        normalizedActual = actualSerial.lower() if actualSerial else None
+        normalizedActual = actualSerial.casefold() if actualSerial else None
         if normalizedExpected and normalizedActual and normalizedActual != normalizedExpected:
             logger.warning(
                 "Printer session mismatch for %s: expected %s, got %s. Reconnecting.",
