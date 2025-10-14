@@ -1320,7 +1320,7 @@ def testFetchFileRejectsExpiredToken(monkeypatch):
     assert not updateRecorder['update'], 'Update should not be called for expired tokens'
 
 
-def testListPendingFilesReturnsActiveEntries(monkeypatch):
+def testListPendingJobsReturnsActiveEntries(monkeypatch):
     activeMetadata = {
         'originalFilename': 'file.gcode',
         'productId': 'product-active',
@@ -1352,16 +1352,31 @@ def testListPendingFilesReturnsActiveEntries(monkeypatch):
     )
     monkeypatch.setattr(main, 'getClients', lambda: mockClients)
 
-    responseBody, statusCode = main.listPendingFiles('recipient123')
+    fakeRequest.headers = {}
+    fakeRequest.args = {}
+    fakeRequest.set_json({'recipientId': 'recipient123'})
+
+    responseBody, statusCode = main.listPendingJobs('app-123')
 
     assert statusCode == 200
+    assert responseBody['ok'] is True
     assert responseBody['recipientId'] == 'recipient123'
-    pendingFiles = responseBody['pendingFiles']
+    pendingFiles = responseBody['pending']
     assert len(pendingFiles) == 1
     assert pendingFiles[0]['fileId'] == 'doc-active'
     assert pendingFiles[0]['fetchToken'] == 'token-active'
     assert pendingFiles[0]['productId'] == 'product-active'
-    assert responseBody['skippedFiles'] == ['doc-expired']
+    assert responseBody['skipped'] == ['doc-expired']
+
+
+def testListRecipientFilesAliasCallsListPendingJobs(monkeypatch):
+    pendingResponse = {'ok': True, 'pending': []}
+    monkeypatch.setattr(main, 'listPendingJobs', lambda appId: (pendingResponse, 200))
+
+    responseBody, statusCode = main.listRecipientFilesAlias('app-xyz')
+
+    assert statusCode == 200
+    assert responseBody == pendingResponse
 
 
 def testPrinterStatusUpdateStoresRecipientId(monkeypatch):
@@ -1398,7 +1413,10 @@ def testPrinterStatusUpdateStoresRecipientId(monkeypatch):
     responseBody, statusCode = main.printerStatusUpdate()
 
     assert statusCode == 200
+    assert responseBody['ok'] is True
+    assert responseBody['success'] is True
     assert responseBody['message'] == 'Printer status updated successfully'
+    assert responseBody['statusId'] == 'status-1'
     assert len(addRecorder) == 1
     storedPayload = addRecorder[0]
     assert storedPayload['recipientId'] == 'recipient-abc'
@@ -1655,6 +1673,8 @@ def testPrinterStatusUpdateAcceptsKeyFromHelper(monkeypatch):
     responseBody, statusCode = main.printerStatusUpdate()
 
     assert statusCode == 200
+    assert responseBody['ok'] is True
+    assert responseBody['success'] is True
     assert responseBody['message'] == 'Printer status updated successfully'
     assert len(addRecorder) == 1
 
@@ -1698,7 +1718,10 @@ def testPrinterStatusUpdateAcceptsInlineSecretManagerKeys(monkeypatch):
     responseBody, statusCode = main.printerStatusUpdate()
 
     assert statusCode == 200
+    assert responseBody['ok'] is True
+    assert responseBody['success'] is True
     assert responseBody['message'] == 'Printer status updated successfully'
+    assert responseBody['statusId'] == 'status-1'
     assert len(addRecorder) == 1
 
 
@@ -1736,7 +1759,9 @@ def testPrinterStatusUpdateRejectsInvalidRecipientId(monkeypatch):
     responseBody, statusCode = main.printerStatusUpdate()
 
     assert statusCode == 400
-    assert responseBody['error'] == 'recipientId must be a non-empty string'
+    assert responseBody['ok'] is False
+    assert responseBody['error_type'] == 'ValidationError'
+    assert responseBody['message'] == 'recipientId must be a non-empty string'
     assert not addRecorder
 
 

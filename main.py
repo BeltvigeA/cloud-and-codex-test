@@ -39,6 +39,31 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 app = Flask(__name__)
 
 
+def makeJsonResponse(payload: dict, statusCode: int = 200):
+    response = jsonify(payload)
+    if hasattr(response, 'headers'):
+        response.headers['Content-Type'] = 'application/json; charset=utf-8'
+        return response, statusCode
+    return response, statusCode
+
+
+def makeErrorResponse(
+    statusCode: int,
+    errorType: str,
+    message: str,
+    detail: str = '',
+    tracebackText: str = '',
+):
+    errorPayload = {
+        'ok': False,
+        'error_type': errorType,
+        'message': message,
+        'detail': detail,
+        'traceback': tracebackText,
+    }
+    return makeJsonResponse(errorPayload, statusCode)
+
+
 allowedUploadExtensions = {'.3mf', '.gcode', '.gco'}
 allowedUploadMimeTypes = {
     'application/octet-stream',
@@ -158,6 +183,50 @@ def loadPrinterApiKeys(secretManagerClient=None) -> Set[str]:
 
 
 validPrinterApiKeys = loadPrinterApiKeys()
+
+
+def getProvidedApiKey() -> Optional[str]:
+    headerKey = request.headers.get('X-API-Key') if hasattr(request, 'headers') else None
+    if headerKey:
+        return headerKey
+
+    queryArgs = getattr(request, 'args', None)
+    if queryArgs and hasattr(queryArgs, 'get'):
+        queryKey = queryArgs.get('apiKey')
+        if queryKey:
+            return queryKey
+
+    return None
+
+
+def ensureValidApiKey() -> Optional[Tuple[dict, int]]:
+    if not validPrinterApiKeys:
+        return None
+
+    providedKey = getProvidedApiKey()
+    if not providedKey or providedKey not in validPrinterApiKeys:
+        logging.warning('Invalid API key provided for printer endpoint access.')
+        return makeErrorResponse(401, 'AuthError', 'Invalid API key')
+
+    return None
+
+
+def getJsonPayload() -> Tuple[Optional[dict], Optional[Tuple[dict, int]]]:
+    if not getattr(request, 'is_json', False):
+        logging.warning('Request content type is not JSON.')
+        return None, makeErrorResponse(400, 'ValidationError', 'Request must be JSON')
+
+    try:
+        payload = request.get_json()
+    except Exception as error:  # pylint: disable=broad-except
+        logging.warning('Failed to parse JSON payload: %s', error)
+        return None, makeErrorResponse(400, 'ValidationError', 'Invalid JSON payload', str(error))
+
+    if not isinstance(payload, dict):
+        logging.warning('JSON payload is not a dictionary.')
+        return None, makeErrorResponse(400, 'ValidationError', 'JSON payload must be an object')
+
+    return payload, None
 
 
 def tryParseKeyValueObject(rawValue: str) -> Optional[dict]:
@@ -1236,6 +1305,81 @@ def buildPendingFileList(
     return pendingFiles, skippedFiles
 
 
+def _handleClientInitializationErrors(error: Exception):
+    if isinstance(error, MissingEnvironmentError):
+        missingVariables = ', '.join(sorted(error.missingVariables))
+        return makeErrorResponse(
+            503,
+            'MissingEnvironmentError',
+            'Missing environment configuration',
+            missingVariables,
+        )
+    if isinstance(error, ClientInitializationError):
+        return makeErrorResponse(
+            500,
+            'ClientInitializationError',
+            'Failed to initialize Google Cloud clients',
+            error.detail,
+        )
+    return makeErrorResponse(500, 'ServerError', 'Internal server error', str(error))
+
+
+def _loadClientsOrError():
+    try:
+        return getClients(), None
+    except Exception as error:  # pylint: disable=broad-except
+        logging.exception('Failed to load clients for request handling.')
+        return None, _handleClientInitializationErrors(error)
+
+
+@app.route('/api/apps/<appId>/functions/listPendingJobs', methods=['POST'])
+def listPendingJobs(appId: str):
+    logging.info('Received request to listPendingJobs for app %s', appId)
+
+    apiKeyError = ensureValidApiKey()
+    if apiKeyError:
+        return apiKeyError
+
+    payload, payloadError = getJsonPayload()
+    if payloadError:
+        return payloadError
+
+    recipientId = payload.get('recipientId')
+    if not isinstance(recipientId, str) or not recipientId.strip():
+        logging.warning('Invalid or missing recipientId when listing pending jobs.')
+        return makeErrorResponse(400, 'ValidationError', 'recipientId missing or invalid')
+
+    sanitizedRecipientId = recipientId.strip()
+
+    clients, clientError = _loadClientsOrError()
+    if clientError:
+        return clientError
+
+    firestoreClient = clients.firestoreClient
+    pendingFiles, skippedFiles = buildPendingFileList(
+        firestoreClient, sanitizedRecipientId
+    )
+
+    responsePayload: Dict[str, object] = {
+        'ok': True,
+        'pending': pendingFiles,
+        'recipientId': sanitizedRecipientId,
+    }
+    if skippedFiles:
+        responsePayload['skipped'] = skippedFiles
+
+    return makeJsonResponse(responsePayload, 200)
+
+
+@app.route('/api/apps/<appId>/functions/listRecipientFiles', methods=['POST'])
+def listRecipientFilesAlias(appId: str):
+    logging.info(
+        'Received legacy request to listRecipientFiles for app %s; redirecting to listPendingJobs.',
+        appId,
+    )
+    return listPendingJobs(appId)
+
+
 @app.route('/recipients/<recipientId>/pending', methods=['GET'])
 def listPendingFiles(recipientId: str):
     logging.info('Received request to /recipients/%s/pending', recipientId)
@@ -1266,79 +1410,90 @@ def listPendingFiles(recipientId: str):
         return jsonify({'error': 'Internal server error'}), 500
 
 
+def _handlePrinterStatusUpdate(appId: Optional[str]):
+    logging.info('Received printer status update for app %s', appId or 'default')
+
+    apiKeyError = ensureValidApiKey()
+    if apiKeyError:
+        return apiKeyError
+
+    payload, payloadError = getJsonPayload()
+    if payloadError:
+        return payloadError
+
+    clients, clientError = _loadClientsOrError()
+    if clientError:
+        return clientError
+
+    firestoreClient = clients.firestoreClient
+
+    recipientId = payload.get('recipientId')
+    if recipientId is not None:
+        if not isinstance(recipientId, str):
+            logging.warning('Invalid recipientId type in printer status update: %s', type(recipientId).__name__)
+            return makeErrorResponse(400, 'ValidationError', 'recipientId must be a non-empty string')
+        sanitizedRecipientId = recipientId.strip()
+        if not sanitizedRecipientId:
+            logging.warning('Empty recipientId provided in printer status update.')
+            return makeErrorResponse(400, 'ValidationError', 'recipientId must be a non-empty string')
+        payload['recipientId'] = sanitizedRecipientId
+
+    requiredFields = [
+        'printerIpAddress',
+        'publicKey',
+        'objectName',
+        'useAms',
+        'printJobId',
+        'productName',
+        'platesRequested',
+        'status',
+        'jobProgress',
+        'materialLevel',
+    ]
+
+    for field in requiredFields:
+        if field not in payload:
+            logging.warning('Missing required field in printer status update: %s', field)
+            return makeErrorResponse(400, 'ValidationError', f'Missing required field: {field}')
+
+    sanitizedStatusData = {
+        key: value
+        for key, value in payload.items()
+        if key not in {'accessCode', 'printerSerial'}
+    }
+    sanitizedStatusData['timestamp'] = firestore.SERVER_TIMESTAMP
+    if appId:
+        sanitizedStatusData['appId'] = appId
+
+    try:
+        documentReference = (
+            firestoreClient.collection(firestoreCollectionPrinterStatus)
+            .add(sanitizedStatusData)
+        )
+    except Exception as error:  # pylint: disable=broad-except
+        logging.exception('Failed to store printer status update.')
+        return makeErrorResponse(500, 'ServerError', 'Failed to store printer status update', str(error))
+
+    responsePayload = {
+        'ok': True,
+        'success': True,
+        'message': 'Printer status updated successfully',
+        'statusId': getattr(documentReference, 'id', None),
+        'organizationId': sanitizedStatusData.get('organizationId'),
+        'printerId': sanitizedStatusData.get('printerId'),
+    }
+
+    return makeJsonResponse(responsePayload, 200)
+
+
+@app.route('/api/apps/<appId>/functions/updatePrinterStatus', methods=['POST'])
+def updatePrinterStatus(appId: str):
+    return _handlePrinterStatusUpdate(appId)
+
+
 @app.route('/printer-status', methods=['POST'])
 def printerStatusUpdate():
-    logging.info('Received request to /printer-status')
-    try:
-        clients, errorResponse = fetchClientsOrResponse()
-        if errorResponse:
-            return jsonify(errorResponse[0]), errorResponse[1]
-
-        firestoreClient = clients.firestoreClient
-
-        apiKey = request.headers.get('X-API-Key')
-        if not apiKey or apiKey not in validPrinterApiKeys:
-            logging.warning('Unauthorized access attempt to /printer-status with API Key: %s', apiKey)
-            return jsonify({'error': 'Unauthorized: Invalid API Key'}), 401
-
-        if not request.is_json:
-            logging.warning('Request content type is not JSON.')
-            return jsonify({'error': 'Request must be JSON'}), 400
-
-        statusData = request.get_json()
-        if not isinstance(statusData, dict):
-            logging.warning('JSON payload is not a dictionary.')
-            return jsonify({'error': 'Invalid JSON format: expected a dictionary'}), 400
-
-        recipientId = statusData.get('recipientId')
-        if recipientId is not None:
-            if not isinstance(recipientId, str):
-                logging.warning(
-                    'Invalid recipientId type in printer status update: %s',
-                    type(recipientId).__name__,
-                )
-                return jsonify({'error': 'recipientId must be a non-empty string'}), 400
-            sanitizedRecipientId = recipientId.strip()
-            if not sanitizedRecipientId:
-                logging.warning('Empty recipientId provided in printer status update.')
-                return jsonify({'error': 'recipientId must be a non-empty string'}), 400
-            statusData['recipientId'] = sanitizedRecipientId
-
-        requiredFields = [
-            'printerIpAddress',
-            'publicKey',
-            'objectName',
-            'useAms',
-            'printJobId',
-            'productName',
-            'platesRequested',
-            'status',
-            'jobProgress',
-            'materialLevel',
-        ]
-        for field in requiredFields:
-            if field not in statusData:
-                logging.warning('Missing required field in printer status update: %s', field)
-                return jsonify({'error': f'Missing required field: {field}'}), 400
-
-        sanitizedStatusData = {
-            key: value
-            for key, value in statusData.items()
-            if key not in {'accessCode', 'printerSerial'}
-        }
-        sanitizedStatusData['timestamp'] = firestore.SERVER_TIMESTAMP
-
-        firestoreClient.collection(firestoreCollectionPrinterStatus).add(sanitizedStatusData)
-        logging.info(
-            'Printer status update received and stored for printerSerial: %s',
-            statusData.get('printerSerial'),
-        )
-
-        return jsonify({'message': 'Printer status updated successfully'}), 200
-
-    except Exception:  # pylint: disable=broad-except
-        logging.exception('An unexpected error occurred during printer status update.')
-        return jsonify({'error': 'Internal server error'}), 500
+    return _handlePrinterStatusUpdate(None)
 
 
 @app.route('/', methods=['GET'])
