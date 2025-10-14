@@ -4,7 +4,7 @@ import sys
 import types
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import pytest
 
@@ -280,7 +280,7 @@ def testValidateRemoteListenAcceptsBareAndQualifiedBaseUrls(
         ("https://status.example.com", "https://status.example.com"),
     ],
 )
-def testStatusCommandUsesFixedEndpointRegardlessOfBaseUrl(
+def testStatusCommandBuildsEndpointFromBaseUrl(
     baseUrl: str, expected: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(
@@ -301,11 +301,44 @@ def testStatusCommandUsesFixedEndpointRegardlessOfBaseUrl(
     arguments = client.parseArguments()
 
     assert client.buildBaseUrl(arguments.baseUrl) == expected
-    assert (
-        client.getPrinterStatusEndpointUrl()
-        == "https://print-flow-pro-eb683cc6.base44.app/api/apps/68b61486e7c52405eb683cc6/functions/updatePrinterStatus"
-    )
+    assert client.getPrinterStatusEndpointUrl(arguments.baseUrl) == f"{expected}/printer-status"
+    assert client.getPrinterStatusEndpointUrl(expected) == f"{expected}/printer-status"
     assert arguments.recipientId is None
+
+
+def testPerformStatusUpdatesUsesProvidedBaseUrl(monkeypatch: pytest.MonkeyPatch) -> None:
+    postedUrls: list[str] = []
+
+    class DummyResponse:
+        text = ""
+        status_code = 200
+
+        def raise_for_status(self) -> None:  # pragma: no cover - no-op
+            return None
+
+    def fakePost(
+        self,
+        url: str,
+        *,
+        headers: Optional[dict[str, str]] = None,
+        json: Optional[dict[str, Any]] = None,
+        timeout: Optional[int] = None,
+    ) -> DummyResponse:
+        postedUrls.append(url)
+        return DummyResponse()
+
+    monkeypatch.setattr(client.requests.Session, "post", fakePost, raising=False)
+    monkeypatch.setattr(client.time, "sleep", lambda _seconds: None)
+
+    client.performStatusUpdates(
+        "printer-status.example.com",
+        "api-key",
+        "printer-123",
+        intervalSeconds=0,
+        numUpdates=1,
+    )
+
+    assert postedUrls == ["https://printer-status.example.com/printer-status"]
 
 
 def testGenerateStatusPayloadIncludesRecipientId() -> None:
