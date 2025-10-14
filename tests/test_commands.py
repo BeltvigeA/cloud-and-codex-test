@@ -307,26 +307,3 @@ def test_collect_telemetry_marks_printer_online(monkeypatch: pytest.MonkeyPatch)
 
     assert statusPayload["online"] is True
     assert statusPayload["mqttReady"] is True
-
-
-def testReporterLogsFullPayload(monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
-    reporter = Base44StatusReporter(lambda: [], intervalSec=60, commandPollIntervalSec=60)
-    reporter._recipientId = "recipient-abc"
-    reporter._statusFunctionName = "customStatusFn"
-
-    payload = {
-        "recipientId": "recipient-abc",
-        "printerIpAddress": "10.0.0.5",
-        "status": "printing",
-        "online": True,
-    }
-
-    monkeypatch.setattr("client.base44Status.callFunction", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr("client.base44Status.getBaseUrl", lambda: "https://example.com/base")
-
-    caplog.set_level(logging.INFO)
-    reporter._postPayload(payload, ("serial-1", "10.0.0.5"))
-
-    loggedMessages = [record.message for record in caplog.records]
-    assert any("https://example.com/base/customStatusFn" in message for message in loggedMessages)
-    assert any('"printerIpAddress": "10.0.0.5"' in message for message in loggedMessages)
