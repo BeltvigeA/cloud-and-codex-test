@@ -44,6 +44,7 @@ def testBuildBase44StatusPayloadMapsFields(monkeypatch: pytest.MonkeyPatch) -> N
     assert payload["jobProgress"] == 43
     assert payload["bedTemp"] == 60
     assert payload["nozzleTemp"] == 200
+    assert payload["online"] is True
     assert payload["firmwareVersion"] == "1.2.3"
     assert payload["fanSpeed"] == pytest.approx(80.0)
     assert payload["printSpeed"] == pytest.approx(150.0)
