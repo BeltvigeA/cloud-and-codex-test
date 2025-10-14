@@ -1031,6 +1031,8 @@ class ListenerGuiApp:
             "progressPercent": None,
             "remainingTimeSeconds": None,
             "gcodeState": None,
+            "online": False,
+            "mqttReady": False,
         }
         if not ipAddress:
             return telemetry
@@ -1062,9 +1064,16 @@ class ListenerGuiApp:
                     mqttStart()
                 elif connectMethod:
                     connectMethod()
-                waitForMqttReady(bambuPrinter)
+                isMqttReady = waitForMqttReady(bambuPrinter)
+                if not isMqttReady:
+                    telemetry["status"] = "Offline"
+                    telemetry["online"] = False
+                    telemetry["mqttReady"] = False
+                    return telemetry
 
                 telemetry["status"] = "Idle"
+                telemetry["online"] = True
+                telemetry["mqttReady"] = True
 
                 progressValue = self._parseOptionalFloat(safePrinterCall("get_percentage"))
                 if progressValue is not None:
@@ -1091,6 +1100,8 @@ class ListenerGuiApp:
 
                 return telemetry
             except Exception as error:  # noqa: BLE001 - telemetry is best-effort
+                telemetry["online"] = False
+                telemetry["mqttReady"] = False
                 logging.debug("Unable to collect Bambu telemetry via API from %s: %s", ipAddress, error)
             finally:
                 if bambuPrinter is not None:
@@ -1106,6 +1117,12 @@ class ListenerGuiApp:
                 bambuTelemetry = self._fetchBambuTelemetry(ipAddress, serialNumber, accessCode)
                 if bambuTelemetry:
                     telemetry.update(bambuTelemetry)
+                    if self._telemetryIndicatesReadiness(bambuTelemetry):
+                        telemetry["online"] = True
+                        telemetry["mqttReady"] = True
+                    elif bambuTelemetry.get("status"):
+                        telemetry["online"] = False
+                        telemetry["mqttReady"] = False
             except Exception as error:  # noqa: BLE001 - telemetry is best-effort
                 logging.debug("Unable to fetch Bambu telemetry from %s: %s", ipAddress, error)
 
@@ -1231,6 +1248,26 @@ class ListenerGuiApp:
                 client.disconnect()
 
         return receivedTelemetry
+
+    def _telemetryIndicatesReadiness(self, telemetry: Dict[str, Any]) -> bool:
+        statusValue = str(telemetry.get("status") or "").strip().lower()
+        if statusValue in {"offline", "unknown"}:
+            pass
+        elif statusValue:
+            return True
+
+        readinessKeys = (
+            "progressPercent",
+            "remainingTimeSeconds",
+            "nozzleTemp",
+            "bedTemp",
+            "gcodeState",
+        )
+        for key in readinessKeys:
+            value = telemetry.get(key)
+            if value not in (None, ""):
+                return True
+        return False
 
     def _interpretBambuStatus(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         percent = self._parseOptionalFloat(payload.get("mc_percent"))

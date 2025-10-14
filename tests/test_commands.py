@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from client import commands  # noqa: E402
 from client.base44Status import Base44StatusReporter  # noqa: E402
+from client.gui import ListenerGuiApp  # noqa: E402
 
 
 def test_list_pending_commands_returns_items(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -229,3 +230,79 @@ def test_status_reporter_handles_control_command(monkeypatch: pytest.MonkeyPatch
 
     assert executed == [("10.0.0.7", "set_bed_temp")]
     assert commandLog == [("cmd-777", True, None)]
+
+
+def test_collect_telemetry_marks_printer_online(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakePrinter:
+        def mqtt_start(self) -> None:
+            return None
+
+        def mqtt_stop(self) -> None:
+            return None
+
+        def get_percentage(self) -> float:
+            return 48.0
+
+        def get_time(self) -> int:
+            return 600
+
+        def get_nozzle_temperature(self) -> float:
+            return 205.0
+
+        def get_bed_temperature(self) -> float:
+            return 60.0
+
+        def get_gcode_state(self) -> str:
+            return "PRINTING"
+
+    fakePrinter = FakePrinter()
+
+    class FakeBambuApi:
+        def Printer(self, _ip: str, _accessCode: str, _serialNumber: str) -> FakePrinter:  # noqa: N802
+            return fakePrinter
+
+    def fakeWaitForMqttReady(_printer: FakePrinter) -> bool:
+        return True
+
+    monkeypatch.setattr("client.gui.bambuApi", FakeBambuApi())
+    monkeypatch.setattr("client.gui.waitForMqttReady", fakeWaitForMqttReady)
+
+    app = ListenerGuiApp.__new__(ListenerGuiApp)
+    app._parseOptionalFloat = ListenerGuiApp._parseOptionalFloat.__get__(app, ListenerGuiApp)
+    app._parseOptionalInt = ListenerGuiApp._parseOptionalInt.__get__(app, ListenerGuiApp)
+    app._parseOptionalString = ListenerGuiApp._parseOptionalString.__get__(app, ListenerGuiApp)
+    app._telemetryIndicatesReadiness = ListenerGuiApp._telemetryIndicatesReadiness.__get__(app, ListenerGuiApp)
+    app._fetchBambuTelemetry = lambda *_args, **_kwargs: {}
+    app._probePrinterAvailability = lambda _ip: "Online"
+
+    printerDetails = {
+        "ipAddress": "192.168.0.50",
+        "serialNumber": "SN-12345",
+        "accessCode": "CODE-123",
+        "brand": "Bambu",
+    }
+
+    printerTelemetry = ListenerGuiApp._collectPrinterTelemetry(app, printerDetails)
+
+    assert printerTelemetry["online"] is True
+    assert printerTelemetry["mqttReady"] is True
+
+    printerSnapshot = {
+        "ip": printerDetails["ipAddress"],
+        "serial": printerDetails["serialNumber"],
+        "status": printerTelemetry["status"],
+        "online": printerTelemetry["online"],
+        "mqttReady": printerTelemetry["mqttReady"],
+        "progress": printerTelemetry["progressPercent"],
+        "bed": printerTelemetry["bedTemp"],
+        "nozzle": printerTelemetry["nozzleTemp"],
+        "timeRemaining": printerTelemetry["remainingTimeSeconds"],
+    }
+
+    reporter = Base44StatusReporter(lambda: [printerSnapshot], intervalSec=60, commandPollIntervalSec=60)
+    reporter._recipientId = "recipient-123"
+
+    statusPayload = reporter._buildPayload(printerSnapshot)
+
+    assert statusPayload["online"] is True
+    assert statusPayload["mqttReady"] is True
