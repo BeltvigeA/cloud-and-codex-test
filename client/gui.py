@@ -1258,6 +1258,7 @@ class ListenerGuiApp:
         outputDir = self.outputDirVar.get().strip()
         logFile = self.logFileVar.get().strip()
         pollInterval = max(5, int(self.pollIntervalVar.get()))
+        statusApiKey = self._resolveStatusApiKey()
 
         if not baseUrl or not recipientId:
             messagebox.showerror("Missing Information", "Base URL and recipient ID are required.")
@@ -1273,7 +1274,7 @@ class ListenerGuiApp:
         self.stopEvent = threading.Event()
         self.listenerThread = threading.Thread(
             target=self._runListener,
-            args=(baseUrl, recipientId, outputDir, pollInterval),
+            args=(baseUrl, recipientId, outputDir, pollInterval, statusApiKey),
             daemon=True,
         )
         self.listenerThread.start()
@@ -1304,6 +1305,7 @@ class ListenerGuiApp:
         recipientId: str,
         outputDir: str,
         pollInterval: int,
+        statusApiKey: str,
     ) -> None:
         try:
             listenForFiles(
@@ -1315,6 +1317,7 @@ class ListenerGuiApp:
                 onFileFetched=self._handleFetchedData,
                 stopEvent=self.stopEvent,
                 logFilePath=str(self.logFilePath) if self.logFilePath else None,
+                statusApiKey=statusApiKey,
             )
         except Exception as error:  # noqa: BLE001 - surface exceptions to the GUI
             logging.exception("Listener encountered an error: %s", error)

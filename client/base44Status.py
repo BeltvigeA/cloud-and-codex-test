@@ -7,15 +7,17 @@ import logging
 import os
 import threading
 import time
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Optional
 
 import requests
 
 LOG = logging.getLogger(__name__)
 
-STATUS_UPDATES_URL = (
-    "https://print-flow-pro-eb683cc6.base44.app/api/apps/68b61486e7c52405eb683cc6/functions/updatePrinterStatus"
+BASE44_FUNCTION_BASE = (
+    "https://print-flow-pro-eb683cc6.base44.app/api/apps/68b61486e7c52405eb683cc6/functions"
 )
+
+STATUS_UPDATES_URL = f"{BASE44_FUNCTION_BASE}/updatePrinterStatus"
 
 BASE44_STATUS_URL = STATUS_UPDATES_URL
 
@@ -23,6 +25,89 @@ HEADERS = {
     "Content-Type": "application/json",
     "X-API-Key": (os.getenv("PRINTER_API_TOKEN") or "").strip(),
 }
+
+LIST_PENDING_FILES_URL = f"{BASE44_FUNCTION_BASE}/listPendingFiles"
+DEFAULT_TIMEOUT_SECONDS = 10
+
+
+def loadApiKey() -> str:
+    """Resolve the Base44 API key from the current environment."""
+
+    return (os.getenv("PRINTER_API_TOKEN") or "").strip()
+
+
+def listPendingFiles(
+    recipientId: str,
+    *,
+    apiKey: Optional[str] = None,
+    timeoutSeconds: float = DEFAULT_TIMEOUT_SECONDS,
+) -> list[dict[str, Any]]:
+    """Retrieve pending print jobs for the provided recipient in a resilient way."""
+
+    normalizedRecipient = (recipientId or "").strip()
+    if not normalizedRecipient:
+        LOG.error("[pending] recipientId mangler – returnerer tom liste")
+        return []
+
+    resolvedApiKey = (apiKey or "").strip() or loadApiKey()
+    headers = {"Content-Type": "application/json"}
+    if resolvedApiKey:
+        headers["X-API-Key"] = resolvedApiKey
+
+    body = {"recipientId": normalizedRecipient}
+
+    try:
+        response = requests.post(
+            LIST_PENDING_FILES_URL,
+            headers=headers,
+            json=body,
+            timeout=max(1.0, float(timeoutSeconds)),
+        )
+    except Exception as error:  # noqa: BLE001 - ensure the caller never crashes
+        LOG.error("[pending] Feil ved henting: %s", error)
+        return []
+
+    contentType = response.headers.get("content-type", "")
+    textBody = response.text or ""
+
+    trimmedBody = textBody.strip()
+    responseCount = "empty"
+    payload: list[dict[str, Any]] = []
+
+    if response.status_code == 204 or not trimmedBody:
+        LOG.info("[pending] url=%s recipientId=%s code=%s json=empty", LIST_PENDING_FILES_URL, normalizedRecipient, response.status_code)
+        return []
+
+    if "application/json" not in contentType.lower():
+        LOG.error(
+            "[pending] Ikke-JSON svar (%s) for recipient %s: %s",
+            response.status_code,
+            normalizedRecipient,
+            textBody[:200],
+        )
+        return []
+
+    try:
+        parsed = response.json()
+    except Exception as error:  # noqa: BLE001 - treat malformed JSON gracefully
+        LOG.error("[pending] Feil ved parsing av JSON for %s: %s", normalizedRecipient, error)
+        return []
+
+    if isinstance(parsed, list):
+        payload = [item for item in parsed if isinstance(item, dict)]
+        responseCount = f"{len(payload)} items"
+    else:
+        LOG.error("[pending] Uventet JSON-format: %s", parsed)
+        return []
+
+    LOG.info(
+        "[pending] url=%s recipientId=%s code=%s json=%s",
+        LIST_PENDING_FILES_URL,
+        normalizedRecipient,
+        response.status_code,
+        responseCount,
+    )
+    return payload
 
 
 def _isoUtcNow() -> str:
@@ -200,4 +285,14 @@ class Base44StatusReporter:
             self._stopEvent.wait(self._intervalSec)
 
 
-__all__ = ["Base44StatusReporter", "STATUS_UPDATES_URL", "BASE44_STATUS_URL", "HEADERS"]
+__all__ = [
+    "BASE44_FUNCTION_BASE",
+    "STATUS_UPDATES_URL",
+    "BASE44_STATUS_URL",
+    "LIST_PENDING_FILES_URL",
+    "DEFAULT_TIMEOUT_SECONDS",
+    "HEADERS",
+    "Base44StatusReporter",
+    "loadApiKey",
+    "listPendingFiles",
+]
