@@ -16,6 +16,7 @@ from urllib.parse import urlparse
 import os
 import requests
 
+from .base44Status import listPendingFiles
 from .database import LocalDatabase
 from .persistence import storePrintSummary
 from .bambuPrinter import (
@@ -155,6 +156,10 @@ def parseArguments() -> argparse.Namespace:
         type=int,
         default=0,
         help="Maximum number of polling iterations (0 for indefinite).",
+    )
+    listenParser.add_argument(
+        "--statusApiKey",
+        help="Optional API key to authenticate pending job polling.",
     )
 
     return parser.parse_args()
@@ -1425,26 +1430,27 @@ def sendHandshakeResponse(
         return None
 
 
-def fetchPendingFiles(baseUrl: str, recipientId: str) -> Optional[List[Dict[str, Any]]]:
-    pendingUrl = buildPendingUrl(baseUrl, recipientId)
-    logging.info("Checking for pending files for recipient %s", recipientId)
-    try:
-        response = requests.get(pendingUrl, timeout=30)
-        response.raise_for_status()
-    except requests.RequestException as error:
-        logging.error("Failed to fetch pending files: %s", error)
-        return None
+def fetchPendingFiles(
+    baseUrl: str,
+    recipientId: str,
+    *,
+    statusApiKey: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Retrieve pending jobs for the recipient via the Base44 function endpoint."""
 
-    try:
-        payload = response.json()
-    except json.JSONDecodeError as error:
-        logging.error("Invalid JSON response when listing pending files: %s", error)
-        return None
+    # baseUrl is retained for compatibility and logging; pending retrieval uses Base44 functions.
+    normalizedRecipient = recipientId.strip()
+    if not normalizedRecipient:
+        logging.error("Recipient ID is required to fetch pending files.")
+        return []
 
-    pendingFiles = payload.get("pendingFiles")
-    if not isinstance(pendingFiles, list):
-        logging.error("Unexpected response format when listing pending files: %s", payload)
-        return None
+    pendingFiles = listPendingFiles(normalizedRecipient, apiKey=statusApiKey)
+    if not pendingFiles:
+        logging.info("No pending files for recipient %s.", normalizedRecipient)
+    else:
+        logging.info(
+            "Found %d pending file(s) for recipient %s.", len(pendingFiles), normalizedRecipient
+        )
 
     return pendingFiles
 
@@ -1526,6 +1532,7 @@ def listenForFiles(
     *,
     logFilePath: Optional[Union[str, Path]] = None,
     database: Optional[LocalDatabase] = None,
+    statusApiKey: Optional[str] = None,
 ) -> None:
     iteration = 0
     ownDatabase = False
@@ -1540,15 +1547,15 @@ def listenForFiles(
         while True:
             if stopEvent and stopEvent.is_set():
                 break
-            pendingFiles = fetchPendingFiles(baseUrl, recipientId)
-            if pendingFiles is None:
-                logging.warning("Unable to retrieve pending files; will retry after delay.")
-            elif not pendingFiles:
-                logging.info("No pending files for recipient %s.", recipientId)
+            if statusApiKey is None:
+                pendingFiles = fetchPendingFiles(baseUrl, recipientId)
             else:
-                logging.info(
-                    "Found %d pending file(s) for recipient %s.", len(pendingFiles), recipientId
+                pendingFiles = fetchPendingFiles(
+                    baseUrl,
+                    recipientId,
+                    statusApiKey=statusApiKey,
                 )
+            if pendingFiles:
                 for pendingFile in pendingFiles:
                     fetchToken = pendingFile.get("fetchToken")
                     if not fetchToken:
@@ -1893,6 +1900,7 @@ def main() -> None:
                 arguments.pollInterval,
                 arguments.maxIterations,
                 logFilePath=arguments.logFile,
+                statusApiKey=arguments.statusApiKey,
             )
     else:
         logging.error("Unknown command: %s", arguments.command)
