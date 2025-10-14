@@ -1411,7 +1411,7 @@ def buildStatusPayload(printer: Any) -> Dict[str, Any]:
     if firmwareValue is None:
         firmwareValue = normalizeText(getattr(printer, "firmware", None))
 
-    statusText = stateValue or ("Printing" if (progressValue or 0.0) > 0.0 else "Online")
+    statusText = stateValue or ("Printing" if (progressValue or 0.0) > 0.0 else "Idle")
 
     return {
         "status": statusText,
@@ -1426,7 +1426,7 @@ def buildStatusPayload(printer: Any) -> Dict[str, Any]:
         "ip": ipValue,
         "serial": serialValue,
         "access_code": accessCodeValue,
-        "online": bool(statusText and statusText.lower() not in {"offline", "unknown"}),
+        "online": None,
         "lastSeen": lastSeen,
         "firmware": firmwareValue,
     }

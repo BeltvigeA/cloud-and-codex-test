@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+import os
 import threading
 import time
 from typing import Any, Callable, Iterable
@@ -11,6 +12,8 @@ from typing import Any, Callable, Iterable
 from .base44 import callFunction, getDefaultApiKey, getStatusFunctionName
 from .commands import completeCommand, listPendingCommands
 from .pending import requestPendingPollTrigger
+from .health import HealthGate, HealthState
+from .reachability import tcpCheck
 
 LOG = logging.getLogger(__name__)
 
@@ -79,6 +82,13 @@ class Base44StatusReporter:
         self._commandPollIntervalSec = max(1, int(commandPollIntervalSec))
         self._nextCommandPollTimestamp = 0.0
         self._commandBackoffSeconds = float(self._commandPollIntervalSec)
+        self._pingIntervalSeconds = max(0.5, float(os.getenv("PING_INTERVAL_SECONDS", "5")))
+        self._failsToOffline = max(1, int(os.getenv("PING_FAILS_TO_OFFLINE", "3")))
+        self._oksToOnline = max(1, int(os.getenv("PING_OKS_TO_ONLINE", "1")))
+        self._statusIntervalSeconds = max(1.0, float(os.getenv("STATUS_INTERVAL_SECONDS", "10")))
+        self._healthByPrinter: dict[tuple[str, str], HealthGate] = {}
+        self._lastPingTimestampByPrinter: dict[tuple[str, str], float] = {}
+        self._lastStatusTimestampByPrinter: dict[tuple[str, str], float] = {}
 
     def start(self, recipientId: str, apiKey: str | None = None) -> None:
         self._recipientId = recipientId.strip()
@@ -89,6 +99,9 @@ class Base44StatusReporter:
         self._statusFunctionName = getStatusFunctionName()
         self._nextCommandPollTimestamp = 0.0
         self._commandBackoffSeconds = float(self._commandPollIntervalSec)
+        self._healthByPrinter.clear()
+        self._lastPingTimestampByPrinter.clear()
+        self._lastStatusTimestampByPrinter.clear()
         self._thread = threading.Thread(target=self._runLoop, name="base44-status", daemon=True)
         self._thread.start()
         LOG.info(
@@ -109,30 +122,33 @@ class Base44StatusReporter:
         if not self._recipientId:
             return {}
 
-        statusValue, onlineFlag = _sanitizeStatus(snapshot)
-        serialKey = str(snapshot.get("serial") or "").strip().lower()
-        ipKey = str(snapshot.get("ip") or "").strip()
-        key = (serialKey, ipKey)
+        key = self._resolvePrinterKey(snapshot)
+        effectiveSnapshot = self._applyHealthToSnapshot(key, snapshot)
 
-        previous = self._lastSnapshotByPrinter.get(key, {})
+        statusValue, onlineFlag = _sanitizeStatus(effectiveSnapshot)
+        serialKey = str(effectiveSnapshot.get("serial") or "").strip().lower()
+        ipKey = str(effectiveSnapshot.get("ip") or "").strip()
+        keyTuple = (serialKey, ipKey)
+
+        previous = self._lastSnapshotByPrinter.get(keyTuple, {})
         lastTemps = {
             "bedTemp": previous.get("bedTemp"),
             "nozzleTemp": previous.get("nozzleTemp"),
             "timestamp": previous.get("timestamp", 0.0),
         }
 
-        currentBed = snapshot.get("bed")
-        currentNozzle = snapshot.get("nozzle")
+        currentBed = effectiveSnapshot.get("bed")
+        currentNozzle = effectiveSnapshot.get("nozzle")
 
-        mqttReady = snapshot.get("mqttReady")
+        mqttReady = effectiveSnapshot.get("mqttReady")
         if mqttReady is False:
-            offlineSince = self._mqttOfflineSince.setdefault(key, time.time())
+            offlineSince = self._mqttOfflineSince.setdefault(keyTuple, time.time())
             if time.time() - offlineSince > 30:
                 onlineFlag = False
         else:
-            self._mqttOfflineSince.pop(key, None)
+            self._mqttOfflineSince.pop(keyTuple, None)
 
-        progressValue = _coerceInt(snapshot.get("progress"))
+        progressValue = _coerceInt(effectiveSnapshot.get("progress"))
         if not onlineFlag:
             progressValue = 0
 
@@ -156,24 +172,24 @@ class Base44StatusReporter:
 
         payload = {
             "recipientId": self._recipientId,
-            "printerIpAddress": snapshot.get("ip"),
-            "serialNumber": snapshot.get("serial"),
+            "printerIpAddress": effectiveSnapshot.get("ip"),
+            "serialNumber": effectiveSnapshot.get("serial"),
             "status": statusValue,
             "online": onlineFlag,
             "jobProgress": progressValue,
-            "currentJobId": snapshot.get("currentJobId"),
+            "currentJobId": effectiveSnapshot.get("currentJobId"),
             "bedTemp": currentBed,
             "nozzleTemp": currentNozzle,
-            "fanSpeed": snapshot.get("fan"),
-            "printSpeed": snapshot.get("speed"),
-            "filamentUsed": snapshot.get("filamentUsed"),
-            "timeRemaining": _coerceInt(snapshot.get("timeRemaining")),
-            "errorMessage": snapshot.get("error"),
+            "fanSpeed": effectiveSnapshot.get("fan"),
+            "printSpeed": effectiveSnapshot.get("speed"),
+            "filamentUsed": effectiveSnapshot.get("filamentUsed"),
+            "timeRemaining": _coerceInt(effectiveSnapshot.get("timeRemaining")),
+            "errorMessage": effectiveSnapshot.get("error"),
             "lastUpdateTimestamp": _isoUtcNow(),
-            "firmwareVersion": snapshot.get("firmware"),
+            "firmwareVersion": effectiveSnapshot.get("firmware"),
         }
 
-        self._lastSnapshotByPrinter[key] = {
+        self._lastSnapshotByPrinter[keyTuple] = {
             "bedTemp": payload.get("bedTemp"),
             "nozzleTemp": payload.get("nozzleTemp"),
             "timestamp": time.time(),
@@ -185,42 +201,36 @@ class Base44StatusReporter:
         self._isRunning = True
         try:
             while not self._stopEvent.is_set():
+                snapshots: list[dict[str, Any]] = []
+                if not self._recipientId:
+                    LOG.debug("Skipping Base44 post: missing recipient")
+                else:
+                    snapshots = list(self._safeCollectSnapshots())
+                    now = time.time()
+                    for snapshot in snapshots:
+                        key = self._resolvePrinterKey(snapshot)
+                        if key is None:
+                            continue
+                        ipAddress = self._resolvePrinterIp(snapshot)
+                        gate = self._getHealthGate(key)
+                        stateAfter, stateChanged = self._ensureHealthState(key, gate, ipAddress, now)
+
+                        if stateChanged and stateAfter.hasState:
+                            changeSnapshot = self._buildStateChangeSnapshot(snapshot, ipAddress, stateAfter)
+                            payload = self._buildPayload(changeSnapshot)
+                            self._postPayload(payload, key)
+                            self._lastStatusTimestampByPrinter[key] = now
+
+                        if stateAfter.hasState and stateAfter.isOnline:
+                            lastStatusAt = self._lastStatusTimestampByPrinter.get(key, 0.0)
+                            if stateChanged or (now - lastStatusAt) >= self._statusIntervalSeconds:
+                                telemetrySnapshot = dict(snapshot)
+                                telemetrySnapshot["online"] = True
+                                payload = self._buildPayload(telemetrySnapshot)
+                                self._postPayload(payload, key)
+                                self._lastStatusTimestampByPrinter[key] = now
+
                 try:
-                    snapshots: list[dict[str, Any]] = []
-                    if not self._recipientId:
-                        LOG.debug("Skipping Base44 post: missing recipient")
-                    else:
-                        snapshots = list(self._getPrintersSnapshotCallable() or [])
-                        for snapshot in snapshots:
-                            payload = self._buildPayload(snapshot)
-                            if not payload:
-                                continue
-
-                            LOG.info(
-                                "[POST] %s recipientId=%s ip=%s status=%s bed=%s nozzle=%s",
-                                self._statusFunctionName,
-                                payload.get("recipientId"),
-                                payload.get("printerIpAddress"),
-                                payload.get("status"),
-                                payload.get("bedTemp"),
-                                payload.get("nozzleTemp"),
-                            )
-
-                            callFunction(
-                                self._statusFunctionName,
-                                payload,
-                                apiKey=self._apiKeyOverride,
-                            )
-
-                            serialKey = str(payload.get("serialNumber") or "").strip().lower()
-                            ipKey = str(payload.get("printerIpAddress") or "").strip()
-                            key = (serialKey, ipKey)
-                            wasOnline = self._lastOnlineStateByPrinter.get(key, False)
-                            nowOnline = bool(payload.get("online"))
-                            self._lastOnlineStateByPrinter[key] = nowOnline
-                            if nowOnline and not wasOnline:
-                                requestPendingPollTrigger()
-
                     self._pollPendingCommands(snapshots)
                 except Exception as error:  # noqa: BLE001
                     LOG.exception("Status push failed: %s", error)
@@ -228,6 +238,146 @@ class Base44StatusReporter:
                 self._stopEvent.wait(self._intervalSec)
         finally:
             self._isRunning = False
+
+
+    def _resolvePrinterKey(self, snapshot: dict[str, Any]) -> tuple[str, str] | None:
+        serialKey = str(snapshot.get("serial") or snapshot.get("serialNumber") or "").strip().lower()
+        ipKey = str(
+            snapshot.get("printerIpAddress")
+            or snapshot.get("ip")
+            or snapshot.get("ipAddress")
+            or ""
+        ).strip()
+        if not serialKey and not ipKey:
+            return None
+        return (serialKey, ipKey)
+
+    def _resolvePrinterIp(self, snapshot: dict[str, Any]) -> str:
+        return str(
+            snapshot.get("printerIpAddress")
+            or snapshot.get("ip")
+            or snapshot.get("ipAddress")
+            or ""
+        ).strip()
+
+    def _getHealthGate(self, key: tuple[str, str]) -> HealthGate:
+        gate = self._healthByPrinter.get(key)
+        if gate is None:
+            gate = HealthGate(self._failsToOffline, self._oksToOnline)
+            self._healthByPrinter[key] = gate
+        return gate
+
+    @staticmethod
+    def _stateChanged(before: HealthState, after: HealthState) -> bool:
+        return (before.hasState != after.hasState) or (before.isOnline != after.isOnline)
+
+    def _ensureHealthState(
+        self,
+        key: tuple[str, str],
+        gate: HealthGate,
+        ipAddress: str,
+        currentTime: float,
+    ) -> tuple[HealthState, bool]:
+        previousState = gate.state
+        lastPing = self._lastPingTimestampByPrinter.get(key, 0.0)
+        shouldProbe = not previousState.hasState or (currentTime - lastPing) >= self._pingIntervalSeconds
+        resultState = previousState
+
+        if shouldProbe:
+            reachable = False
+            if ipAddress:
+                try:
+                    reachable = tcpCheck(ipAddress)
+                except Exception:  # noqa: BLE001 - treat as unreachable
+                    reachable = False
+            resultState = gate.observe(reachable)
+            self._lastPingTimestampByPrinter[key] = currentTime
+
+        return resultState, self._stateChanged(previousState, resultState)
+
+    def _buildStateChangeSnapshot(
+        self,
+        snapshot: dict[str, Any],
+        ipAddress: str,
+        state: HealthState,
+    ) -> dict[str, Any]:
+        resolved = dict(snapshot)
+        resolved["online"] = state.isOnline
+        if ipAddress:
+            resolved.setdefault("printerIpAddress", ipAddress)
+            resolved.setdefault("ip", ipAddress)
+        if state.isOnline:
+            resolved.setdefault("status", resolved.get("status") or "Online")
+        else:
+            resolved["status"] = resolved.get("status") or "Offline"
+            resolved["bedTemp"] = None
+            resolved["nozzleTemp"] = None
+            resolved["bed"] = None
+            resolved["nozzle"] = None
+            resolved["progress"] = 0
+            resolved["timeRemaining"] = None
+            resolved["remainingTimeSeconds"] = None
+        return resolved
+
+    def _applyHealthToSnapshot(
+        self,
+        key: tuple[str, str] | None,
+        snapshot: dict[str, Any],
+    ) -> dict[str, Any]:
+        if key is None:
+            return snapshot
+        gate = self._healthByPrinter.get(key)
+        if gate is None:
+            return snapshot
+        resolved = dict(snapshot)
+        if not gate.state.hasState:
+            resolved["online"] = False
+            resolved["status"] = resolved.get("status") or "Offline"
+            resolved["bedTemp"] = None
+            resolved["nozzleTemp"] = None
+            resolved["bed"] = None
+            resolved["nozzle"] = None
+            resolved["progress"] = 0
+            resolved["timeRemaining"] = None
+            resolved["remainingTimeSeconds"] = None
+            return resolved
+        resolved["online"] = gate.state.isOnline
+        if not gate.state.isOnline:
+            resolved["status"] = resolved.get("status") or "Offline"
+            resolved["bedTemp"] = None
+            resolved["nozzleTemp"] = None
+            resolved["bed"] = None
+            resolved["nozzle"] = None
+            resolved["progress"] = 0
+            resolved["timeRemaining"] = None
+            resolved["remainingTimeSeconds"] = None
+        return resolved
+
+    def _postPayload(self, payload: dict[str, Any], key: tuple[str, str]) -> None:
+        if not payload:
+            return
+
+        LOG.info(
+            "[POST] %s recipientId=%s ip=%s status=%s bed=%s nozzle=%s",
+            self._statusFunctionName,
+            payload.get("recipientId"),
+            payload.get("printerIpAddress"),
+            payload.get("status"),
+            payload.get("bedTemp"),
+            payload.get("nozzleTemp"),
+        )
+
+        callFunction(
+            self._statusFunctionName,
+            payload,
+            apiKey=self._apiKeyOverride,
+        )
+
+        wasOnline = self._lastOnlineStateByPrinter.get(key, False)
+        nowOnline = bool(payload.get("online"))
+        self._lastOnlineStateByPrinter[key] = nowOnline
+        if wasOnline and not nowOnline:
+            requestPendingPollTrigger()
 
 
     def _pollPendingCommands(self, snapshots: list[dict[str, Any]]) -> None:
@@ -296,6 +446,11 @@ class Base44StatusReporter:
                     LOG.error("[commands] Klarte ikke markere %s som manglende", commandId)
                 return
             snapshots[:] = freshSnapshots
+
+        key = self._resolvePrinterKey(snapshot)
+        if key is not None:
+            gate = self._getHealthGate(key)
+            self._ensureHealthState(key, gate, printerIp or self._resolvePrinterIp(snapshot), time.time())
 
         payload = self._buildPayload(snapshot)
         if not payload:

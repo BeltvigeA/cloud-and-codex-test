@@ -114,6 +114,7 @@ def test_status_reporter_handles_poke_command(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setattr("client.base44Status.listPendingCommands", fakeListPendingCommands)
     monkeypatch.setattr("client.base44Status.completeCommand", fakeCompleteCommand)
     monkeypatch.setattr("client.base44Status.callFunction", fakeCallFunction)
+    monkeypatch.setattr("client.base44Status.tcpCheck", lambda _ip: True)
 
     reporter = Base44StatusReporter(lambda: snapshots, intervalSec=60, commandPollIntervalSec=1)
     reporter._recipientId = "recipient-xyz"
