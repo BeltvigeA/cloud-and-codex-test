@@ -71,6 +71,7 @@ allowedUploadMimeTypes = {
     'text/plain',
     'model/3mf',
 }
+readyToClaimStatuses: Set[str] = {'uploaded', 'queued'}
 
 
 firestoreCollectionFiles = os.environ.get('FIRESTORE_COLLECTION_FILES', 'files')
@@ -227,6 +228,17 @@ def getJsonPayload() -> Tuple[Optional[dict], Optional[Tuple[dict, int]]]:
         return None, makeErrorResponse(400, 'ValidationError', 'JSON payload must be an object')
 
     return payload, None
+
+
+def requireSanitizedStringField(
+    payload: dict, fieldName: str
+) -> Tuple[Optional[str], Optional[Tuple[dict, int]]]:
+    value = payload.get(fieldName)
+    if not isinstance(value, str) or not value.strip():
+        logging.warning('Invalid or missing %s value.', fieldName)
+        return None, makeErrorResponse(400, 'ValidationError', f'{fieldName} missing or invalid')
+
+    return value.strip(), None
 
 
 def tryParseKeyValueObject(rawValue: str) -> Optional[dict]:
@@ -1270,11 +1282,13 @@ def buildPendingFileList(
     skippedFiles: List[str] = []
     currentTime = datetime.now(timezone.utc)
 
-    fileQuery = (
-        firestoreClient.collection(firestoreCollectionFiles)
-        .where('recipientId', '==', recipientId)
-        .where('fetchTokenConsumed', '==', False)
+    fileQuery = firestoreClient.collection(firestoreCollectionFiles).where(
+        'recipientId', '==', recipientId
     )
+    if readyToClaimStatuses:
+        fileQuery = fileQuery.where('status', 'in', sorted(readyToClaimStatuses))
+
+    fileQuery = fileQuery.where('fetchTokenConsumed', '==', False)
 
     for documentSnapshot in fileQuery.stream():
         metadata = documentSnapshot.to_dict() or {}
@@ -1285,6 +1299,11 @@ def buildPendingFileList(
 
         fetchTokenExpiry = metadata.get('fetchTokenExpiry')
         if isinstance(fetchTokenExpiry, datetime) and fetchTokenExpiry < currentTime:
+            skippedFiles.append(documentSnapshot.id)
+            continue
+
+        status = metadata.get('status')
+        if status not in readyToClaimStatuses:
             skippedFiles.append(documentSnapshot.id)
             continue
 
@@ -1378,6 +1397,96 @@ def listRecipientFilesAlias(appId: str):
         appId,
     )
     return listPendingJobs(appId)
+
+
+@app.route('/api/apps/<appId>/functions/claimJob', methods=['POST'])
+def claimJob(appId: str):
+    logging.info('Received request to claimJob for app %s', appId)
+
+    apiKeyError = ensureValidApiKey()
+    if apiKeyError:
+        return apiKeyError
+
+    payload, payloadError = getJsonPayload()
+    if payloadError:
+        return payloadError
+
+    jobId, jobIdError = requireSanitizedStringField(payload, 'jobId')
+    if jobIdError:
+        return jobIdError
+
+    printerId, printerIdError = requireSanitizedStringField(payload, 'printerId')
+    if printerIdError:
+        return printerIdError
+
+    recipientId, recipientIdError = requireSanitizedStringField(payload, 'recipientId')
+    if recipientIdError:
+        return recipientIdError
+
+    clients, clientError = _loadClientsOrError()
+    if clientError:
+        return clientError
+
+    firestoreClient = clients.firestoreClient
+    jobCollection = firestoreClient.collection(firestoreCollectionFiles)
+    jobReference = jobCollection.document(jobId)
+
+    try:
+        transactionFactory = getattr(firestoreClient, 'transaction', None)
+        transaction = transactionFactory() if callable(transactionFactory) else None
+        jobSnapshot = jobReference.get(transaction=transaction) if transaction else jobReference.get()
+    except Exception as error:  # pylint: disable=broad-except
+        logging.exception('Failed to load job %s for claiming.', jobId)
+        return makeErrorResponse(500, 'ServerError', 'Failed to load job metadata', str(error))
+
+    if not getattr(jobSnapshot, 'exists', False):
+        logging.info('Job %s not found when attempting to claim.', jobId)
+        return makeErrorResponse(404, 'NotFound', 'Job not found')
+
+    jobMetadata = jobSnapshot.to_dict() or {}
+    currentStatus = jobMetadata.get('status')
+    if currentStatus not in readyToClaimStatuses:
+        logging.info(
+            'Job %s cannot be claimed because it is in status %s.', jobId, currentStatus
+        )
+        return makeErrorResponse(409, 'ConflictError', 'Job already claimed or not ready')
+
+    existingRecipientId = jobMetadata.get('recipientId')
+    if existingRecipientId and existingRecipientId != recipientId:
+        logging.warning(
+            'Job %s recipient mismatch: expected %s, received %s.',
+            jobId,
+            existingRecipientId,
+            recipientId,
+        )
+        return makeErrorResponse(403, 'ForbiddenError', 'recipientId does not match job owner')
+
+    updatePayload = {
+        'status': 'printing',
+        'assignedPrinterId': printerId,
+        'claimedBy': recipientId,
+        'claimedAt': firestore.SERVER_TIMESTAMP,
+    }
+
+    try:
+        if transaction:
+            transaction.update(jobReference, updatePayload)
+            if hasattr(transaction, 'commit'):
+                transaction.commit()
+        else:
+            jobReference.update(updatePayload)
+    except Exception as error:  # pylint: disable=broad-except
+        logging.exception('Failed to update job %s during claim.', jobId)
+        return makeErrorResponse(500, 'ServerError', 'Failed to claim job', str(error))
+
+    responsePayload = {
+        'ok': True,
+        'jobId': jobId,
+        'status': 'printing',
+        'assignedPrinterId': printerId,
+    }
+
+    return makeJsonResponse(responsePayload, 200)
 
 
 @app.route('/recipients/<recipientId>/pending', methods=['GET'])
