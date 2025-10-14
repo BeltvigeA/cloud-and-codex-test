@@ -14,6 +14,8 @@ from .commands import completeCommand, listPendingCommands
 from .pending import requestPendingPollTrigger
 from .health import HealthGate, HealthState
 from .reachability import tcpCheck
+from .bambuClient import BambuLanClient
+from .controls import executeCommand
 
 LOG = logging.getLogger(__name__)
 
@@ -89,6 +91,7 @@ class Base44StatusReporter:
         self._healthByPrinter: dict[tuple[str, str], HealthGate] = {}
         self._lastPingTimestampByPrinter: dict[tuple[str, str], float] = {}
         self._lastStatusTimestampByPrinter: dict[tuple[str, str], float] = {}
+        self._lanClients: dict[tuple[str, str], BambuLanClient] = {}
 
     def start(self, recipientId: str, apiKey: str | None = None) -> None:
         self._recipientId = recipientId.strip()
@@ -102,6 +105,7 @@ class Base44StatusReporter:
         self._healthByPrinter.clear()
         self._lastPingTimestampByPrinter.clear()
         self._lastStatusTimestampByPrinter.clear()
+        self._resetLanClients()
         self._thread = threading.Thread(target=self._runLoop, name="base44-status", daemon=True)
         self._thread.start()
         LOG.info(
@@ -116,7 +120,16 @@ class Base44StatusReporter:
             self._thread.join(timeout=2)
         self._thread = None
         self._isRunning = False
+        self._resetLanClients()
         LOG.info("Base44StatusReporter stopped")
+
+    def _resetLanClients(self) -> None:
+        for client in list(self._lanClients.values()):
+            try:
+                client.disconnect()
+            except Exception:  # noqa: BLE001 - best-effort cleanup
+                LOG.debug("Failed to disconnect LAN client", exc_info=True)
+        self._lanClients.clear()
 
     def _buildPayload(self, snapshot: dict[str, Any]) -> dict[str, Any]:
         if not self._recipientId:
@@ -126,6 +139,9 @@ class Base44StatusReporter:
         effectiveSnapshot = self._applyHealthToSnapshot(key, snapshot)
 
         statusValue, onlineFlag = _sanitizeStatus(effectiveSnapshot)
+        mqttReady = bool(effectiveSnapshot.get("mqttReady"))
+        if not mqttReady:
+            onlineFlag = False
         serialKey = str(effectiveSnapshot.get("serial") or "").strip().lower()
         ipKey = str(effectiveSnapshot.get("ip") or "").strip()
         keyTuple = (serialKey, ipKey)
@@ -187,6 +203,7 @@ class Base44StatusReporter:
             "errorMessage": effectiveSnapshot.get("error"),
             "lastUpdateTimestamp": _isoUtcNow(),
             "firmwareVersion": effectiveSnapshot.get("firmware"),
+            "mqttReady": mqttReady,
         }
 
         self._lastSnapshotByPrinter[keyTuple] = {
@@ -302,11 +319,13 @@ class Base44StatusReporter:
         state: HealthState,
     ) -> dict[str, Any]:
         resolved = dict(snapshot)
-        resolved["online"] = state.isOnline
+        mqttReady = bool(resolved.get("mqttReady"))
+        resolved["mqttReady"] = mqttReady
+        resolved["online"] = state.isOnline and mqttReady
         if ipAddress:
             resolved.setdefault("printerIpAddress", ipAddress)
             resolved.setdefault("ip", ipAddress)
-        if state.isOnline:
+        if resolved["online"]:
             resolved.setdefault("status", resolved.get("status") or "Online")
         else:
             resolved["status"] = resolved.get("status") or "Offline"
@@ -330,7 +349,9 @@ class Base44StatusReporter:
         if gate is None:
             return snapshot
         resolved = dict(snapshot)
-        if not gate.state.hasState:
+        mqttReady = bool(snapshot.get("mqttReady"))
+        resolved["mqttReady"] = mqttReady
+        if not gate.state.hasState or not mqttReady:
             resolved["online"] = False
             resolved["status"] = resolved.get("status") or "Offline"
             resolved["bedTemp"] = None
@@ -341,8 +362,8 @@ class Base44StatusReporter:
             resolved["timeRemaining"] = None
             resolved["remainingTimeSeconds"] = None
             return resolved
-        resolved["online"] = gate.state.isOnline
-        if not gate.state.isOnline:
+        resolved["online"] = gate.state.isOnline and mqttReady
+        if not resolved["online"]:
             resolved["status"] = resolved.get("status") or "Offline"
             resolved["bedTemp"] = None
             resolved["nozzleTemp"] = None
@@ -420,10 +441,17 @@ class Base44StatusReporter:
             LOG.warning("[commands] Hopper over kommando uten ID: %r", command)
             return
 
-        if commandType != "poke":
-            errorMessage = f"Ukjent type {command.get('commandType')}"
-            if not completeCommand(commandId, False, recipientId=self._recipientId, error=errorMessage):
-                LOG.error("[commands] Klarte ikke markere %s som ukjent", commandId)
+        if commandType == "poke":
+            self._handlePokeCommand(command, snapshots)
+            return
+
+        self._handleControlCommand(command, commandType, snapshots)
+
+
+    def _handlePokeCommand(self, command: dict[str, Any], snapshots: list[dict[str, Any]]) -> None:
+        commandId = str(command.get("commandId") or "").strip()
+        if not commandId:
+            LOG.warning("[commands] Hopper over kommando uten ID: %r", command)
             return
 
         printerIp = str(command.get("printerIpAddress") or "").strip()
@@ -486,6 +514,158 @@ class Base44StatusReporter:
             return
 
         LOG.info("[commands] Poke ferdig for %s", printerIp)
+
+
+    def _handleControlCommand(
+        self,
+        command: dict[str, Any],
+        commandType: str,
+        snapshots: list[dict[str, Any]],
+    ) -> None:
+        commandId = str(command.get("commandId") or "").strip()
+        printerIp = str(command.get("printerIpAddress") or "").strip()
+        if not printerIp:
+            if not completeCommand(commandId, False, recipientId=self._recipientId, error="Printeradresse mangler"):
+                LOG.error("[commands] Klarte ikke markere %s uten ip", commandId)
+            return
+
+        snapshot = self._findOrRefreshSnapshot(printerIp, snapshots)
+        if snapshot is None:
+            if not completeCommand(
+                commandId,
+                False,
+                recipientId=self._recipientId,
+                error=f"Printer {printerIp} ikke funnet",
+            ):
+                LOG.error("[commands] Klarte ikke markere %s som manglende", commandId)
+            return
+
+        credentials = self._resolvePrinterCredentials(snapshot, command, printerIp)
+        if credentials is None:
+            if not completeCommand(
+                commandId,
+                False,
+                recipientId=self._recipientId,
+                error="Mangler tilgangskode",
+            ):
+                LOG.error("[commands] Klarte ikke markere %s uten tilgangskode", commandId)
+            return
+
+        key = self._resolvePrinterKey(snapshot) or (
+            credentials["serial"].strip().lower(),
+            credentials["ip"],
+        )
+        gate = self._getHealthGate(key)
+        self._ensureHealthState(key, gate, printerIp, time.time())
+
+        try:
+            client = self._getLanClient(key, credentials)
+            executeCommand(client, command)
+        except NotImplementedError as error:
+            LOG.error("[commands] Kommando ikke støttet: %s", error)
+            completeCommand(
+                commandId,
+                False,
+                recipientId=self._recipientId,
+                error=str(error),
+            )
+            return
+        except Exception as error:
+            LOG.exception("[commands] Kontrollkommando feilet for %s", printerIp)
+            completeCommand(
+                commandId,
+                False,
+                recipientId=self._recipientId,
+                error=str(error),
+            )
+            return
+
+        if not completeCommand(commandId, True, recipientId=self._recipientId):
+            LOG.error("[commands] Klarte ikke bekrefte %s", commandId)
+            return
+
+        LOG.info("[commands] Kommando %s ferdig for %s", commandType, printerIp)
+
+
+    def _findOrRefreshSnapshot(
+        self,
+        printerIp: str,
+        snapshots: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        snapshot = self._findSnapshotForIp(printerIp, snapshots)
+        if snapshot is not None:
+            return snapshot
+        freshSnapshots = self._safeCollectSnapshots()
+        snapshot = self._findSnapshotForIp(printerIp, freshSnapshots)
+        if snapshot is not None:
+            snapshots[:] = freshSnapshots
+        return snapshot
+
+
+    def _resolvePrinterCredentials(
+        self,
+        snapshot: dict[str, Any],
+        command: dict[str, Any],
+        printerIp: str,
+    ) -> dict[str, str] | None:
+        metadata = command.get("metadata") or {}
+
+        def _extract(source: dict[str, Any], keys: Iterable[str]) -> str:
+            for key in keys:
+                if key in source:
+                    value = source.get(key)
+                    if value is not None:
+                        text = str(value).strip()
+                        if text:
+                            return text
+            return ""
+
+        serialValue = _extract(snapshot, ("serial", "serialNumber", "printerSerial"))
+        if not serialValue:
+            serialValue = _extract(metadata, ("serial", "serialNumber", "printerSerial"))
+
+        accessCodeValue = _extract(
+            snapshot,
+            ("accessCode", "access_code", "lanAccessCode", "lan_access_code"),
+        )
+        if not accessCodeValue:
+            accessCodeValue = _extract(
+                metadata,
+                ("accessCode", "access_code", "lanAccessCode", "lan_access_code"),
+            )
+
+        if not accessCodeValue:
+            return None
+
+        return {
+            "ip": printerIp,
+            "serial": serialValue or "",
+            "accessCode": accessCodeValue,
+        }
+
+
+    def _getLanClient(
+        self,
+        key: tuple[str, str],
+        credentials: dict[str, str],
+    ) -> BambuLanClient:
+        normalizedKey = (key[0].strip().lower(), credentials["ip"])
+        client = self._lanClients.get(normalizedKey)
+        if client is not None:
+            if client.ipAddress != credentials["ip"] or client.accessCode != credentials["accessCode"]:
+                try:
+                    client.disconnect()
+                except Exception:
+                    LOG.debug("Klarte ikke å koble fra gammel klient", exc_info=True)
+                client = None
+        if client is None:
+            client = BambuLanClient(
+                credentials["ip"],
+                credentials["accessCode"],
+                credentials.get("serial") or None,
+            )
+            self._lanClients[normalizedKey] = client
+        return client
 
 
     def _findSnapshotForIp(self, printerIp: str, snapshots: list[dict[str, Any]]) -> dict[str, Any] | None:

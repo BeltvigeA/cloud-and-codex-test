@@ -2,22 +2,24 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from typing import Any, Dict, List, Optional
 
-from .base44 import callFunction
+import requests
 
 LOG = logging.getLogger(__name__)
 
-_DEFAULT_COMMANDS_FUNCTION = "listPendingCommands"
-_DEFAULT_COMPLETE_FUNCTION = "completePrinterCommand"
+
+def _resolveBaseUrl() -> str:
+    baseUrl = (os.getenv("BASE44_BASE") or "").strip()
+    return baseUrl.rstrip("/")
 
 
 def _resolveRecipientId(explicitRecipientId: Optional[str] = None) -> str:
-    candidate = (explicitRecipientId or "").strip()
-    if candidate:
-        return candidate
+    if explicitRecipientId and explicitRecipientId.strip():
+        return explicitRecipientId.strip()
     envCandidate = (
         os.getenv("BASE44_RECIPIENT_ID")
         or os.getenv("RECIPIENT_ID")
@@ -26,16 +28,19 @@ def _resolveRecipientId(explicitRecipientId: Optional[str] = None) -> str:
     return envCandidate.strip()
 
 
-def getCommandsFunctionName() -> str:
-    """Return the configured Base44 commands function name."""
+def _buildHeaders() -> Dict[str, str]:
+    headers = {"Content-Type": "application/json"}
+    apiKey = (os.getenv("BASE44_API_KEY") or "").strip()
+    if apiKey:
+        headers["X-API-Key"] = apiKey
+    return headers
 
-    return os.getenv("BASE44_COMMANDS_FN", _DEFAULT_COMMANDS_FUNCTION)
 
-
-def getCompleteFunctionName() -> str:
-    """Return the configured Base44 complete-command function name."""
-
-    return os.getenv("BASE44_COMPLETE_CMD_FN", _DEFAULT_COMPLETE_FUNCTION)
+def _buildUrl(functionName: str) -> str:
+    baseUrl = _resolveBaseUrl()
+    if not baseUrl:
+        raise RuntimeError("BASE44_BASE is not configured")
+    return f"{baseUrl}/{functionName}".rstrip("/")
 
 
 def listPendingCommands(
@@ -43,37 +48,37 @@ def listPendingCommands(
     *,
     functionName: Optional[str] = None,
 ) -> Optional[List[Dict[str, Any]]]:
-    """Fetch pending commands for the configured recipient.
-
-    Returns a list of commands when the request succeeds. ``None`` indicates that
-    the remote call failed and should be retried later. An empty list means the
-    call was successful but no commands were available.
-    """
-
     resolvedRecipientId = _resolveRecipientId(recipientId)
     if not resolvedRecipientId:
         LOG.error("[commands] Recipient ID mangler")
         return []
 
-    targetFunction = (functionName or getCommandsFunctionName()).strip() or _DEFAULT_COMMANDS_FUNCTION
-    payload = {"recipientId": resolvedRecipientId}
-    responseData = callFunction(targetFunction, payload)
+    resolvedFunction = (functionName or os.getenv("BASE44_COMMANDS_FN") or "listPendingCommands").strip()
+    if not resolvedFunction:
+        resolvedFunction = "listPendingCommands"
 
-    if responseData is None:
-        LOG.warning(
-            "[commands] %s ga ingen respons for %s", targetFunction, resolvedRecipientId
-        )
+    try:
+        url = _buildUrl(resolvedFunction)
+    except Exception as error:  # noqa: BLE001 - configuration error
+        LOG.error("[commands] Klarte ikke å bygge URL: %s", error)
         return None
 
-    if not isinstance(responseData, dict):
-        LOG.error(
-            "[commands] Uventet respons fra %s: %r",
-            targetFunction,
-            responseData,
-        )
+    payload = {"recipientId": resolvedRecipientId}
+
+    try:
+        response = requests.post(url, json=payload, headers=_buildHeaders(), timeout=10)
+        response.raise_for_status()
+    except requests.RequestException as error:
+        LOG.warning("[commands] %s feilet: %s", resolvedFunction, error)
+        return None
+
+    try:
+        data = response.json()
+    except ValueError:
+        LOG.error("[commands] Kunne ikke parse JSON-respons")
         return []
 
-    commands = responseData.get("commands") or []
+    commands = data.get("commands", []) if isinstance(data, dict) else []
     if not isinstance(commands, list):
         LOG.error("[commands] 'commands' hadde feil format: %r", commands)
         return []
@@ -94,8 +99,6 @@ def completeCommand(
     error: Optional[str] = None,
     functionName: Optional[str] = None,
 ) -> bool:
-    """Mark a command as completed or failed in Base44."""
-
     normalizedCommandId = (commandId or "").strip()
     if not normalizedCommandId:
         LOG.error("[commands] commandId mangler ved fullføring")
@@ -106,19 +109,39 @@ def completeCommand(
         LOG.error("[commands] Recipient ID mangler ved fullføring")
         return False
 
-    targetFunction = (functionName or getCompleteFunctionName()).strip() or _DEFAULT_COMPLETE_FUNCTION
+    resolvedFunction = (functionName or os.getenv("BASE44_COMPLETE_CMD_FN") or "completePrinterCommand").strip()
+    if not resolvedFunction:
+        resolvedFunction = "completePrinterCommand"
+
+    try:
+        url = _buildUrl(resolvedFunction)
+    except Exception as error:  # noqa: BLE001 - configuration error
+        LOG.error("[commands] Klarte ikke å bygge URL: %s", error)
+        return False
+
     payload: Dict[str, Any] = {
         "commandId": normalizedCommandId,
         "recipientId": resolvedRecipientId,
         "success": bool(success),
+        "error": str(error) if (error and not success) else None,
     }
-    if not success and error:
-        payload["error"] = str(error)
-    else:
-        payload["error"] = None
 
-    responseData = callFunction(targetFunction, payload)
-    if isinstance(responseData, dict) and responseData.get("ok") is True:
+    try:
+        response = requests.post(url, json=payload, headers=_buildHeaders(), timeout=10)
+        response.raise_for_status()
+    except requests.RequestException as requestError:
+        LOG.error("[commands] %s feilet: %s", resolvedFunction, requestError)
+        return False
+
+    try:
+        data = response.json() if response.text.strip() else {}
+    except ValueError:
+        try:
+            data = json.loads(response.text)
+        except ValueError:
+            data = {}
+
+    if isinstance(data, dict) and data.get("ok") is True:
         LOG.info(
             "[commands] Markerte %s som %s",
             normalizedCommandId,
@@ -126,14 +149,8 @@ def completeCommand(
         )
         return True
 
-    LOG.error(
-        "[commands] Klarte ikke markere %s: %r",
-        normalizedCommandId,
-        responseData,
-    )
+    LOG.error("[commands] Uventet respons ved fullføring: %r", data)
     return False
 
 
-# snake_case compatibility exports
-list_pending_commands = listPendingCommands
-complete_command = completeCommand
+__all__ = ["listPendingCommands", "completeCommand"]

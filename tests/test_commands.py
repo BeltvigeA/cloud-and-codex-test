@@ -3,9 +3,10 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-import pytest
-
+import json
 import sys
+
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -14,33 +15,49 @@ from client.base44Status import Base44StatusReporter  # noqa: E402
 
 
 def test_list_pending_commands_returns_items(monkeypatch: pytest.MonkeyPatch) -> None:
-    capturedCalls: List[Tuple[str, Dict[str, Any]]] = []
+    capturedRequests: List[Tuple[str, Dict[str, Any]]] = []
 
-    def fakeCall(functionName: str, payload: Dict[str, Any], **_kwargs: Any) -> Dict[str, Any]:
-        capturedCalls.append((functionName, payload))
-        return {
-            "ok": True,
-            "commands": [
-                {"commandId": "cmd-123", "commandType": "poke", "printerIpAddress": "10.0.0.1"}
-            ],
-        }
+    class FakeResponse:
+        def __init__(self, payload: Dict[str, Any]):
+            self._payload = payload
+            self.status_code = 200
+            self.text = json.dumps(payload)
 
-    monkeypatch.setattr(commands, "callFunction", fakeCall)
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> Dict[str, Any]:
+            return self._payload
+
+    def fakePost(url: str, *, json: Dict[str, Any], headers: Dict[str, Any], timeout: int) -> FakeResponse:  # type: ignore[override]
+        capturedRequests.append((url, json))
+        return FakeResponse(
+            {
+                "ok": True,
+                "commands": [
+                    {"commandId": "cmd-123", "commandType": "poke", "printerIpAddress": "10.0.0.1"}
+                ],
+            }
+        )
+
+    monkeypatch.setattr(commands.requests, "post", fakePost)
+    monkeypatch.setenv("BASE44_BASE", "https://example.com/api")
     monkeypatch.setenv("BASE44_RECIPIENT_ID", "recipient-xyz")
 
     result = commands.listPendingCommands()
 
     assert isinstance(result, list)
     assert result and result[0]["commandId"] == "cmd-123"
-    assert capturedCalls[0][0] == "listPendingCommands"
-    assert capturedCalls[0][1]["recipientId"] == "recipient-xyz"
+    assert capturedRequests[0][0] == "https://example.com/api/listPendingCommands"
+    assert capturedRequests[0][1]["recipientId"] == "recipient-xyz"
 
 
 def test_list_pending_commands_returns_none_on_failure(monkeypatch: pytest.MonkeyPatch) -> None:
-    def fakeCall(*_args: Any, **_kwargs: Any) -> None:
-        return None
+    def fakePost(*_args: Any, **_kwargs: Any) -> Any:
+        raise commands.requests.RequestException("boom")
 
-    monkeypatch.setattr(commands, "callFunction", fakeCall)
+    monkeypatch.setattr(commands.requests, "post", fakePost)
+    monkeypatch.setenv("BASE44_BASE", "https://example.com/api")
     monkeypatch.setenv("BASE44_RECIPIENT_ID", "recipient-xyz")
 
     result = commands.listPendingCommands()
@@ -51,11 +68,24 @@ def test_list_pending_commands_returns_none_on_failure(monkeypatch: pytest.Monke
 def test_complete_command_marks_success(monkeypatch: pytest.MonkeyPatch) -> None:
     capturedPayloads: List[Dict[str, Any]] = []
 
-    def fakeCall(functionName: str, payload: Dict[str, Any], **_kwargs: Any) -> Dict[str, Any]:
-        capturedPayloads.append(payload)
-        return {"ok": True, "status": "completed"}
+    class FakeResponse:
+        def __init__(self, payload: Dict[str, Any]):
+            self._payload = payload
+            self.status_code = 200
+            self.text = json.dumps(payload)
 
-    monkeypatch.setattr(commands, "callFunction", fakeCall)
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> Dict[str, Any]:
+            return self._payload
+
+    def fakePost(url: str, *, json: Dict[str, Any], headers: Dict[str, Any], timeout: int) -> FakeResponse:  # type: ignore[override]
+        capturedPayloads.append(json)
+        return FakeResponse({"ok": True, "status": "completed"})
+
+    monkeypatch.setattr(commands.requests, "post", fakePost)
+    monkeypatch.setenv("BASE44_BASE", "https://example.com/api")
 
     assert commands.completeCommand("cmd-99", True, recipientId="recipient-1") is True
     assert capturedPayloads[0]["commandId"] == "cmd-99"
@@ -74,6 +104,7 @@ def test_status_reporter_handles_poke_command(monkeypatch: pytest.MonkeyPatch) -
             "bed": 60.0,
             "nozzle": 200.0,
             "timeRemaining": 120,
+            "mqttReady": True,
         }
     ]
 
@@ -127,3 +158,74 @@ def test_status_reporter_handles_poke_command(monkeypatch: pytest.MonkeyPatch) -
     assert postedPayloads, "Status payload should be posted for poke"
     assert postedPayloads[0]["printerIpAddress"] == "10.0.0.7"
     assert commandLog == [("cmd-555", True, None)]
+
+
+def test_status_reporter_handles_control_command(monkeypatch: pytest.MonkeyPatch) -> None:
+    snapshots: List[Dict[str, Any]] = [
+        {
+            "ip": "10.0.0.7",
+            "serial": "SN-42",
+            "status": "Idle",
+            "online": True,
+            "progress": 0,
+            "bed": 0.0,
+            "nozzle": 0.0,
+            "timeRemaining": 0,
+            "mqttReady": True,
+            "accessCode": "abcd1234",
+        }
+    ]
+
+    commandLog: List[Tuple[str, bool, Optional[str]]] = []
+    executed: List[Tuple[str, str]] = []
+
+    def fakeListPendingCommands(_recipientId: str) -> List[Dict[str, Any]]:
+        return [
+            {
+                "commandId": "cmd-777",
+                "commandType": "set_bed_temp",
+                "printerIpAddress": "10.0.0.7",
+                "metadata": {"target": 60},
+            }
+        ]
+
+    def fakeCompleteCommand(
+        commandId: str,
+        success: bool,
+        *,
+        recipientId: Optional[str] = None,
+        error: Optional[str] = None,
+    ) -> bool:
+        commandLog.append((commandId, success, error))
+        return True
+
+    class FakeClient:
+        def __init__(self, ip: str, accessCode: str, serial: Optional[str]) -> None:
+            self.ipAddress = ip
+            self.accessCode = accessCode
+            self.serialNumber = serial
+
+        def disconnect(self) -> None:
+            return None
+
+    def fakeExecute(client: Any, command: Dict[str, Any]) -> None:
+        executed.append((client.ipAddress, command.get("commandType", "")))
+
+    monkeypatch.setattr(commands, "listPendingCommands", fakeListPendingCommands)
+    monkeypatch.setattr(commands, "completeCommand", fakeCompleteCommand)
+    monkeypatch.setattr("client.base44Status.listPendingCommands", fakeListPendingCommands)
+    monkeypatch.setattr("client.base44Status.completeCommand", fakeCompleteCommand)
+    monkeypatch.setattr("client.base44Status.BambuLanClient", FakeClient)
+    monkeypatch.setattr("client.base44Status.executeCommand", fakeExecute)
+    monkeypatch.setattr("client.base44Status.tcpCheck", lambda _ip: True)
+
+    reporter = Base44StatusReporter(lambda: snapshots, intervalSec=60, commandPollIntervalSec=1)
+    reporter._recipientId = "recipient-xyz"
+    reporter._statusFunctionName = "updatePrinterStatus"
+    reporter._commandBackoffSeconds = 1.0
+    reporter._nextCommandPollTimestamp = 0.0
+
+    reporter._pollPendingCommands(list(snapshots))
+
+    assert executed == [("10.0.0.7", "set_bed_temp")]
+    assert commandLog == [("cmd-777", True, None)]
