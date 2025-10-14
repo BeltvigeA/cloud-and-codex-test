@@ -29,9 +29,9 @@ Combining the SDK with our existing status callbacks preserves the same downstre
 4. Extend the printer entry in the local configuration with:
    ```json
    {
-     "serialNumber": "01S00C371400307",
+     "serialNumber": "01S00C37134327",
      "ipAddress": "192.168.86.63",
-     "accessCode": "22917574",
+     "accessCode": "22917575",
      "lanStrategy": "bambuApi"
    }
    ```
