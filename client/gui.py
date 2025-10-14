@@ -6,6 +6,7 @@ import contextlib
 import json
 import logging
 import os
+import secrets
 import socket
 import ssl
 import threading
@@ -15,9 +16,10 @@ from queue import Empty, Queue
 from typing import Any, Callable, Dict, Optional
 
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import messagebox, ttk
 
 from .base44Status import Base44StatusReporter
+from .database import LocalDatabase
 
 from .bambuPrinter import (
     BambuPrintOptions,
@@ -47,6 +49,14 @@ try:  # pragma: no cover - optional dependency in GUI environments
     import bambulabs_api as bambuApi  # type: ignore
 except ImportError:  # pragma: no cover - handled when Developer Mode packages missing
     bambuApi = None  # type: ignore
+
+
+hardCodedStatusApiKey = (
+    "V9JDvmqG9SB40JpmNu1HwM8ZbvplTrf7ddjudAe6yvjg7hbENEgA429N6xuio4CWQ7nv30fk0c2V8WiOemNWuP2PCKa9dbp7Aoww5lfQPdQu1FGuNKgUZ4wmA23sFCQ7lpxRq9cgZdIWMmwY2EpeYCR13UMgUzDqE8Su6GDPXuXHuPcMKxZnrI9vKNFjtxtCymw1Q8Wr"
+)
+hardCodedPollIntervalSeconds = 30
+defaultListenerLogPath = Path.home() / ".printmaster" / "listener-log.json"
+recipientRotationIntervalSeconds = 600
 
 
 def addPrinterIdentityToPayload(
@@ -115,21 +125,44 @@ class ListenerGuiApp:
         self.statusRefreshIntervalMs = 30_000
         self.pendingImmediateStatusRefresh = False
 
+        self.localDatabase = LocalDatabase()
+        self.recipientRotationIntervalSeconds = recipientRotationIntervalSeconds
+        self.lastRecipientRotation: Optional[datetime] = None
+
+        self.baseUrlValue = defaultBaseUrl
+        self.outputDirectoryValue = str(defaultFilesDirectory)
+        self.logFileValue = str(defaultListenerLogPath)
+        self.pollIntervalSeconds = hardCodedPollIntervalSeconds
+        self.listenerStatusApiKey = hardCodedStatusApiKey
+
         self.listenerRecipientId = ""
-        self.listenerStatusApiKey = ""
         self.listenerActive = False
         self.listenerReady = False
         self.base44ReporterActive = False
+
+        self.recipientVar = tk.StringVar()
+        self.recipientVar.trace_add("write", lambda *_: self._updateListenerRecipient())
+        self.recipientHidden = True
+        self.recipientEntry: Optional[ttk.Entry] = None
+        self.recipientToggleButton: Optional[ttk.Button] = None
+        self.rotateRecipientButton: Optional[ttk.Button] = None
+        self.recipientRotationLabel: Optional[ttk.Label] = None
+        self.recipientRotationJobId: Optional[str] = None
 
         self.base44Reporter = Base44StatusReporter(
             getPrintersSnapshotCallable=self._snapshotPrintersForBase44,
             intervalSec=5,
         )
 
+        self.root.protocol("WM_DELETE_WINDOW", self.handleWindowClose)
+
+        self.initializeRecipientSettings()
         self._buildLayout()
+        self.applyRecipientVisibility()
         self.root.after(200, self._processLogQueue)
         self.root.after(200, self._processPrinterStatusUpdates)
         self._scheduleStatusRefresh(0)
+        self._scheduleRecipientRotationUpdate()
 
     def log(self, message: str) -> None:
         self.logQueue.put(str(message))
@@ -149,67 +182,49 @@ class ListenerGuiApp:
         self._buildPrintersTab(printersFrame)
 
     def _buildListenerTab(self, parent: ttk.Frame, paddingOptions: Dict[str, int]) -> None:
-        ttk.Label(parent, text="Base URL:").grid(row=0, column=0, sticky=tk.W, **paddingOptions)
-        self.baseUrlVar = tk.StringVar(value=defaultBaseUrl)
-        ttk.Entry(parent, textvariable=self.baseUrlVar, width=50).grid(
-            row=0, column=1, sticky=tk.EW, **paddingOptions
+        ttk.Label(parent, text="Recipient ID:").grid(row=0, column=0, sticky=tk.W, **paddingOptions)
+        entryFrame = ttk.Frame(parent)
+        entryFrame.grid(row=0, column=1, sticky=tk.EW, **paddingOptions)
+        self.recipientEntry = ttk.Entry(
+            entryFrame,
+            textvariable=self.recipientVar,
+            width=40,
+            state="readonly",
         )
+        self.recipientEntry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        controlsFrame = ttk.Frame(entryFrame)
+        controlsFrame.pack(side=tk.LEFT, padx=(6, 0))
+        self.recipientToggleButton = ttk.Button(
+            controlsFrame,
+            text="Vis",
+            width=8,
+            command=self.toggleRecipientVisibility,
+        )
+        self.recipientToggleButton.pack(side=tk.TOP, fill=tk.X)
+        self.rotateRecipientButton = ttk.Button(
+            controlsFrame,
+            text="Roter",
+            width=8,
+            command=self.rotateRecipientId,
+        )
+        self.rotateRecipientButton.pack(side=tk.TOP, fill=tk.X, pady=(4, 0))
 
-        ttk.Label(parent, text="Channel (Recipient ID):").grid(
-            row=1, column=0, sticky=tk.W, **paddingOptions
-        )
-        self.recipientVar = tk.StringVar()
-        self.recipientVar.trace_add("write", lambda *_: self._updateListenerRecipient())
-        ttk.Entry(parent, textvariable=self.recipientVar, width=30).grid(
-            row=1, column=1, sticky=tk.EW, **paddingOptions
-        )
-        self._updateListenerRecipient()
-
-        ttk.Label(parent, text="Status API Key:").grid(row=2, column=0, sticky=tk.W, **paddingOptions)
-        self.statusApiKeyVar = tk.StringVar()
-        self.statusApiKeyVar.trace_add("write", lambda *_: self._updateListenerStatusApiKey())
-        ttk.Entry(parent, textvariable=self.statusApiKeyVar, width=30, show="*").grid(
-            row=2, column=1, sticky=tk.EW, **paddingOptions
-        )
-        self._updateListenerStatusApiKey()
-
-        ttk.Label(parent, text="Output Directory:").grid(row=3, column=0, sticky=tk.W, **paddingOptions)
-        self.outputDirVar = tk.StringVar(value=str(defaultFilesDirectory))
-        outputDirFrame = ttk.Frame(parent)
-        outputDirFrame.grid(row=3, column=1, sticky=tk.EW, **paddingOptions)
-        outputDirEntry = ttk.Entry(outputDirFrame, textvariable=self.outputDirVar, width=40)
-        outputDirEntry.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        ttk.Button(outputDirFrame, text="Browse", command=self._chooseOutputDir).pack(side=tk.LEFT, padx=4)
-
-        ttk.Label(parent, text="JSON Log File:").grid(row=4, column=0, sticky=tk.W, **paddingOptions)
-        self.logFileVar = tk.StringVar(
-            value=str(Path.home() / ".printmaster" / "listener-log.json")
-        )
-        logFileFrame = ttk.Frame(parent)
-        logFileFrame.grid(row=4, column=1, sticky=tk.EW, **paddingOptions)
-        logFileEntry = ttk.Entry(logFileFrame, textvariable=self.logFileVar, width=40)
-        logFileEntry.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        ttk.Button(logFileFrame, text="Browse", command=self._chooseLogFile).pack(side=tk.LEFT, padx=4)
-
-        ttk.Label(parent, text="Poll Interval (seconds):").grid(row=5, column=0, sticky=tk.W, **paddingOptions)
-        self.pollIntervalVar = tk.IntVar(value=30)
-        ttk.Spinbox(parent, from_=5, to=3600, textvariable=self.pollIntervalVar).grid(
-            row=5, column=1, sticky=tk.W, **paddingOptions
-        )
+        self.recipientRotationLabel = ttk.Label(parent, text="")
+        self.recipientRotationLabel.grid(row=1, column=0, columnspan=2, sticky=tk.W, **paddingOptions)
 
         buttonFrame = ttk.Frame(parent)
-        buttonFrame.grid(row=6, column=0, columnspan=2, pady=12)
+        buttonFrame.grid(row=2, column=0, columnspan=2, pady=12)
         self.startButton = ttk.Button(buttonFrame, text="Start Listening", command=self.startListening)
         self.startButton.pack(side=tk.LEFT, padx=6)
         self.stopButton = ttk.Button(buttonFrame, text="Stop", command=self.stopListening, state=tk.DISABLED)
         self.stopButton.pack(side=tk.LEFT, padx=6)
 
-        ttk.Label(parent, text="Event Log:").grid(row=7, column=0, sticky=tk.W, **paddingOptions)
+        ttk.Label(parent, text="Event Log:").grid(row=3, column=0, sticky=tk.W, **paddingOptions)
         self.logText = tk.Text(parent, height=10, state=tk.DISABLED)
-        self.logText.grid(row=7, column=1, sticky=tk.NSEW, **paddingOptions)
+        self.logText.grid(row=3, column=1, sticky=tk.NSEW, **paddingOptions)
 
         parent.columnconfigure(1, weight=1)
-        parent.rowconfigure(7, weight=1)
+        parent.rowconfigure(3, weight=1)
 
     def _buildPrintersTab(self, parent: ttk.Frame) -> None:
         self.printerSearchVar = tk.StringVar()
@@ -299,6 +314,133 @@ class ListenerGuiApp:
         self.printerTree.bind("<<TreeviewSelect>>", self._onPrinterSelection)
 
         self._refreshPrinterList()
+
+    def initializeRecipientSettings(self) -> None:
+        storedRecipientId = ""
+        storedRotationValue = None
+        try:
+            storedRecipient = self.localDatabase.getListenerSetting("recipientId")
+            if isinstance(storedRecipient, str):
+                storedRecipientId = storedRecipient.strip()
+        except Exception as error:
+            logging.exception("Failed to load stored recipient ID: %s", error)
+        try:
+            storedRotationValue = self.localDatabase.getListenerSetting("recipientLastRotatedAt")
+        except Exception as error:
+            logging.exception("Failed to load recipient rotation timestamp: %s", error)
+
+        rotationTimestamp: Optional[datetime] = None
+        if storedRotationValue:
+            with contextlib.suppress(ValueError):
+                rotationTimestamp = datetime.fromisoformat(storedRotationValue)
+        if rotationTimestamp and rotationTimestamp.tzinfo is None:
+            rotationTimestamp = rotationTimestamp.replace(tzinfo=timezone.utc)
+
+        if not storedRecipientId:
+            storedRecipientId = self.generateRecipientId()
+            rotationTimestamp = datetime.now(timezone.utc)
+            self.persistRecipientSettings(storedRecipientId, rotationTimestamp)
+        elif rotationTimestamp is None:
+            rotationTimestamp = datetime.now(timezone.utc)
+            self.persistRecipientSettings(storedRecipientId, rotationTimestamp)
+
+        self.lastRecipientRotation = rotationTimestamp
+        self.recipientVar.set(storedRecipientId)
+
+    def generateRecipientId(self) -> str:
+        return secrets.token_urlsafe(32)
+
+    def persistRecipientSettings(self, recipientId: str, rotationTimestamp: datetime) -> None:
+        try:
+            normalizedTimestamp = rotationTimestamp.astimezone(timezone.utc)
+        except ValueError:
+            normalizedTimestamp = datetime.now(timezone.utc)
+        try:
+            self.localDatabase.setListenerSetting("recipientId", recipientId)
+            self.localDatabase.setListenerSetting(
+                "recipientLastRotatedAt",
+                normalizedTimestamp.isoformat(),
+            )
+        except Exception as error:
+            logging.exception("Failed to persist recipient settings: %s", error)
+
+    def secondsUntilRecipientRotationAvailable(self) -> int:
+        if not self.lastRecipientRotation:
+            return 0
+        elapsed = datetime.now(timezone.utc) - self.lastRecipientRotation
+        remaining = self.recipientRotationIntervalSeconds - int(elapsed.total_seconds())
+        return max(0, remaining)
+
+    def rotateRecipientId(self) -> None:
+        remainingSeconds = self.secondsUntilRecipientRotationAvailable()
+        if remainingSeconds > 0:
+            minutes, seconds = divmod(remainingSeconds, 60)
+            messagebox.showinfo(
+                "Roter resipient-ID",
+                f"Resipient-ID kan roteres om {minutes:02d}:{seconds:02d}.",
+            )
+            return
+
+        newRecipientId = self.generateRecipientId()
+        rotationTimestamp = datetime.now(timezone.utc)
+        self.persistRecipientSettings(newRecipientId, rotationTimestamp)
+        self.lastRecipientRotation = rotationTimestamp
+        self.recipientVar.set(newRecipientId)
+        self.logQueue.put("Resipient-ID rotert.")
+
+    def toggleRecipientVisibility(self) -> None:
+        self.recipientHidden = not self.recipientHidden
+        self.applyRecipientVisibility()
+
+    def applyRecipientVisibility(self) -> None:
+        if not self.recipientEntry or not self.recipientToggleButton:
+            return
+        if self.recipientHidden:
+            previousState = self.recipientEntry.cget("state")
+            self.recipientEntry.configure(state="normal")
+            self.recipientEntry.configure(show="•")
+            self.recipientEntry.configure(state=previousState)
+            self.recipientToggleButton.configure(text="Vis")
+        else:
+            previousState = self.recipientEntry.cget("state")
+            self.recipientEntry.configure(state="normal")
+            self.recipientEntry.configure(show="")
+            self.recipientEntry.configure(state=previousState)
+            self.recipientToggleButton.configure(text="Skjul")
+
+    def _scheduleRecipientRotationUpdate(self) -> None:
+        self.recipientRotationJobId = self.root.after(1_000, self.updateRecipientRotationUi)
+
+    def updateRecipientRotationUi(self) -> None:
+        self.recipientRotationJobId = None
+        remainingSeconds = self.secondsUntilRecipientRotationAvailable()
+        if self.rotateRecipientButton:
+            if remainingSeconds > 0:
+                self.rotateRecipientButton.config(state=tk.DISABLED)
+            else:
+                self.rotateRecipientButton.config(state=tk.NORMAL)
+        if self.recipientRotationLabel:
+            if remainingSeconds > 0:
+                minutes, seconds = divmod(remainingSeconds, 60)
+                self.recipientRotationLabel.config(
+                    text=f"Kan roteres om {minutes:02d}:{seconds:02d}"
+                )
+            else:
+                self.recipientRotationLabel.config(text="Kan roteres nå.")
+        self._scheduleRecipientRotationUpdate()
+
+    def handleWindowClose(self) -> None:
+        try:
+            self.stopListening()
+            if self.base44ReporterActive:
+                self.base44Reporter.stop()
+        finally:
+            if self.recipientRotationJobId is not None:
+                with contextlib.suppress(Exception):
+                    self.root.after_cancel(self.recipientRotationJobId)
+            with contextlib.suppress(Exception):
+                self.localDatabase.close()
+            self.root.destroy()
 
     def _loadPrinters(self) -> list[Dict[str, Any]]:
         try:
@@ -516,16 +658,8 @@ class ListenerGuiApp:
         self.listenerRecipientId = self.recipientVar.get().strip() if hasattr(self, "recipientVar") else ""
         self._updateStatusReporterState()
 
-    def _updateListenerStatusApiKey(self, *_args: Any) -> None:
-        self.listenerStatusApiKey = (
-            self.statusApiKeyVar.get().strip() if hasattr(self, "statusApiKeyVar") else ""
-        )
-        self._updateStatusReporterState()
-
     def _resolveStatusApiKey(self) -> str:
-        if self.listenerStatusApiKey:
-            return self.listenerStatusApiKey
-        return os.getenv("PRINTER_API_TOKEN", "").strip()
+        return self.listenerStatusApiKey
 
     def _snapshotPrintersForBase44(self) -> list[Dict[str, Any]]:
         snapshots: list[Dict[str, Any]] = []
@@ -1203,30 +1337,16 @@ class ListenerGuiApp:
             self._updateStatusReporterState(allowReadyUpdate=True)
         self.root.after(500, self._processPrinterStatusUpdates)
 
-    def _chooseOutputDir(self) -> None:
-        selectedDir = filedialog.askdirectory(title="Select Output Directory")
-        if selectedDir:
-            self.outputDirVar.set(selectedDir)
-
-    def _chooseLogFile(self) -> None:
-        selectedFile = filedialog.asksaveasfilename(
-            title="Select JSON Log File",
-            defaultextension=".json",
-            filetypes=(("JSON Files", "*.json"), ("All Files", "*.*")),
-        )
-        if selectedFile:
-            self.logFileVar.set(selectedFile)
-
     def startListening(self) -> None:
         if self.listenerThread and self.listenerThread.is_alive():
             messagebox.showinfo("Listener", "Listener is already running.")
             return
 
-        baseUrl = self.baseUrlVar.get().strip()
+        baseUrl = self.baseUrlValue
         recipientId = self.recipientVar.get().strip()
-        outputDir = self.outputDirVar.get().strip()
-        logFile = self.logFileVar.get().strip()
-        pollInterval = max(5, int(self.pollIntervalVar.get()))
+        outputDir = self.outputDirectoryValue
+        logFile = self.logFileValue
+        pollInterval = max(5, int(self.pollIntervalSeconds))
         statusApiKey = self._resolveStatusApiKey()
 
         if not baseUrl or not recipientId:

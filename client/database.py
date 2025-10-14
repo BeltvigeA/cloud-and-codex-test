@@ -104,9 +104,38 @@ class LocalDatabase:
                 self.connection.execute(
                     "ALTER TABLE products ADD COLUMN downloadedFilePath TEXT"
                 )
+            self.connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS listenerSettings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )
+                """
+            )
 
     def close(self) -> None:
         self.connection.close()
+
+    def getListenerSetting(self, key: str) -> Optional[str]:
+        cursor = self.connection.execute(
+            "SELECT value FROM listenerSettings WHERE key = ?",
+            (key,),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return None
+        return row["value"]
+
+    def setListenerSetting(self, key: str, value: str) -> None:
+        with self.connection:
+            self.connection.execute(
+                """
+                INSERT INTO listenerSettings (key, value)
+                VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                (key, value),
+            )
 
     def upsertPrinter(
         self,
