@@ -398,3 +398,63 @@ def test_applySkippedObjectsToArchiveRejectsUnknownOrder(
 
     assert "Unable to locate slicer objects" in str(errorInfo.value)
     assert "Unable to locate slicer objects" in caplog.text
+
+
+def test_failedSerialResponseAllowsJobStart(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakePrinter:
+        def __init__(self) -> None:
+            self.serial = "SERIAL123"
+            self.serialNumber = "SERIAL123"
+            self.infoCalls = 0
+            self.stateCalls = 0
+            self.mqttStarted = False
+            self.startedPrint = False
+            self.startArguments = None
+
+        def get_printer_info(self) -> Dict[str, Any]:
+            self.infoCalls += 1
+            if self.infoCalls == 1:
+                return {"serial": "FAILED"}
+            return {"serial": "SERIAL123"}
+
+        def get_state(self) -> Dict[str, Any]:
+            self.stateCalls += 1
+            return {"serial": "FAILED" if self.stateCalls == 1 else "SERIAL123"}
+
+        def mqtt_start(self) -> None:
+            self.mqttStarted = True
+
+        def start_print(self, uploadName: str, startParam: Any | None = None) -> None:
+            self.startedPrint = True
+            self.startArguments = (uploadName, startParam)
+
+    fakePrinter = FakePrinter()
+
+    printerSession = bambuPrinter.PrinterSession(
+        ipAddress="192.168.2.50",
+        serialNumber="SERIAL123",
+        accessCode="ACCESS",
+    )
+    printerSession.client = fakePrinter
+
+    ensureCalls: list[float] = []
+
+    def fakeEnsureMqttConnected(
+        printer: Any, *, timeoutSeconds: float = 25.0, **_kwargs: Any
+    ) -> bool:
+        ensureCalls.append(timeoutSeconds)
+        return True
+
+    monkeypatch.setattr(bambuPrinter, "ensureMqttConnected", fakeEnsureMqttConnected)
+
+    returnedPrinter = bambuPrinter.ensurePrinterSessionReady(printerSession)
+
+    assert returnedPrinter is fakePrinter
+    assert printerSession.mqttReady is True
+    assert ensureCalls
+
+    bambuPrinter.startWithLibrary(fakePrinter, "job.3mf", None, expectedSerial="SERIAL123")
+
+    assert fakePrinter.mqttStarted is True
+    assert fakePrinter.startedPrint is True
+    assert fakePrinter.startArguments == ("job.3mf", None)
