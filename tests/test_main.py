@@ -2001,6 +2001,96 @@ def testPrinterStatusUpdateRejectsInvalidRecipientId(monkeypatch):
     assert not addRecorder
 
 
+def testQueuePrinterControlCommandStoresRecord(monkeypatch):
+    updateRecorder = {'set': None, 'update': []}
+    mockClients = main.ClientBundle(
+        storageClient=MockStorageClient(),
+        firestoreClient=MockFirestoreClient(updateRecorder=updateRecorder),
+        kmsClient=MockEncryptClient({'sensitive': 'value'}),
+        kmsKeyPath='projects/test/locations/test/keyRings/test/cryptoKeys/test',
+        gcsBucketName='test-bucket',
+    )
+
+    monkeypatch.setattr(main, 'getClients', lambda: mockClients)
+    monkeypatch.setattr(main, 'validPrinterApiKeys', {'control-key'})
+
+    fakeRequest.headers = {'X-API-Key': 'control-key'}
+    fakeRequest.set_json(
+        {
+            'commandType': 'set_nozzle_temp',
+            'printerIpAddress': '192.168.1.5',
+            'recipientId': 'recipient-123',
+            'metadata': {'target': 215},
+        }
+    )
+
+    responseBody, statusCode = main.queuePrinterControlCommand()
+
+    assert statusCode == 202
+    assert responseBody['ok'] is True
+    assert responseBody['status'] == 'queued'
+    assert updateRecorder['set'] is not None
+    assert updateRecorder['set']['commandType'] == 'set_nozzle_temp'
+    assert updateRecorder['set']['status'] == 'pending'
+    assert updateRecorder['set']['metadata'] == {'target': 215}
+    assert updateRecorder['set']['recipientId'] == 'recipient-123'
+    assert updateRecorder['set']['printerIpAddress'] == '192.168.1.5'
+    assert updateRecorder['set']['commandId'] == responseBody['commandId']
+
+
+def testQueuePrinterControlCommandParsesStringMetadata(monkeypatch):
+    updateRecorder = {'set': None, 'update': []}
+    mockClients = main.ClientBundle(
+        storageClient=MockStorageClient(),
+        firestoreClient=MockFirestoreClient(updateRecorder=updateRecorder),
+        kmsClient=MockEncryptClient({'sensitive': 'value'}),
+        kmsKeyPath='projects/test/locations/test/keyRings/test/cryptoKeys/test',
+        gcsBucketName='test-bucket',
+    )
+
+    monkeypatch.setattr(main, 'getClients', lambda: mockClients)
+    monkeypatch.setattr(main, 'validPrinterApiKeys', {'control-key'})
+
+    fakeRequest.headers = {'X-API-Key': 'control-key'}
+    fakeRequest.set_json(
+        {
+            'commandType': 'home_all',
+            'printerSerial': 'SN-001',
+            'metadata': '{"axis":"z"}',
+        }
+    )
+
+    responseBody, statusCode = main.queuePrinterControlCommand()
+
+    assert statusCode == 202
+    assert responseBody['ok'] is True
+    assert updateRecorder['set']['printerSerial'] == 'SN-001'
+    assert updateRecorder['set']['metadata'] == {'axis': 'z'}
+
+
+def testQueuePrinterControlCommandRequiresPrinterIdentifier(monkeypatch):
+    mockClients = main.ClientBundle(
+        storageClient=MockStorageClient(),
+        firestoreClient=MockFirestoreClient(),
+        kmsClient=MockEncryptClient({'sensitive': 'value'}),
+        kmsKeyPath='projects/test/locations/test/keyRings/test/cryptoKeys/test',
+        gcsBucketName='test-bucket',
+    )
+
+    monkeypatch.setattr(main, 'getClients', lambda: mockClients)
+    monkeypatch.setattr(main, 'validPrinterApiKeys', {'control-key'})
+
+    fakeRequest.headers = {'X-API-Key': 'control-key'}
+    fakeRequest.set_json({'commandType': 'jog', 'metadata': {'axis': 'x', 'delta': 5}})
+
+    responseBody, statusCode = main.queuePrinterControlCommand()
+
+    assert statusCode == 400
+    assert responseBody['ok'] is False
+    assert responseBody['error_type'] == 'ValidationError'
+    assert 'printerIpAddress or printerSerial' in responseBody['message']
+
+
 def testUploadFileReportsMissingEnvironment(monkeypatch):
     def raiseMissing():
         raise main.MissingEnvironmentError(['GCP_PROJECT_ID'])
