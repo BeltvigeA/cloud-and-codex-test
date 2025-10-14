@@ -1,12 +1,13 @@
-"""Pending job utilities built on top of the Base44 helpers."""
+"""Pending job utilities for interacting with the Cloud Run backend."""
 
 from __future__ import annotations
 
 import logging
 import threading
+from importlib import import_module
 from typing import Any, Dict, List, Optional
 
-from .base44 import callFunction, getBaseUrl, getPendingFunctionName
+import requests
 
 LOG = logging.getLogger(__name__)
 
@@ -31,43 +32,51 @@ def consumePendingPollTrigger() -> bool:
 def listPending(
     recipientId: str,
     *,
-    functionName: Optional[str] = None,
+    baseUrl: str,
     apiKey: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    """Retrieve pending files for the specified recipient."""
+    """Retrieve pending files for the specified recipient from Cloud Run."""
 
     normalizedRecipient = (recipientId or "").strip()
     if not normalizedRecipient:
         LOG.error("[pending] recipientId is required")
         return []
 
-    resolvedFunction = functionName or getPendingFunctionName()
-    responseData = callFunction(
-        resolvedFunction,
-        {"recipientId": normalizedRecipient},
-        apiKey=apiKey,
-    )
+    try:
+        clientModule = import_module("client.client")
+        pendingUrl = clientModule.buildPendingUrl(baseUrl, normalizedRecipient)
+    except Exception as error:  # pragma: no cover - unexpected import failure
+        LOG.error("[pending] Unable to resolve pending URL: %s", error)
+        return []
+
+    headers = {"Accept": "application/json"}
+    if apiKey:
+        headers["X-API-Key"] = apiKey
+
+    try:
+        response = requests.get(pendingUrl, headers=headers, timeout=30)
+        response.raise_for_status()
+    except requests.RequestException as error:
+        LOG.error("[pending] Failed to fetch pending jobs from %s: %s", pendingUrl, error)
+        return []
+
+    try:
+        responseData = response.json()
+    except ValueError as error:
+        LOG.error("[pending] Invalid JSON payload from %s: %s", pendingUrl, error)
+        return []
 
     jobs: List[Dict[str, Any]] = []
     if isinstance(responseData, dict):
-        for key in ("jobs", "files", "pending", "pendingFiles"):
-            payloadItems = responseData.get(key)
-            if isinstance(payloadItems, list):
-                jobs = [item for item in payloadItems if isinstance(item, dict)]
-                if jobs:
-                    break
+        payloadItems = responseData.get("pendingFiles")
+        if isinstance(payloadItems, list):
+            jobs = [item for item in payloadItems if isinstance(item, dict)]
     elif isinstance(responseData, list):
         jobs = [item for item in responseData if isinstance(item, dict)]
-    elif responseData is None:
-        jobs = []
-    else:
-        LOG.error("[pending] Unexpected payload from %s: %s", resolvedFunction, responseData)
-        jobs = []
 
     LOG.info(
-        "[pending] url=%s/%s recipientId=%s count=%s",
-        getBaseUrl(),
-        resolvedFunction,
+        "[pending] url=%s recipientId=%s count=%s",
+        pendingUrl,
         normalizedRecipient,
         len(jobs),
     )

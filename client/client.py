@@ -1436,15 +1436,28 @@ def fetchPendingFiles(
     *,
     statusApiKey: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    """Retrieve pending jobs for the recipient via the Base44 function endpoint."""
+    """Retrieve pending jobs for the recipient via the Cloud Run endpoint."""
 
-    # baseUrl is retained for compatibility and logging; pending retrieval uses Base44 functions.
     normalizedRecipient = recipientId.strip()
     if not normalizedRecipient:
         logging.error("Recipient ID is required to fetch pending files.")
         return []
 
-    pendingFiles = listPending(normalizedRecipient, apiKey=statusApiKey)
+    try:
+        pendingUrl = buildPendingUrl(baseUrl, normalizedRecipient)
+    except ValueError as error:
+        logging.error(
+            "Failed to build pending URL for recipient %s: %s", normalizedRecipient, error
+        )
+        return []
+
+    logging.info("Requesting pending jobs from %s", pendingUrl)
+
+    pendingFiles = listPending(
+        normalizedRecipient,
+        baseUrl=baseUrl,
+        apiKey=statusApiKey,
+    )
     if not pendingFiles:
         logging.info("No pending files for recipient %s.", normalizedRecipient)
     else:
