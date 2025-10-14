@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from .base44 import callFunction, getBaseUrl, getPendingFunctionName
 
@@ -48,26 +48,28 @@ def listPending(
         apiKey=apiKey,
     )
 
-    files: List[Dict[str, Any]] = []
-    if isinstance(responseData, dict) and isinstance(responseData.get("files"), list):
-        files = [item for item in responseData["files"] if isinstance(item, dict)]
+    jobs: List[Dict[str, Any]] = []
+    if isinstance(responseData, dict):
+        if isinstance(responseData.get("jobs"), list):
+            jobs = [item for item in responseData["jobs"] if isinstance(item, dict)]
+        elif isinstance(responseData.get("files"), list):
+            jobs = [item for item in responseData["files"] if isinstance(item, dict)]
     elif isinstance(responseData, list):
-        files = [item for item in responseData if isinstance(item, dict)]
+        jobs = [item for item in responseData if isinstance(item, dict)]
     elif responseData is None:
-        files = []
+        jobs = []
     else:
         LOG.error("[pending] Unexpected payload from %s: %s", resolvedFunction, responseData)
-        files = []
+        jobs = []
 
     LOG.info(
-        "[pending] url=%s/%s recipientId=%s code=%s json=%s",
+        "[pending] url=%s/%s recipientId=%s count=%s",
         getBaseUrl(),
         resolvedFunction,
         normalizedRecipient,
-        "200" if responseData is not None else "204",
-        f"{len(files)} items" if files else "empty",
+        len(jobs),
     )
-    return files
+    return jobs
 
 
 # snake_case compatibility exports

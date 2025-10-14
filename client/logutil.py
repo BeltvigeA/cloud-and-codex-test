@@ -1,4 +1,4 @@
-"""Logging helpers for rate-limiting repeated error messages."""
+"""Logging helpers for rate-limiting repeated messages."""
 
 from __future__ import annotations
 
@@ -12,8 +12,14 @@ _LAST_EVENT_TIMES: Dict[str, float] = {}
 _LOCK = threading.Lock()
 
 
-def rateLimitError(key: str, message: str, minSeconds: float = 5.0) -> None:
-    """Log an error message at most once per *minSeconds* for the given key."""
+def rateLimit(
+    key: str,
+    message: str,
+    *,
+    level: str = "error",
+    minSeconds: float = 5.0,
+) -> None:
+    """Log *message* with rate-limiting enforced per *key*."""
 
     now = time.time()
     with _LOCK:
@@ -21,8 +27,19 @@ def rateLimitError(key: str, message: str, minSeconds: float = 5.0) -> None:
         if now - lastTime < max(0.1, float(minSeconds)):
             return
         _LAST_EVENT_TIMES[key] = now
-    _LOG.error(message)
+
+    logMethod = getattr(logging, level, None)
+    if not callable(logMethod):
+        logMethod = _LOG.error
+    logMethod(message)
 
 
-# snake_case compatibility alias
+def rateLimitError(key: str, message: str, minSeconds: float = 5.0) -> None:
+    """Backward-compatible wrapper that logs at error level."""
+
+    rateLimit(key, message, level="error", minSeconds=minSeconds)
+
+
+# snake_case compatibility aliases for legacy imports
+rate_limit = rateLimit
 rate_limit_error = rateLimitError
