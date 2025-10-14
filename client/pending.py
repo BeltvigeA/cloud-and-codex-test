@@ -50,10 +50,12 @@ def listPending(
 
     jobs: List[Dict[str, Any]] = []
     if isinstance(responseData, dict):
-        if isinstance(responseData.get("jobs"), list):
-            jobs = [item for item in responseData["jobs"] if isinstance(item, dict)]
-        elif isinstance(responseData.get("files"), list):
-            jobs = [item for item in responseData["files"] if isinstance(item, dict)]
+        for key in ("jobs", "files", "pending", "pendingFiles"):
+            payloadItems = responseData.get(key)
+            if isinstance(payloadItems, list):
+                jobs = [item for item in payloadItems if isinstance(item, dict)]
+                if jobs:
+                    break
     elif isinstance(responseData, list):
         jobs = [item for item in responseData if isinstance(item, dict)]
     elif responseData is None:
