@@ -14,7 +14,7 @@ LOG = logging.getLogger(__name__)
 _DEFAULT_BASE_URL = (
     "https://print-flow-pro-eb683cc6.base44.app/api/apps/68b61486e7c52405eb683cc6/functions"
 )
-_DEFAULT_PENDING_FUNCTION = "listRecipientFiles"
+_DEFAULT_PENDING_FUNCTION = "listPendingJobs"
 _DEFAULT_STATUS_FUNCTION = "updatePrinterStatus"
 _DEFAULT_TIMEOUT_SECONDS = 10.0
 
@@ -75,7 +75,6 @@ def callFunction(
         LOG.error("[base44] %s: exception %s", functionName, error)
         return None
 
-    contentType = (response.headers.get("content-type") or "").lower()
     textBody = response.text or ""
 
     if response.status_code == 204 or not textBody.strip():
@@ -91,25 +90,35 @@ def callFunction(
         )
         return None
 
-    if "application/json" not in contentType:
-        LOG.error(
-            "[base44] %s: non-JSON %s: %s",
-            functionName,
-            response.status_code,
-            textBody[:200],
-        )
-        return None
-
+    parsed: Any
     try:
         parsed = response.json()
-    except json.JSONDecodeError as error:
-        LOG.error("[base44] %s: invalid JSON (%s)", functionName, error)
-        return None
+    except ValueError:
+        try:
+            parsed = json.loads(textBody)
+            LOG.debug(
+                "[base44] %s: parsed JSON without application/json header",
+                functionName,
+            )
+        except ValueError:
+            LOG.error(
+                "[base44] %s: could not parse JSON %s: %s",
+                functionName,
+                response.status_code,
+                textBody[:200],
+            )
+            return None
 
     if isinstance(parsed, dict) and "error_type" in parsed:
         LOG.error("[base44] %s: remote error %s", functionName, parsed)
         return None
 
+    LOG.info(
+        "[base44] %s: %s %s",
+        functionName,
+        response.status_code,
+        "ok",
+    )
     return parsed
 
 

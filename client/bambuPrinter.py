@@ -34,7 +34,7 @@ except ImportError:  # pragma: no cover - handled gracefully by callers
 
 import requests
 
-from .logutil import rateLimitError
+from .logutil import rateLimit
 
 
 _bambulabsApiModule = importlib.util.find_spec("bambulabs_api")
@@ -1692,50 +1692,81 @@ def startStatusHeartbeat(
         lastSnapshot: Dict[str, Any] = {}
         lastSnapshotAt: float = 0.0
         lastOfflinePostAt: float = 0.0
+
+        def hasSensorData(snapshot: Dict[str, Any]) -> bool:
+            bedValue = coerceFloatValue(
+                snapshot.get("bedTemp")
+                or snapshot.get("bed")
+                or snapshot.get("bed_temp")
+                or snapshot.get("bedTemperature")
+            )
+            nozzleValue = coerceFloatValue(
+                snapshot.get("nozzleTemp")
+                or snapshot.get("nozzle")
+                or snapshot.get("nozzle_temp")
+                or snapshot.get("nozzleTemperature")
+            )
+            values = [value for value in (bedValue, nozzleValue) if value is not None]
+            return any(abs(value) > 0.01 for value in values)
+
         try:
             while not stopEvent.is_set():
                 now = time.time()
-                try:
-                    snapshotCandidate = statusSupplier() if statusSupplier else buildStatusPayload(printer)
-                except Exception as error:  # pragma: no cover - defensive logging
-                    logger.debug("Heartbeat snapshot failed", exc_info=error)
-                    snapshotCandidate = {}
-
-                if isinstance(snapshotCandidate, dict) and snapshotCandidate:
-                    lastSnapshot = dict(snapshotCandidate)
-                    lastSnapshot.setdefault("lastSeen", isoNow())
-                    lastSnapshotAt = now
-
                 try:
                     mqttReady = printerIsMqttReady(printer)
                 except Exception as error:  # pragma: no cover - defensive logging
                     logger.debug("Heartbeat readiness check failed", exc_info=error)
                     mqttReady = False
 
-                if not mqttReady:
-                    rateLimitError(f"mqtt_not_ready:{heartbeatKey}", "MQTT ikke klar – hopper over lesing")
+                payloadToSend: Dict[str, Any] | None = None
+                waitSeconds = intervalSeconds
+
+                if mqttReady:
+                    try:
+                        snapshotCandidate = (
+                            statusSupplier() if statusSupplier else buildStatusPayload(printer)
+                        )
+                    except Exception as error:  # pragma: no cover - defensive logging
+                        logger.debug("Heartbeat snapshot failed", exc_info=error)
+                        snapshotCandidate = {}
+
+                    if isinstance(snapshotCandidate, dict) and snapshotCandidate:
+                        if hasSensorData(snapshotCandidate) or snapshotCandidate.get("online") is False:
+                            lastSnapshot = dict(snapshotCandidate)
+                            lastSnapshot.setdefault("lastSeen", isoNow())
+                            lastSnapshotAt = now
+                        else:
+                            rateLimit(
+                                f"values_not_ready:{heartbeatKey}",
+                                "Printer Values Not Available Yet",
+                                level="warning",
+                            )
+                    else:
+                        snapshotCandidate = {}
+                else:
+                    rateLimit(
+                        f"mqtt_not_ready:{heartbeatKey}",
+                        "MQTT ikke klar – hopper over lesing",
+                        level="warning",
+                    )
 
                 hasFreshSnapshot = bool(lastSnapshot) and (
                     mqttReady or (lastSnapshotAt and (now - lastSnapshotAt) <= freshnessSeconds)
                 )
 
-                if mqttReady and not hasFreshSnapshot:
-                    rateLimitError(
-                        f"values_not_ready:{heartbeatKey}", "Printer Values Not Available Yet"
-                    )
-
                 if hasFreshSnapshot:
                     payloadToSend = dict(lastSnapshot)
-                    try:
-                        postStatus(payloadToSend, printerConfig)
-                    except Exception:  # pragma: no cover - status posting best-effort
-                        logger.debug("Heartbeat post failed", exc_info=True)
-                    stopEvent.wait(intervalSeconds)
-                    continue
-
-                if not mqttReady and now - lastOfflinePostAt >= offlineIntervalSeconds:
-                    resolvedIp = printerConfig.get("ipAddress") or (lastSnapshot.get("ip") if lastSnapshot else None)
-                    offlinePayload = {
+                    if not hasSensorData(payloadToSend):
+                        payloadToSend["online"] = False
+                        payloadToSend["status"] = payloadToSend.get("status") or "offline"
+                        payloadToSend["bedTemp"] = None
+                        payloadToSend["nozzleTemp"] = None
+                elif now - lastOfflinePostAt >= offlineIntervalSeconds:
+                    resolvedIp = (
+                        printerConfig.get("ipAddress")
+                        or (lastSnapshot.get("ip") if lastSnapshot else None)
+                    )
+                    payloadToSend = {
                         "status": "offline",
                         "ip": resolvedIp,
                         "printerIpAddress": resolvedIp,
@@ -1744,17 +1775,18 @@ def startStatusHeartbeat(
                         "lastSeen": isoNow(),
                         "online": False,
                     }
-                    try:
-                        postStatus(offlinePayload, printerConfig)
-                    except Exception:  # pragma: no cover - status posting best-effort
-                        logger.debug("Heartbeat offline post failed", exc_info=True)
                     lastOfflinePostAt = now
+                    waitSeconds = min(intervalSeconds, 1.0)
+                else:
+                    waitSeconds = min(intervalSeconds, 1.0)
 
-                if not mqttReady:
-                    stopEvent.wait(min(intervalSeconds, 1.0))
-                    continue
+                if payloadToSend:
+                    try:
+                        postStatus(payloadToSend, printerConfig)
+                    except Exception:  # pragma: no cover - status posting best-effort
+                        logger.debug("Heartbeat post failed", exc_info=True)
 
-                stopEvent.wait(intervalSeconds)
+                stopEvent.wait(waitSeconds)
         finally:
             with _statusHeartbeatLock:
                 current = _statusHeartbeatEvents.get(heartbeatKey)
