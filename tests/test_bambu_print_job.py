@@ -458,3 +458,53 @@ def test_failedSerialResponseAllowsJobStart(monkeypatch: pytest.MonkeyPatch) -> 
     assert fakePrinter.mqttStarted is True
     assert fakePrinter.startedPrint is True
     assert fakePrinter.startArguments == ("job.3mf", None)
+
+
+def test_ensurePrinterSessionReadyIgnoresFailedState(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakePrinter:
+        def __init__(self) -> None:
+            self.serial = "SERIAL123"
+            self.serialNumber = "SERIAL123"
+            self.stateCalls = 0
+            self.mqttStarted = False
+            self.startedPrint = False
+            self.startArguments: tuple[str, Any | None] | None = None
+
+        def get_state(self) -> Dict[str, Any]:
+            self.stateCalls += 1
+            if self.stateCalls == 1:
+                return {"serial": "FAILED"}
+            return {"serial": "SERIAL123"}
+
+        def mqtt_start(self) -> None:
+            self.mqttStarted = True
+
+        def start_print(self, uploadName: str, startParam: Any | None = None) -> None:
+            self.startedPrint = True
+            self.startArguments = (uploadName, startParam)
+
+    fakePrinter = FakePrinter()
+
+    printerSession = bambuPrinter.PrinterSession(
+        ipAddress="192.168.2.55",
+        serialNumber="SERIAL123",
+        accessCode="ACCESS",
+    )
+    printerSession.client = fakePrinter
+
+    def fakeEnsureMqttConnected(printer: Any, *, timeoutSeconds: float = 25.0, **_kwargs: Any) -> bool:
+        assert timeoutSeconds == 25.0
+        return True
+
+    monkeypatch.setattr(bambuPrinter, "ensureMqttConnected", fakeEnsureMqttConnected)
+
+    returnedPrinter = bambuPrinter.ensurePrinterSessionReady(printerSession)
+
+    assert returnedPrinter is fakePrinter
+    assert printerSession.mqttReady is True
+
+    bambuPrinter.startWithLibrary(fakePrinter, "job.3mf", None, expectedSerial="SERIAL123")
+
+    assert fakePrinter.mqttStarted is True
+    assert fakePrinter.startedPrint is True
+    assert fakePrinter.startArguments == ("job.3mf", None)
