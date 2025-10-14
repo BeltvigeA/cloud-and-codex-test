@@ -217,18 +217,51 @@ class MockEncryptClient:
 
 
 class MockDocument:
-    def __init__(self, updateRecorder, addRecorder):
+    def __init__(self, documentStore, docId, updateRecorder, addRecorder):
+        self.documentStore = documentStore
+        self.docId = docId
         self.updateRecorder = updateRecorder
         self.addRecorder = addRecorder
 
     def set(self, metadata):
+        self.documentStore[self.docId] = metadata
         self.updateRecorder['set'] = metadata
 
     def update(self, payload):
+        existingMetadata = dict(self.documentStore.get(self.docId, {}))
+        for key, value in payload.items():
+            if value is main.DELETE_FIELD:
+                existingMetadata.pop(key, None)
+            else:
+                existingMetadata[key] = value
+        self.documentStore[self.docId] = existingMetadata
         self.updateRecorder['update'].append(payload)
 
+    def get(self, transaction=None):  # pylint: disable=unused-argument
+        metadata = self.documentStore.get(self.docId)
+        if metadata is None:
+            return MockDocumentSnapshot(self.docId, None, exists=False)
+        return MockDocumentSnapshot(self.docId, metadata)
+
     def collection(self, _name):
-        return MockCollection([], self.updateRecorder, self.addRecorder)
+        return MockCollection([], self.documentStore, self.updateRecorder, self.addRecorder)
+
+
+class MockTransaction:
+    def __init__(self, documentStore, updateRecorder):
+        self.documentStore = documentStore
+        self.updateRecorder = updateRecorder
+        self.writes = []
+
+    def get(self, documentReference):
+        return documentReference.get(transaction=self)
+
+    def update(self, documentReference, payload):
+        documentReference.update(payload)
+        self.writes.append((documentReference.docId, payload))
+
+    def commit(self):
+        return self.writes
 
 
 class MockQuery:
@@ -242,13 +275,24 @@ class MockQuery:
         self.filters = filters or []
 
     def where(self, field, operator, value):  # pylint: disable=unused-argument
-        if operator != '==':
-            raise NotImplementedError('Only equality filters are supported in tests')
         filteredSnapshots = []
+        if operator == '==':
+            def condition(metadata):
+                return metadata.get(field) == value
+
+        elif operator == 'in':
+            allowedValues = set(value)
+
+            def condition(metadata):
+                return metadata.get(field) in allowedValues
+        else:
+            raise NotImplementedError('Only == and in filters are supported in tests')
+
         for snapshot in self.documentSnapshots:
             metadata = snapshot.to_dict() or {}
-            if metadata.get(field) == value:
+            if condition(metadata):
                 filteredSnapshots.append(snapshot)
+
         return MockQuery(filteredSnapshots, self.filters + [(field, operator, value)])
 
     def limit(self, _count):
@@ -259,16 +303,25 @@ class MockQuery:
 
 
 class MockCollection:
-    def __init__(self, documentSnapshots, updateRecorder, addRecorder):
-        self.documentSnapshots = documentSnapshots
+    def __init__(self, documentSnapshots, documentStore, updateRecorder, addRecorder):
+        self.documentSnapshots = list(documentSnapshots)
+        self.documentStore = documentStore
         self.updateRecorder = updateRecorder
         self.addRecorder = addRecorder
 
-    def document(self, _docId):
-        return MockDocument(self.updateRecorder, self.addRecorder)
+    def _currentSnapshots(self):
+        if self.documentStore:
+            return [
+                MockDocumentSnapshot(docId, metadata)
+                for docId, metadata in self.documentStore.items()
+            ]
+        return list(self.documentSnapshots)
 
-    def where(self, _field, _operator, _value):
-        return MockQuery(self.documentSnapshots)
+    def document(self, docId):
+        return MockDocument(self.documentStore, docId, self.updateRecorder, self.addRecorder)
+
+    def where(self, field, operator, value):
+        return MockQuery(self._currentSnapshots()).where(field, operator, value)
 
     def add(self, payload):
         self.addRecorder.append(payload)
@@ -284,26 +337,42 @@ class MockFirestoreClient:
         addRecorder=None,
     ):
         if documentSnapshots is not None:
-            self.documentSnapshots = documentSnapshots
+            self.documentSnapshots = list(documentSnapshots)
         elif documentSnapshot is not None:
             self.documentSnapshots = [documentSnapshot]
         else:
             self.documentSnapshots = []
         self.updateRecorder = updateRecorder or {'set': None, 'update': []}
         self.addRecorder = addRecorder if addRecorder is not None else []
+        self.documentStore = {}
+        for snapshot in self.documentSnapshots:
+            metadata = snapshot.to_dict()
+            if metadata is not None:
+                self.documentStore[snapshot.id] = dict(metadata)
 
     def collection(self, _name):
-        if not self.documentSnapshots:
-            return MockCollection([], self.updateRecorder, self.addRecorder)
-        return MockCollection(self.documentSnapshots, self.updateRecorder, self.addRecorder)
+        snapshots = self.documentSnapshots or self._currentSnapshots()
+        return MockCollection(snapshots, self.documentStore, self.updateRecorder, self.addRecorder)
+
+    def transaction(self):
+        return MockTransaction(self.documentStore, self.updateRecorder)
+
+    def _currentSnapshots(self):
+        return [
+            MockDocumentSnapshot(docId, metadata)
+            for docId, metadata in self.documentStore.items()
+        ]
 
 
 class MockDocumentSnapshot:
-    def __init__(self, docId, metadata):
+    def __init__(self, docId, metadata, exists=True):
         self.id = docId
         self._metadata = metadata
+        self.exists = exists
 
     def to_dict(self):
+        if not self.exists:
+            return None
         return self._metadata
 
 
@@ -728,6 +797,7 @@ def testFetchFileFirstUseSuccess(monkeypatch):
         'gcsPath': 'recipient123/file.gcode',
         'fetchTokenExpiry': datetime.now(timezone.utc) + timedelta(minutes=5),
         'fetchTokenConsumed': False,
+        'fetchToken': 'testFetchToken',
         'originalFilename': None,
     }
     documentSnapshot = MockDocumentSnapshot('doc123', metadata)
@@ -776,6 +846,7 @@ def testFetchFileMetadataOnly(monkeypatch):
         'gcsPath': 'recipient123/file.gcode',
         'fetchTokenExpiry': datetime.now(timezone.utc) + timedelta(minutes=5),
         'fetchTokenConsumed': False,
+        'fetchToken': 'testFetchToken',
         'originalFilename': 'part-c.gcode',
     }
     documentSnapshot = MockDocumentSnapshot('doc789', metadata)
@@ -827,6 +898,7 @@ def testFetchFileUsesIamSigningWhenSignBytesMissing(monkeypatch):
         'gcsPath': 'recipient123/file.gcode',
         'fetchTokenExpiry': datetime.now(timezone.utc) + timedelta(minutes=5),
         'fetchTokenConsumed': False,
+        'fetchToken': 'testFetchToken',
     }
     documentSnapshot = MockDocumentSnapshot('doc123', metadata)
     updateRecorder = {'set': None, 'update': []}
@@ -888,6 +960,7 @@ def testFetchFileScopesCredentialsForIamSigning(monkeypatch):
         'gcsPath': 'recipient123/file.gcode',
         'fetchTokenExpiry': datetime.now(timezone.utc) + timedelta(minutes=5),
         'fetchTokenConsumed': False,
+        'fetchToken': 'testFetchToken',
     }
     documentSnapshot = MockDocumentSnapshot('doc123', metadata)
     updateRecorder = {'set': None, 'update': []}
@@ -974,6 +1047,7 @@ def testFetchFileInvalidDecryptedMetadata(monkeypatch):
         'gcsPath': 'recipient123/file.gcode',
         'fetchTokenExpiry': datetime.now(timezone.utc) + timedelta(minutes=5),
         'fetchTokenConsumed': False,
+        'fetchToken': 'testFetchToken',
     }
     documentSnapshot = MockDocumentSnapshot('doc123', metadata)
 
@@ -1004,6 +1078,7 @@ def testFetchFileMissingIamPermissions(monkeypatch):
         'gcsPath': 'recipient123/file.gcode',
         'fetchTokenExpiry': datetime.now(timezone.utc) + timedelta(minutes=5),
         'fetchTokenConsumed': False,
+        'fetchToken': 'testFetchToken',
     }
     documentSnapshot = MockDocumentSnapshot('doc123', metadata)
     updateRecorder = {'set': None, 'update': []}
@@ -1050,6 +1125,7 @@ def testFetchFileStorageApiError(monkeypatch, caplog):
         'gcsPath': 'recipient123/file.gcode',
         'fetchTokenExpiry': datetime.now(timezone.utc) + timedelta(minutes=5),
         'fetchTokenConsumed': False,
+        'fetchToken': 'testFetchToken',
     }
     documentSnapshot = MockDocumentSnapshot('doc123', metadata)
     updateRecorder = {'set': None, 'update': []}
@@ -1100,6 +1176,7 @@ def testFetchFileMissingSigningKey(monkeypatch):
         'gcsPath': 'recipient123/file.gcode',
         'fetchTokenExpiry': datetime.now(timezone.utc) + timedelta(minutes=5),
         'fetchTokenConsumed': False,
+        'fetchToken': 'testFetchToken',
     }
     documentSnapshot = MockDocumentSnapshot('doc123', metadata)
     updateRecorder = {'set': None, 'update': []}
@@ -1143,6 +1220,7 @@ def testFetchFileUnsignedCredentialsLogsDetail(monkeypatch, caplog):
         'gcsPath': 'recipient123/file.gcode',
         'fetchTokenExpiry': datetime.now(timezone.utc) + timedelta(minutes=5),
         'fetchTokenConsumed': False,
+        'fetchToken': 'testFetchToken',
     }
     documentSnapshot = MockDocumentSnapshot('doc123', metadata)
     updateRecorder = {'set': None, 'update': []}
@@ -1192,6 +1270,7 @@ def testFetchFileReturnsLegacyUnencryptedMetadata(monkeypatch):
         'gcsPath': 'recipient123/file.gcode',
         'fetchTokenExpiry': datetime.now(timezone.utc) + timedelta(minutes=5),
         'fetchTokenConsumed': False,
+        'fetchToken': 'testFetchToken',
     }
     documentSnapshot = MockDocumentSnapshot('doc123', metadata)
     updateRecorder = {'set': None, 'update': []}
@@ -1237,6 +1316,7 @@ def testFetchFileMissingGcsPath(monkeypatch):
         'unencryptedData': {'visible': 'info'},
         'fetchTokenExpiry': datetime.now(timezone.utc) + timedelta(minutes=5),
         'fetchTokenConsumed': False,
+        'fetchToken': 'testFetchToken',
     }
     documentSnapshot = MockDocumentSnapshot('doc123', metadata)
     updateRecorder = {'set': None, 'update': []}
@@ -1265,6 +1345,7 @@ def testFetchFileRejectsConsumedToken(monkeypatch):
         'gcsPath': 'recipient123/file.gcode',
         'fetchTokenExpiry': datetime.now(timezone.utc) + timedelta(minutes=5),
         'fetchTokenConsumed': True,
+        'fetchToken': 'testFetchToken',
     }
     documentSnapshot = MockDocumentSnapshot('doc123', metadata)
     updateRecorder = {'set': None, 'update': []}
@@ -1296,6 +1377,7 @@ def testFetchFileRejectsExpiredToken(monkeypatch):
         'gcsPath': 'recipient123/file.gcode',
         'fetchTokenExpiry': datetime.now(timezone.utc) - timedelta(minutes=1),
         'fetchTokenConsumed': False,
+        'fetchToken': 'testFetchToken',
     }
     documentSnapshot = MockDocumentSnapshot('doc123', metadata)
     updateRecorder = {'set': None, 'update': []}
@@ -1329,6 +1411,7 @@ def testListPendingJobsReturnsActiveEntries(monkeypatch):
         'fetchTokenConsumed': False,
         'status': 'uploaded',
         'timestamp': datetime.now(timezone.utc),
+        'recipientId': 'recipient123',
     }
     expiredMetadata = {
         'originalFilename': 'old-file.gcode',
@@ -1338,6 +1421,7 @@ def testListPendingJobsReturnsActiveEntries(monkeypatch):
         'fetchTokenConsumed': False,
         'status': 'uploaded',
         'timestamp': datetime.now(timezone.utc),
+        'recipientId': 'recipient123',
     }
     documentSnapshots = [
         MockDocumentSnapshot('doc-active', activeMetadata),
@@ -1369,6 +1453,51 @@ def testListPendingJobsReturnsActiveEntries(monkeypatch):
     assert responseBody['skipped'] == ['doc-expired']
 
 
+def testListPendingJobsSkipsJobsNotReadyForClaim(monkeypatch):
+    readyMetadata = {
+        'originalFilename': 'file.gcode',
+        'productId': 'product-ready',
+        'fetchToken': 'token-ready',
+        'fetchTokenExpiry': datetime.now(timezone.utc) + timedelta(minutes=5),
+        'fetchTokenConsumed': False,
+        'status': 'queued',
+        'timestamp': datetime.now(timezone.utc),
+        'recipientId': 'recipient123',
+    }
+    printingMetadata = {
+        'originalFilename': 'file-printing.gcode',
+        'productId': 'product-printing',
+        'fetchToken': 'token-printing',
+        'fetchTokenExpiry': datetime.now(timezone.utc) + timedelta(minutes=5),
+        'fetchTokenConsumed': False,
+        'status': 'printing',
+        'timestamp': datetime.now(timezone.utc),
+        'recipientId': 'recipient123',
+    }
+    documentSnapshots = [
+        MockDocumentSnapshot('doc-ready', readyMetadata),
+        MockDocumentSnapshot('doc-printing', printingMetadata),
+    ]
+    mockClients = main.ClientBundle(
+        storageClient=MockStorageClient(),
+        firestoreClient=MockFirestoreClient(documentSnapshots=documentSnapshots),
+        kmsClient=MockEncryptClient({'sensitive': 'value'}),
+        kmsKeyPath='projects/test/locations/test/keyRings/test/cryptoKeys/test',
+        gcsBucketName='test-bucket',
+    )
+    monkeypatch.setattr(main, 'getClients', lambda: mockClients)
+
+    fakeRequest.headers = {}
+    fakeRequest.args = {}
+    fakeRequest.set_json({'recipientId': 'recipient123'})
+
+    responseBody, statusCode = main.listPendingJobs('app-123')
+
+    assert statusCode == 200
+    assert responseBody['ok'] is True
+    assert [item['fileId'] for item in responseBody['pending']] == ['doc-ready']
+
+
 def testListRecipientFilesAliasCallsListPendingJobs(monkeypatch):
     pendingResponse = {'ok': True, 'pending': []}
     monkeypatch.setattr(main, 'listPendingJobs', lambda appId: (pendingResponse, 200))
@@ -1377,6 +1506,113 @@ def testListRecipientFilesAliasCallsListPendingJobs(monkeypatch):
 
     assert statusCode == 200
     assert responseBody == pendingResponse
+
+
+def testClaimJobUpdatesStatusToPrinting(monkeypatch):
+    updateRecorder = {'set': None, 'update': []}
+    jobMetadata = {
+        'recipientId': 'recipient123',
+        'status': 'uploaded',
+        'fetchTokenConsumed': False,
+        'fetchToken': 'token-ready',
+    }
+    documentSnapshot = MockDocumentSnapshot('job-123', jobMetadata)
+    mockClients = main.ClientBundle(
+        storageClient=MockStorageClient(),
+        firestoreClient=MockFirestoreClient(
+            documentSnapshot=documentSnapshot, updateRecorder=updateRecorder
+        ),
+        kmsClient=MockEncryptClient({'sensitive': 'value'}),
+        kmsKeyPath='projects/test/locations/test/keyRings/test/cryptoKeys/test',
+        gcsBucketName='test-bucket',
+    )
+    monkeypatch.setattr(main, 'getClients', lambda: mockClients)
+
+    fakeRequest.headers = {}
+    fakeRequest.args = {}
+    fakeRequest.set_json(
+        {
+            'jobId': 'job-123',
+            'printerId': 'printer-1',
+            'recipientId': 'recipient123',
+        }
+    )
+
+    responseBody, statusCode = main.claimJob('app-123')
+
+    assert statusCode == 200
+    assert responseBody['ok'] is True
+    assert responseBody['jobId'] == 'job-123'
+    assert responseBody['assignedPrinterId'] == 'printer-1'
+    assert responseBody['status'] == 'printing'
+    assert mockClients.firestoreClient.documentStore['job-123']['status'] == 'printing'
+
+    assert updateRecorder['update'], 'Expected update to be recorded'
+    updatePayload = updateRecorder['update'][-1]
+    assert updatePayload['status'] == 'printing'
+    assert updatePayload['assignedPrinterId'] == 'printer-1'
+    assert updatePayload['claimedBy'] == 'recipient123'
+    assert updatePayload['claimedAt'] is firestoreModule.SERVER_TIMESTAMP
+
+
+def testClaimJobRejectsWhenAlreadyClaimed(monkeypatch):
+    jobMetadata = {
+        'recipientId': 'recipient123',
+        'status': 'printing',
+        'assignedPrinterId': 'printer-existing',
+    }
+    documentSnapshot = MockDocumentSnapshot('job-123', jobMetadata)
+    mockClients = main.ClientBundle(
+        storageClient=MockStorageClient(),
+        firestoreClient=MockFirestoreClient(documentSnapshot=documentSnapshot),
+        kmsClient=MockEncryptClient({'sensitive': 'value'}),
+        kmsKeyPath='projects/test/locations/test/keyRings/test/cryptoKeys/test',
+        gcsBucketName='test-bucket',
+    )
+    monkeypatch.setattr(main, 'getClients', lambda: mockClients)
+
+    fakeRequest.headers = {}
+    fakeRequest.args = {}
+    fakeRequest.set_json(
+        {
+            'jobId': 'job-123',
+            'printerId': 'printer-new',
+            'recipientId': 'recipient123',
+        }
+    )
+
+    responseBody, statusCode = main.claimJob('app-123')
+
+    assert statusCode == 409
+    assert responseBody['ok'] is False
+    assert 'already' in responseBody['message'].lower()
+
+
+def testClaimJobReturnsNotFoundForMissingJob(monkeypatch):
+    mockClients = main.ClientBundle(
+        storageClient=MockStorageClient(),
+        firestoreClient=MockFirestoreClient(),
+        kmsClient=MockEncryptClient({'sensitive': 'value'}),
+        kmsKeyPath='projects/test/locations/test/keyRings/test/cryptoKeys/test',
+        gcsBucketName='test-bucket',
+    )
+    monkeypatch.setattr(main, 'getClients', lambda: mockClients)
+
+    fakeRequest.headers = {}
+    fakeRequest.args = {}
+    fakeRequest.set_json(
+        {
+            'jobId': 'job-missing',
+            'printerId': 'printer-1',
+            'recipientId': 'recipient123',
+        }
+    )
+
+    responseBody, statusCode = main.claimJob('app-123')
+
+    assert statusCode == 404
+    assert responseBody['ok'] is False
+    assert responseBody['error_type'] == 'NotFound'
 
 
 def testPrinterStatusUpdateStoresRecipientId(monkeypatch):
