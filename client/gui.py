@@ -564,6 +564,13 @@ class ListenerGuiApp:
             else:
                 onlineFlag = normalizedStatus.lower() not in {"", "offline", "unknown"}
 
+        mqttReadyFlag = record.get("mqttReady")
+        if isinstance(mqttReadyFlag, bool):
+            if not mqttReadyFlag:
+                onlineFlag = False
+        else:
+            mqttReadyFlag = onlineFlag
+
         progressCandidate = record.get("progress")
         if progressCandidate is None:
             progressCandidate = record.get("progressPercent")
@@ -571,6 +578,9 @@ class ListenerGuiApp:
 
         bedTemp = self._parseOptionalFloat(record.get("bedTemp"))
         nozzleTemp = self._parseOptionalFloat(record.get("nozzleTemp"))
+        if not onlineFlag:
+            bedTemp = None
+            nozzleTemp = None
         remainingCandidate = record.get("remainingTimeSeconds") or record.get("timeRemaining")
         remainingSeconds = self._parseOptionalInt(remainingCandidate)
         fanSpeed = self._parseOptionalInt(record.get("fanSpeed"))
@@ -607,15 +617,18 @@ class ListenerGuiApp:
             "timeRemaining": remainingSeconds,
             "error": errorMessage,
             "firmware": firmwareVersion,
+            "mqttReady": bool(mqttReadyFlag),
         }
 
         return snapshot
 
     def _updateStatusReporterState(self, *, allowReadyUpdate: bool = False) -> None:
         snapshots = self._snapshotPrintersForBase44()
-        hasOnlinePrinter = any(snapshot.get("online") for snapshot in snapshots)
-        if allowReadyUpdate and self.listenerActive and hasOnlinePrinter:
+        hasReadyPrinter = any(snapshot.get("mqttReady") for snapshot in snapshots)
+        if allowReadyUpdate and self.listenerActive and hasReadyPrinter:
             self.listenerReady = True
+        elif allowReadyUpdate and not hasReadyPrinter:
+            self.listenerReady = False
 
         apiKey = self._resolveStatusApiKey()
         shouldRun = (
@@ -624,6 +637,7 @@ class ListenerGuiApp:
             and bool(self.listenerRecipientId)
             and bool(apiKey)
             and bool(snapshots)
+            and hasReadyPrinter
         )
 
         if shouldRun and not self.base44ReporterActive:
@@ -853,6 +867,7 @@ class ListenerGuiApp:
                 "serial": self._parseOptionalString(printer.get("serialNumber")),
                 "access_code": self._parseOptionalString(printer.get("accessCode")),
                 "lastSeen": datetime.now(timezone.utc).isoformat(),
+                "recipientId": self.listenerRecipientId,
             }
             try:
                 postStatus(statusPayload, currentDetails)
@@ -888,6 +903,7 @@ class ListenerGuiApp:
                                 "serial": self._parseOptionalString(latest.get("serialNumber")),
                                 "access_code": self._parseOptionalString(latest.get("accessCode")),
                                 "lastSeen": datetime.now(timezone.utc).isoformat(),
+                                "recipientId": self.listenerRecipientId,
                             }
 
                         stopEvent = startStatusHeartbeat(
@@ -1272,6 +1288,12 @@ class ListenerGuiApp:
 
         self.logFilePath = Path(logFile).expanduser().resolve()
         self.stopEvent = threading.Event()
+
+        for printer in self.printers:
+            if isinstance(printer, dict):
+                printer["statusRecipientId"] = recipientId
+        self._savePrinters()
+
         self.listenerThread = threading.Thread(
             target=self._runListener,
             args=(baseUrl, recipientId, outputDir, pollInterval, statusApiKey),
@@ -1330,6 +1352,8 @@ class ListenerGuiApp:
         if not printerConfig:
             self.log("Ingen printer i printers.json – kan ikke sende.")
             return
+
+        printerConfig["statusRecipientId"] = self.listenerRecipientId
 
         metadataForUpsert = metadata.get("unencryptedData") if isinstance(metadata.get("unencryptedData"), dict) else metadata
         upsertedRecord = upsertPrinterFromJobMetadata(metadataForUpsert)

@@ -16,7 +16,7 @@ from urllib.parse import urlparse
 import os
 import requests
 
-from .base44Status import listPendingFiles
+from .pending import consumePendingPollTrigger, listPending
 from .database import LocalDatabase
 from .persistence import storePrintSummary
 from .bambuPrinter import (
@@ -1444,7 +1444,7 @@ def fetchPendingFiles(
         logging.error("Recipient ID is required to fetch pending files.")
         return []
 
-    pendingFiles = listPendingFiles(normalizedRecipient, apiKey=statusApiKey)
+    pendingFiles = listPending(normalizedRecipient, apiKey=statusApiKey)
     if not pendingFiles:
         logging.info("No pending files for recipient %s.", normalizedRecipient)
     else:
@@ -1537,16 +1537,43 @@ def listenForFiles(
     iteration = 0
     ownDatabase = False
     resolvedLogPath: Optional[Path] = None
+    normalizedRecipient = recipientId.strip()
+    recipientId = normalizedRecipient
     if logFilePath:
         resolvedLogPath = Path(logFilePath).expanduser().resolve()
     if database is None:
         database = LocalDatabase()
         ownDatabase = True
 
+    minBackoffSeconds = max(5, min(int(pollInterval), 10))
+    maxBackoffSeconds = max(minBackoffSeconds, 60)
+    currentBackoffSeconds = float(minBackoffSeconds)
+    nextSleepSeconds = 0.0
+
     try:
         while True:
             if stopEvent and stopEvent.is_set():
                 break
+            if maxIterations and iteration >= maxIterations:
+                break
+
+            if nextSleepSeconds > 0:
+                if consumePendingPollTrigger():
+                    nextSleepSeconds = 0.0
+                if nextSleepSeconds > 0:
+                    if stopEvent:
+                        if stopEvent.wait(timeout=nextSleepSeconds):
+                            break
+                    else:
+                        time.sleep(nextSleepSeconds)
+
+            if stopEvent and stopEvent.is_set():
+                break
+            if maxIterations and iteration >= maxIterations:
+                break
+
+            iteration += 1
+
             if statusApiKey is None:
                 pendingFiles = fetchPendingFiles(baseUrl, recipientId)
             else:
@@ -1555,6 +1582,22 @@ def listenForFiles(
                     recipientId,
                     statusApiKey=statusApiKey,
                 )
+
+            if pendingFiles:
+                currentBackoffSeconds = float(minBackoffSeconds)
+            else:
+                currentBackoffSeconds = min(
+                    float(maxBackoffSeconds),
+                    max(float(minBackoffSeconds), currentBackoffSeconds * 2),
+                )
+
+            logging.info(
+                "[pending] %d filer for recipient %s (backoff=%ss)",
+                len(pendingFiles),
+                recipientId,
+                int(currentBackoffSeconds),
+            )
+
             if pendingFiles:
                 for pendingFile in pendingFiles:
                     fetchToken = pendingFile.get("fetchToken")
@@ -1766,15 +1809,12 @@ def listenForFiles(
                     if fetchResult is not None and onFileFetched:
                         onFileFetched(entryData)
 
-            iteration += 1
-            if maxIterations and iteration >= maxIterations:
-                break
+            if consumePendingPollTrigger():
+                currentBackoffSeconds = float(minBackoffSeconds)
+                nextSleepSeconds = 0.0
+                continue
 
-            if stopEvent:
-                if stopEvent.wait(timeout=pollInterval):
-                    break
-            else:
-                time.sleep(pollInterval)
+            nextSleepSeconds = currentBackoffSeconds
     finally:
         if ownDatabase and database is not None:
             database.close()

@@ -34,6 +34,8 @@ except ImportError:  # pragma: no cover - handled gracefully by callers
 
 import requests
 
+from .logutil import rateLimitError
+
 
 _bambulabsApiModule = importlib.util.find_spec("bambulabs_api")
 if _bambulabsApiModule is not None:
@@ -1622,6 +1624,18 @@ def buildBase44StatusPayload(status: Dict[str, Any], printerConfig: Dict[str, An
     if progressValue is not None:
         jobProgress = int(max(0, min(100, round(progressValue))))
 
+    bedTempPayload = int(bedTempValue) if bedTempValue is not None else None
+    nozzleTempPayload = int(nozzleTempValue) if nozzleTempValue is not None else None
+    onlinePayload = (
+        bool(onlineFlag)
+        if onlineFlag is not None
+        else normalizedStatus.lower() not in {"offline", "unknown"}
+    )
+    if not onlinePayload:
+        bedTempPayload = None
+        nozzleTempPayload = None
+        jobProgress = 0
+
     payload = {
         "recipientId": recipientId,
         "printerIpAddress": printerIpAddress,
@@ -1629,8 +1643,8 @@ def buildBase44StatusPayload(status: Dict[str, Any], printerConfig: Dict[str, An
         "status": normalizedStatus,
         "jobProgress": jobProgress,
         "currentJobId": currentJobId,
-        "bedTemp": int(bedTempValue) if bedTempValue is not None else 0,
-        "nozzleTemp": int(nozzleTempValue) if nozzleTempValue is not None else 0,
+        "bedTemp": bedTempPayload,
+        "nozzleTemp": nozzleTempPayload,
         "fanSpeed": fanSpeedValue,
         "printSpeed": printSpeedValue,
         "filamentUsed": filamentUsedValue,
@@ -1638,6 +1652,7 @@ def buildBase44StatusPayload(status: Dict[str, Any], printerConfig: Dict[str, An
         "errorMessage": str(errorMessage) if errorMessage not in (None, "") else None,
         "lastUpdateTimestamp": isoNow(),
         "firmwareVersion": str(firmwareVersion) if firmwareVersion not in (None, "") else None,
+        "online": onlinePayload,
     }
 
     currentJobIdValue = payload.get("currentJobId")
@@ -1697,9 +1712,17 @@ def startStatusHeartbeat(
                     logger.debug("Heartbeat readiness check failed", exc_info=error)
                     mqttReady = False
 
+                if not mqttReady:
+                    rateLimitError(f"mqtt_not_ready:{heartbeatKey}", "MQTT ikke klar – hopper over lesing")
+
                 hasFreshSnapshot = bool(lastSnapshot) and (
                     mqttReady or (lastSnapshotAt and (now - lastSnapshotAt) <= freshnessSeconds)
                 )
+
+                if mqttReady and not hasFreshSnapshot:
+                    rateLimitError(
+                        f"values_not_ready:{heartbeatKey}", "Printer Values Not Available Yet"
+                    )
 
                 if hasFreshSnapshot:
                     payloadToSend = dict(lastSnapshot)
@@ -1710,21 +1733,26 @@ def startStatusHeartbeat(
                     stopEvent.wait(intervalSeconds)
                     continue
 
-                if now - lastOfflinePostAt >= offlineIntervalSeconds:
+                if not mqttReady and now - lastOfflinePostAt >= offlineIntervalSeconds:
                     resolvedIp = printerConfig.get("ipAddress") or (lastSnapshot.get("ip") if lastSnapshot else None)
                     offlinePayload = {
-                        "status": "Offline",
+                        "status": "offline",
                         "ip": resolvedIp,
                         "printerIpAddress": resolvedIp,
-                        "nozzleTemp": 0,
-                        "bedTemp": 0,
+                        "nozzleTemp": None,
+                        "bedTemp": None,
                         "lastSeen": isoNow(),
+                        "online": False,
                     }
                     try:
                         postStatus(offlinePayload, printerConfig)
                     except Exception:  # pragma: no cover - status posting best-effort
                         logger.debug("Heartbeat offline post failed", exc_info=True)
                     lastOfflinePostAt = now
+
+                if not mqttReady:
+                    stopEvent.wait(min(intervalSeconds, 1.0))
+                    continue
 
                 stopEvent.wait(intervalSeconds)
         finally:
