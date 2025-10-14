@@ -1,0 +1,128 @@
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import pytest
+
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from client import commands  # noqa: E402
+from client.base44Status import Base44StatusReporter  # noqa: E402
+
+
+def test_list_pending_commands_returns_items(monkeypatch: pytest.MonkeyPatch) -> None:
+    capturedCalls: List[Tuple[str, Dict[str, Any]]] = []
+
+    def fakeCall(functionName: str, payload: Dict[str, Any], **_kwargs: Any) -> Dict[str, Any]:
+        capturedCalls.append((functionName, payload))
+        return {
+            "ok": True,
+            "commands": [
+                {"commandId": "cmd-123", "commandType": "poke", "printerIpAddress": "10.0.0.1"}
+            ],
+        }
+
+    monkeypatch.setattr(commands, "callFunction", fakeCall)
+    monkeypatch.setenv("BASE44_RECIPIENT_ID", "recipient-xyz")
+
+    result = commands.listPendingCommands()
+
+    assert isinstance(result, list)
+    assert result and result[0]["commandId"] == "cmd-123"
+    assert capturedCalls[0][0] == "listPendingCommands"
+    assert capturedCalls[0][1]["recipientId"] == "recipient-xyz"
+
+
+def test_list_pending_commands_returns_none_on_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fakeCall(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr(commands, "callFunction", fakeCall)
+    monkeypatch.setenv("BASE44_RECIPIENT_ID", "recipient-xyz")
+
+    result = commands.listPendingCommands()
+
+    assert result is None
+
+
+def test_complete_command_marks_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    capturedPayloads: List[Dict[str, Any]] = []
+
+    def fakeCall(functionName: str, payload: Dict[str, Any], **_kwargs: Any) -> Dict[str, Any]:
+        capturedPayloads.append(payload)
+        return {"ok": True, "status": "completed"}
+
+    monkeypatch.setattr(commands, "callFunction", fakeCall)
+
+    assert commands.completeCommand("cmd-99", True, recipientId="recipient-1") is True
+    assert capturedPayloads[0]["commandId"] == "cmd-99"
+    assert capturedPayloads[0]["success"] is True
+    assert capturedPayloads[0]["error"] is None
+
+
+def test_status_reporter_handles_poke_command(monkeypatch: pytest.MonkeyPatch) -> None:
+    snapshots: List[Dict[str, Any]] = [
+        {
+            "ip": "10.0.0.7",
+            "serial": "SN-42",
+            "status": "Printing",
+            "online": True,
+            "progress": 25,
+            "bed": 60.0,
+            "nozzle": 200.0,
+            "timeRemaining": 120,
+        }
+    ]
+
+    postedPayloads: List[Dict[str, Any]] = []
+    commandLog: List[Tuple[str, bool, Optional[str]]] = []
+
+    def fakeListPendingCommands(_recipientId: str) -> List[Dict[str, Any]]:
+        return [
+            {
+                "commandId": "cmd-555",
+                "commandType": "poke",
+                "printerIpAddress": "10.0.0.7",
+            }
+        ]
+
+    def fakeCompleteCommand(
+        commandId: str,
+        success: bool,
+        *,
+        recipientId: Optional[str] = None,
+        error: Optional[str] = None,
+    ) -> bool:
+        commandLog.append((commandId, success, error))
+        return True
+
+    def fakeCallFunction(
+        functionName: str,
+        payload: Dict[str, Any],
+        *,
+        apiKey: Optional[str] = None,
+        timeoutSeconds: float = 0,
+    ) -> Dict[str, Any]:
+        postedPayloads.append(payload)
+        return {"ok": True}
+
+    monkeypatch.setattr(commands, "listPendingCommands", fakeListPendingCommands)
+    monkeypatch.setattr(commands, "completeCommand", fakeCompleteCommand)
+    monkeypatch.setattr("client.base44Status.listPendingCommands", fakeListPendingCommands)
+    monkeypatch.setattr("client.base44Status.completeCommand", fakeCompleteCommand)
+    monkeypatch.setattr("client.base44Status.callFunction", fakeCallFunction)
+
+    reporter = Base44StatusReporter(lambda: snapshots, intervalSec=60, commandPollIntervalSec=1)
+    reporter._recipientId = "recipient-xyz"
+    reporter._statusFunctionName = "updatePrinterStatus"
+    reporter._commandBackoffSeconds = 1.0
+    reporter._nextCommandPollTimestamp = 0.0
+
+    reporter._pollPendingCommands(list(snapshots))
+
+    assert postedPayloads, "Status payload should be posted for poke"
+    assert postedPayloads[0]["printerIpAddress"] == "10.0.0.7"
+    assert commandLog == [("cmd-555", True, None)]

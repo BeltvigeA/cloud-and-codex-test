@@ -9,6 +9,7 @@ import time
 from typing import Any, Callable, Iterable
 
 from .base44 import callFunction, getDefaultApiKey, getStatusFunctionName
+from .commands import completeCommand, listPendingCommands
 from .pending import requestPendingPollTrigger
 
 LOG = logging.getLogger(__name__)
@@ -58,7 +59,12 @@ def _isZeroLike(value: Any) -> bool:
 class Base44StatusReporter:
     """Periodically pushes printer snapshots to Base44 while running."""
 
-    def __init__(self, getPrintersSnapshotCallable: Callable[[], Iterable[dict[str, Any]]], intervalSec: int = 5) -> None:
+    def __init__(
+        self,
+        getPrintersSnapshotCallable: Callable[[], Iterable[dict[str, Any]]],
+        intervalSec: int = 5,
+        commandPollIntervalSec: int = 5,
+    ) -> None:
         self._getPrintersSnapshotCallable = getPrintersSnapshotCallable
         self._intervalSec = max(1, int(intervalSec))
         self._thread: threading.Thread | None = None
@@ -70,6 +76,9 @@ class Base44StatusReporter:
         self._lastOnlineStateByPrinter: dict[tuple[str, str], bool] = {}
         self._isRunning = False
         self._statusFunctionName = getStatusFunctionName()
+        self._commandPollIntervalSec = max(1, int(commandPollIntervalSec))
+        self._nextCommandPollTimestamp = 0.0
+        self._commandBackoffSeconds = float(self._commandPollIntervalSec)
 
     def start(self, recipientId: str, apiKey: str | None = None) -> None:
         self._recipientId = recipientId.strip()
@@ -78,6 +87,8 @@ class Base44StatusReporter:
         if self._isRunning:
             return
         self._statusFunctionName = getStatusFunctionName()
+        self._nextCommandPollTimestamp = 0.0
+        self._commandBackoffSeconds = float(self._commandPollIntervalSec)
         self._thread = threading.Thread(target=self._runLoop, name="base44-status", daemon=True)
         self._thread.start()
         LOG.info(
@@ -175,6 +186,7 @@ class Base44StatusReporter:
         try:
             while not self._stopEvent.is_set():
                 try:
+                    snapshots: list[dict[str, Any]] = []
                     if not self._recipientId:
                         LOG.debug("Skipping Base44 post: missing recipient")
                     else:
@@ -208,12 +220,141 @@ class Base44StatusReporter:
                             self._lastOnlineStateByPrinter[key] = nowOnline
                             if nowOnline and not wasOnline:
                                 requestPendingPollTrigger()
+
+                    self._pollPendingCommands(snapshots)
                 except Exception as error:  # noqa: BLE001
                     LOG.exception("Status push failed: %s", error)
 
                 self._stopEvent.wait(self._intervalSec)
         finally:
             self._isRunning = False
+
+
+    def _pollPendingCommands(self, snapshots: list[dict[str, Any]]) -> None:
+        if self._commandPollIntervalSec <= 0 or not self._recipientId:
+            return
+
+        currentTime = time.time()
+        if currentTime < self._nextCommandPollTimestamp:
+            return
+
+        commands = listPendingCommands(self._recipientId)
+        if commands is None:
+            self._commandBackoffSeconds = min(
+                30.0,
+                max(self._commandBackoffSeconds * 2, float(self._commandPollIntervalSec)),
+            )
+            self._nextCommandPollTimestamp = currentTime + self._commandBackoffSeconds
+            LOG.warning(
+                "[commands] Kommando-poll feilet for %s. Nytt forsøk om %.0fs",
+                self._recipientId,
+                self._commandBackoffSeconds,
+            )
+            return
+
+        self._commandBackoffSeconds = float(self._commandPollIntervalSec)
+        self._nextCommandPollTimestamp = currentTime + self._commandPollIntervalSec
+
+        if not commands:
+            LOG.debug("[commands] Ingen kommandoer for %s", self._recipientId)
+            return
+
+        for command in commands:
+            self._handleCommand(command, snapshots)
+
+
+    def _handleCommand(self, command: dict[str, Any], snapshots: list[dict[str, Any]]) -> None:
+        commandId = str(command.get("commandId") or "").strip()
+        commandType = str(command.get("commandType") or "").strip().lower()
+        if not commandId:
+            LOG.warning("[commands] Hopper over kommando uten ID: %r", command)
+            return
+
+        if commandType != "poke":
+            errorMessage = f"Ukjent type {command.get('commandType')}"
+            if not completeCommand(commandId, False, recipientId=self._recipientId, error=errorMessage):
+                LOG.error("[commands] Klarte ikke markere %s som ukjent", commandId)
+            return
+
+        printerIp = str(command.get("printerIpAddress") or "").strip()
+        if not printerIp:
+            if not completeCommand(commandId, False, recipientId=self._recipientId, error="Printeradresse mangler"):
+                LOG.error("[commands] Klarte ikke markere %s uten ip", commandId)
+            return
+
+        snapshot = self._findSnapshotForIp(printerIp, snapshots)
+        if snapshot is None:
+            freshSnapshots = self._safeCollectSnapshots()
+            snapshot = self._findSnapshotForIp(printerIp, freshSnapshots)
+            if snapshot is None:
+                if not completeCommand(
+                    commandId,
+                    False,
+                    recipientId=self._recipientId,
+                    error=f"Printer {printerIp} ikke funnet",
+                ):
+                    LOG.error("[commands] Klarte ikke markere %s som manglende", commandId)
+                return
+            snapshots[:] = freshSnapshots
+
+        payload = self._buildPayload(snapshot)
+        if not payload:
+            if not completeCommand(
+                commandId,
+                False,
+                recipientId=self._recipientId,
+                error="Statusdata utilgjengelig",
+            ):
+                LOG.error("[commands] Klarte ikke markere %s uten payload", commandId)
+            return
+
+        payload.setdefault("printerIpAddress", printerIp)
+
+        response = callFunction(
+            self._statusFunctionName,
+            payload,
+            apiKey=self._apiKeyOverride,
+        )
+
+        if isinstance(response, dict) and response.get("ok") is False:
+            if not completeCommand(
+                commandId,
+                False,
+                recipientId=self._recipientId,
+                error="Statusoppdatering avvist",
+            ):
+                LOG.error("[commands] Klarte ikke markere %s som avvist", commandId)
+            return
+
+        if not completeCommand(commandId, True, recipientId=self._recipientId):
+            LOG.error("[commands] Klarte ikke bekrefte %s", commandId)
+            return
+
+        LOG.info("[commands] Poke ferdig for %s", printerIp)
+
+
+    def _findSnapshotForIp(self, printerIp: str, snapshots: list[dict[str, Any]]) -> dict[str, Any] | None:
+        normalizedIp = printerIp.strip()
+        if not normalizedIp:
+            return None
+        for snapshot in snapshots:
+            candidateIp = str(
+                snapshot.get("printerIpAddress")
+                or snapshot.get("ip")
+                or snapshot.get("ipAddress")
+                or ""
+            ).strip()
+            if candidateIp == normalizedIp:
+                return snapshot
+        return None
+
+
+    def _safeCollectSnapshots(self) -> list[dict[str, Any]]:
+        try:
+            return list(self._getPrintersSnapshotCallable() or [])
+        except Exception as error:  # noqa: BLE001
+            LOG.exception("[commands] Klarte ikke hente printerstatus: %s", error)
+            return []
 
 
 __all__ = [
