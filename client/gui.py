@@ -552,13 +552,13 @@ class ListenerGuiApp:
         normalizedStatus = statusValue.strip() or "Offline"
 
         explicitOnline = record.get("online")
-        if isinstance(explicitOnline, bool):
-            onlineFlag = explicitOnline
+        if isinstance(explicitOnline, bool) and explicitOnline:
+            onlineFlag = True
         else:
             onlineFlag = False
 
         mqttReadyFlag = record.get("mqttReady")
-        if isinstance(mqttReadyFlag, bool) and not mqttReadyFlag:
+        if not isinstance(mqttReadyFlag, bool) or not mqttReadyFlag:
             onlineFlag = False
 
         progressCandidate = record.get("progress")
@@ -608,6 +608,7 @@ class ListenerGuiApp:
             "error": errorMessage,
             "firmware": firmwareVersion,
             "mqttReady": bool(mqttReadyFlag),
+            "accessCode": self._parseOptionalString(record.get("accessCode")),
         }
 
         return snapshot
