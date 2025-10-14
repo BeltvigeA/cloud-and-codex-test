@@ -27,12 +27,13 @@ from .bambuPrinter import (
 )
 
 
-defaultBaseUrl = "https://print-flow-pro-eb683cc6.base44.app"
+defaultBaseUrl = "https://printer-backend-934564650450.europe-west1.run.app"
 defaultFilesDirectory = Path.home() / ".printmaster" / "files"
 
 
-def getPrinterStatusEndpointUrl() -> str:
-    return "https://print-flow-pro-eb683cc6.base44.app/api/apps/68b61486e7c52405eb683cc6/functions/updatePrinterStatus"
+def getPrinterStatusEndpointUrl(baseUrl: str) -> str:
+    resolvedBase = buildBaseUrl(baseUrl)
+    return f"{resolvedBase}/printer-status"
 
 
 def configureLogging() -> None:
@@ -1841,7 +1842,8 @@ def performStatusUpdates(
     numUpdates: int,
     recipientId: Optional[str] = None,
 ) -> None:
-    statusUrl = getPrinterStatusEndpointUrl()
+    resolvedBaseUrl = buildBaseUrl(baseUrl)
+    statusUrl = getPrinterStatusEndpointUrl(resolvedBaseUrl)
     session = requests.Session()
     headers = {"X-API-Key": apiKey, "Content-Type": "application/json"}
 
