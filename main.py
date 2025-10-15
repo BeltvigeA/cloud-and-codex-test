@@ -39,6 +39,17 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 app = Flask(__name__)
 
 
+def logEvent(event: str, level: str = 'INFO', **fields) -> None:
+    record = {
+        'event': event,
+        'ts': datetime.now(timezone.utc).isoformat(),
+        **fields,
+    }
+    serialized = json.dumps(record, ensure_ascii=False)
+    logMethod = getattr(logging, level.lower(), logging.info)
+    logMethod(serialized)
+
+
 def makeJsonResponse(payload: dict, statusCode: int = 200):
     response = jsonify(payload)
     if hasattr(response, 'headers'):
@@ -1054,6 +1065,21 @@ def productStatusUpdate(productId: str):
             statusRecord['fileStatus'] = currentFileStatus
 
         firestoreClient.collection(firestoreCollectionPrinterStatus).add(statusRecord)
+        logEvent(
+            'status_received',
+            appId=payload.get('appId'),
+            recipientId=statusRecord.get('recipientId'),
+            serial=statusRecord.get('printerSerial')
+            or statusRecord.get('serialNumber')
+            or payload.get('printerSerial')
+            or payload.get('serialNumber'),
+            ip=statusRecord.get('printerIpAddress')
+            or statusRecord.get('ip')
+            or payload.get('printerIpAddress'),
+            state=payload.get('status'),
+            progress=payload.get('jobProgress'),
+            mqttReady=payload.get('mqttReady'),
+        )
         logging.info('Stored product status update for %s with file %s', productId, documentSnapshot.id)
 
         return jsonify({'message': 'Product status recorded'}), 200
@@ -1530,6 +1556,8 @@ def claimJob(appId: str):
         logging.exception('Failed to update job %s during claim.', jobId)
         return makeErrorResponse(500, 'ServerError', 'Failed to claim job', str(error))
 
+    logEvent('job_claimed', jobId=jobId, recipientId=recipientId, printerId=printerId)
+
     responsePayload = {
         'ok': True,
         'jobId': jobId,
@@ -1696,6 +1724,17 @@ def queuePrinterControlCommand():
             str(error),
         )
 
+    logEvent(
+        'command_queued',
+        commandId=commandId,
+        commandType=commandType,
+        recipientId=recipientId,
+        printerSerial=printerSerial,
+        printerIpAddress=printerIpAddress,
+        expiresAt=expiresAtTimestamp.isoformat() if expiresAtTimestamp else None,
+        metadata=metadata or {},
+    )
+
     responsePayload = {
         'ok': True,
         'status': 'queued',
@@ -1703,6 +1742,52 @@ def queuePrinterControlCommand():
     }
 
     return makeJsonResponse(responsePayload, 202)
+
+
+@app.route('/debug/listPendingCommands', methods=['POST'])
+def debugListPendingCommands():
+    logging.info('Received request to /debug/listPendingCommands')
+
+    apiKeyError = ensureValidApiKey()
+    if apiKeyError:
+        return apiKeyError
+
+    payload, payloadError = getJsonPayload()
+    if payloadError:
+        return payloadError
+
+    recipientId, recipientError = requireSanitizedStringField(payload, 'recipientId')
+    if recipientError:
+        return recipientError
+
+    limitValue = payload.get('limit', 25)
+    try:
+        limitSize = max(1, int(limitValue))
+    except (TypeError, ValueError):
+        limitSize = 25
+
+    clients, clientError = _loadClientsOrError()
+    if clientError:
+        return clientError
+
+    firestoreClient = clients.firestoreClient
+    query = (
+        firestoreClient.collection(firestoreCollectionPrinterCommands)
+        .where('recipientId', '==', recipientId)
+        .where('status', '==', 'pending')
+        .order_by('createdAt', direction=firestore.Query.DESCENDING)
+        .limit(limitSize)
+    )
+
+    documents = list(query.stream())
+    commands = []
+    for document in documents:
+        commandData = document.to_dict() or {}
+        commandData['docId'] = document.id
+        commands.append(commandData)
+
+    responsePayload = {'count': len(commands), 'commands': commands}
+    return makeJsonResponse(responsePayload, 200)
 
 
 def _handlePrinterStatusUpdate(appId: Optional[str]):

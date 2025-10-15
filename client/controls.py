@@ -6,6 +6,7 @@ import logging
 from typing import Any, Dict
 
 from .bambuClient import BambuLanClient
+from .logbus import log
 
 LOG = logging.getLogger(__name__)
 
@@ -17,28 +18,42 @@ def executeCommand(client: BambuLanClient, command: Dict[str, Any]) -> None:
     metadata = command.get("metadata") or {}
 
     LOG.info("Executing command %s for %s", commandType or "<unknown>", client.ipAddress)
+    log(
+        "INFO",
+        "control",
+        "exec_start",
+        commandType=commandType,
+        metadata=metadata,
+        ip=client.ipAddress,
+        serial=getattr(client, "serialNumber", "") or "",
+    )
 
-    if commandType == "set_bed_temp":
-        target = int(metadata.get("target"))
-        client.setBedTemp(target)
-    elif commandType == "set_nozzle_temp":
-        target = int(metadata.get("target"))
-        client.setNozzleTemp(target)
-    elif commandType == "home_all":
-        client.homeAll()
-    elif commandType == "jog":
-        axis = str(metadata.get("axis"))
-        delta = float(metadata.get("delta"))
-        feed = int(metadata.get("feed", 3000))
-        client.jog(axis, delta, feed)
-    elif commandType == "camera_on":
-        client.cameraOn()
-    elif commandType == "camera_off":
-        client.cameraOff()
-    elif commandType == "poke":
-        raise NotImplementedError("poke should be handled by status routines")
-    else:
-        raise ValueError(f"Unknown commandType {commandType}")
+    try:
+        if commandType == "set_bed_temp":
+            target = int(metadata.get("target"))
+            client.setBedTemp(target)
+        elif commandType == "set_nozzle_temp":
+            target = int(metadata.get("target"))
+            client.setNozzleTemp(target)
+        elif commandType == "home_all":
+            client.homeAll()
+        elif commandType == "jog":
+            axis = str(metadata.get("axis"))
+            delta = float(metadata.get("delta"))
+            feed = int(metadata.get("feed", 3000))
+            client.jog(axis, delta, feed)
+        elif commandType == "camera_on":
+            client.cameraOn()
+        elif commandType == "camera_off":
+            client.cameraOff()
+        elif commandType == "poke":
+            raise NotImplementedError("poke should be handled by status routines")
+        else:
+            raise ValueError(f"Unknown commandType {commandType}")
+        log("INFO", "control", "exec_done", commandType=commandType)
+    except Exception as error:
+        log("ERROR", "control", "exec_failed", commandType=commandType, error=str(error))
+        raise
 
 
 __all__ = ["executeCommand"]

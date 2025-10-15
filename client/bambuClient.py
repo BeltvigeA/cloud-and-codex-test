@@ -6,6 +6,8 @@ import logging
 import socket
 from typing import Any, Optional
 
+from .logbus import log
+
 try:  # pragma: no cover - optional dependency in some environments
     import bambulabs_api as bambuApi  # type: ignore
 except ImportError:  # pragma: no cover - handled gracefully by callers
@@ -89,8 +91,12 @@ class BambuLanClient:
                 self.connect()
             except Exception:  # pragma: no cover - connection errors handled via False
                 LOG.debug("Unable to connect printer", exc_info=True)
+                log("ERROR", "status-printer", "mqtt_connect", ip=self.ipAddress, ok=False)
                 return False
-        return self.healthCheck()
+        log("INFO", "status-printer", "mqtt_connect", ip=self.ipAddress, ok=self.printer is not None)
+        healthy = self.healthCheck()
+        log("INFO", "status-printer", "mqtt_port_probe", ip=self.ipAddress, ok=healthy)
+        return healthy
 
     def _sendGcode(self, command: str) -> None:
         if not self.printer:
@@ -98,6 +104,7 @@ class BambuLanClient:
         sendMethod = getattr(self.printer, "send_gcode", None)
         if not callable(sendMethod):
             raise RuntimeError("This bambulabs_api version lacks send_gcode support")
+        log("INFO", "control", "gcode", line=command)
         sendMethod(command)
 
     def setBedTemp(self, targetCelsius: int) -> None:
