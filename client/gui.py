@@ -19,7 +19,7 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 
 from .base44Status import Base44StatusReporter
-from .conn_errors_page import ConnErrorsPage
+# Connection Errors tab removed (we filter in Logs page instead)
 from .database import LocalDatabase
 from .log_page import LogsPage
 from .print_jobs_page import PrintJobsPage
@@ -161,7 +161,7 @@ class ListenerGuiApp:
 
         self.initializeRecipientSettings()
         self._buildLayout()
-        self._initializeConnectionErrorsToggle()
+        # removed: separate connection-errors tab toggle
         self.applyRecipientVisibility()
         self.root.after(200, self._processLogQueue)
         self.root.after(200, self._processPrinterStatusUpdates)
@@ -191,18 +191,9 @@ class ListenerGuiApp:
         self.printJobsPage = PrintJobsPage(self.notebook)
         self.notebook.add(self.printJobsPage, text="Print Jobs")
 
-        self.connectionErrorsPage = ConnErrorsPage(self.notebook)
-        self._connectionErrorsVisible = False
+        # Connection Errors tab removed
 
-    def _initializeConnectionErrorsToggle(self) -> None:
-        self.connectionErrorsToggleVar = tk.BooleanVar(value=False)
-        self.connectionErrorsToggle = ttk.Checkbutton(
-            self.logsPage.toolbar,
-            text="Connection Errors tab",
-            variable=self.connectionErrorsToggleVar,
-            command=self._toggleConnectionErrorsTab,
-        )
-        self.connectionErrorsToggle.pack(side=tk.LEFT, padx=4)
+    # removed: connection errors tab + toggle (use Logs filters)
 
     def _buildListenerTab(self, parent: ttk.Frame, paddingOptions: Dict[str, int]) -> None:
         ttk.Label(parent, text="Recipient ID:").grid(row=0, column=0, sticky=tk.W, **paddingOptions)
@@ -1454,18 +1445,7 @@ class ListenerGuiApp:
         self.stopButton.config(state=tk.DISABLED)
         self._appendLogLine("Stopped listening.")
 
-    def _toggleConnectionErrorsTab(self) -> None:
-        shouldShow = bool(self.connectionErrorsToggleVar.get())
-        if shouldShow and not self._connectionErrorsVisible:
-            self.notebook.add(self.connectionErrorsPage, text="Connection Errors")
-            self.notebook.select(self.connectionErrorsPage)
-            self._connectionErrorsVisible = True
-        elif not shouldShow and self._connectionErrorsVisible:
-            try:
-                self.notebook.forget(self.connectionErrorsPage)
-            except Exception:
-                pass
-            self._connectionErrorsVisible = False
+    # removed: connection errors tab toggle handler
 
     def _runListener(
         self,

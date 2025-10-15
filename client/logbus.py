@@ -113,6 +113,30 @@ class LogBusHandler(logging.Handler):
                 return 'status-base44'
             if lowered in {'bambuclient', 'bambuprinter', 'status'}:
                 return 'status-printer'
+            if lowered in {'mqtt', 'mqtt_client', 'paho', 'paho.mqtt', 'paho.mqtt.client'}:
+                try:
+                    levelNumber = record.levelno
+                except Exception:
+                    levelNumber = logging.INFO
+                messageText = ''
+                try:
+                    messageText = (record.getMessage() or '').lower()
+                except Exception:
+                    messageText = ''
+                if levelNumber >= logging.WARNING or any(
+                    keyword in messageText
+                    for keyword in (
+                        'not connected',
+                        'connection',
+                        'refused',
+                        'unavailable',
+                        'timed out',
+                        'timeout',
+                        'values not available',
+                    )
+                ):
+                    return 'conn-error'
+                return 'status-printer'
         return 'listener'
 
     def _resolveEventName(self, record: logging.LogRecord) -> str:
