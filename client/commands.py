@@ -181,162 +181,86 @@ def _makeLoggableCommand(command: Dict[str, Any]) -> Dict[str, Any]:
     return sanitizedCommand
 
 
-def _listPendingCommandsFromFirestore(
-    recipientId: str,
-    *,
-    limitSize: Optional[int] = None,
-) -> List[Dict[str, Any]]:
-    collectionName = _getCommandCollectionName()
-    resolvedLimit = limitSize if limitSize is not None else _getFirestoreLimit()
+def _listPendingCommandsFromFirestore(recipientId: str, limit: int = 25) -> list[dict[str, Any]]:
+    """
+    Fetch pending commands from Firestore. If the ordered query requires a composite index,
+    fall back to a simpler query (without order_by) and sort in memory.
+    Always emits control-category logs so the GUI shows what happened.
+    """
+    from google.cloud import firestore  # local import to avoid hard dep on import time
+    log("INFO", "control", "poll_start",
+        source="firestore", recipientId=recipientId,
+        collection=firestoreCollectionPrinterCommands, limit=limit)
 
-    log(
-        "INFO",
-        "control",
-        "poll_start",
-        source="firestore",
-        recipientId=recipientId,
-        collection=collectionName,
-        limit=resolvedLimit,
-    )
-
-    firestoreClient = _getFirestoreClient()
-    if firestoreClient is None:
-        LOG.error("[commands] Firestore-klient er ikke tilgjengelig for kommando-polling")
-        log(
-            "ERROR",
-            "control",
-            "firestore_client_error",
-            recipientId=recipientId,
-            collection=collectionName,
-            source="firestore",
-            error="client_unavailable",
-        )
+    fc = _getFirestoreClient()
+    if fc is None:
+        log("ERROR", "control", "firestore_client_error", recipientId=recipientId)
         return []
 
-    def _shouldTriggerIndexFallback(errorMessage: str) -> bool:
-        return "requires an index" in errorMessage.lower()
-
-    def _fallbackDocumentsWithoutOrdering() -> List[Any]:
-        fallbackQuery = (
-            firestoreClient.collection(collectionName)
-            .where("recipientId", "==", recipientId)
-            .where("status", "==", "pending")
-            .limit(resolvedLimit)
-        )
-        fallbackDocuments = list(fallbackQuery.stream())
-
-        def _resolveCreatedAtValue(document: Any) -> datetime:
-            payload = document.to_dict() or {}
-            createdAt = payload.get("createdAt")
-            if hasattr(createdAt, "to_datetime"):
-                try:
-                    return createdAt.to_datetime()  # type: ignore[call-arg, return-value]
-                except Exception:  # pragma: no cover - defensive fallback
-                    return datetime.min
-            if isinstance(createdAt, datetime):
-                return createdAt
-            if isinstance(createdAt, date):
-                return datetime.combine(createdAt, datetime.min.time())
-            return datetime.min
-
-        fallbackDocuments.sort(key=_resolveCreatedAtValue, reverse=True)
-        return fallbackDocuments
-
+    # First try: with order_by createdAt (preferred)
+    docs = None
     try:
-        query = (
-            firestoreClient.collection(collectionName)
-            .where("recipientId", "==", recipientId)
-            .where("status", "==", "pending")
-            .order_by("createdAt", direction=firestore.Query.DESCENDING)
-            .limit(resolvedLimit)
-        )
-        documents = list(query.stream())
-    except googleApiExceptions.GoogleAPICallError as error:
-        errorMessage = str(error)
-        LOG.error("[commands] Firestore-spørring feilet: %s", errorMessage)
-        log(
-            "ERROR",
-            "control",
-            "firestore_poll_failed",
-            recipientId=recipientId,
-            collection=collectionName,
-            source="firestore",
-            error=errorMessage,
-        )
-        if not _shouldTriggerIndexFallback(errorMessage):
-            return []
-        try:
-            documents = _fallbackDocumentsWithoutOrdering()
-        except Exception as fallbackError:  # pylint: disable=broad-except
-            log(
-                "ERROR",
-                "control",
-                "firestore_poll_failed_no_orderby",
-                recipientId=recipientId,
-                collection=collectionName,
-                source="firestore",
-                error=str(fallbackError),
-            )
-            return []
-    except Exception as error:  # pylint: disable=broad-except
-        errorMessage = str(error)
-        LOG.exception("[commands] Uventet Firestore-feil under henting av kommandoer")
-        log(
-            "ERROR",
-            "control",
-            "firestore_poll_failed",
-            recipientId=recipientId,
-            collection=collectionName,
-            source="firestore",
-            error=errorMessage,
-        )
-        if not _shouldTriggerIndexFallback(errorMessage):
-            return []
-        try:
-            documents = _fallbackDocumentsWithoutOrdering()
-        except Exception as fallbackError:  # pylint: disable=broad-except
-            log(
-                "ERROR",
-                "control",
-                "firestore_poll_failed_no_orderby",
-                recipientId=recipientId,
-                collection=collectionName,
-                source="firestore",
-                error=str(fallbackError),
-            )
-            return []
+        q = (fc.collection(firestoreCollectionPrinterCommands)
+             .where("recipientId", "==", recipientId)
+             .where("status", "==", "pending")
+             .order_by("createdAt", direction=firestore.Query.DESCENDING)
+             .limit(limit))
+        docs = list(q.stream())
+    except Exception as e:  # noqa: BLE001
+        msg = str(e)
+        log("ERROR", "control", "_listPendingCommandsFromFirestore",
+            f"[commands] Firestore-spørring feilet: {msg}")
+        log("ERROR", "control", "firestore_poll_failed",
+            recipientId=recipientId, collection=firestoreCollectionPrinterCommands,
+            source="firestore", error=msg)
 
-    commands: List[Dict[str, Any]] = []
-    for document in documents:
-        documentPayload = document.to_dict() or {}
-        documentPayload.setdefault("commandId", document.id)
-        commands.append(documentPayload)
+        # Fallback if index missing: remove order_by and sort in memory
+        if "requires an index" in msg.lower():
+            try:
+                q2 = (fc.collection(firestoreCollectionPrinterCommands)
+                      .where("recipientId", "==", recipientId)
+                      .where("status", "==", "pending")
+                      .limit(limit))
+                docs = list(q2.stream())
+                # sort in memory by createdAt desc if available
+                def _created_at(doc):
+                    data = doc.to_dict() or {}
+                    ts = data.get("createdAt")
+                    try:
+                        # Firestore Timestamp has to_datetime()
+                        return ts.to_datetime() if hasattr(ts, "to_datetime") else ts
+                    except Exception:
+                        return None
+                docs.sort(key=_created_at, reverse=True)
+                log("INFO", "control", "firestore_fallback_used",
+                    recipientId=recipientId, collection=firestoreCollectionPrinterCommands,
+                    reason="missing_index", returned=len(docs))
+            except Exception as e2:  # noqa: BLE001
+                log("ERROR", "control", "firestore_poll_failed_no_orderby",
+                    recipientId=recipientId, collection=firestoreCollectionPrinterCommands,
+                    source="firestore", error=str(e2))
+                docs = []  # ensure not None
+        else:
+            docs = []  # non-index error -> return empty list
 
-    log(
-        "INFO",
-        "control",
-        "poll_ok",
-        source="firestore",
-        recipientId=recipientId,
-        collection=collectionName,
-        count=len(commands),
-    )
+    # Build rows
+    rows: list[dict[str, Any]] = []
+    for d in docs or []:
+        data = d.to_dict() or {}
+        data["commandId"] = data.get("commandId") or getattr(d, "id", None)
+        rows.append(data)
 
-    for command in commands[:10]:
-        log(
-            "INFO",
-            "control",
-            "incoming_item",
-            recipientId=recipientId,
-            commandId=str(command.get("commandId")),
-            commandType=str(command.get("commandType")),
-            metadata=_sanitizeLogValue(command.get("metadata")),
-            source="firestore",
-        )
+    log("INFO", "control", "poll_ok",
+        source="firestore", recipientId=recipientId,
+        collection=firestoreCollectionPrinterCommands, count=len(rows))
 
-    return commands
+    for r in rows[:10]:
+        log("INFO", "control", "incoming_item",
+            commandId=r.get("commandId"),
+            commandType=r.get("commandType"),
+            recipientId=recipientId)
 
-
+    return rows
 def _completeCommandInFirestore(
     commandId: str,
     recipientId: str,
