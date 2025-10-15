@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import textwrap
 import time
 import tkinter as tk
 from tkinter import ttk
@@ -92,8 +93,8 @@ class LogsPage(ttk.Frame):
         for event in rows:
             timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(event.ts))
             contextText = json.dumps(event.ctx, ensure_ascii=False)
-            message = event.message or ""
-            values = (timestamp, event.level, event.category, event.event, f"{message} {contextText}".strip())
+            message = self._buildWrappedMessage(event.message or "", contextText)
+            values = (timestamp, event.level, event.category, event.event, message)
             itemId = self._tree.insert("", "end", values=values)
             self._itemEvents[itemId] = event
 
@@ -130,6 +131,13 @@ class LogsPage(ttk.Frame):
         children = self._tree.get_children()
         if children:
             self._tree.see(children[-1])
+
+    def _buildWrappedMessage(self, message: str, contextText: str) -> str:
+        combined = f"{message} {contextText}".strip()
+        if not combined:
+            return combined
+        wrappedLines = textwrap.wrap(combined, width=110, break_long_words=False, break_on_hyphens=False)
+        return "\n".join(wrappedLines)
 
 
 __all__ = ["LogsPage"]
