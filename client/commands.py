@@ -10,6 +10,9 @@ from typing import Any, Dict, List, Optional
 
 import requests
 
+from google.api_core import exceptions as googleApiExceptions
+from google.cloud import firestore
+
 from .base44 import getBaseUrl
 from .logbus import log
 
@@ -17,6 +20,7 @@ LOG = logging.getLogger(__name__)
 
 
 _missingBaseLogged = False
+_firestoreClientHandle: Optional[firestore.Client] = None
 
 
 def _resolveBaseUrl() -> str:
@@ -35,6 +39,46 @@ def _logMissingBaseUrl() -> None:
             "[commands] BASE44_BASE mangler – kommandopoller er deaktivert midlertidig."
         )
         _missingBaseLogged = True
+
+
+def _resolveProjectId() -> str:
+    projectId = (os.getenv("FIRESTORE_PROJECT_ID") or os.getenv("GCP_PROJECT_ID") or "").strip()
+    return projectId
+
+
+def _getFirestoreClient() -> Optional[firestore.Client]:
+    global _firestoreClientHandle
+    if _firestoreClientHandle is not None:
+        return _firestoreClientHandle
+
+    projectId = _resolveProjectId()
+    if not projectId:
+        return None
+
+    try:
+        _firestoreClientHandle = firestore.Client(project=projectId)
+    except googleApiExceptions.GoogleAPIError as error:
+        LOG.error("[commands] Kunne ikke opprette Firestore-klient: %s", error)
+        log(
+            "ERROR",
+            "control",
+            "firestore_client_error",
+            projectId=projectId,
+            error=str(error),
+        )
+        return None
+    except Exception as error:  # pylint: disable=broad-except
+        LOG.exception("[commands] Uventet feil ved opprettelse av Firestore-klient")
+        log(
+            "ERROR",
+            "control",
+            "firestore_client_exception",
+            projectId=projectId,
+            error=str(error),
+        )
+        return None
+
+    return _firestoreClientHandle
 
 
 def _resolveRecipientId(explicitRecipientId: Optional[str] = None) -> str:
@@ -64,6 +108,213 @@ def _buildUrl(functionName: str) -> str:
     return f"{baseUrl}/{functionName}".rstrip("/")
 
 
+def _getCommandCollectionName() -> str:
+    collectionName = (os.getenv("FIRESTORE_COLLECTION_PRINTER_COMMANDS") or "printer_commands").strip()
+    if not collectionName:
+        collectionName = "printer_commands"
+    return collectionName
+
+
+def _getFirestoreLimit() -> int:
+    limitValue = os.getenv("FIRESTORE_COMMAND_LIMIT", "25").strip()
+    try:
+        limitSize = max(1, int(limitValue))
+    except ValueError:
+        limitSize = 25
+    return limitSize
+
+
+def _listPendingCommandsFromFirestore(recipientId: str) -> Optional[List[Dict[str, Any]]]:
+    firestoreClient = _getFirestoreClient()
+    if firestoreClient is None:
+        return None
+
+    collectionName = _getCommandCollectionName()
+    limitSize = _getFirestoreLimit()
+
+    log(
+        "INFO",
+        "control",
+        "poll_start",
+        recipientId=recipientId,
+        source="firestore",
+        collection=collectionName,
+        limit=limitSize,
+    )
+
+    started = time.time()
+
+    try:
+        query = (
+            firestoreClient.collection(collectionName)
+            .where("recipientId", "==", recipientId)
+            .where("status", "==", "pending")
+            .order_by("createdAt", direction=firestore.Query.ASCENDING)
+            .limit(limitSize)
+        )
+        documents = list(query.stream())
+    except googleApiExceptions.GoogleAPICallError as error:
+        LOG.error("[commands] Firestore-spørring feilet: %s", error)
+        log(
+            "ERROR",
+            "control",
+            "firestore_poll_failed",
+            recipientId=recipientId,
+            source="firestore",
+            collection=collectionName,
+            error=str(error),
+        )
+        return []
+    except Exception as error:  # pylint: disable=broad-except
+        LOG.exception("[commands] Uventet Firestore-feil under henting av kommandoer")
+        log(
+            "ERROR",
+            "control",
+            "firestore_poll_exception",
+            recipientId=recipientId,
+            source="firestore",
+            collection=collectionName,
+            error=str(error),
+        )
+        return []
+
+    elapsedMs = int((time.time() - started) * 1000)
+
+    commands: List[Dict[str, Any]] = []
+    for document in documents:
+        documentPayload = document.to_dict() or {}
+        documentPayload.setdefault("commandId", document.id)
+        documentPayload["docId"] = document.id
+        commands.append(documentPayload)
+
+    log(
+        "INFO",
+        "control",
+        "poll_payload",
+        "Mottok Firestore-kontrollpayload",
+        recipientId=recipientId,
+        source="firestore",
+        collection=collectionName,
+        count=len(commands),
+        payload=commands,
+    )
+
+    log(
+        "INFO",
+        "control",
+        "poll_ok",
+        recipientId=recipientId,
+        source="firestore",
+        collection=collectionName,
+        ms=elapsedMs,
+        count=len(commands),
+    )
+
+    for command in commands:
+        log(
+            "INFO",
+            "control",
+            "incoming_detail",
+            "Firestore-kontrollkommando mottatt",
+            commandId=str(command.get("commandId")),
+            commandType=str(command.get("commandType")),
+            metadata=command.get("metadata"),
+            rawCommand=command,
+            source="firestore",
+        )
+
+    return commands
+
+
+def _completeCommandInFirestore(
+    commandId: str,
+    recipientId: str,
+    success: bool,
+    error: Optional[str],
+) -> Optional[bool]:
+    firestoreClient = _getFirestoreClient()
+    if firestoreClient is None:
+        return None
+
+    collectionName = _getCommandCollectionName()
+    updatePayload: Dict[str, Any] = {
+        "status": "completed" if success else "failed",
+        "completedAt": firestore.SERVER_TIMESTAMP,
+        "success": success,
+    }
+    if error and not success:
+        updatePayload["errorMessage"] = error
+
+    log(
+        "INFO",
+        "control",
+        "complete_start",
+        commandId=commandId,
+        recipientId=recipientId,
+        source="firestore",
+        status=updatePayload["status"],
+    )
+
+    documentRef = firestoreClient.collection(collectionName).document(commandId)
+
+    try:
+        documentRef.update(updatePayload)
+    except googleApiExceptions.NotFound:
+        LOG.warning("[commands] Fant ikke Firestore-kommando %s for oppdatering", commandId)
+        log(
+            "WARNING",
+            "control",
+            "firestore_complete_missing",
+            commandId=commandId,
+            recipientId=recipientId,
+            source="firestore",
+        )
+        return False
+    except googleApiExceptions.GoogleAPICallError as apiError:
+        LOG.error(
+            "[commands] Firestore-oppdatering feilet for %s: %s",
+            commandId,
+            apiError,
+        )
+        log(
+            "ERROR",
+            "control",
+            "firestore_complete_failed",
+            commandId=commandId,
+            recipientId=recipientId,
+            source="firestore",
+            error=str(apiError),
+        )
+        return False
+    except Exception as exceptionError:  # pylint: disable=broad-except
+        LOG.exception(
+            "[commands] Uventet feil ved Firestore-oppdatering for %s",
+            commandId,
+        )
+        log(
+            "ERROR",
+            "control",
+            "firestore_complete_exception",
+            commandId=commandId,
+            recipientId=recipientId,
+            source="firestore",
+            error=str(exceptionError),
+        )
+        return False
+
+    log(
+        "INFO",
+        "control",
+        "complete_ok",
+        commandId=commandId,
+        recipientId=recipientId,
+        source="firestore",
+        status=updatePayload["status"],
+    )
+
+    return True
+
+
 def listPendingCommands(
     recipientId: Optional[str] = None,
     *,
@@ -73,6 +324,10 @@ def listPendingCommands(
     if not resolvedRecipientId:
         LOG.error("[commands] Recipient ID mangler")
         return []
+
+    firestoreCommands = _listPendingCommandsFromFirestore(resolvedRecipientId)
+    if firestoreCommands is not None:
+        return firestoreCommands
 
     resolvedFunction = (functionName or os.getenv("BASE44_COMMANDS_FN") or "listPendingCommands").strip()
     if not resolvedFunction:
@@ -90,6 +345,7 @@ def listPendingCommands(
         "poll_start",
         recipientId=resolvedRecipientId,
         url=url,
+        source="http",
     )
     started = time.time()
 
@@ -104,6 +360,7 @@ def listPendingCommands(
             "poll_failed",
             recipientId=resolvedRecipientId,
             url=url,
+            source="http",
             error=str(error),
         )
         return None
@@ -118,8 +375,21 @@ def listPendingCommands(
             "poll_bad_json",
             recipientId=resolvedRecipientId,
             url=url,
+            source="http",
         )
         return []
+
+    log(
+        "INFO",
+        "control",
+        "poll_payload",
+        "Mottok kontrollpayload",
+        recipientId=resolvedRecipientId,
+        url=url,
+        source="http",
+        status=response.status_code,
+        payload=data,
+    )
 
     commands = data.get("commands", []) if isinstance(data, dict) else []
     if not isinstance(commands, list):
@@ -130,6 +400,7 @@ def listPendingCommands(
             "poll_bad_format",
             recipientId=resolvedRecipientId,
             url=url,
+            source="http",
             response=data,
         )
         return []
@@ -146,9 +417,24 @@ def listPendingCommands(
         "poll_ok",
         recipientId=resolvedRecipientId,
         url=url,
+        source="http",
         ms=elapsedMs,
         count=len(commands),
     )
+
+    for command in commands:
+        if isinstance(command, dict):
+            log(
+                "INFO",
+                "control",
+                "incoming_detail",
+                "Kontrollkommando mottatt",
+                commandId=str(command.get("commandId")),
+                commandType=str(command.get("commandType")),
+                metadata=command.get("metadata"),
+                rawCommand=command,
+                source="http",
+            )
     return [command for command in commands if isinstance(command, dict)]
 
 
@@ -169,6 +455,15 @@ def completeCommand(
     if not resolvedRecipientId:
         LOG.error("[commands] Recipient ID mangler ved fullføring")
         return False
+
+    firestoreResult = _completeCommandInFirestore(
+        normalizedCommandId,
+        resolvedRecipientId,
+        bool(success),
+        error,
+    )
+    if firestoreResult is not None:
+        return firestoreResult
 
     resolvedFunction = (functionName or os.getenv("BASE44_COMPLETE_CMD_FN") or "completePrinterCommand").strip()
     if not resolvedFunction:

@@ -16,7 +16,101 @@ from client.base44Status import Base44StatusReporter  # noqa: E402
 from client.gui import ListenerGuiApp  # noqa: E402
 
 
-def test_list_pending_commands_returns_items(monkeypatch: pytest.MonkeyPatch) -> None:
+class FakeFirestoreDocument:
+    def __init__(self, docId: str, data: Dict[str, Any]):
+        self.id = docId
+        self._data = data
+
+    def to_dict(self) -> Dict[str, Any]:
+        return dict(self._data)
+
+    def update(self, payload: Dict[str, Any]) -> None:
+        self._data.update(payload)
+
+
+class FakeFirestoreQuery:
+    def __init__(self, documents: List[FakeFirestoreDocument]):
+        self._documents = documents
+        self._limit = len(documents)
+
+    def where(self, fieldName: str, _operator: str, value: Any) -> "FakeFirestoreQuery":
+        filtered = [doc for doc in self._documents if doc.to_dict().get(fieldName) == value]
+        return FakeFirestoreQuery(filtered)
+
+    def order_by(self, _fieldName: str, direction: Any = None) -> "FakeFirestoreQuery":  # noqa: D401, ANN001
+        return self
+
+    def limit(self, size: int) -> "FakeFirestoreQuery":
+        limited = FakeFirestoreQuery(self._documents)
+        limited._limit = size  # pylint: disable=protected-access
+        return limited
+
+    def stream(self) -> List[FakeFirestoreDocument]:
+        return self._documents[: self._limit]
+
+
+class FakeFirestoreCollection:
+    def __init__(self, documents: Dict[str, FakeFirestoreDocument]):
+        self._documents = documents
+
+    def document(self, docId: str) -> FakeFirestoreDocument:
+        if docId not in self._documents:
+            self._documents[docId] = FakeFirestoreDocument(docId, {})
+        return self._documents[docId]
+
+    def where(self, fieldName: str, operator: str, value: Any) -> FakeFirestoreQuery:
+        documents = list(self._documents.values())
+        return FakeFirestoreQuery(documents).where(fieldName, operator, value)
+
+
+class FakeFirestoreClient:
+    def __init__(self, documents: Dict[str, FakeFirestoreDocument]):
+        self._collections = {"printer_commands": FakeFirestoreCollection(documents)}
+
+    def collection(self, name: str) -> FakeFirestoreCollection:
+        return self._collections.setdefault(name, FakeFirestoreCollection({}))
+
+
+def test_list_pending_commands_reads_from_firestore(monkeypatch: pytest.MonkeyPatch) -> None:
+    documents = {
+        "cmd-001": FakeFirestoreDocument(
+            "cmd-001",
+            {
+                "commandId": "cmd-001",
+                "commandType": "poke",
+                "recipientId": "recipient-xyz",
+                "status": "pending",
+            },
+        ),
+        "cmd-002": FakeFirestoreDocument(
+            "cmd-002",
+            {
+                "commandId": "cmd-002",
+                "commandType": "set_bed_temp",
+                "recipientId": "recipient-xyz",
+                "status": "pending",
+                "metadata": {"target": 60},
+            },
+        ),
+    }
+
+    fakeClient = FakeFirestoreClient(documents)
+
+    monkeypatch.setenv("FIRESTORE_PROJECT_ID", "test-project")
+    monkeypatch.setenv("FIRESTORE_COLLECTION_PRINTER_COMMANDS", "printer_commands")
+    commands._firestoreClientHandle = None  # type: ignore[attr-defined]
+    monkeypatch.setattr(commands, "_getFirestoreClient", lambda: fakeClient)
+    monkeypatch.setattr(commands, "firestore", type("FirestoreNamespace", (), {"Query": type("Query", (), {"ASCENDING": "ASCENDING", "DESCENDING": "DESCENDING"}), "SERVER_TIMESTAMP": object()})())
+
+    result = commands.listPendingCommands("recipient-xyz")
+
+    assert isinstance(result, list)
+    assert len(result) == 2
+    assert result[0]["commandId"] == "cmd-001"
+    assert result[1]["metadata"]["target"] == 60
+
+
+def test_list_pending_commands_falls_back_to_http(monkeypatch: pytest.MonkeyPatch) -> None:
     capturedRequests: List[Tuple[str, Dict[str, Any]]] = []
 
     class FakeResponse:
@@ -31,17 +125,25 @@ def test_list_pending_commands_returns_items(monkeypatch: pytest.MonkeyPatch) ->
         def json(self) -> Dict[str, Any]:
             return self._payload
 
+    def fakeGetFirestoreClient() -> None:
+        return None
+
     def fakePost(url: str, *, json: Dict[str, Any], headers: Dict[str, Any], timeout: int) -> FakeResponse:  # type: ignore[override]
         capturedRequests.append((url, json))
         return FakeResponse(
             {
                 "ok": True,
                 "commands": [
-                    {"commandId": "cmd-123", "commandType": "poke", "printerIpAddress": "10.0.0.1"}
+                    {
+                        "commandId": "cmd-123",
+                        "commandType": "poke",
+                        "printerIpAddress": "10.0.0.1",
+                    }
                 ],
             }
         )
 
+    monkeypatch.setattr(commands, "_getFirestoreClient", fakeGetFirestoreClient)
     monkeypatch.setattr(commands.requests, "post", fakePost)
     monkeypatch.setenv("BASE44_BASE", "https://example.com/api")
     monkeypatch.setenv("BASE44_RECIPIENT_ID", "recipient-xyz")
@@ -58,6 +160,7 @@ def test_list_pending_commands_returns_none_on_failure(monkeypatch: pytest.Monke
     def fakePost(*_args: Any, **_kwargs: Any) -> Any:
         raise commands.requests.RequestException("boom")
 
+    monkeypatch.setattr(commands, "_getFirestoreClient", lambda: None)
     monkeypatch.setattr(commands.requests, "post", fakePost)
     monkeypatch.setenv("BASE44_BASE", "https://example.com/api")
     monkeypatch.setenv("BASE44_RECIPIENT_ID", "recipient-xyz")
@@ -86,6 +189,7 @@ def test_complete_command_marks_success(monkeypatch: pytest.MonkeyPatch) -> None
         capturedPayloads.append(json)
         return FakeResponse({"ok": True, "status": "completed"})
 
+    monkeypatch.setattr(commands, "_completeCommandInFirestore", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(commands.requests, "post", fakePost)
     monkeypatch.setenv("BASE44_BASE", "https://example.com/api")
 
@@ -93,6 +197,45 @@ def test_complete_command_marks_success(monkeypatch: pytest.MonkeyPatch) -> None
     assert capturedPayloads[0]["commandId"] == "cmd-99"
     assert capturedPayloads[0]["success"] is True
     assert capturedPayloads[0]["error"] is None
+
+
+def test_complete_command_updates_firestore(monkeypatch: pytest.MonkeyPatch) -> None:
+    updateLog: List[Tuple[str, Dict[str, Any]]] = []
+
+    documents = {
+        "cmd-555": FakeFirestoreDocument(
+            "cmd-555",
+            {
+                "commandId": "cmd-555",
+                "recipientId": "recipient-xyz",
+                "status": "pending",
+            },
+        )
+    }
+
+    class RecordingDocument(FakeFirestoreDocument):
+        def update(self, payload: Dict[str, Any]) -> None:
+            updateLog.append((self.id, payload))
+            super().update(payload)
+
+    recordingDocuments = {
+        key: RecordingDocument(key, value.to_dict()) for key, value in documents.items()
+    }
+
+    fakeClient = FakeFirestoreClient(recordingDocuments)
+
+    monkeypatch.setenv("FIRESTORE_PROJECT_ID", "test-project")
+    monkeypatch.setenv("FIRESTORE_COLLECTION_PRINTER_COMMANDS", "printer_commands")
+    commands._firestoreClientHandle = None  # type: ignore[attr-defined]
+    monkeypatch.setattr(commands, "_getFirestoreClient", lambda: fakeClient)
+    monkeypatch.setattr(commands, "firestore", type("FirestoreNamespace", (), {"Query": type("Query", (), {"ASCENDING": "ASCENDING", "DESCENDING": "DESCENDING"}), "SERVER_TIMESTAMP": object()})())
+
+    result = commands.completeCommand("cmd-555", True, recipientId="recipient-xyz")
+
+    assert result is True
+    assert updateLog
+    assert updateLog[0][0] == "cmd-555"
+    assert updateLog[0][1]["status"] == "completed"
 
 
 def test_status_reporter_handles_poke_command(monkeypatch: pytest.MonkeyPatch) -> None:
