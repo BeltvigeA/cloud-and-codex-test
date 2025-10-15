@@ -9,12 +9,30 @@ from typing import Any, Dict, List, Optional
 
 import requests
 
+from .base44 import getBaseUrl
+
 LOG = logging.getLogger(__name__)
+
+
+_missingBaseLogged = False
 
 
 def _resolveBaseUrl() -> str:
     baseUrl = (os.getenv("BASE44_BASE") or "").strip()
-    return baseUrl.rstrip("/")
+    if baseUrl:
+        return baseUrl.rstrip("/")
+
+    fallback = (getBaseUrl() or "").strip()
+    return fallback.rstrip("/")
+
+
+def _logMissingBaseUrl() -> None:
+    global _missingBaseLogged
+    if not _missingBaseLogged:
+        LOG.warning(
+            "[commands] BASE44_BASE mangler – kommandopoller er deaktivert midlertidig."
+        )
+        _missingBaseLogged = True
 
 
 def _resolveRecipientId(explicitRecipientId: Optional[str] = None) -> str:
@@ -39,7 +57,8 @@ def _buildHeaders() -> Dict[str, str]:
 def _buildUrl(functionName: str) -> str:
     baseUrl = _resolveBaseUrl()
     if not baseUrl:
-        raise RuntimeError("BASE44_BASE is not configured")
+        _logMissingBaseUrl()
+        return ""
     return f"{baseUrl}/{functionName}".rstrip("/")
 
 
@@ -57,10 +76,8 @@ def listPendingCommands(
     if not resolvedFunction:
         resolvedFunction = "listPendingCommands"
 
-    try:
-        url = _buildUrl(resolvedFunction)
-    except Exception as error:  # noqa: BLE001 - configuration error
-        LOG.error("[commands] Klarte ikke å bygge URL: %s", error)
+    url = _buildUrl(resolvedFunction)
+    if not url:
         return None
 
     payload = {"recipientId": resolvedRecipientId}
@@ -113,10 +130,8 @@ def completeCommand(
     if not resolvedFunction:
         resolvedFunction = "completePrinterCommand"
 
-    try:
-        url = _buildUrl(resolvedFunction)
-    except Exception as error:  # noqa: BLE001 - configuration error
-        LOG.error("[commands] Klarte ikke å bygge URL: %s", error)
+    url = _buildUrl(resolvedFunction)
+    if not url:
         return False
 
     payload: Dict[str, Any] = {

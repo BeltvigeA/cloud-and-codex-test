@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 import copy
+import logging
 import xml.etree.ElementTree as ET
 import zipfile
 from pathlib import Path
@@ -447,7 +448,9 @@ def test_failedSerialResponseAllowsJobStart(monkeypatch: pytest.MonkeyPatch) -> 
 
     monkeypatch.setattr(bambuPrinter, "ensureMqttConnected", fakeEnsureMqttConnected)
 
-    returnedPrinter = bambuPrinter.ensurePrinterSessionReady(printerSession)
+    returnedPrinter = bambuPrinter.ensurePrinterSessionReady(
+        printerSession, expectedSerial="SERIAL123"
+    )
 
     assert returnedPrinter is fakePrinter
     assert printerSession.mqttReady is True
@@ -460,21 +463,22 @@ def test_failedSerialResponseAllowsJobStart(monkeypatch: pytest.MonkeyPatch) -> 
     assert fakePrinter.startArguments == ("job.3mf", None)
 
 
-def test_ensurePrinterSessionReadyIgnoresFailedState(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_ensurePrinterSessionReadyWaitsForRealSerial(monkeypatch: pytest.MonkeyPatch) -> None:
     class FakePrinter:
         def __init__(self) -> None:
-            self.serial = "SERIAL123"
-            self.serialNumber = "SERIAL123"
-            self.stateCalls = 0
+            self.responses = ["IDLE", "IDLE", "SERIAL123"]
             self.mqttStarted = False
             self.startedPrint = False
             self.startArguments: tuple[str, Any | None] | None = None
+            self.requestCalls = 0
 
-        def get_state(self) -> Dict[str, Any]:
-            self.stateCalls += 1
-            if self.stateCalls == 1:
-                return {"serial": "FAILED"}
-            return {"serial": "SERIAL123"}
+        def get_printer_info(self) -> Dict[str, Any]:
+            return {"serial": self.responses[0]}
+
+        def request_device_info(self) -> None:
+            self.requestCalls += 1
+            if len(self.responses) > 1:
+                self.responses.pop(0)
 
         def mqtt_start(self) -> None:
             self.mqttStarted = True
@@ -498,13 +502,167 @@ def test_ensurePrinterSessionReadyIgnoresFailedState(monkeypatch: pytest.MonkeyP
 
     monkeypatch.setattr(bambuPrinter, "ensureMqttConnected", fakeEnsureMqttConnected)
 
-    returnedPrinter = bambuPrinter.ensurePrinterSessionReady(printerSession)
+    returnedPrinter = bambuPrinter.ensurePrinterSessionReady(
+        printerSession, expectedSerial="SERIAL123"
+    )
 
     assert returnedPrinter is fakePrinter
     assert printerSession.mqttReady is True
+    assert printerSession.serialNumber == "SERIAL123"
+    assert fakePrinter.requestCalls >= 1
 
     bambuPrinter.startWithLibrary(fakePrinter, "job.3mf", None, expectedSerial="SERIAL123")
 
     assert fakePrinter.mqttStarted is True
     assert fakePrinter.startedPrint is True
     assert fakePrinter.startArguments == ("job.3mf", None)
+
+
+def test_ensurePrinterSessionReadyRaisesOnMismatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakePrinter:
+        def __init__(self) -> None:
+            self.serial = "WRONG"
+            self.serialNumber = "WRONG"
+
+        def get_printer_info(self) -> Dict[str, Any]:
+            return {"serial": "WRONG"}
+
+        def disconnect(self) -> None:
+            return None
+
+    fakePrinter = FakePrinter()
+
+    printerSession = bambuPrinter.PrinterSession(
+        ipAddress="192.168.2.99",
+        serialNumber="SERIAL123",
+        accessCode="ACCESS",
+    )
+
+    def fakeAcquire(self: bambuPrinter.PrinterSession) -> Any:
+        if self.client is None:
+            self.client = fakePrinter
+        return self.client
+
+    monkeypatch.setattr(bambuPrinter.PrinterSession, "acquireClient", fakeAcquire)
+
+    monkeypatch.setattr(bambuPrinter, "ensureMqttConnected", lambda *_args, **_kwargs: True)
+
+    with pytest.raises(RuntimeError) as errorInfo:
+        bambuPrinter.ensurePrinterSessionReady(
+            printerSession, expectedSerial="SERIAL123", serialWaitSeconds=0.5
+        )
+
+    assert "Connected to feil printer" in str(errorInfo.value)
+
+
+def test_ensurePrinterSessionReadyWarnsWhenSerialMissing(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    class FakePrinter:
+        def get_printer_info(self) -> Dict[str, Any]:
+            return {}
+
+    fakePrinter = FakePrinter()
+
+    printerSession = bambuPrinter.PrinterSession(
+        ipAddress="192.168.2.66",
+        serialNumber="SERIAL123",
+        accessCode="ACCESS",
+    )
+    printerSession.client = fakePrinter
+
+    monkeypatch.setattr(
+        bambuPrinter,
+        "ensureMqttConnected",
+        lambda _printer, **_kwargs: True,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        returnedPrinter = bambuPrinter.ensurePrinterSessionReady(
+            printerSession,
+            expectedSerial="SERIAL123",
+            serialWaitSeconds=0.1,
+            serialPollIntervalSeconds=0.01,
+        )
+
+    assert returnedPrinter is fakePrinter
+    assert any("Kunne ikke bekrefte printer-SN" in message for message in caplog.messages)
+
+
+def test_waitForMqttAndStatusReturnsTrue(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakePrinter:
+        def __init__(self) -> None:
+            self.stateCalls = 0
+            self.connected = False
+
+        def mqtt_connected(self) -> bool:
+            return self.connected
+
+        def get_state(self) -> Dict[str, Any]:
+            self.stateCalls += 1
+            if self.stateCalls < 3:
+                raise RuntimeError("Not ready yet")
+            return {"state": {"state": "IDLE"}}
+
+    fakePrinter = FakePrinter()
+
+    printerSession = bambuPrinter.PrinterSession(
+        ipAddress="192.168.2.77",
+        serialNumber="SERIAL123",
+        accessCode="ACCESS",
+    )
+    printerSession.client = fakePrinter
+
+    def fakeEnsureMqttConnected(printer: Any, *, timeoutSeconds: float = 25.0, **_kwargs: Any) -> bool:
+        assert printer is fakePrinter
+        fakePrinter.connected = True
+        return True
+
+    monkeypatch.setattr(bambuPrinter, "ensureMqttConnected", fakeEnsureMqttConnected)
+    monkeypatch.setattr(bambuPrinter.time, "sleep", lambda _seconds: None)
+
+    result = bambuPrinter.waitForMqttAndStatus(
+        printerSession,
+        maxWaitSeconds=1.0,
+        staleAfterSeconds=1.0,
+        pollIntervalSeconds=0.01,
+    )
+
+    assert result is True
+    assert printerSession.mqttReady is True
+    assert printerSession.lastStatusTimestamp > 0
+    assert fakePrinter.stateCalls >= 3
+
+
+def test_waitForMqttAndStatusTimesOut(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    class FakePrinter:
+        def mqtt_connected(self) -> bool:
+            return True
+
+        def get_state(self) -> Dict[str, Any]:
+            raise RuntimeError("Still warming up")
+
+    fakePrinter = FakePrinter()
+
+    printerSession = bambuPrinter.PrinterSession(
+        ipAddress="192.168.2.88",
+        serialNumber="SERIAL123",
+        accessCode="ACCESS",
+    )
+    printerSession.client = fakePrinter
+
+    monkeypatch.setattr(bambuPrinter, "ensureMqttConnected", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(bambuPrinter.time, "sleep", lambda _seconds: None)
+
+    with caplog.at_level(logging.WARNING):
+        result = bambuPrinter.waitForMqttAndStatus(
+            printerSession,
+            maxWaitSeconds=0.2,
+            staleAfterSeconds=0.05,
+            pollIntervalSeconds=0.01,
+        )
+
+    assert result is False
+    assert any("MQTT-status ble ikke fersk" in message for message in caplog.messages)

@@ -62,6 +62,8 @@ _serialSentinelValues = {
     "NA",
     "NULL",
     "NONE",
+    "IDLE",
+    "PRINTING",
 }
 
 printerSessionsLock = Lock()
@@ -2356,7 +2358,11 @@ def sendBambuPrintJob(
                         if statusConfig:
                             postStatus(initialStatusPayload, statusConfig)
                         if isinstance(uploadSession.session, PrinterSession):
-                            printerClient = ensurePrinterSessionReady(printerSession)
+                            waitForMqttAndStatus(printerSession)
+                            printerClient = ensurePrinterSessionReady(
+                                printerSession,
+                                expectedSerial=options.serialNumber,
+                            )
                         else:
                             printerClient = uploadSession.printer
                         startViaBambuapiAfterUpload(
@@ -2439,6 +2445,7 @@ __all__ = [
     "summarizeStatusMessages",
     "uploadViaFtps",
     "waitForMqttReady",
+    "waitForMqttAndStatus",
     "ensureMqttConnected",
     "printerIsMqttReady",
     "waitForStartAck",
@@ -2457,6 +2464,7 @@ class PrinterSession:
     client: Any | None = None
     lock: Lock = field(default_factory=Lock)
     mqttReady: bool = False
+    lastStatusTimestamp: float = 0.0
 
     def acquireClient(self) -> Any:
         if bambulabsApi is None:
@@ -2467,6 +2475,40 @@ class PrinterSession:
                 raise RuntimeError("bambulabs_api.Printer is not available")
             self.client = printerClass(self.ipAddress, self.accessCode, self.serialNumber)
         return self.client
+
+    def connectMqttIfNeeded(self, *, timeoutSeconds: float = 25.0) -> bool:
+        printer = self.acquireClient()
+        ready = ensureMqttConnected(printer, timeoutSeconds=timeoutSeconds)
+        self.mqttReady = ready
+        return ready
+
+    def requestDeviceInfo(self) -> None:
+        printer = self.acquireClient()
+        requestMethod = getattr(printer, "request_device_info", None)
+        if callable(requestMethod):
+            requestMethod()
+
+    def getSerial(self) -> Optional[str]:
+        printer = self.acquireClient()
+        serialCandidate = _extractSerialFromPrinter(printer)
+        if serialCandidate:
+            self.serialNumber = serialCandidate
+        return serialCandidate
+
+    def getState(self) -> Optional[str]:
+        printer = self.acquireClient()
+        stateAccessor = getattr(printer, "get_state", None) or getattr(printer, "get_status", None)
+        if not callable(stateAccessor):
+            return None
+        try:
+            payload = stateAccessor()
+        except Exception:
+            logger.debug("Unable to retrieve printer state", exc_info=True)
+            return None
+        stateValue = _extractPrinterState(payload)
+        if stateValue:
+            self.lastStatusTimestamp = time.monotonic()
+        return stateValue
 
 
 def getOrCreatePrinterSession(ipAddress: str, serialNumber: str, accessCode: str) -> PrinterSession:
@@ -2510,53 +2552,162 @@ def resetPrinterSession(session: PrinterSession) -> None:
             pass
 
 
+def waitForMqttAndStatus(
+    session: PrinterSession,
+    *,
+    maxWaitSeconds: float = 10.0,
+    staleAfterSeconds: float = 3.0,
+    pollIntervalSeconds: float = 0.2,
+) -> bool:
+    """Wait for MQTT connectivity and a fresh status snapshot before starting."""
+
+    deadline = time.monotonic() + maxWaitSeconds
+    try:
+        session.connectMqttIfNeeded(timeoutSeconds=maxWaitSeconds)
+    except Exception:
+        logger.debug("Unable to establish MQTT connection during wait", exc_info=True)
+
+    printer = session.client or session.acquireClient()
+    statusAccessor = getattr(printer, "get_state", None) or getattr(printer, "get_status", None)
+    lastStatusTimestamp = session.lastStatusTimestamp
+    lastStatusErrorLogged = False
+
+    while time.monotonic() < deadline:
+        if not session.mqttReady:
+            try:
+                session.mqttReady = printerIsMqttReady(printer)
+            except Exception:
+                session.mqttReady = False
+
+        if callable(statusAccessor):
+            try:
+                payload = statusAccessor()
+            except Exception:
+                if not lastStatusErrorLogged:
+                    logger.debug("Printer values not available yet", exc_info=True)
+                    lastStatusErrorLogged = True
+            else:
+                stateValue = _extractPrinterState(payload)
+                if stateValue:
+                    lastStatusTimestamp = time.monotonic()
+                    session.lastStatusTimestamp = lastStatusTimestamp
+                    lastStatusErrorLogged = False
+
+        if session.mqttReady and lastStatusTimestamp:
+            if time.monotonic() - lastStatusTimestamp <= staleAfterSeconds:
+                return True
+
+        time.sleep(pollIntervalSeconds)
+
+    logger.warning(
+        "MQTT-status ble ikke fersk innen %.1fs (mqttReady=%s)",
+        maxWaitSeconds,
+        session.mqttReady,
+    )
+    return False
+
+
 def _extractSerialFromPrinter(printer: Any) -> Optional[str]:
-    infoMethod = getattr(printer, "get_printer_info", None)
-    if callable(infoMethod):
+    """Best effort extraction of a serial number from printer metadata."""
+
+    if printer is None:
+        return None
+
+    for accessorName in (
+        "get_device_info",
+        "get_printer_info",
+        "device_info",
+        "deviceInfo",
+        "printer_info",
+    ):
+        accessor = getattr(printer, accessorName, None)
         try:
-            infoPayload = infoMethod()
-            serialCandidate = _extractSerialFromPayload(infoPayload)
-            if serialCandidate:
-                return serialCandidate
+            payload = accessor() if callable(accessor) else accessor
         except Exception:
-            logger.debug("Unable to resolve serial via get_printer_info", exc_info=True)
-    stateMethod = getattr(printer, "get_state", None)
-    if callable(stateMethod):
-        try:
-            statePayload = stateMethod()
-            serialCandidate = _extractSerialFromPayload(statePayload)
-            if serialCandidate:
-                return serialCandidate
-        except Exception:
-            logger.debug("Unable to resolve serial via get_state", exc_info=True)
+            logger.debug("Unable to resolve serial via %s", accessorName, exc_info=True)
+            continue
+        serialCandidate = _extractSerialFromPayload(payload)
+        if serialCandidate:
+            return serialCandidate
+
     for attributeName in ("serial", "serialNumber"):
         normalizedAttribute = _normalizeSerialCandidate(getattr(printer, attributeName, None))
         if normalizedAttribute:
             return normalizedAttribute
+
     return None
 
 
-def ensurePrinterSessionReady(session: PrinterSession, *, timeoutSeconds: float = 25.0) -> Any:
-    expectedSerial = _normalizeSerialCandidate(session.serialNumber)
-    normalizedExpected = expectedSerial.casefold() if expectedSerial else None
+def ensurePrinterSessionReady(
+    session: PrinterSession,
+    *,
+    expectedSerial: Optional[str] = None,
+    timeoutSeconds: float = 25.0,
+    serialWaitSeconds: float = 10.0,
+    serialPollIntervalSeconds: float = 0.25,
+) -> Any:
+    """Ensure the printer session is connected and matches the expected serial."""
+
+    expectedCandidate = _normalizeSerialCandidate(expectedSerial or session.serialNumber)
+    expectedKey = expectedCandidate.casefold() if expectedCandidate else None
     attempts = 0
-    printer = session.acquireClient()
+    lastObservedSerial: Optional[str] = None
+
     while attempts < 2:
         attempts += 1
-        ready = ensureMqttConnected(printer, timeoutSeconds=timeoutSeconds)
-        session.mqttReady = ready
-        actualSerial = _extractSerialFromPrinter(printer)
-        normalizedActual = actualSerial.casefold() if actualSerial else None
-        if normalizedExpected and normalizedActual and normalizedActual != normalizedExpected:
+        printer = session.acquireClient()
+        session.connectMqttIfNeeded(timeoutSeconds=timeoutSeconds)
+
+        try:
+            session.requestDeviceInfo()
+        except Exception:
+            logger.debug("Unable to request printer device info", exc_info=True)
+
+        deadline = time.monotonic() + serialWaitSeconds
+        actualSerial = session.getSerial()
+        normalizedActual = _normalizeSerialCandidate(actualSerial)
+
+        while normalizedActual is None and time.monotonic() < deadline:
+            time.sleep(serialPollIntervalSeconds)
+            try:
+                session.requestDeviceInfo()
+            except Exception:
+                logger.debug("Unable to request printer device info", exc_info=True)
+            actualSerial = session.getSerial()
+            normalizedActual = _normalizeSerialCandidate(actualSerial)
+
+        if normalizedActual is None:
+            if expectedCandidate:
+                logger.warning(
+                    "Kunne ikke bekrefte printer-SN innen %.1fs (forventet=%s). Fortsetter forsiktig.",
+                    serialWaitSeconds,
+                    expectedCandidate,
+                )
+            else:
+                logger.warning(
+                    "Kunne ikke bekrefte printer-SN innen %.1fs. Fortsetter forsiktig.",
+                    serialWaitSeconds,
+                )
+            return printer
+
+        lastObservedSerial = normalizedActual
+        session.serialNumber = normalizedActual
+
+        if expectedKey and normalizedActual.casefold() != expectedKey:
             logger.warning(
                 "Printer session mismatch for %s: expected %s, got %s. Reconnecting.",
                 session.ipAddress,
-                session.serialNumber,
-                actualSerial,
+                expectedCandidate,
+                normalizedActual,
             )
             resetPrinterSession(session)
-            printer = session.acquireClient()
             continue
+
         return printer
+
     resetPrinterSession(session)
+    if expectedCandidate:
+        raise RuntimeError(
+            f"Connected to feil printer – avbryter (expected {expectedCandidate}, got {lastObservedSerial or 'ukjent'})"
+        )
     raise RuntimeError("Connected to feil printer – avbryter")
