@@ -14,6 +14,7 @@ import ssl
 import tempfile
 import time
 import uuid
+from .bambu_connect import send_via_bambu_connect
 import zipfile
 import xml.etree.ElementTree as ET
 import logging
@@ -2062,6 +2063,7 @@ class BambuPrintOptions:
     ipAddress: str
     serialNumber: str
     accessCode: str
+    useConnect: bool = True
     brand: str = "Bambu Lab"
     nickname: Optional[str] = None
     useCloud: bool = False
@@ -2381,7 +2383,19 @@ def sendBambuPrintJob(
         if skippedObjects:
             applySkippedObjectsToArchive(workingPath, skippedObjects)
 
-        if options.useCloud and options.cloudUrl:
+        
+        # --- Prefer Bambu Connect deep-link handoff when enabled ---
+        if getattr(options, "useConnect", True):
+            logPrintJob("INFO", "connect_prepare", method="bambu-connect", local=str(workingPath), displayName=remoteName)
+            ok = send_via_bambu_connect(str(workingPath), remoteName)
+            if ok:
+                if statusCallback:
+                    statusCallback({"status": "connectLaunched", "file": str(workingPath)})
+                return {"method": "bambu-connect", "localFile": str(workingPath)}
+            else:
+                logPrintJob("ERROR", "connect_failed", method="bambu-connect")
+        # ------------------------------------------------------------
+if options.useCloud and options.cloudUrl:
             payload = buildCloudJobPayload(
                 ip=options.ipAddress,
                 serial=options.serialNumber,
