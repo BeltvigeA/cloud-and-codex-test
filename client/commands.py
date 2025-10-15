@@ -121,6 +121,17 @@ def listPendingCommands(
         )
         return []
 
+    log(
+        "INFO",
+        "control",
+        "poll_payload",
+        "Mottok kontrollpayload",
+        recipientId=resolvedRecipientId,
+        url=url,
+        status=response.status_code,
+        payload=data,
+    )
+
     commands = data.get("commands", []) if isinstance(data, dict) else []
     if not isinstance(commands, list):
         LOG.error("[commands] 'commands' hadde feil format: %r", commands)
@@ -149,6 +160,19 @@ def listPendingCommands(
         ms=elapsedMs,
         count=len(commands),
     )
+
+    for command in commands:
+        if isinstance(command, dict):
+            log(
+                "INFO",
+                "control",
+                "incoming_detail",
+                "Kontrollkommando mottatt",
+                commandId=str(command.get("commandId")),
+                commandType=str(command.get("commandType")),
+                metadata=command.get("metadata"),
+                rawCommand=command,
+            )
     return [command for command in commands if isinstance(command, dict)]
 
 
