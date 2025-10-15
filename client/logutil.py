@@ -7,7 +7,7 @@ import threading
 import time
 from typing import Dict
 
-from . import logbus
+from .logbus import log
 
 _LOG = logging.getLogger(__name__)
 _LAST_EVENT_TIMES: Dict[str, float] = {}
@@ -21,6 +21,7 @@ def rateLimit(
     level: str = "error",
     minSeconds: float = 5.0,
     category: str | None = None,
+    event: str | None = None,
 ) -> None:
     """Log *message* with rate-limiting enforced per *key*."""
 
@@ -36,11 +37,12 @@ def rateLimit(
         logMethod = _LOG.error
     logMethod(message)
 
-    resolvedCategory = category or "error"
-    try:
-        logbus.log(level.upper(), resolvedCategory, key, message)
-    except Exception:  # pragma: no cover - logging must not fail
-        return
+    if category:
+        try:
+            resolvedEvent = event or key
+            log(level.upper(), category, resolvedEvent, message)
+        except Exception:  # pragma: no cover - logging must not fail
+            return
 
 
 def rateLimitError(
@@ -49,6 +51,7 @@ def rateLimitError(
     minSeconds: float = 5.0,
     *,
     category: str | None = None,
+    event: str | None = None,
 ) -> None:
     """Backward-compatible wrapper that logs at error level."""
 
@@ -58,6 +61,7 @@ def rateLimitError(
         level="error",
         minSeconds=minSeconds,
         category=category,
+        event=event,
     )
 
 
