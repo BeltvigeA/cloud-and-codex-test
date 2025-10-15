@@ -42,6 +42,18 @@ class LogsPage(ttk.Frame):
         self._clearButton = ttk.Button(self.toolbar, text="Clear", command=self._handleClear)
         self._clearButton.pack(side=tk.RIGHT, padx=4)
 
+        self._copyLogButton = ttk.Button(
+            self.toolbar,
+            text="Copy log",
+            command=self._copyLogToClipboard,
+        )
+        self._copyLogButton.pack(side=tk.RIGHT, padx=4, before=self._clearButton)
+
+        self._statusMessage = tk.StringVar(value="")
+        self._statusLabel = ttk.Label(self, textvariable=self._statusMessage, anchor=tk.W)
+        self._statusLabel.pack(fill=tk.X, padx=4, pady=(4, 0))
+        self._statusClearJobId: str | None = None
+
         self._tree = ttk.Treeview(
             self,
             columns=("time", "level", "category", "event", "message"),
@@ -126,10 +138,52 @@ class LogsPage(ttk.Frame):
                 BUS.clear(category=category)
         self.refresh()
 
+    def _copyLogToClipboard(self) -> None:
+        rows = self._filteredRows()
+        if not rows:
+            self._setStatusMessage("No log entries to copy")
+            return
+
+        lines = []
+        for event in rows:
+            eventPayload = {
+                "ts": event.ts,
+                "level": event.level,
+                "category": event.category,
+                "event": event.event,
+                "message": event.message,
+                "ctx": event.ctx,
+            }
+            lines.append(json.dumps(eventPayload, ensure_ascii=False))
+
+        fullText = "\n".join(lines)
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(fullText)
+        except tk.TclError:
+            self._setStatusMessage("Unable to access clipboard")
+            return
+
+        self._setStatusMessage(f"Copied {len(rows)} log entries")
+
     def _scrollToBottom(self) -> None:
         children = self._tree.get_children()
         if children:
             self._tree.see(children[-1])
+
+    def _setStatusMessage(self, message: str, duration: int = 2000) -> None:
+        if self._statusClearJobId is not None:
+            self.after_cancel(self._statusClearJobId)
+            self._statusClearJobId = None
+
+        self._statusMessage.set(message)
+
+        if message:
+            self._statusClearJobId = self.after(duration, self._clearStatusMessage)
+
+    def _clearStatusMessage(self) -> None:
+        self._statusMessage.set("")
+        self._statusClearJobId = None
 
 
 __all__ = ["LogsPage"]
