@@ -1,85 +1,183 @@
-codex & cloud 
+Cloud Printer Backend & Client (LAN + Firestore)
+===============================================
 
+Hva er dette?
+-------------
 
-Project ID=print-pipe-demo
-GCS_BUCKET_NAME=3mf-gcode-container
-KMS_KEY_RING=my-printer-keyring
-KMS_KEY_NAME=printer-data-key
-KMS_LOCATION=europe-west1
-FIRESTORE_COLLECTION_FILES=print_jobs
-FIRESTORE_COLLECTION_PRINTER_STATUS=printer_telemetry
-SECRET_MANAGER_API_KEYS_PATH=projects/934564650450/secrets/printer-api-keys/versions/latest
+Cloud Run API for å motta jobber, kontrollere skrivere og lagre tilstand.
 
+Klient som kjører lokalt, snakker med Bambu over LAN (MQTT/FTPS) og med Firestore.
 
-SECRET_MANAGER_API_KEYS_PATH keys=
-1ORJkv4IZtQjYIniGFX8fr340VreiBhK1XNcDZ3GVlaNSPSCkm6EIZy4m6XOJDF0XAPLcELuZSQnEHxvBMqhD9b5q5Klf0QE9fwih9TOgC2K643cOrhOPZJMVwb9BV7i5Q7R8u8mxPutdWz0RVXP7w
+Miljø (hurtigstart)
+-------------------
 
-c3Lr1YyProjUnzf2GeG8MeGYb0UWNt5jnZLd6Svk7DvysymtwkcJatQC4xlsdK9Cy3h4nFkEJmAXBib99tE5N7Ake2OO7rzZGhQSnGcXjhcYu1YOd7rwLKkHecqU8m4bFBjY9CBztbFRsRT883DFi7
+API base URL (prod):
+https://printer-backend-934564650450.europe-west1.run.app
 
-## Local development
+Firestore prosjekt:
+print-pipe-demo (sett FIRESTORE_PROJECT_ID eller GCP_PROJECT_ID)
 
-### Backend server
+Klient (miljøvariabler):
 
-1. Opprett et virtuelt miljø og installer avhengighetene:
-
-   ```bash
-   python -m venv .venv
-   source .venv/bin/activate
-   pip install -r requirements.txt
-   ```
-
-2. Sett nødvendige miljøvariabler for Google Cloud (erstatt med dine egne verdier):
-
-   ```bash
-   export GCP_PROJECT_ID="<prosjekt-id>"
-   export GCS_BUCKET_NAME="<bucket>"
-   export KMS_KEY_RING="<keyring>"
-   export KMS_KEY_NAME="<key>"
-   export KMS_LOCATION="<region>"
-   export FIRESTORE_COLLECTION_FILES="print_jobs"
-   export FIRESTORE_COLLECTION_PRINTER_STATUS="printer_telemetry"
-   ```
-
-3. Start utviklingsserveren lokalt:
-
-   ```bash
-   flask --app main run --debug
-   ```
-
-   Serveren lytter som standard på `http://127.0.0.1:5000`.
-
-### Lokal PC-klient
-
-Installer klientavhengigheter (bruk gjerne det samme virtuelle miljøet). På Windows med PowerShell:
-
-```powershell
-Set-Location -Path <prosjektmappe>
-py -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
+```
+FIRESTORE_PROJECT_ID=print-pipe-demo
+# eller
+GCP_PROJECT_ID=print-pipe-demo
+# og ev. lokal autentisering:
+GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account.json
 ```
 
-Klienten kjøres nå utelukkende via kommandolinjen. Følgende PowerShell-eksempler viser hvordan du bruker de viktigste kommandoene:
+API-endepunkter (med fulle URL-er)
+----------------------------------
 
-- **Hente én fil via token**:
+1) POST /control
 
-  ```powershell
-  python -m client.client fetch --baseUrl http://127.0.0.1:5000 --fetchToken <token> --outputDir .\nedlastinger
-  ```
+URL: https://printer-backend-934564650450.europe-west1.run.app/control
+Headers: X-API-Key: <key>
+Body:
 
-- **Lytte etter jobber for en bestemt mottaker** (klienten henter automatisk nye filer for valgt `recipientId`):
+```
+{
+  "recipientId": "…",
+  "printerSerial": "01P00A381200434",
+  "commandType": "heat",
+  "metadata": { "bedTemp": 80 },
+  "expiresAt": "2025-10-15T05:53:28Z"
+}
+```
 
-  ```powershell
-  python -m client.client listen --baseUrl http://127.0.0.1:5000 --recipientId <recipientId> --outputDir .\nedlastinger --pollInterval 30
-  ```
+Effekt: Oppretter dokument i Firestore printer_commands med status="pending".
 
-- **Sende statusoppdateringer**:
+2) POST /products/<productId>/handshake
 
-  ```powershell
-  python -m client.client status --baseUrl http://127.0.0.1:5000 --apiKey <api-nokkel> --printerSerial PRN-001 --interval 60 --numUpdates 5
-  ```
+URL: https://printer-backend-934564650450.europe-west1.run.app/products/<productId>/handshake
+Bruk: Klient for å hente filreferanser/metadata før opplasting/print.
 
-Klienten bruker `listen`-kommandoen til å velge hvilken mottaker den skal overvåke og laster automatisk ned alle filer som er tildelt den valgte mottakeren.
+3) POST /api/apps/<appId>/functions/updatePrinterStatus
 
+URL: https://printer-backend-934564650450.europe-west1.run.app/api/apps/<appId>/functions/updatePrinterStatus
+Bruk: Klient poster snapshots (temperatur, progress, state). Lagres i printer_telemetry.
 
-python -m client.gui
+4) (Valgfritt debug) POST /debug/listPendingCommands
+
+URL: https://printer-backend-934564650450.europe-west1.run.app/debug/listPendingCommands
+Body:
+
+```
+{ "recipientId": "…" }
+```
+
+Bruk: Direkte test av backend-tilgjengelige kommandoer (om Base44 mangler).
+
+Firestore Collections
+---------------------
+
+printer_commands
+
+Felter: recipientId, commandId, commandType, metadata, status, createdAt, (ev. expiresAt, printerSerial, printerIpAddress)
+
+Klientens poller: Leser WHERE recipientId==RID AND status=="pending".
+
+printer_telemetry
+
+Status og målinger postet av klienten.
+
+print_jobs
+
+Opplasting/print-jobb journal (valgfritt, hvis aktivert).
+
+Klienten – hvordan den virker
+-----------------------------
+
+Oppsett
+~~~~~~~
+
+GUI for Recipient ID, IP/Serial for printere, og API-nøkkel.
+
+Start Listening → starter:
+
+- StatusReporter (Base44) – pusher snapshots til API.
+- CommandPoller (Firestore) – henter pending-kommandoer.
+
+CommandPoller (viktig)
+~~~~~~~~~~~~~~~~~~~~~~
+
+Henter fra Firestore (printer_commands) hvert ~5 s.
+
+Logger i Logs:
+
+- control: poll_start (source=firestore)
+- control: poll_ok (count=…)
+- control: incoming_item (commandId, commandType)
+
+Feil: control: firestore_client_error / control: firestore_poll_failed / control: poll_exception
+
+Kan trigge kjeding til executor (valgfritt) – i denne versjonen logger vi først for observabilitet.
+
+Logging (kategorier)
+~~~~~~~~~~~~~~~~~~~~
+
+- listener – fil-/handshake/GUI-operasjoner
+- control – kommando-henting/utførelse
+- status-printer – telemetri/health/MQTT
+- status-base44 – posting til API
+- print-job – opplasting/start/progress/ferdig/feil
+- conn-error – tilkoblingsfeil (default av i GUI-filter)
+
+Eksempelflyt (kommando)
+~~~~~~~~~~~~~~~~~~~~~~~
+
+Tjenesten (eller Base44) kaller
+POST https://printer-backend-934564650450.europe-west1.run.app/control
+med commandType=heat, metadata={"bedTemp":80}, recipientId="RID".
+
+API lager dokument i Firestore printer_commands:
+
+```
+{
+  commandId: "...",
+  recipientId: "RID",
+  commandType: "heat",
+  metadata: { bedTemp: 80 },
+  status: "pending",
+  createdAt: <timestamp>
+}
+```
+
+Klienten (CommandPoller) henter → Logs → control viser:
+
+- poll_start (source=firestore)
+- poll_ok (count=1)
+- incoming_item (commandId="...", commandType="heat")
+
+Feilsøking
+~~~~~~~~~~
+
+Ingen logs i control:
+Bekreft:
+
+- FIRESTORE_PROJECT_ID/GCP_PROJECT_ID er satt i klientens miljø.
+- Tjenestekonto/credentials (lokalt) via GOOGLE_APPLICATION_CREDENTIALS.
+- Dokumenter i printer_commands har riktig recipientId & status="pending".
+- Se etter control: firestore_client_error/firestore_poll_failed.
+
+For mange MQTT-feil i “listener”:
+Kategori-resolver i logbus ruter nå mqtt_client/paho-logger til conn-error.
+
+5) Akseptansekriterier (må oppfylles)
+-------------------------------------
+
+Legg inn dokument i printer_commands (status pending, korrekt recipientId).
+Innen ~5 sek skal GUI vise i Logs → control:
+
+poll_start (source=firestore) → poll_ok (count≥1) → incoming_item.
+
+Uten gyldig Firestore-tilgang skal GUI vise feil i Logs → control (ikke være helt stille).
+
+6) Endringsliste (kode)
+-----------------------
+
+- client/command_poller.py – NY fil ifølge 3.1.
+- client/commands.py – styr Firestore først, eksplisitt logging (3.2).
+- client/gui.py – importer/start/stopp poller + oppdatere recipient (3.3).
+- (README) – erstatt med innholdet i kapittel 4.

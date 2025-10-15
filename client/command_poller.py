@@ -1,10 +1,4 @@
-
-"""Background poller that fetches pending control commands from Firestore and logs them.
-
-It uses client.commands.listPendingCommands which already performs structured logging
-to the 'control' category (poll_start/poll_ok/poll_failed/incoming/...).
-This poller ensures those logs show up in the GUI even before any printer is connected.
-"""
+"""Background poller for Firestore printer commands."""
 
 from __future__ import annotations
 
@@ -17,28 +11,35 @@ from .logbus import log
 
 
 class CommandPoller:
+    """Periodically fetch pending commands for the active recipient."""
+
     def __init__(self, intervalSec: float = 5.0) -> None:
-        self._intervalSec = max(1.0, float(intervalSec))
+        self._intervalSeconds = max(1.0, float(intervalSec))
         self._recipientId: str = ""
         self._thread: Optional[threading.Thread] = None
         self._stopEvent = threading.Event()
 
     def start(self, recipientId: str) -> None:
         self._recipientId = (recipientId or "").strip()
-        self._stopEvent.clear()
         if self._thread and self._thread.is_alive():
-            # Already running; just update recipient
+            log("INFO", "control", "poller_already_running", recipientId=self._recipientId)
             return
+        self._stopEvent.clear()
         self._thread = threading.Thread(target=self._run, name="command-poller", daemon=True)
         self._thread.start()
-        log("INFO", "control", "poller_started", recipientId=self._recipientId, intervalSec=self._intervalSec)
+        log(
+            "INFO",
+            "control",
+            "poller_started",
+            recipientId=self._recipientId,
+            intervalSec=self._intervalSeconds,
+        )
 
     def stop(self) -> None:
         self._stopEvent.set()
-        log("INFO", "control", "poller_stopping")
-        t = self._thread
-        if t and t.is_alive():
-            t.join(timeout=1.0)
+        threadHandle = self._thread
+        if threadHandle and threadHandle.is_alive():
+            threadHandle.join(timeout=1.0)
         self._thread = None
         log("INFO", "control", "poller_stopped")
 
@@ -46,18 +47,16 @@ class CommandPoller:
         self._recipientId = (recipientId or "").strip()
         log("INFO", "control", "poller_recipient_updated", recipientId=self._recipientId)
 
-    # --- internals ---
     def _run(self) -> None:
         while not self._stopEvent.is_set():
-            rid = self._recipientId
-            if rid:
+            currentRecipientId = self._recipientId
+            if currentRecipientId:
                 try:
-                    # The function itself logs poll_start/poll_ok/poll_failed and incoming items
-                    listPendingCommands(rid)
-                except Exception as e:  # noqa: BLE001
-                    log("ERROR", "control", "poll_exception", error=str(e))
-            # Sleep in short steps so stop() is responsive
-            for _ in range(int(self._intervalSec * 10)):
+                    listPendingCommands(currentRecipientId)
+                except Exception as error:  # noqa: BLE001 - logging error but continue loop
+                    log("ERROR", "control", "poll_exception", error=str(error))
+            sleepSlices = int(self._intervalSeconds * 10)
+            for _ in range(max(1, sleepSlices)):
                 if self._stopEvent.is_set():
                     break
                 time.sleep(0.1)
