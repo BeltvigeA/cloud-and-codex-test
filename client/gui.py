@@ -676,6 +676,11 @@ class ListenerGuiApp:
     def _updateListenerRecipient(self, *_args: Any) -> None:
         self.listenerRecipientId = self.recipientVar.get().strip() if hasattr(self, "recipientVar") else ""
         self._updateStatusReporterState()
+        try:
+            if getattr(self, "commandPoller", None):
+                self.commandPoller.setRecipientId(self.listenerRecipientId)
+        except Exception:
+            logging.debug("Command poller recipient update failed", exc_info=True)
 
     def _resolveStatusApiKey(self) -> str:
         return self.listenerStatusApiKey

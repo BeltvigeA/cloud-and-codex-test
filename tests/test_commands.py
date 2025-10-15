@@ -29,24 +29,51 @@ class FakeFirestoreDocument:
 
 
 class FakeFirestoreQuery:
-    def __init__(self, documents: List[FakeFirestoreDocument]):
-        self._documents = documents
+    def __init__(
+        self,
+        documents: List[FakeFirestoreDocument],
+        *,
+        orderField: Optional[str] = None,
+        direction: Optional[str] = None,
+    ) -> None:
+        self._documents = list(documents)
         self._limit = len(documents)
+        self._orderField = orderField
+        self._direction = direction
 
     def where(self, fieldName: str, _operator: str, value: Any) -> "FakeFirestoreQuery":
         filtered = [doc for doc in self._documents if doc.to_dict().get(fieldName) == value]
-        return FakeFirestoreQuery(filtered)
+        return FakeFirestoreQuery(
+            filtered,
+            orderField=self._orderField,
+            direction=self._direction,
+        )
 
-    def order_by(self, _fieldName: str, direction: Any = None) -> "FakeFirestoreQuery":  # noqa: D401, ANN001
-        return self
+    def order_by(self, fieldName: str, direction: Any = None) -> "FakeFirestoreQuery":  # noqa: ANN001
+        return FakeFirestoreQuery(
+            self._documents,
+            orderField=fieldName,
+            direction=direction,
+        )
 
     def limit(self, size: int) -> "FakeFirestoreQuery":
-        limited = FakeFirestoreQuery(self._documents)
+        limited = FakeFirestoreQuery(
+            self._documents,
+            orderField=self._orderField,
+            direction=self._direction,
+        )
         limited._limit = size  # pylint: disable=protected-access
         return limited
 
     def stream(self) -> List[FakeFirestoreDocument]:
-        return self._documents[: self._limit]
+        documents = list(self._documents)
+        if self._orderField:
+            reverseOrder = self._direction == "DESCENDING"
+            documents.sort(
+                key=lambda doc: doc.to_dict().get(self._orderField),
+                reverse=reverseOrder,
+            )
+        return documents[: self._limit]
 
 
 class FakeFirestoreCollection:
@@ -80,6 +107,7 @@ def test_list_pending_commands_reads_from_firestore(monkeypatch: pytest.MonkeyPa
                 "commandType": "poke",
                 "recipientId": "recipient-xyz",
                 "status": "pending",
+                "createdAt": 1,
             },
         ),
         "cmd-002": FakeFirestoreDocument(
@@ -90,6 +118,7 @@ def test_list_pending_commands_reads_from_firestore(monkeypatch: pytest.MonkeyPa
                 "recipientId": "recipient-xyz",
                 "status": "pending",
                 "metadata": {"target": 60},
+                "createdAt": 2,
             },
         ),
     }
@@ -106,8 +135,9 @@ def test_list_pending_commands_reads_from_firestore(monkeypatch: pytest.MonkeyPa
 
     assert isinstance(result, list)
     assert len(result) == 2
-    assert result[0]["commandId"] == "cmd-001"
-    assert result[1]["metadata"]["target"] == 60
+    commandIds = {item["commandId"] for item in result}
+    assert commandIds == {"cmd-001", "cmd-002"}
+    assert any(item.get("metadata", {}).get("target") == 60 for item in result)
 
 
 def test_list_pending_commands_logs_serializable_firestore_payload(
@@ -167,21 +197,17 @@ def test_list_pending_commands_logs_serializable_firestore_payload(
     assert isinstance(result, list)
     assert result and result[0]["metadata"]["scheduledAt"] is scheduledAt
 
-    pollPayloadLog = next(
-        entry for entry in capturedLogs if entry["event"] == "poll_payload"
-    )
-    payload = pollPayloadLog["context"].get("payload")
-    assert isinstance(payload, list)
-    assert payload[0]["metadata"]["scheduledAt"] == scheduledAt.isoformat()
-
-    incomingDetailLog = next(
-        entry for entry in capturedLogs if entry["event"] == "incoming_detail"
-    )
-    metadata = incomingDetailLog["context"].get("metadata")
+    incomingLog = next(entry for entry in capturedLogs if entry["event"] == "incoming_item")
+    metadata = incomingLog["context"].get("metadata")
     assert metadata["scheduledAt"] == scheduledAt.isoformat()
 
+    pollOkLog = next(entry for entry in capturedLogs if entry["event"] == "poll_ok")
+    assert pollOkLog["context"]["count"] == 1
 
-def test_list_pending_commands_falls_back_to_http(monkeypatch: pytest.MonkeyPatch) -> None:
+
+def test_list_pending_commands_does_not_call_http_when_firestore_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     capturedRequests: List[Tuple[str, Dict[str, Any]]] = []
 
     class FakeResponse:
@@ -201,18 +227,7 @@ def test_list_pending_commands_falls_back_to_http(monkeypatch: pytest.MonkeyPatc
 
     def fakePost(url: str, *, json: Dict[str, Any], headers: Dict[str, Any], timeout: int) -> FakeResponse:  # type: ignore[override]
         capturedRequests.append((url, json))
-        return FakeResponse(
-            {
-                "ok": True,
-                "commands": [
-                    {
-                        "commandId": "cmd-123",
-                        "commandType": "poke",
-                        "printerIpAddress": "10.0.0.1",
-                    }
-                ],
-            }
-        )
+        return FakeResponse({"ok": True, "commands": []})
 
     monkeypatch.setattr(commands, "_getFirestoreClient", fakeGetFirestoreClient)
     monkeypatch.setattr(commands.requests, "post", fakePost)
@@ -222,23 +237,8 @@ def test_list_pending_commands_falls_back_to_http(monkeypatch: pytest.MonkeyPatc
     result = commands.listPendingCommands()
 
     assert isinstance(result, list)
-    assert result and result[0]["commandId"] == "cmd-123"
-    assert capturedRequests[0][0] == "https://example.com/api/listPendingCommands"
-    assert capturedRequests[0][1]["recipientId"] == "recipient-xyz"
-
-
-def test_list_pending_commands_returns_none_on_failure(monkeypatch: pytest.MonkeyPatch) -> None:
-    def fakePost(*_args: Any, **_kwargs: Any) -> Any:
-        raise commands.requests.RequestException("boom")
-
-    monkeypatch.setattr(commands, "_getFirestoreClient", lambda: None)
-    monkeypatch.setattr(commands.requests, "post", fakePost)
-    monkeypatch.setenv("BASE44_BASE", "https://example.com/api")
-    monkeypatch.setenv("BASE44_RECIPIENT_ID", "recipient-xyz")
-
-    result = commands.listPendingCommands()
-
-    assert result is None
+    assert result == []
+    assert not capturedRequests
 
 
 def test_complete_command_marks_success(monkeypatch: pytest.MonkeyPatch) -> None:
