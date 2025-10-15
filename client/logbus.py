@@ -64,4 +64,75 @@ def log(level: str, category: str, event: str, message: str = '', **context: Any
     BUS.emit(level, category, event, message, **context)
 
 
-__all__ = ['BUS', 'LogBus', 'LogEvent', 'log']
+class LogBusHandler(logging.Handler):
+    """Bridge standard logging records into the structured log bus."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setLevel(logging.NOTSET)
+        self._exceptionFormatter = logging.Formatter()
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if record.name.startswith(__name__):
+            return
+
+        try:
+            category = self._resolveCategory(record)
+            eventName = self._resolveEventName(record)
+            message = record.getMessage()
+            context = self._buildContext(record)
+            BUS.emit(record.levelname, category, eventName, message, **context)
+        except Exception:  # noqa: BLE001 - logging handlers must not raise
+            self.handleError(record)
+
+    def _resolveCategory(self, record: logging.LogRecord) -> str:
+        parts = [part for part in record.name.split('.') if part]
+        for part in reversed(parts):
+            lowered = part.lower()
+            if lowered in {'commands', 'controls'}:
+                return 'control'
+            if lowered == 'base44status':
+                return 'status-base44'
+            if lowered in {'bambuclient', 'bambuprinter', 'status'}:
+                return 'status-printer'
+        return 'listener'
+
+    def _resolveEventName(self, record: logging.LogRecord) -> str:
+        if record.funcName:
+            return record.funcName
+        if record.name:
+            return record.name.split('.')[-1]
+        return 'log'
+
+    def _buildContext(self, record: logging.LogRecord) -> Dict[str, Any]:
+        context: Dict[str, Any] = {
+            'logger': record.name,
+            'module': record.module,
+            'line': record.lineno,
+        }
+        if record.threadName:
+            context['thread'] = record.threadName
+        if record.processName:
+            context['process'] = record.processName
+        if record.exc_info:
+            context['exception'] = self._exceptionFormatter.formatException(record.exc_info)
+        if record.stack_info:
+            context['stack'] = record.stack_info
+        for key in ('extra', 'data'):
+            if hasattr(record, key):
+                value = getattr(record, key)
+                if isinstance(value, dict):
+                    for extraKey, extraValue in value.items():
+                        context.setdefault(extraKey, extraValue)
+        return context
+
+
+def installLogBusHandler() -> None:
+    rootLogger = logging.getLogger()
+    for handler in rootLogger.handlers:
+        if isinstance(handler, LogBusHandler):
+            return
+    rootLogger.addHandler(LogBusHandler())
+
+
+__all__ = ['BUS', 'LogBus', 'LogEvent', 'LogBusHandler', 'installLogBusHandler', 'log']
