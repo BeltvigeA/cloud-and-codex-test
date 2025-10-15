@@ -34,6 +34,7 @@ except ImportError:  # pragma: no cover - handled gracefully by callers
 
 import requests
 
+from .logbus import log
 from .logutil import rateLimit
 
 
@@ -90,8 +91,10 @@ def ensurePrinterPortsReachable(ip: str, *, timeoutSeconds: float = 3.0) -> None
     """Validate that the critical FTPS and MQTT ports are reachable."""
 
     if not portOpen(ip, 990, timeoutSeconds=timeoutSeconds):
+        log("ERROR", "conn-error", "ftps_unreachable", ip=ip, port=990)
         raise RuntimeError(f"FTPS (990) utilgjengelig mot {ip}")
     if not portOpen(ip, 8883, timeoutSeconds=timeoutSeconds):
+        log("ERROR", "conn-error", "mqtt_unreachable", ip=ip, port=8883)
         raise RuntimeError(f"MQTT (8883) utilgjengelig mot {ip}")
 
 
@@ -370,6 +373,8 @@ def uploadViaFtps(
     insecureTls: bool = True,
     timeout: int = 120,
     dataStream: Optional[BinaryIO] = None,
+    serial: Optional[str] = None,
+    jobId: Optional[str] = None,
 ) -> str:
     """Upload a file to the printer SD card using FTPS."""
 
@@ -381,6 +386,12 @@ def uploadViaFtps(
     except (OSError, socket.timeout, ssl.SSLError, EOFError) as connectionError:
         errorMessage = f"Failed to connect to Bambu printer FTPS endpoint {ip}:{port}: {connectionError}"
         logger.error(errorMessage)
+        context: Dict[str, Any] = {"ip": ip, "port": port}
+        if serial:
+            context["serial"] = serial
+        if jobId:
+            context["jobId"] = jobId
+        log("ERROR", "conn-error", "ftps_connect_failed", error=str(connectionError), **context)
         raise RuntimeError(errorMessage) from connectionError
     ftps.timeout = timeout
     try:
@@ -934,6 +945,7 @@ def startViaBambuapiAfterUpload(
     ip: str,
     accessCode: str,
     serial: str,
+    jobId: Optional[str] = None,
 ) -> bool:
     """Start a print using the official bambulabs_api MQTT session."""
 
@@ -957,6 +969,10 @@ def startViaBambuapiAfterUpload(
         bool(useAms),
     )
 
+    logContext: Dict[str, Any] = {"ip": ip, "serial": serial, "file": remoteName}
+    if jobId:
+        logContext["jobId"] = jobId
+
     fallbackEnabled = os.getenv("RAW_MQTT_FALLBACK") == "1"
 
     try:
@@ -967,12 +983,14 @@ def startViaBambuapiAfterUpload(
             expectedSerial=serial,
         )
         logger.info("Startkommando sendt via bambulabs_api")
+        log("INFO", "print-job", "start_sent", **logContext)
     except Exception as startError:
         if not useAms and fallbackEnabled:
             logger.warning(
                 "Start via bambulabs_api feilet (%s). Faller tilbake til rå MQTT-spool.",
                 startError,
             )
+            log("WARNING", "print-job", "start_fallback", reason=str(startError), **logContext)
             publishSpoolStart(
                 printer=printer,
                 ip=ip,
@@ -981,12 +999,17 @@ def startViaBambuapiAfterUpload(
                 uploadName=remoteName,
                 paramPathOrPlate=startArgument,
             )
+            log("INFO", "print-job", "start_sent", **logContext)
         else:
+            log("ERROR", "print-job", "start_failed", error=str(startError), **logContext)
             raise
 
     started = waitForStartAck(printer)
     if not started:
         ensureMqttConnected(printer)
+        log("WARNING", "print-job", "start_ack_timeout", **logContext)
+    else:
+        log("INFO", "print-job", "start_ack", **logContext)
     return started
 
 
@@ -1140,8 +1163,26 @@ def startPrintViaMqtt(
     sendStartCommand: bool = True,
     initialStatus: Optional[Dict[str, Any]] = None,
     statusCallback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    jobId: Optional[str] = None,
 ) -> None:
     """Start a print job via MQTT and stream status messages."""
+
+    logContext: Dict[str, Any] = {"ip": ip, "serial": serial, "file": sdFileName}
+    if jobId:
+        logContext["jobId"] = jobId
+    if paramPath:
+        logContext["param"] = paramPath
+
+    def logPrintJob(level: str, eventName: str, **extra: Any) -> None:
+        context = dict(logContext)
+        for key, value in extra.items():
+            if value is not None:
+                context[key] = value
+        log(level, "print-job", eventName, **context)
+
+    startedLogged = False
+    completedLogged = False
+    lastProgressLogged = -5
 
     if mqtt is None:  # pragma: no cover - exercised when dependency missing
         raise RuntimeError("paho-mqtt is required for MQTT print control")
@@ -1156,20 +1197,50 @@ def startPrintViaMqtt(
     hmsWarningIssued = False
 
     def emitStatus(payload: Dict[str, Any]) -> None:
-        if not statusCallback:
-            return
-        try:
-            statusCallback(dict(payload))
-        except Exception:  # pragma: no cover - callback exceptions should not stop MQTT loop
-            logger.exception("Status callback failed for MQTT payload")
+        nonlocal startedLogged, completedLogged
+
+        statusValue = str(payload.get("status") or "").strip().lower() if payload else ""
+        if statusValue in {"starting", "start", "started"} and not startedLogged:
+            logPrintJob("INFO", "started")
+            startedLogged = True
+        elif statusValue in {"completed", "finished", "success"} and not completedLogged:
+            logPrintJob("INFO", "completed")
+            completedLogged = True
+        elif statusValue in {"error", "failed", "fault", "alarm"}:
+            logPrintJob("ERROR", "failed", reason=payload.get("error") or payload.get("message"))
+
+        if statusCallback:
+            try:
+                statusCallback(dict(payload))
+            except Exception:  # pragma: no cover - callback exceptions should not stop MQTT loop
+                logger.exception("Status callback failed for MQTT payload")
 
     def handleProgress(statusPayload: Dict[str, Any]) -> None:
-        nonlocal lastStatus
+        nonlocal lastStatus, lastProgressLogged, completedLogged
         trackedKeys = ("mc_percent", "gcode_state", "mc_remaining_time", "nozzle_temper", "bed_temper")
         snapshot = {key: statusPayload.get(key) for key in trackedKeys if statusPayload.get(key) is not None}
         if not snapshot or snapshot == lastStatus:
             return
         lastStatus = snapshot
+
+        progressCandidate = snapshot.get("mc_percent")
+        progressInt: Optional[int] = None
+        if progressCandidate is not None:
+            try:
+                progressFloat = float(progressCandidate)
+                progressInt = int(max(0, min(100, round(progressFloat))))
+            except (TypeError, ValueError):
+                progressInt = None
+        if progressInt is not None:
+            if progressInt == 100 and not completedLogged:
+                lastProgressLogged = progressInt
+                logPrintJob("INFO", "progress", progress=progressInt)
+                logPrintJob("INFO", "completed")
+                completedLogged = True
+            elif progressInt - lastProgressLogged >= 5:
+                lastProgressLogged = progressInt
+                logPrintJob("INFO", "progress", progress=progressInt)
+
         emitStatus({"status": "progress", **snapshot})
 
     def onConnect(client: mqtt.Client, *args, **_kwargs):  # type: ignore[no-redef]
@@ -1257,6 +1328,9 @@ def startPrintViaMqtt(
             f"{connectionProblem}"
         )
         logger.error(errorMessage)
+        logPrintJob("ERROR", "start_failed", error=str(connectionProblem))
+        connContext: Dict[str, Any] = {"ip": ip, "serial": serial, "jobId": jobId}
+        log("ERROR", "conn-error", "mqtt_connect_failed", error=str(connectionProblem), **{k: v for k, v in connContext.items() if v is not None})
         raise RuntimeError(errorMessage) from connectionProblem
 
     client.loop_start()
@@ -1264,11 +1338,30 @@ def startPrintViaMqtt(
     if not connectionReady.wait(timeout=10):
         client.loop_stop()
         client.disconnect()
+        logPrintJob("ERROR", "start_failed", error="mqtt_connect_timeout")
+        log(
+            "ERROR",
+            "conn-error",
+            "mqtt_connect_timeout",
+            ip=ip,
+            serial=serial,
+            jobId=jobId,
+        )
         raise RuntimeError(f"Timed out waiting for MQTT connection to {serial}")
 
     if connectionError:
         client.loop_stop()
         client.disconnect()
+        logPrintJob("ERROR", "start_failed", error=connectionError)
+        log(
+            "ERROR",
+            "conn-error",
+            "mqtt_connect_failed",
+            ip=ip,
+            serial=serial,
+            jobId=jobId,
+            error=connectionError,
+        )
         raise RuntimeError(connectionError)
 
     url = f"file:///sdcard/{sdFileName}"
@@ -1316,6 +1409,7 @@ def startPrintViaMqtt(
         )
         client.publish(topicRequest, json.dumps(payload), qos=1)
         logger.info("Startkommando sendt")
+        logPrintJob("INFO", "start_sent")
     else:
         logger.info("Monitoring MQTT status etter API-start")
 
@@ -2014,6 +2108,25 @@ def buildPrinterTransferFileName(localPath: Path) -> str:
     return normalizeRemoteFileName(trimmedName)
 
 
+def extractJobIdentifier(*sources: Optional[Dict[str, Any]]) -> Optional[str]:
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        for key in ("jobId", "printJobId", "currentJobId"):
+            value = source.get(key)
+            if value is None:
+                continue
+            if isinstance(value, str):
+                candidate = value.strip()
+                if candidate:
+                    return candidate
+            else:
+                text = str(value).strip()
+                if text:
+                    return text
+    return None
+
+
 def _normalizeString(value: Any) -> Optional[str]:
     if value is None:
         return None
@@ -2194,6 +2307,24 @@ def sendBambuPrintJob(
         forceSpool=not bool(options.useAms),
     )
 
+    jobIdValue = extractJobIdentifier(jobMetadata, statusConfig)
+    baseLogContext: Dict[str, Any] = {
+        "jobId": jobIdValue,
+        "serial": options.serialNumber,
+        "ip": options.ipAddress,
+        "file": str(resolvedPath),
+        "remote": remoteName,
+    }
+    if plateIndex is not None:
+        baseLogContext["plate"] = plateIndex
+
+    def logPrintJob(level: str, eventName: str, **extra: Any) -> None:
+        context = {key: value for key, value in baseLogContext.items() if value not in (None, "")}
+        for key, value in extra.items():
+            if value not in (None, ""):
+                context[key] = value
+        log(level, "print-job", eventName, **context)
+
     printerSession: PrinterSession | None = None
     if bambulabsApi is not None:
         try:
@@ -2260,24 +2391,37 @@ def sendBambuPrintJob(
                 secureConnection=options.secureConnection,
                 localPath=workingPath,
             )
-            response = sendPrintJobViaCloud(options.cloudUrl, payload, timeoutSeconds=options.cloudTimeout)
+            logPrintJob("INFO", "upload_start", method="cloud")
+            try:
+                response = sendPrintJobViaCloud(options.cloudUrl, payload, timeoutSeconds=options.cloudTimeout)
+            except Exception as cloudError:
+                logPrintJob("ERROR", "upload_failed", method="cloud", error=str(cloudError))
+                raise
+            logPrintJob("INFO", "upload_ok", method="cloud")
             if statusCallback:
                 statusCallback({"status": "cloudAccepted", "response": response})
             return {"method": "cloud", "remoteFile": remoteName, "paramPath": paramPath, "response": response}
 
         def uploadAndStartViaBambuApi() -> str:
+            logPrintJob("INFO", "upload_start")
             initialStatusPayload: Optional[Dict[str, Any]] = None
             if printerSession is None:
-                uploadSession = uploadViaBambulabsApi(
-                    ip=options.ipAddress,
-                    serial=options.serialNumber,
-                    accessCode=options.accessCode,
-                    localPath=workingPath,
-                    remoteName=remoteName,
-                    returnPrinter=True,
-                )
+                try:
+                    uploadSession = uploadViaBambulabsApi(
+                        ip=options.ipAddress,
+                        serial=options.serialNumber,
+                        accessCode=options.accessCode,
+                        localPath=workingPath,
+                        remoteName=remoteName,
+                        returnPrinter=True,
+                    )
+                except Exception as uploadError:
+                    logPrintJob("ERROR", "upload_failed", error=str(uploadError))
+                    raise
                 try:
                     uploaded = uploadSession.remoteName
+                    baseLogContext["remote"] = uploaded
+                    logPrintJob("INFO", "upload_ok", remote=uploaded)
                     if statusCallback:
                         statusCallback(
                             {
@@ -2308,34 +2452,45 @@ def sendBambuPrintJob(
                         ip=options.ipAddress,
                         accessCode=options.accessCode,
                         serial=options.serialNumber,
+                        jobId=jobIdValue,
                     )
                 finally:
                     uploadSession.close()
             else:
                 with printerSession.lock:
                     try:
-                        uploadSession = uploadViaBambulabsApi(
-                            ip=options.ipAddress,
-                            serial=options.serialNumber,
-                            accessCode=options.accessCode,
-                            localPath=workingPath,
-                            remoteName=remoteName,
-                            returnPrinter=True,
-                            session=printerSession,
-                        )
+                        try:
+                            uploadSession = uploadViaBambulabsApi(
+                                ip=options.ipAddress,
+                                serial=options.serialNumber,
+                                accessCode=options.accessCode,
+                                localPath=workingPath,
+                                remoteName=remoteName,
+                                returnPrinter=True,
+                                session=printerSession,
+                            )
+                        except Exception as uploadError:
+                            logPrintJob("ERROR", "upload_failed", error=str(uploadError))
+                            raise
                     except TypeError as uploadError:
                         if "session" not in str(uploadError):
                             raise
-                        uploadSession = uploadViaBambulabsApi(
-                            ip=options.ipAddress,
-                            serial=options.serialNumber,
-                            accessCode=options.accessCode,
-                            localPath=workingPath,
-                            remoteName=remoteName,
-                            returnPrinter=True,
-                        )
+                        try:
+                            uploadSession = uploadViaBambulabsApi(
+                                ip=options.ipAddress,
+                                serial=options.serialNumber,
+                                accessCode=options.accessCode,
+                                localPath=workingPath,
+                                remoteName=remoteName,
+                                returnPrinter=True,
+                            )
+                        except Exception as uploadRetryError:
+                            logPrintJob("ERROR", "upload_failed", error=str(uploadRetryError))
+                            raise
                     try:
                         uploaded = uploadSession.remoteName
+                        baseLogContext["remote"] = uploaded
+                        logPrintJob("INFO", "upload_ok", remote=uploaded)
                         if statusCallback:
                             statusCallback(
                                 {
@@ -2374,6 +2529,7 @@ def sendBambuPrintJob(
                             ip=options.ipAddress,
                             accessCode=options.accessCode,
                             serial=options.serialNumber,
+                            jobId=jobIdValue,
                         )
                     except Exception:
                         resetPrinterSession(printerSession)
@@ -2397,10 +2553,15 @@ def sendBambuPrintJob(
                 sendStartCommand=False,
                 initialStatus=initialStatusPayload,
                 statusCallback=statusCallback,
+                jobId=jobIdValue,
             )
             return uploaded
 
-        uploadedName = uploadAndStartViaBambuApi()
+        try:
+            uploadedName = uploadAndStartViaBambuApi()
+        except Exception as jobError:
+            logPrintJob("ERROR", "failed", error=str(jobError))
+            raise
         return {
             "method": "lan",
             "remoteFile": uploadedName,
