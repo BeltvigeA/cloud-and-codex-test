@@ -386,7 +386,6 @@ def listPendingCommands(
         "Mottok kontrollpayload",
         recipientId=resolvedRecipientId,
         url=url,
-        source="http",
         status=response.status_code,
         payload=data,
     )
@@ -433,7 +432,6 @@ def listPendingCommands(
                 commandType=str(command.get("commandType")),
                 metadata=command.get("metadata"),
                 rawCommand=command,
-                source="http",
             )
     return [command for command in commands if isinstance(command, dict)]
 
