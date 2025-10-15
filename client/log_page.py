@@ -17,6 +17,8 @@ class LogsPage(ttk.Frame):
         super().__init__(parent)
         self._categoryVariables: Dict[str, tk.BooleanVar] = {}
         self._itemEvents: Dict[str, LogEvent] = {}
+        self._selectedEvent: LogEvent | None = None
+        self._selectedEventKey: tuple | None = None
 
         self.toolbar = ttk.Frame(self)
         self.toolbar.pack(fill=tk.X)
@@ -71,6 +73,7 @@ class LogsPage(ttk.Frame):
             self._tree.column(column, width=width, anchor=tk.W)
         self._tree.pack(fill=tk.BOTH, expand=True)
         self._tree.bind("<Double-1>", self._openDetails)
+        self._tree.bind("<<TreeviewSelect>>", self._handleSelect)
 
         self.after(500, self.refresh)
 
@@ -95,12 +98,20 @@ class LogsPage(ttk.Frame):
         return rows
 
     def refresh(self) -> None:
+        selection = self._tree.selection()
+        if selection:
+            previousItemId = selection[0]
+            previousEvent = self._itemEvents.get(previousItemId)
+            if previousEvent:
+                self._setSelectedEvent(previousEvent)
+
         rows = self._filteredRows()
         self._itemEvents.clear()
 
         for item in self._tree.get_children():
             self._tree.delete(item)
 
+        matchedItemId = None
         for event in rows:
             timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(event.ts))
             contextText = json.dumps(event.ctx, ensure_ascii=False)
@@ -108,15 +119,28 @@ class LogsPage(ttk.Frame):
             values = (timestamp, event.level, event.category, event.event, f"{message} {contextText}".strip())
             itemId = self._tree.insert("", "end", values=values)
             self._itemEvents[itemId] = event
+            if matchedItemId is None and self._selectedEventMatches(event):
+                matchedItemId = itemId
+                self._setSelectedEvent(event)
+
+        if matchedItemId is not None:
+            self._tree.selection_set(matchedItemId)
+            self._tree.see(matchedItemId)
+        else:
+            self._setSelectedEvent(None)
 
         self.after(1000, self.refresh)
 
     def _openDetails(self, _event: tk.Event[tk.Misc]) -> None:
-        selection = self._tree.selection()
-        if not selection:
-            return
-        itemId = selection[0]
-        event = self._itemEvents.get(itemId)
+        event = self._selectedEvent
+        if event is None:
+            selection = self._tree.selection()
+            if not selection:
+                return
+            itemId = selection[0]
+            event = self._itemEvents.get(itemId)
+            if event:
+                self._setSelectedEvent(event)
         if not event:
             return
         showJsonViewer(
@@ -170,6 +194,40 @@ class LogsPage(ttk.Frame):
         children = self._tree.get_children()
         if children:
             self._tree.see(children[-1])
+
+    def _handleSelect(self, _event: tk.Event[tk.Misc]) -> None:
+        selection = self._tree.selection()
+        if not selection:
+            self._setSelectedEvent(None)
+            return
+        itemId = selection[0]
+        event = self._itemEvents.get(itemId)
+        self._setSelectedEvent(event)
+
+    def _setSelectedEvent(self, event: LogEvent | None) -> None:
+        self._selectedEvent = event
+        self._selectedEventKey = self._eventKey(event) if event else None
+
+    def _selectedEventMatches(self, event: LogEvent) -> bool:
+        if self._selectedEvent is event:
+            return True
+        if self._selectedEventKey is None:
+            return False
+        return self._eventKey(event) == self._selectedEventKey
+
+    def _eventKey(self, event: LogEvent | None) -> tuple | None:
+        if event is None:
+            return None
+        contextText = json.dumps(event.ctx, ensure_ascii=False, sort_keys=True)
+        message = event.message or ""
+        return (
+            event.ts,
+            event.level,
+            event.category,
+            event.event,
+            message,
+            contextText,
+        )
 
     def _setStatusMessage(self, message: str, duration: int = 2000) -> None:
         if self._statusClearJobId is not None:
