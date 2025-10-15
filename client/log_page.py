@@ -18,28 +18,28 @@ class LogsPage(ttk.Frame):
         self._categoryVariables: Dict[str, tk.BooleanVar] = {}
         self._itemEvents: Dict[str, LogEvent] = {}
 
-        toolbar = ttk.Frame(self)
-        toolbar.pack(fill=tk.X)
+        self.toolbar = ttk.Frame(self)
+        self.toolbar.pack(fill=tk.X)
 
         for category in CATEGORIES:
             defaultValue = category != "conn-error"
             variable = tk.BooleanVar(value=defaultValue)
             self._categoryVariables[category] = variable
             ttk.Checkbutton(
-                toolbar,
+                self.toolbar,
                 text=category,
                 variable=variable,
                 command=self.refresh,
             ).pack(side=tk.LEFT, padx=4)
 
         self._searchValue = tk.StringVar()
-        ttk.Entry(toolbar, textvariable=self._searchValue, width=28).pack(side=tk.RIGHT, padx=6)
-        ttk.Label(toolbar, text="Search").pack(side=tk.RIGHT)
+        ttk.Entry(self.toolbar, textvariable=self._searchValue, width=28).pack(side=tk.RIGHT, padx=6)
+        ttk.Label(self.toolbar, text="Search").pack(side=tk.RIGHT)
 
-        self._scrollButton = ttk.Button(toolbar, text="Scroll to bottom", command=self._scrollToBottom)
+        self._scrollButton = ttk.Button(self.toolbar, text="Scroll to bottom", command=self._scrollToBottom)
         self._scrollButton.pack(side=tk.RIGHT, padx=4)
 
-        self._clearButton = ttk.Button(toolbar, text="Clear", command=self._handleClear)
+        self._clearButton = ttk.Button(self.toolbar, text="Clear", command=self._handleClear)
         self._clearButton.pack(side=tk.RIGHT, padx=4)
 
         self._tree = ttk.Treeview(
