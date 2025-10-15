@@ -44,12 +44,19 @@ class LogsPage(ttk.Frame):
         self._clearButton = ttk.Button(self.toolbar, text="Clear", command=self._handleClear)
         self._clearButton.pack(side=tk.RIGHT, padx=4)
 
-        self._copyLogButton = ttk.Button(
+        self.copyAllLogsButton = ttk.Button(
             self.toolbar,
-            text="Copy log",
-            command=self._copyLogToClipboard,
+            text="Copy all logs",
+            command=self.copyAllLogsToClipboard,
         )
-        self._copyLogButton.pack(side=tk.RIGHT, padx=4, before=self._clearButton)
+        self.copyAllLogsButton.pack(side=tk.RIGHT, padx=4, before=self._clearButton)
+
+        self.copySelectedLogButton = ttk.Button(
+            self.toolbar,
+            text="Copy selected log",
+            command=self.copySelectedLogToClipboard,
+        )
+        self.copySelectedLogButton.pack(side=tk.RIGHT, padx=4, before=self.copyAllLogsButton)
 
         self._statusMessage = tk.StringVar(value="")
         self._statusLabel = ttk.Label(self, textvariable=self._statusMessage, anchor=tk.W)
@@ -162,7 +169,7 @@ class LogsPage(ttk.Frame):
                 BUS.clear(category=category)
         self.refresh()
 
-    def _copyLogToClipboard(self) -> None:
+    def copyAllLogsToClipboard(self) -> None:
         rows = self._filteredRows()
         if not rows:
             self._setStatusMessage("No log entries to copy")
@@ -181,14 +188,40 @@ class LogsPage(ttk.Frame):
             lines.append(json.dumps(eventPayload, ensure_ascii=False))
 
         fullText = "\n".join(lines)
-        try:
-            self.clipboard_clear()
-            self.clipboard_append(fullText)
-        except tk.TclError:
-            self._setStatusMessage("Unable to access clipboard")
+        if not self._copyTextToClipboard(fullText):
             return
 
         self._setStatusMessage(f"Copied {len(rows)} log entries")
+
+    def copySelectedLogToClipboard(self) -> None:
+        event = self._selectedEvent
+        if event is None:
+            self._setStatusMessage("No log entry selected")
+            return
+
+        eventPayload = {
+            "ts": event.ts,
+            "level": event.level,
+            "category": event.category,
+            "event": event.event,
+            "message": event.message,
+            "ctx": event.ctx,
+        }
+        fullText = json.dumps(eventPayload, ensure_ascii=False)
+        if not self._copyTextToClipboard(fullText):
+            return
+
+        self._setStatusMessage("Copied selected log entry")
+
+    def _copyTextToClipboard(self, text: str) -> bool:
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(text)
+        except tk.TclError:
+            self._setStatusMessage("Unable to access clipboard")
+            return False
+
+        return True
 
     def _scrollToBottom(self) -> None:
         children = self._tree.get_children()
