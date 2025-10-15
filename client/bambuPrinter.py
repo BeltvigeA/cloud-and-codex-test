@@ -1862,6 +1862,7 @@ def startStatusHeartbeat(
                                 "Printer Values Not Available Yet",
                                 level="warning",
                                 category="conn-error",
+                                event="values_not_ready",
                             )
                     else:
                         snapshotCandidate = {}
@@ -1871,6 +1872,7 @@ def startStatusHeartbeat(
                         "MQTT ikke klar – hopper over lesing",
                         level="warning",
                         category="conn-error",
+                        event="mqtt_not_ready",
                     )
 
                 hasFreshSnapshot = bool(lastSnapshot) and (
