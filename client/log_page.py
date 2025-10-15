@@ -6,37 +6,61 @@ import json
 import time
 import tkinter as tk
 from tkinter import ttk
-from typing import Dict, List
+from dataclasses import dataclass, field
+from typing import Callable, Dict, Iterable, List, Sequence
 
 from .json_viewer import showJsonViewer
 from .logbus import BUS, CATEGORIES, LogEvent
 
 
+@dataclass(frozen=True)
+class LogsPageConfig:
+    """Configuration helper for tailoring the :class:`LogsPage` widget."""
+
+    allowedCategories: Sequence[str] | None = None
+    showCategoryFilters: bool = True
+    defaultCategoryState: Dict[str, bool] = field(default_factory=dict)
+    description: str | None = None
+    placeholderEvents: Sequence[Dict[str, object]] = ()
+    requireContent: bool = False
+    levelFilter: Callable[[LogEvent], bool] | None = None
+    searchLabel: str = "Search"
+
+
 class LogsPage(ttk.Frame):
-    def __init__(self, parent: tk.Misc):
+    def __init__(self, parent: tk.Misc, config: LogsPageConfig | None = None):
         super().__init__(parent)
+        self._config = config or LogsPageConfig()
         self._categoryVariables: Dict[str, tk.BooleanVar] = {}
         self._itemEvents: Dict[str, LogEvent] = {}
         self._selectedEvent: LogEvent | None = None
         self._selectedEventKey: tuple | None = None
+        self._allowedCategories = self._resolveAllowedCategories()
+        self._placeholderEvents = list(self._config.placeholderEvents)
 
         self.toolbar = ttk.Frame(self)
         self.toolbar.pack(fill=tk.X)
 
-        for category in CATEGORIES:
-            defaultValue = category != "conn-error"
-            variable = tk.BooleanVar(value=defaultValue)
-            self._categoryVariables[category] = variable
-            ttk.Checkbutton(
-                self.toolbar,
-                text=category,
-                variable=variable,
-                command=self.refresh,
-            ).pack(side=tk.LEFT, padx=4)
+        resolvedCategories = list(self._allowedCategories or CATEGORIES)
+        if self._config.showCategoryFilters:
+            for category in resolvedCategories:
+                defaultValue = self._resolveDefaultCategoryState(category)
+                variable = tk.BooleanVar(value=defaultValue)
+                self._categoryVariables[category] = variable
+                ttk.Checkbutton(
+                    self.toolbar,
+                    text=category,
+                    variable=variable,
+                    command=self.refresh,
+                ).pack(side=tk.LEFT, padx=4)
+        else:
+            for category in resolvedCategories:
+                defaultValue = self._resolveDefaultCategoryState(category)
+                self._categoryVariables[category] = tk.BooleanVar(value=defaultValue)
 
         self._searchValue = tk.StringVar()
         ttk.Entry(self.toolbar, textvariable=self._searchValue, width=28).pack(side=tk.RIGHT, padx=6)
-        ttk.Label(self.toolbar, text="Search").pack(side=tk.RIGHT)
+        ttk.Label(self.toolbar, text=self._config.searchLabel or "Search").pack(side=tk.RIGHT)
 
         self._scrollButton = ttk.Button(self.toolbar, text="Scroll to bottom", command=self._scrollToBottom)
         self._scrollButton.pack(side=tk.RIGHT, padx=4)
@@ -58,9 +82,17 @@ class LogsPage(ttk.Frame):
         )
         self.copySelectedLogButton.pack(side=tk.RIGHT, padx=4, before=self.copyAllLogsButton)
 
+        descriptionText = (self._config.description or "").strip()
+        if descriptionText:
+            self._descriptionLabel = ttk.Label(self, text=descriptionText, anchor=tk.W, wraplength=900)
+            self._descriptionLabel.pack(fill=tk.X, padx=4, pady=(4, 0))
+        else:
+            self._descriptionLabel = None
+
         self._statusMessage = tk.StringVar(value="")
         self._statusLabel = ttk.Label(self, textvariable=self._statusMessage, anchor=tk.W)
-        self._statusLabel.pack(fill=tk.X, padx=4, pady=(4, 0))
+        statusPadding = (0, 0) if descriptionText else (4, 0)
+        self._statusLabel.pack(fill=tk.X, padx=4, pady=statusPadding)
         self._statusClearJobId: str | None = None
 
         self._tree = ttk.Treeview(
@@ -91,10 +123,17 @@ class LogsPage(ttk.Frame):
             for category, variable in self._categoryVariables.items()
             if variable.get()
         }
+        allowedCategories = set(self._allowedCategories or CATEGORIES)
         events = BUS.snapshot()[-2000:]
         rows: List[LogEvent] = []
         for event in events:
+            if allowedCategories and event.category not in allowedCategories:
+                continue
             if enabledCategories and event.category not in enabledCategories:
+                continue
+            if self._config.levelFilter and not self._config.levelFilter(event):
+                continue
+            if self._config.requireContent and not (event.message or event.ctx):
                 continue
             if searchFilter:
                 contextText = json.dumps(event.ctx, ensure_ascii=False)
@@ -102,6 +141,22 @@ class LogsPage(ttk.Frame):
                 if searchFilter not in combined:
                     continue
             rows.append(event)
+        if not rows and self._placeholderEvents:
+            placeholderRows = []
+            baseTimestamp = time.time()
+            for index, placeholder in enumerate(self._placeholderEvents):
+                placeholderEvent = self._buildPlaceholderEvent(placeholder, baseTimestamp + index)
+                if placeholderEvent is None:
+                    continue
+                if enabledCategories and placeholderEvent.category not in enabledCategories:
+                    continue
+                if searchFilter:
+                    contextText = json.dumps(placeholderEvent.ctx, ensure_ascii=False)
+                    combined = f"{placeholderEvent.message} {contextText}".lower()
+                    if searchFilter not in combined:
+                        continue
+                placeholderRows.append(placeholderEvent)
+            rows = placeholderRows
         return rows
 
     def refresh(self) -> None:
@@ -276,5 +331,35 @@ class LogsPage(ttk.Frame):
         self._statusMessage.set("")
         self._statusClearJobId = None
 
+    def _resolveAllowedCategories(self) -> Iterable[str]:
+        if self._config.allowedCategories:
+            categories: List[str] = []
+            for category in self._config.allowedCategories:
+                if category not in categories:
+                    categories.append(category)
+            return categories
+        return list(CATEGORIES)
 
-__all__ = ["LogsPage"]
+    def _resolveDefaultCategoryState(self, category: str) -> bool:
+        if category in self._config.defaultCategoryState:
+            return bool(self._config.defaultCategoryState[category])
+        return category != "conn-error"
+
+    def _buildPlaceholderEvent(
+        self, placeholder: Dict[str, object], timestamp: float
+    ) -> LogEvent | None:
+        category = str(placeholder.get("category") or "").strip()
+        if not category:
+            return None
+        level = str(placeholder.get("level") or "INFO").upper()
+        eventName = str(placeholder.get("event") or "placeholder")
+        message = str(placeholder.get("message") or "")
+        contextValue = placeholder.get("ctx")
+        if isinstance(contextValue, dict):
+            context = contextValue
+        else:
+            context = {}
+        return LogEvent(timestamp, level, category, eventName, message, context)
+
+
+__all__ = ["LogsPage", "LogsPageConfig"]
