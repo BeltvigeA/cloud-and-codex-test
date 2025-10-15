@@ -6,12 +6,30 @@ import json
 import logging
 import os
 import time
-from typing import Any, Dict, List, Optional
+from copy import deepcopy
+from datetime import date, datetime
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
 from google.api_core import exceptions as googleApiExceptions
 from google.cloud import firestore
+
+try:  # pragma: no cover - optional dependency availability varies in tests
+    from google.cloud.firestore_v1 import _helpers as firestoreHelpers  # type: ignore[attr-defined]
+except ImportError:  # pragma: no cover - fallback when Firestore helpers missing
+    firestoreHelpers = None  # type: ignore[assignment]
+
+
+_FIRESTORE_TIMESTAMP_TYPES: Tuple[type, ...] = ()
+if firestoreHelpers is not None:
+    timestampTypes = []
+    for helperName in ("Timestamp", "DatetimeWithNanoseconds"):
+        helperType = getattr(firestoreHelpers, helperName, None)
+        if helperType is not None:
+            timestampTypes.append(helperType)
+    _FIRESTORE_TIMESTAMP_TYPES = tuple(timestampTypes)
+
 
 from .base44 import getBaseUrl
 from .logbus import log
@@ -124,6 +142,39 @@ def _getFirestoreLimit() -> int:
     return limitSize
 
 
+def _sanitizeLogValue(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {key: _sanitizeLogValue(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_sanitizeLogValue(item) for item in value]
+    if isinstance(value, tuple):
+        return [_sanitizeLogValue(item) for item in value]
+    if isinstance(value, set):
+        return [_sanitizeLogValue(item) for item in value]
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if _FIRESTORE_TIMESTAMP_TYPES and isinstance(value, _FIRESTORE_TIMESTAMP_TYPES):
+        if hasattr(value, "isoformat"):
+            try:
+                return value.isoformat()  # type: ignore[no-any-return]
+            except TypeError:
+                pass
+        if hasattr(value, "to_datetime"):
+            converted = value.to_datetime()  # type: ignore[call-arg]
+            if isinstance(converted, (datetime, date)):
+                return converted.isoformat()
+    return value
+
+
+def _makeLoggableCommand(command: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(command, dict):
+        return {}
+    sanitizedCommand = deepcopy(command)
+    for key, value in sanitizedCommand.items():
+        sanitizedCommand[key] = _sanitizeLogValue(value)
+    return sanitizedCommand
+
+
 def _listPendingCommandsFromFirestore(recipientId: str) -> Optional[List[Dict[str, Any]]]:
     firestoreClient = _getFirestoreClient()
     if firestoreClient is None:
@@ -196,7 +247,7 @@ def _listPendingCommandsFromFirestore(recipientId: str) -> Optional[List[Dict[st
         source="firestore",
         collection=collectionName,
         count=len(commands),
-        payload=commands,
+        payload=[_makeLoggableCommand(command) for command in commands],
     )
 
     log(
@@ -218,8 +269,8 @@ def _listPendingCommandsFromFirestore(recipientId: str) -> Optional[List[Dict[st
             "Firestore-kontrollkommando mottatt",
             commandId=str(command.get("commandId")),
             commandType=str(command.get("commandType")),
-            metadata=command.get("metadata"),
-            rawCommand=command,
+            metadata=_sanitizeLogValue(command.get("metadata")),
+            rawCommand=_makeLoggableCommand(command),
             source="firestore",
         )
 
@@ -387,7 +438,7 @@ def listPendingCommands(
         recipientId=resolvedRecipientId,
         url=url,
         status=response.status_code,
-        payload=data,
+        payload=_sanitizeLogValue(deepcopy(data)) if isinstance(data, (dict, list)) else _sanitizeLogValue(data),
     )
 
     commands = data.get("commands", []) if isinstance(data, dict) else []
@@ -430,8 +481,8 @@ def listPendingCommands(
                 "Kontrollkommando mottatt",
                 commandId=str(command.get("commandId")),
                 commandType=str(command.get("commandType")),
-                metadata=command.get("metadata"),
-                rawCommand=command,
+                metadata=_sanitizeLogValue(command.get("metadata")),
+                rawCommand=_makeLoggableCommand(command),
             )
     return [command for command in commands if isinstance(command, dict)]
 

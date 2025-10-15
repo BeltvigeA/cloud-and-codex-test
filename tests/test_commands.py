@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
-
 import json
 import logging
 import sys
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 import pytest
 
@@ -108,6 +108,77 @@ def test_list_pending_commands_reads_from_firestore(monkeypatch: pytest.MonkeyPa
     assert len(result) == 2
     assert result[0]["commandId"] == "cmd-001"
     assert result[1]["metadata"]["target"] == 60
+
+
+def test_list_pending_commands_logs_serializable_firestore_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scheduledAt = datetime(2024, 1, 2, 3, 4, 5)
+    firestoreDocuments = {
+        "cmd-300": FakeFirestoreDocument(
+            "cmd-300",
+            {
+                "commandId": "cmd-300",
+                "commandType": "schedule_print",
+                "recipientId": "recipient-xyz",
+                "status": "pending",
+                "metadata": {"scheduledAt": scheduledAt},
+            },
+        )
+    }
+
+    fakeClient = FakeFirestoreClient(firestoreDocuments)
+    capturedLogs: List[Dict[str, Any]] = []
+
+    def fakeLog(
+        level: str,
+        category: str,
+        event: str,
+        message: str = "",
+        **context: Any,
+    ) -> None:
+        capturedLogs.append(
+            {
+                "level": level,
+                "category": category,
+                "event": event,
+                "message": message,
+                "context": context,
+            }
+        )
+
+    monkeypatch.setenv("FIRESTORE_PROJECT_ID", "test-project")
+    monkeypatch.setenv("FIRESTORE_COLLECTION_PRINTER_COMMANDS", "printer_commands")
+    commands._firestoreClientHandle = None  # type: ignore[attr-defined]
+    monkeypatch.setattr(commands, "_getFirestoreClient", lambda: fakeClient)
+    monkeypatch.setattr(
+        commands,
+        "firestore",
+        type(
+            "FirestoreNamespace",
+            (),
+            {"Query": type("Query", (), {"ASCENDING": "ASCENDING", "DESCENDING": "DESCENDING"}), "SERVER_TIMESTAMP": object()},
+        )(),
+    )
+    monkeypatch.setattr(commands, "log", fakeLog)
+
+    result = commands.listPendingCommands("recipient-xyz")
+
+    assert isinstance(result, list)
+    assert result and result[0]["metadata"]["scheduledAt"] is scheduledAt
+
+    pollPayloadLog = next(
+        entry for entry in capturedLogs if entry["event"] == "poll_payload"
+    )
+    payload = pollPayloadLog["context"].get("payload")
+    assert isinstance(payload, list)
+    assert payload[0]["metadata"]["scheduledAt"] == scheduledAt.isoformat()
+
+    incomingDetailLog = next(
+        entry for entry in capturedLogs if entry["event"] == "incoming_detail"
+    )
+    metadata = incomingDetailLog["context"].get("metadata")
+    assert metadata["scheduledAt"] == scheduledAt.isoformat()
 
 
 def test_list_pending_commands_falls_back_to_http(monkeypatch: pytest.MonkeyPatch) -> None:
