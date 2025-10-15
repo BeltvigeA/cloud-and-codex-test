@@ -1092,8 +1092,10 @@ def waitForPrinterStart(
 
         stateLower = (stateValue or "").lower()
         gcodeUpper = (gcodeStateValue or "").upper()
-        hasHeatingState = any(keyword in stateLower for keyword in ("heat", "warm", "run", "print"))
-        hasActiveGcode = gcodeUpper in {"HEATING", "RUNNING", "PRINTING"}
+        hasHeatingState = any(
+            keyword in stateLower for keyword in ("heat", "warm", "run", "print", "prep")
+        )
+        hasActiveGcode = gcodeUpper in {"HEATING", "RUNNING", "PRINTING", "PREPARE"}
         hasProgress = (progressValue or 0.0) > 0.0
 
         if hasHeatingState or hasActiveGcode or hasProgress:
