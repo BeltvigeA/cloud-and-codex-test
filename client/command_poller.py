@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import threading
 import time
-from typing import Optional
+from typing import Callable, Optional
 
 from .commands import listPendingCommands
 from .logbus import log
@@ -13,11 +13,17 @@ from .logbus import log
 class CommandPoller:
     """Periodically fetch pending commands for the active recipient."""
 
-    def __init__(self, intervalSec: float = 5.0) -> None:
+    def __init__(
+        self,
+        intervalSec: float = 5.0,
+        *,
+        sleepCallable: Optional[Callable[[float], None]] = None,
+    ) -> None:
         self._intervalSeconds = max(1.0, float(intervalSec))
         self._recipientId: str = ""
         self._thread: Optional[threading.Thread] = None
         self._stopEvent = threading.Event()
+        self._sleepCallable: Callable[[float], None] = sleepCallable or time.sleep
 
     def start(self, recipientId: str) -> None:
         self._recipientId = (recipientId or "").strip()
@@ -59,4 +65,4 @@ class CommandPoller:
             for _ in range(max(1, sleepSlices)):
                 if self._stopEvent.is_set():
                     break
-                time.sleep(0.1)
+                self._sleepCallable(0.1)
