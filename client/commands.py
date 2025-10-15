@@ -5,11 +5,13 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from typing import Any, Dict, List, Optional
 
 import requests
 
 from .base44 import getBaseUrl
+from .logbus import log
 
 LOG = logging.getLogger(__name__)
 
@@ -82,28 +84,70 @@ def listPendingCommands(
 
     payload = {"recipientId": resolvedRecipientId}
 
+    log(
+        "INFO",
+        "control",
+        "poll_start",
+        recipientId=resolvedRecipientId,
+        url=url,
+    )
+    started = time.time()
+
     try:
         response = requests.post(url, json=payload, headers=_buildHeaders(), timeout=10)
         response.raise_for_status()
     except requests.RequestException as error:
         LOG.warning("[commands] %s feilet: %s", resolvedFunction, error)
+        log(
+            "ERROR",
+            "control",
+            "poll_failed",
+            recipientId=resolvedRecipientId,
+            url=url,
+            error=str(error),
+        )
         return None
 
     try:
         data = response.json()
     except ValueError:
         LOG.error("[commands] Kunne ikke parse JSON-respons")
+        log(
+            "ERROR",
+            "control",
+            "poll_bad_json",
+            recipientId=resolvedRecipientId,
+            url=url,
+        )
         return []
 
     commands = data.get("commands", []) if isinstance(data, dict) else []
     if not isinstance(commands, list):
         LOG.error("[commands] 'commands' hadde feil format: %r", commands)
+        log(
+            "ERROR",
+            "control",
+            "poll_bad_format",
+            recipientId=resolvedRecipientId,
+            url=url,
+            response=data,
+        )
         return []
 
+    elapsedMs = int((time.time() - started) * 1000)
     LOG.info(
         "[commands] %d ventende kommandoer for %s",
         len(commands),
         resolvedRecipientId,
+    )
+    log(
+        "INFO",
+        "control",
+        "poll_ok",
+        recipientId=resolvedRecipientId,
+        url=url,
+        ms=elapsedMs,
+        count=len(commands),
     )
     return [command for command in commands if isinstance(command, dict)]
 
@@ -141,11 +185,27 @@ def completeCommand(
         "error": str(error) if (error and not success) else None,
     }
 
+    log(
+        "INFO",
+        "control",
+        "complete_start",
+        commandId=normalizedCommandId,
+        success=bool(success),
+    )
+
     try:
         response = requests.post(url, json=payload, headers=_buildHeaders(), timeout=10)
         response.raise_for_status()
     except requests.RequestException as requestError:
         LOG.error("[commands] %s feilet: %s", resolvedFunction, requestError)
+        log(
+            "ERROR",
+            "control",
+            "complete_failed",
+            commandId=normalizedCommandId,
+            success=bool(success),
+            error=str(requestError),
+        )
         return False
 
     try:
@@ -162,9 +222,24 @@ def completeCommand(
             normalizedCommandId,
             "completed" if success else "failed",
         )
+        log(
+            "INFO",
+            "control",
+            "complete_ok",
+            commandId=normalizedCommandId,
+            success=bool(success),
+        )
         return True
 
     LOG.error("[commands] Uventet respons ved fullføring: %r", data)
+    log(
+        "ERROR",
+        "control",
+        "complete_bad_response",
+        commandId=normalizedCommandId,
+        success=bool(success),
+        response=data,
+    )
     return False
 
 

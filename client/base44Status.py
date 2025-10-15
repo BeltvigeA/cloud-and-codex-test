@@ -17,6 +17,7 @@ from .health import HealthGate, HealthState
 from .reachability import tcpCheck
 from .bambuClient import BambuLanClient
 from .controls import executeCommand
+from .logbus import log
 
 LOG = logging.getLogger(__name__)
 
@@ -232,11 +233,22 @@ class Base44StatusReporter:
                         ipAddress = self._resolvePrinterIp(snapshot)
                         gate = self._getHealthGate(key)
                         stateAfter, stateChanged = self._ensureHealthState(key, gate, ipAddress, now)
+                        serialKey, ipKey = key
+                        mqttReady = bool(snapshot.get("mqttReady"))
+                        log(
+                            "INFO",
+                            "status-printer",
+                            "health",
+                            serial=serialKey,
+                            ip=ipAddress or ipKey,
+                            online=stateAfter.isOnline,
+                            mqttReady=mqttReady,
+                        )
 
                         if stateChanged and stateAfter.hasState:
                             changeSnapshot = self._buildStateChangeSnapshot(snapshot, ipAddress, stateAfter)
                             payload = self._buildPayload(changeSnapshot)
-                            self._postPayload(payload, key)
+                            self._postStatus(payload, key)
                             self._lastStatusTimestampByPrinter[key] = now
 
                         if stateAfter.hasState and stateAfter.isOnline:
@@ -245,7 +257,7 @@ class Base44StatusReporter:
                                 telemetrySnapshot = dict(snapshot)
                                 telemetrySnapshot["online"] = True
                                 payload = self._buildPayload(telemetrySnapshot)
-                                self._postPayload(payload, key)
+                                self._postStatus(payload, key)
                                 self._lastStatusTimestampByPrinter[key] = now
 
                 try:
@@ -375,7 +387,7 @@ class Base44StatusReporter:
             resolved["remainingTimeSeconds"] = None
         return resolved
 
-    def _postPayload(self, payload: dict[str, Any], key: tuple[str, str]) -> None:
+    def _postStatus(self, payload: dict[str, Any], key: tuple[str, str]) -> None:
         if not payload:
             return
 
@@ -386,12 +398,29 @@ class Base44StatusReporter:
             serializedPayload = repr(payload)
 
         LOG.info("[POST] Base44 status url=%s payload=%s", statusUrl, serializedPayload)
+        log(
+            "INFO",
+            "status-base44",
+            "post_start",
+            function=self._statusFunctionName,
+            recipientId=self._recipientId,
+        )
 
-        callFunction(
+        response = callFunction(
             self._statusFunctionName,
             payload,
-            apiKey=self._apiKeyOverride,
+            apiKey=self._apiKeyOverride or getDefaultApiKey(),
         )
+        if isinstance(response, dict) and response.get("ok"):
+            log("INFO", "status-base44", "post_ok", function=self._statusFunctionName)
+        else:
+            log(
+                "ERROR",
+                "status-base44",
+                "post_failed",
+                function=self._statusFunctionName,
+                response=response,
+            )
 
         wasOnline = self._lastOnlineStateByPrinter.get(key, False)
         nowOnline = bool(payload.get("online"))
@@ -428,6 +457,16 @@ class Base44StatusReporter:
         if not commands:
             LOG.debug("[commands] Ingen kommandoer for %s", self._recipientId)
             return
+
+        log("INFO", "control", "incoming", count=len(commands))
+        for command in commands[:5]:
+            log(
+                "INFO",
+                "control",
+                "incoming_item",
+                commandId=str(command.get("commandId")),
+                commandType=str(command.get("commandType")),
+            )
 
         for command in commands:
             self._handleCommand(command, snapshots)
