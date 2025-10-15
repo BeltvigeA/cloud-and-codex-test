@@ -401,6 +401,39 @@ def test_applySkippedObjectsToArchiveRejectsUnknownOrder(
     assert "Unable to locate slicer objects" in caplog.text
 
 
+def test_waitForPrinterStartTreatsPrepareAsActive() -> None:
+    class FakePrinter:
+        def __init__(self) -> None:
+            self.stateCalls = 0
+
+        def get_state(self) -> str:
+            self.stateCalls += 1
+            if self.stateCalls == 1:
+                return "IDLE"
+            return "PREPARE"
+
+        def get_gcode_state(self) -> str:
+            if self.stateCalls == 1:
+                return "IDLE"
+            return "PREPARE"
+
+        def get_percentage(self) -> float:
+            return 0.0
+
+    fakePrinter = FakePrinter()
+
+    started, stateValue, progressValue, gcodeStateValue = bambuPrinter.waitForPrinterStart(
+        fakePrinter,
+        timeoutSeconds=1,
+        pollIntervalSeconds=0,
+    )
+
+    assert started is True
+    assert stateValue == "PREPARE"
+    assert progressValue == 0.0
+    assert gcodeStateValue == "PREPARE"
+
+
 def test_failedSerialResponseAllowsJobStart(monkeypatch: pytest.MonkeyPatch) -> None:
     class FakePrinter:
         def __init__(self) -> None:
