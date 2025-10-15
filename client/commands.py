@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import time
 from copy import deepcopy
 from datetime import date, datetime
 from typing import Any, Dict, List, Optional, Tuple
@@ -71,6 +70,13 @@ def _getFirestoreClient() -> Optional[firestore.Client]:
 
     projectId = _resolveProjectId()
     if not projectId:
+        log(
+            "ERROR",
+            "control",
+            "firestore_client_error",
+            source="firestore",
+            error="missing_project_id",
+        )
         return None
 
     try:
@@ -175,33 +181,45 @@ def _makeLoggableCommand(command: Dict[str, Any]) -> Dict[str, Any]:
     return sanitizedCommand
 
 
-def _listPendingCommandsFromFirestore(recipientId: str) -> Optional[List[Dict[str, Any]]]:
-    firestoreClient = _getFirestoreClient()
-    if firestoreClient is None:
-        return None
-
+def _listPendingCommandsFromFirestore(
+    recipientId: str,
+    *,
+    limitSize: Optional[int] = None,
+) -> List[Dict[str, Any]]:
     collectionName = _getCommandCollectionName()
-    limitSize = _getFirestoreLimit()
+    resolvedLimit = limitSize if limitSize is not None else _getFirestoreLimit()
 
     log(
         "INFO",
         "control",
         "poll_start",
-        recipientId=recipientId,
         source="firestore",
+        recipientId=recipientId,
         collection=collectionName,
-        limit=limitSize,
+        limit=resolvedLimit,
     )
 
-    started = time.time()
+    firestoreClient = _getFirestoreClient()
+    if firestoreClient is None:
+        LOG.error("[commands] Firestore-klient er ikke tilgjengelig for kommando-polling")
+        log(
+            "ERROR",
+            "control",
+            "firestore_client_error",
+            recipientId=recipientId,
+            collection=collectionName,
+            source="firestore",
+            error="client_unavailable",
+        )
+        return []
 
     try:
         query = (
             firestoreClient.collection(collectionName)
             .where("recipientId", "==", recipientId)
             .where("status", "==", "pending")
-            .order_by("createdAt", direction=firestore.Query.ASCENDING)
-            .limit(limitSize)
+            .order_by("createdAt", direction=firestore.Query.DESCENDING)
+            .limit(resolvedLimit)
         )
         documents = list(query.stream())
     except googleApiExceptions.GoogleAPICallError as error:
@@ -211,8 +229,8 @@ def _listPendingCommandsFromFirestore(recipientId: str) -> Optional[List[Dict[st
             "control",
             "firestore_poll_failed",
             recipientId=recipientId,
-            source="firestore",
             collection=collectionName,
+            source="firestore",
             error=str(error),
         )
         return []
@@ -221,56 +239,39 @@ def _listPendingCommandsFromFirestore(recipientId: str) -> Optional[List[Dict[st
         log(
             "ERROR",
             "control",
-            "firestore_poll_exception",
+            "firestore_poll_failed",
             recipientId=recipientId,
-            source="firestore",
             collection=collectionName,
+            source="firestore",
             error=str(error),
         )
         return []
-
-    elapsedMs = int((time.time() - started) * 1000)
 
     commands: List[Dict[str, Any]] = []
     for document in documents:
         documentPayload = document.to_dict() or {}
         documentPayload.setdefault("commandId", document.id)
-        documentPayload["docId"] = document.id
         commands.append(documentPayload)
 
     log(
         "INFO",
         "control",
-        "poll_payload",
-        "Mottok Firestore-kontrollpayload",
-        recipientId=recipientId,
-        source="firestore",
-        collection=collectionName,
-        count=len(commands),
-        payload=[_makeLoggableCommand(command) for command in commands],
-    )
-
-    log(
-        "INFO",
-        "control",
         "poll_ok",
-        recipientId=recipientId,
         source="firestore",
+        recipientId=recipientId,
         collection=collectionName,
-        ms=elapsedMs,
         count=len(commands),
     )
 
-    for command in commands:
+    for command in commands[:10]:
         log(
             "INFO",
             "control",
-            "incoming_detail",
-            "Firestore-kontrollkommando mottatt",
+            "incoming_item",
+            recipientId=recipientId,
             commandId=str(command.get("commandId")),
             commandType=str(command.get("commandType")),
             metadata=_sanitizeLogValue(command.get("metadata")),
-            rawCommand=_makeLoggableCommand(command),
             source="firestore",
         )
 
@@ -370,121 +371,16 @@ def listPendingCommands(
     recipientId: Optional[str] = None,
     *,
     functionName: Optional[str] = None,
-) -> Optional[List[Dict[str, Any]]]:
+) -> List[Dict[str, Any]]:
     resolvedRecipientId = _resolveRecipientId(recipientId)
     if not resolvedRecipientId:
         LOG.error("[commands] Recipient ID mangler")
         return []
 
-    firestoreCommands = _listPendingCommandsFromFirestore(resolvedRecipientId)
-    if firestoreCommands is not None:
-        return firestoreCommands
-
-    resolvedFunction = (functionName or os.getenv("BASE44_COMMANDS_FN") or "listPendingCommands").strip()
-    if not resolvedFunction:
-        resolvedFunction = "listPendingCommands"
-
-    url = _buildUrl(resolvedFunction)
-    if not url:
-        return None
-
-    payload = {"recipientId": resolvedRecipientId}
-
-    log(
-        "INFO",
-        "control",
-        "poll_start",
-        recipientId=resolvedRecipientId,
-        url=url,
-        source="http",
-    )
-    started = time.time()
-
-    try:
-        response = requests.post(url, json=payload, headers=_buildHeaders(), timeout=10)
-        response.raise_for_status()
-    except requests.RequestException as error:
-        LOG.warning("[commands] %s feilet: %s", resolvedFunction, error)
-        log(
-            "ERROR",
-            "control",
-            "poll_failed",
-            recipientId=resolvedRecipientId,
-            url=url,
-            source="http",
-            error=str(error),
-        )
-        return None
-
-    try:
-        data = response.json()
-    except ValueError:
-        LOG.error("[commands] Kunne ikke parse JSON-respons")
-        log(
-            "ERROR",
-            "control",
-            "poll_bad_json",
-            recipientId=resolvedRecipientId,
-            url=url,
-            source="http",
-        )
-        return []
-
-    log(
-        "INFO",
-        "control",
-        "poll_payload",
-        "Mottok kontrollpayload",
-        recipientId=resolvedRecipientId,
-        url=url,
-        status=response.status_code,
-        payload=_sanitizeLogValue(deepcopy(data)) if isinstance(data, (dict, list)) else _sanitizeLogValue(data),
-    )
-
-    commands = data.get("commands", []) if isinstance(data, dict) else []
-    if not isinstance(commands, list):
-        LOG.error("[commands] 'commands' hadde feil format: %r", commands)
-        log(
-            "ERROR",
-            "control",
-            "poll_bad_format",
-            recipientId=resolvedRecipientId,
-            url=url,
-            source="http",
-            response=data,
-        )
-        return []
-
-    elapsedMs = int((time.time() - started) * 1000)
-    LOG.info(
-        "[commands] %d ventende kommandoer for %s",
-        len(commands),
+    return _listPendingCommandsFromFirestore(
         resolvedRecipientId,
+        limitSize=_getFirestoreLimit(),
     )
-    log(
-        "INFO",
-        "control",
-        "poll_ok",
-        recipientId=resolvedRecipientId,
-        url=url,
-        source="http",
-        ms=elapsedMs,
-        count=len(commands),
-    )
-
-    for command in commands:
-        if isinstance(command, dict):
-            log(
-                "INFO",
-                "control",
-                "incoming_detail",
-                "Kontrollkommando mottatt",
-                commandId=str(command.get("commandId")),
-                commandType=str(command.get("commandType")),
-                metadata=_sanitizeLogValue(command.get("metadata")),
-                rawCommand=_makeLoggableCommand(command),
-            )
-    return [command for command in commands if isinstance(command, dict)]
 
 
 def completeCommand(
