@@ -161,7 +161,7 @@ class ListenerGuiApp:
 
         self.initializeRecipientSettings()
         self._buildLayout()
-        self._createMenuBar()
+        self._initializeConnectionErrorsToggle()
         self.applyRecipientVisibility()
         self.root.after(200, self._processLogQueue)
         self.root.after(200, self._processPrinterStatusUpdates)
@@ -193,6 +193,16 @@ class ListenerGuiApp:
 
         self.connectionErrorsPage = ConnErrorsPage(self.notebook)
         self._connectionErrorsVisible = False
+
+    def _initializeConnectionErrorsToggle(self) -> None:
+        self.connectionErrorsToggleVar = tk.BooleanVar(value=False)
+        self.connectionErrorsToggle = ttk.Checkbutton(
+            self.logsPage.toolbar,
+            text="Connection Errors tab",
+            variable=self.connectionErrorsToggleVar,
+            command=self._toggleConnectionErrorsTab,
+        )
+        self.connectionErrorsToggle.pack(side=tk.LEFT, padx=4)
 
     def _buildListenerTab(self, parent: ttk.Frame, paddingOptions: Dict[str, int]) -> None:
         ttk.Label(parent, text="Recipient ID:").grid(row=0, column=0, sticky=tk.W, **paddingOptions)
@@ -1444,21 +1454,8 @@ class ListenerGuiApp:
         self.stopButton.config(state=tk.DISABLED)
         self._appendLogLine("Stopped listening.")
 
-    def _createMenuBar(self) -> None:
-        menuBar = tk.Menu(self.root)
-        viewMenu = tk.Menu(menuBar, tearoff=0)
-        self._showConnectionErrorsVar = tk.BooleanVar(value=False)
-        viewMenu.add_checkbutton(
-            label="Show Connection Errors tab",
-            variable=self._showConnectionErrorsVar,
-            command=self._toggleConnectionErrorsTab,
-        )
-        menuBar.add_cascade(label="View", menu=viewMenu)
-        self.root.config(menu=menuBar)
-        self._menuBar = menuBar
-
     def _toggleConnectionErrorsTab(self) -> None:
-        shouldShow = bool(self._showConnectionErrorsVar.get())
+        shouldShow = bool(self.connectionErrorsToggleVar.get())
         if shouldShow and not self._connectionErrorsVisible:
             self.notebook.add(self.connectionErrorsPage, text="Connection Errors")
             self.notebook.select(self.connectionErrorsPage)
