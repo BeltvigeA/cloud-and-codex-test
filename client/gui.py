@@ -19,6 +19,7 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 
 from .base44Status import Base44StatusReporter
+from .command_poller import CommandPoller
 # Connection Errors tab removed (we filter in Logs page instead)
 from .database import LocalDatabase
 from .log_page import LogsPage
@@ -158,8 +159,12 @@ class ListenerGuiApp:
         )
 
         self.root.protocol("WM_DELETE_WINDOW", self.handleWindowClose)
+        self.commandPoller = CommandPoller(intervalSec=5.0)
 
         self.initializeRecipientSettings()
+        # Ensure Firestore project-id is available for local polling
+        if not os.getenv('FIRESTORE_PROJECT_ID') and not os.getenv('GCP_PROJECT_ID'):
+            os.environ['FIRESTORE_PROJECT_ID'] = os.getenv('DEFAULT_FIRESTORE_PROJECT_ID', 'print-pipe-demo')
         self._buildLayout()
         # removed: separate connection-errors tab toggle
         self.applyRecipientVisibility()
@@ -1399,6 +1404,11 @@ class ListenerGuiApp:
         logFile = self.logFileValue
         pollInterval = max(5, int(self.pollIntervalSeconds))
         statusApiKey = self._resolveStatusApiKey()
+        # Start Firestore command poller regardless of printer readiness
+        try:
+            self.commandPoller.start(recipientId)
+        except Exception as e:
+            logging.exception('Failed to start command poller: %s', e)
 
         if not baseUrl or not recipientId:
             messagebox.showerror("Missing Information", "Base URL and recipient ID are required.")
@@ -1437,6 +1447,10 @@ class ListenerGuiApp:
         self._updateStatusReporterState()
         if self.stopEvent:
             self.stopEvent.set()
+        try:
+            self.commandPoller.stop()
+        except Exception:
+            logging.debug('Command poller stop failed', exc_info=True)
         if self.listenerThread and self.listenerThread.is_alive() and threading.current_thread() != self.listenerThread:
             self.listenerThread.join(timeout=0.5)
         self.listenerThread = None
