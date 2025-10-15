@@ -35,14 +35,15 @@ def rateLimit(
     logMethod = getattr(logging, level, None)
     if not callable(logMethod):
         logMethod = _LOG.error
-    logMethod(message)
 
     if category:
         try:
             resolvedEvent = event or key
-            log(level.upper(), category, resolvedEvent, message)
+            log(level.upper(), category, resolvedEvent, message, key=key)
         except Exception:  # pragma: no cover - logging must not fail
-            return
+            logMethod(message)
+    else:
+        logMethod(message)
 
 
 def rateLimitError(
