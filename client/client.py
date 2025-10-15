@@ -25,6 +25,7 @@ from .bambuPrinter import (
     sendBambuPrintJob,
     upsertPrinterFromJobMetadata,
 )
+from .logbus import installLogBusHandler
 
 
 defaultBaseUrl = "https://printer-backend-934564650450.europe-west1.run.app"
@@ -42,6 +43,7 @@ def configureLogging() -> None:
         format="%(asctime)s - %(levelname)s - %(message)s",
         stream=sys.stdout,
     )
+    installLogBusHandler()
 
 
 def parseArguments() -> argparse.Namespace:
