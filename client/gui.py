@@ -20,6 +20,7 @@ from tkinter import messagebox, ttk
 
 from .base44Status import Base44StatusReporter
 from .database import LocalDatabase
+from .log_page import LogsPage
 
 from .bambuPrinter import (
     BambuPrintOptions,
@@ -170,16 +171,19 @@ class ListenerGuiApp:
     def _buildLayout(self) -> None:
         paddingOptions = {"padx": 8, "pady": 4}
 
-        notebook = ttk.Notebook(self.root)
-        notebook.pack(fill=tk.BOTH, expand=True)
+        self.notebook = ttk.Notebook(self.root)
+        self.notebook.pack(fill=tk.BOTH, expand=True)
 
-        listenerFrame = ttk.Frame(notebook)
-        notebook.add(listenerFrame, text="Listener")
+        listenerFrame = ttk.Frame(self.notebook)
+        self.notebook.add(listenerFrame, text="Listener")
         self._buildListenerTab(listenerFrame, paddingOptions)
 
-        printersFrame = ttk.Frame(notebook)
-        notebook.add(printersFrame, text="3D Printers")
+        printersFrame = ttk.Frame(self.notebook)
+        self.notebook.add(printersFrame, text="3D Printers")
         self._buildPrintersTab(printersFrame)
+
+        self.logsPage = LogsPage(self.notebook)
+        self.notebook.add(self.logsPage, text="Logs")
 
     def _buildListenerTab(self, parent: ttk.Frame, paddingOptions: Dict[str, int]) -> None:
         ttk.Label(parent, text="Recipient ID:").grid(row=0, column=0, sticky=tk.W, **paddingOptions)
