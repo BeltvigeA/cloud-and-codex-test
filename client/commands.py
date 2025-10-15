@@ -187,7 +187,7 @@ def _listPendingCommandsFromFirestore(recipientId: str, limit: int = 25) -> list
     fall back to a simpler query (without order_by) and sort in memory.
     Always emits control-category logs so the GUI shows what happened.
     """
-    from google.cloud import firestore  # local import to avoid hard dep on import time
+    firestoreCollectionPrinterCommands = _getCommandCollectionName()
     log("INFO", "control", "poll_start",
         source="firestore", recipientId=recipientId,
         collection=firestoreCollectionPrinterCommands, limit=limit)
@@ -255,10 +255,10 @@ def _listPendingCommandsFromFirestore(recipientId: str, limit: int = 25) -> list
         collection=firestoreCollectionPrinterCommands, count=len(rows))
 
     for r in rows[:10]:
-        log("INFO", "control", "incoming_item",
-            commandId=r.get("commandId"),
-            commandType=r.get("commandType"),
-            recipientId=recipientId)
+        loggableRow = _makeLoggableCommand(r)
+        if "recipientId" not in loggableRow:
+            loggableRow["recipientId"] = recipientId
+        log("INFO", "control", "incoming_item", **loggableRow)
 
     return rows
 def _completeCommandInFirestore(
@@ -362,7 +362,7 @@ def listPendingCommands(
 
     return _listPendingCommandsFromFirestore(
         resolvedRecipientId,
-        limitSize=_getFirestoreLimit(),
+        limit=_getFirestoreLimit(),
     )
 
 

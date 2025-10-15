@@ -22,7 +22,8 @@ from .base44Status import Base44StatusReporter
 from .command_poller import CommandPoller
 # Connection Errors tab removed (we filter in Logs page instead)
 from .database import LocalDatabase
-from .log_page import LogsPage
+from .log_page import LogsPage, LogsPageConfig
+from .logbus import CATEGORIES, LogEvent
 from .print_jobs_page import PrintJobsPage
 
 from .bambuPrinter import (
@@ -190,13 +191,95 @@ class ListenerGuiApp:
         self.notebook.add(printersFrame, text="3D Printers")
         self._buildPrintersTab(printersFrame)
 
-        self.logsPage = LogsPage(self.notebook)
-        self.notebook.add(self.logsPage, text="Logs")
+        googleCloudListenerPlaceholders = [
+            {
+                "category": "listener",
+                "event": "firestore_listener",
+                "message": "Lytter etter printerkommandoer fra Google Cloud Firestore",
+                "ctx": {"collection": "printer_commands", "status": "idle"},
+            },
+            {
+                "category": "listener",
+                "event": "pending_files_listener",
+                "message": "Lytter etter filer som skal hentes fra Base44",
+                "ctx": {"description": "Ingen filer mottatt ennå"},
+            },
+            {
+                "category": "listener",
+                "event": "status_listener",
+                "message": "Venter på statusoppdateringer fra printere",
+                "ctx": {"source": "cloud_status_stream"},
+            },
+        ]
+
+        listenerChannelConfig = LogsPageConfig(
+            allowedCategories=("listener",),
+            showCategoryFilters=False,
+            defaultCategoryState={"listener": True},
+            description="Oversikt over alle aktive lyttefunksjoner fra Google Cloud.",
+            placeholderEvents=googleCloudListenerPlaceholders,
+            searchLabel="Søk",
+        )
+        self.listenerChannelPage = LogsPage(self.notebook, config=listenerChannelConfig)
+        self.notebook.add(self.listenerChannelPage, text="Lyttekanal")
+
+        listenerDataConfig = LogsPageConfig(
+            allowedCategories=("listener",),
+            showCategoryFilters=False,
+            defaultCategoryState={"listener": True},
+            description="Viser kun lyttehendelser som inneholder mottatt data.",
+            requireContent=True,
+            searchLabel="Søk",
+        )
+        self.listenerDataPage = LogsPage(self.notebook, config=listenerDataConfig)
+        self.notebook.add(self.listenerDataPage, text="Lyttedata")
+
+        base44LogConfig = LogsPageConfig(
+            allowedCategories=("control", "status-base44", "status-printer", "print-job"),
+            showCategoryFilters=True,
+            defaultCategoryState={
+                "control": True,
+                "status-base44": True,
+                "status-printer": True,
+                "print-job": True,
+            },
+            description=(
+                "Base44.com logg over sendte og mottatte meldinger. Bruk avkrysninger for å filtrere kategorier."
+            ),
+            searchLabel="Søk",
+        )
+        self.base44LogsPage = LogsPage(self.notebook, config=base44LogConfig)
+        self.notebook.add(self.base44LogsPage, text="Base44 Logg")
+
+        connectionErrorConfig = LogsPageConfig(
+            allowedCategories=("conn-error",),
+            showCategoryFilters=False,
+            defaultCategoryState={"conn-error": True},
+            description="Alle registrerte tilkoblingsfeil.",
+            searchLabel="Søk",
+        )
+        self.connectionErrorLogsPage = LogsPage(self.notebook, config=connectionErrorConfig)
+        self.notebook.add(self.connectionErrorLogsPage, text="Tilkoblingsfeil")
+
+        def _isErrorLevel(event: LogEvent) -> bool:
+            return event.level in {"ERROR", "CRITICAL"}
+
+        errorLogConfig = LogsPageConfig(
+            showCategoryFilters=False,
+            description="Samlevisning av alle feil som ikke er tilkoblingsrelaterte.",
+            levelFilter=_isErrorLevel,
+            defaultCategoryState={category: True for category in CATEGORIES},
+            searchLabel="Søk",
+        )
+        self.errorLogsPage = LogsPage(self.notebook, config=errorLogConfig)
+        self.notebook.add(self.errorLogsPage, text="Feil")
+
+        allLogsConfig = LogsPageConfig(description="Alle logger samlet.", searchLabel="Søk")
+        self.logsPage = LogsPage(self.notebook, config=allLogsConfig)
+        self.notebook.add(self.logsPage, text="Alle logger")
 
         self.printJobsPage = PrintJobsPage(self.notebook)
         self.notebook.add(self.printJobsPage, text="Print Jobs")
-
-        # Connection Errors tab removed
 
     # removed: connection errors tab + toggle (use Logs filters)
 
