@@ -213,6 +213,35 @@ def _listPendingCommandsFromFirestore(
         )
         return []
 
+    def _shouldTriggerIndexFallback(errorMessage: str) -> bool:
+        return "requires an index" in errorMessage.lower()
+
+    def _fallbackDocumentsWithoutOrdering() -> List[Any]:
+        fallbackQuery = (
+            firestoreClient.collection(collectionName)
+            .where("recipientId", "==", recipientId)
+            .where("status", "==", "pending")
+            .limit(resolvedLimit)
+        )
+        fallbackDocuments = list(fallbackQuery.stream())
+
+        def _resolveCreatedAtValue(document: Any) -> datetime:
+            payload = document.to_dict() or {}
+            createdAt = payload.get("createdAt")
+            if hasattr(createdAt, "to_datetime"):
+                try:
+                    return createdAt.to_datetime()  # type: ignore[call-arg, return-value]
+                except Exception:  # pragma: no cover - defensive fallback
+                    return datetime.min
+            if isinstance(createdAt, datetime):
+                return createdAt
+            if isinstance(createdAt, date):
+                return datetime.combine(createdAt, datetime.min.time())
+            return datetime.min
+
+        fallbackDocuments.sort(key=_resolveCreatedAtValue, reverse=True)
+        return fallbackDocuments
+
     try:
         query = (
             firestoreClient.collection(collectionName)
@@ -223,7 +252,8 @@ def _listPendingCommandsFromFirestore(
         )
         documents = list(query.stream())
     except googleApiExceptions.GoogleAPICallError as error:
-        LOG.error("[commands] Firestore-spørring feilet: %s", error)
+        errorMessage = str(error)
+        LOG.error("[commands] Firestore-spørring feilet: %s", errorMessage)
         log(
             "ERROR",
             "control",
@@ -231,10 +261,25 @@ def _listPendingCommandsFromFirestore(
             recipientId=recipientId,
             collection=collectionName,
             source="firestore",
-            error=str(error),
+            error=errorMessage,
         )
-        return []
+        if not _shouldTriggerIndexFallback(errorMessage):
+            return []
+        try:
+            documents = _fallbackDocumentsWithoutOrdering()
+        except Exception as fallbackError:  # pylint: disable=broad-except
+            log(
+                "ERROR",
+                "control",
+                "firestore_poll_failed_no_orderby",
+                recipientId=recipientId,
+                collection=collectionName,
+                source="firestore",
+                error=str(fallbackError),
+            )
+            return []
     except Exception as error:  # pylint: disable=broad-except
+        errorMessage = str(error)
         LOG.exception("[commands] Uventet Firestore-feil under henting av kommandoer")
         log(
             "ERROR",
@@ -243,9 +288,23 @@ def _listPendingCommandsFromFirestore(
             recipientId=recipientId,
             collection=collectionName,
             source="firestore",
-            error=str(error),
+            error=errorMessage,
         )
-        return []
+        if not _shouldTriggerIndexFallback(errorMessage):
+            return []
+        try:
+            documents = _fallbackDocumentsWithoutOrdering()
+        except Exception as fallbackError:  # pylint: disable=broad-except
+            log(
+                "ERROR",
+                "control",
+                "firestore_poll_failed_no_orderby",
+                recipientId=recipientId,
+                collection=collectionName,
+                source="firestore",
+                error=str(fallbackError),
+            )
+            return []
 
     commands: List[Dict[str, Any]] = []
     for document in documents:
