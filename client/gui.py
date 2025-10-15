@@ -679,6 +679,7 @@ class ListenerGuiApp:
         try:
             if getattr(self, "commandPoller", None):
                 self.commandPoller.setRecipientId(self.listenerRecipientId)
+                self._syncCommandPollerState()
         except Exception:
             logging.debug("Command poller recipient update failed", exc_info=True)
 
@@ -795,6 +796,25 @@ class ListenerGuiApp:
         elif not shouldRun and self.base44ReporterActive:
             self.base44Reporter.stop()
             self.base44ReporterActive = False
+        self._syncCommandPollerState()
+
+    def _syncCommandPollerState(self) -> None:
+        commandPoller = getattr(self, "commandPoller", None)
+        if not commandPoller:
+            return
+        shouldRun = (
+            self.listenerActive
+            and bool(self.listenerRecipientId)
+            and not self.base44ReporterActive
+        )
+        try:
+            if shouldRun:
+                commandPoller.setRecipientId(self.listenerRecipientId)
+                commandPoller.start(self.listenerRecipientId)
+            else:
+                commandPoller.stop()
+        except Exception:
+            logging.debug("Command poller sync failed", exc_info=True)
 
     def _clearPrinterSearch(self) -> None:
         self.printerSearchVar.set("")
@@ -1409,12 +1429,6 @@ class ListenerGuiApp:
         logFile = self.logFileValue
         pollInterval = max(5, int(self.pollIntervalSeconds))
         statusApiKey = self._resolveStatusApiKey()
-        # Start Firestore command poller regardless of printer readiness
-        try:
-            self.commandPoller.start(recipientId)
-        except Exception as e:
-            logging.exception('Failed to start command poller: %s', e)
-
         if not baseUrl or not recipientId:
             messagebox.showerror("Missing Information", "Base URL and recipient ID are required.")
             return
