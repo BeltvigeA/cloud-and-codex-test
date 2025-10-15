@@ -13,6 +13,17 @@ from typing import Any, Dict, List
 _LOG = logging.getLogger(__name__)
 
 
+CATEGORIES: List[str] = [
+    "listener",
+    "control",
+    "status-base44",
+    "status-printer",
+    "print-job",
+    "conn-error",
+    "error",
+]
+
+
 @dataclass
 class LogEvent:
     ts: float
@@ -55,6 +66,13 @@ class LogBus:
     def snapshot(self) -> List[LogEvent]:
         with self._lock:
             return list(self._buffer)
+
+    def clear(self, category: str | None = None) -> None:
+        with self._lock:
+            if category is None:
+                self._buffer.clear()
+            else:
+                self._buffer = [event for event in self._buffer if event.category != category]
 
 
 BUS = LogBus()
@@ -135,4 +153,4 @@ def installLogBusHandler() -> None:
     rootLogger.addHandler(LogBusHandler())
 
 
-__all__ = ['BUS', 'LogBus', 'LogEvent', 'LogBusHandler', 'installLogBusHandler', 'log']
+__all__ = ['BUS', 'CATEGORIES', 'LogBus', 'LogEvent', 'LogBusHandler', 'installLogBusHandler', 'log']

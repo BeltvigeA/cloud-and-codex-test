@@ -92,10 +92,26 @@ class BambuLanClient:
             except Exception:  # pragma: no cover - connection errors handled via False
                 LOG.debug("Unable to connect printer", exc_info=True)
                 log("ERROR", "status-printer", "mqtt_connect", ip=self.ipAddress, ok=False)
+                log(
+                    "ERROR",
+                    "conn-error",
+                    "mqtt_connect_failed",
+                    ip=self.ipAddress,
+                    serial=self.serialNumber,
+                )
                 return False
         log("INFO", "status-printer", "mqtt_connect", ip=self.ipAddress, ok=self.printer is not None)
         healthy = self.healthCheck()
         log("INFO", "status-printer", "mqtt_port_probe", ip=self.ipAddress, ok=healthy)
+        if not healthy:
+            log(
+                "ERROR",
+                "conn-error",
+                "health_failed",
+                ip=self.ipAddress,
+                serial=self.serialNumber,
+                detail="tcp:8883 no response",
+            )
         return healthy
 
     def _sendGcode(self, command: str) -> None:
