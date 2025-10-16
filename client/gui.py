@@ -1,0 +1,1795 @@
+"""Simple GUI application for listening to channels and logging data to JSON."""
+
+from __future__ import annotations
+
+import contextlib
+import json
+import logging
+import os
+import socket
+import ssl
+import threading
+import uuid
+from datetime import datetime
+from pathlib import Path
+from queue import Empty, Queue
+from typing import Any, Callable, Dict, Optional
+
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+
+import requests
+
+
+def addPrinterIdentityToPayload(
+    payload: Dict[str, Any], printerSerial: Optional[str], accessCode: Optional[str]
+) -> Dict[str, Any]:
+    if printerSerial:
+        payload["printerSerial"] = printerSerial
+    if accessCode:
+        payload["accessCode"] = accessCode
+    return payload
+
+from .bambuPrinter import BambuPrintOptions, postStatus, sendBambuPrintJob
+from .client import (
+    appendJsonLogEntry,
+    buildBaseUrl,
+    configureLogging,
+    defaultBaseUrl,
+    defaultFilesDirectory,
+    ensureOutputDirectory,
+    getPrinterStatusEndpointUrl,
+    interpretBoolean,
+    interpretInteger,
+    listenForFiles,
+)
+
+try:  # pragma: no cover - optional dependency in some test environments
+    import paho.mqtt.client as mqtt  # type: ignore
+except ImportError:  # pragma: no cover - gracefully handled when MQTT is unavailable
+    mqtt = None  # type: ignore
+
+
+def loadPrinters() -> list[Dict[str, Any]]:
+    path = os.path.expanduser("~/.printmaster/printers.json")
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return []
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        return [data]
+    return []
+
+
+def pickPrinter(metadata: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    printers = loadPrinters()
+    if not printers:
+        return None
+    serialNumber = (metadata or {}).get("serialNumber")
+    nickname = (metadata or {}).get("nickname")
+    if isinstance(serialNumber, str) and serialNumber.strip():
+        normalizedSerial = serialNumber.strip()
+        for printer in printers:
+            if str(printer.get("serialNumber", "")).strip() == normalizedSerial:
+                return printer
+    if isinstance(nickname, str) and nickname.strip():
+        normalizedNickname = nickname.strip().lower()
+        for printer in printers:
+            printerNickname = str(printer.get("nickname") or "").strip().lower()
+            if printerNickname == normalizedNickname:
+                return printer
+    return printers[0]
+
+
+
+class ListenerGuiApp:
+    def __init__(self) -> None:
+        configureLogging()
+        self.root = tk.Tk()
+        self.root.title("Cloud Printer Listener")
+        self.root.geometry("560x420")
+
+        self.logQueue: "Queue[str]" = Queue()
+        self.listenerThread: Optional[threading.Thread] = None
+        self.stopEvent: Optional[threading.Event] = None
+        self.logFilePath: Optional[Path] = None
+
+        self.printerStoragePath = Path.home() / ".printmaster" / "printers.json"
+        self.printers: list[Dict[str, Any]] = self._loadPrinters()
+        self.printerStatusQueue: "Queue[tuple[str, Any]]" = Queue()
+        self.statusRefreshThread: Optional[threading.Thread] = None
+        self.statusRefreshIntervalMs = 60_000
+        self.pendingImmediateStatusRefresh = False
+
+        self.listenerRecipientId = ""
+        self.listenerStatusApiKey = ""
+
+        self._buildLayout()
+        self.root.after(200, self._processLogQueue)
+        self.root.after(200, self._processPrinterStatusUpdates)
+        self._scheduleStatusRefresh(0)
+
+    def log(self, message: str) -> None:
+        self.logQueue.put(str(message))
+
+    def _buildLayout(self) -> None:
+        paddingOptions = {"padx": 8, "pady": 4}
+
+        notebook = ttk.Notebook(self.root)
+        notebook.pack(fill=tk.BOTH, expand=True)
+
+        listenerFrame = ttk.Frame(notebook)
+        notebook.add(listenerFrame, text="Listener")
+        self._buildListenerTab(listenerFrame, paddingOptions)
+
+        printersFrame = ttk.Frame(notebook)
+        notebook.add(printersFrame, text="3D Printers")
+        self._buildPrintersTab(printersFrame)
+
+    def _buildListenerTab(self, parent: ttk.Frame, paddingOptions: Dict[str, int]) -> None:
+        ttk.Label(parent, text="Base URL:").grid(row=0, column=0, sticky=tk.W, **paddingOptions)
+        self.baseUrlVar = tk.StringVar(value=defaultBaseUrl)
+        ttk.Entry(parent, textvariable=self.baseUrlVar, width=50).grid(
+            row=0, column=1, sticky=tk.EW, **paddingOptions
+        )
+
+        ttk.Label(parent, text="Channel (Recipient ID):").grid(
+            row=1, column=0, sticky=tk.W, **paddingOptions
+        )
+        self.recipientVar = tk.StringVar()
+        self.recipientVar.trace_add("write", lambda *_: self._updateListenerRecipient())
+        ttk.Entry(parent, textvariable=self.recipientVar, width=30).grid(
+            row=1, column=1, sticky=tk.EW, **paddingOptions
+        )
+        self._updateListenerRecipient()
+
+        ttk.Label(parent, text="Status API Key:").grid(row=2, column=0, sticky=tk.W, **paddingOptions)
+        self.statusApiKeyVar = tk.StringVar()
+        self.statusApiKeyVar.trace_add("write", lambda *_: self._updateListenerStatusApiKey())
+        ttk.Entry(parent, textvariable=self.statusApiKeyVar, width=30, show="*").grid(
+            row=2, column=1, sticky=tk.EW, **paddingOptions
+        )
+        self._updateListenerStatusApiKey()
+
+        ttk.Label(parent, text="Output Directory:").grid(row=3, column=0, sticky=tk.W, **paddingOptions)
+        self.outputDirVar = tk.StringVar(value=str(defaultFilesDirectory))
+        outputDirFrame = ttk.Frame(parent)
+        outputDirFrame.grid(row=3, column=1, sticky=tk.EW, **paddingOptions)
+        outputDirEntry = ttk.Entry(outputDirFrame, textvariable=self.outputDirVar, width=40)
+        outputDirEntry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(outputDirFrame, text="Browse", command=self._chooseOutputDir).pack(side=tk.LEFT, padx=4)
+
+        ttk.Label(parent, text="JSON Log File:").grid(row=4, column=0, sticky=tk.W, **paddingOptions)
+        self.logFileVar = tk.StringVar(
+            value=str(Path.home() / ".printmaster" / "listener-log.json")
+        )
+        logFileFrame = ttk.Frame(parent)
+        logFileFrame.grid(row=4, column=1, sticky=tk.EW, **paddingOptions)
+        logFileEntry = ttk.Entry(logFileFrame, textvariable=self.logFileVar, width=40)
+        logFileEntry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(logFileFrame, text="Browse", command=self._chooseLogFile).pack(side=tk.LEFT, padx=4)
+
+        ttk.Label(parent, text="Poll Interval (seconds):").grid(row=5, column=0, sticky=tk.W, **paddingOptions)
+        self.pollIntervalVar = tk.IntVar(value=30)
+        ttk.Spinbox(parent, from_=5, to=3600, textvariable=self.pollIntervalVar).grid(
+            row=5, column=1, sticky=tk.W, **paddingOptions
+        )
+
+        buttonFrame = ttk.Frame(parent)
+        buttonFrame.grid(row=6, column=0, columnspan=2, pady=12)
+        self.startButton = ttk.Button(buttonFrame, text="Start Listening", command=self.startListening)
+        self.startButton.pack(side=tk.LEFT, padx=6)
+        self.stopButton = ttk.Button(buttonFrame, text="Stop", command=self.stopListening, state=tk.DISABLED)
+        self.stopButton.pack(side=tk.LEFT, padx=6)
+
+        ttk.Label(parent, text="Event Log:").grid(row=7, column=0, sticky=tk.W, **paddingOptions)
+        self.logText = tk.Text(parent, height=10, state=tk.DISABLED)
+        self.logText.grid(row=7, column=1, sticky=tk.NSEW, **paddingOptions)
+
+        parent.columnconfigure(1, weight=1)
+        parent.rowconfigure(7, weight=1)
+
+    def _buildPrintersTab(self, parent: ttk.Frame) -> None:
+        self.printerSearchVar = tk.StringVar()
+        self.printerBrandOptions = [
+            "Bambu Lab",
+            "Creality",
+            "Prusa Research",
+            "Anycubic",
+            "Flashforge",
+            "Ultimaker",
+            "MakerBot",
+            "Formlabs",
+        ]
+        self.printerStatusOptions = [
+            "Unknown",
+            "Online",
+            "Idle",
+            "Printing",
+            "Paused",
+            "Completed",
+            "Error",
+            "Offline",
+        ]
+
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(2, weight=1)
+
+        searchFrame = ttk.Frame(parent)
+        searchFrame.grid(row=0, column=0, sticky=tk.EW, padx=8, pady=(8, 4))
+        ttk.Label(searchFrame, text="Search by Name or IP:").pack(side=tk.LEFT)
+        searchEntry = ttk.Entry(searchFrame, textvariable=self.printerSearchVar, width=30)
+        searchEntry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6)
+        ttk.Button(searchFrame, text="Clear", command=self._clearPrinterSearch).pack(side=tk.LEFT)
+        self.printerSearchVar.trace_add("write", lambda *_: self._refreshPrinterList())
+
+        actionFrame = ttk.Frame(parent)
+        actionFrame.grid(row=1, column=0, sticky=tk.EW, padx=8, pady=4)
+        ttk.Button(actionFrame, text="Add Printer", command=self._openAddPrinterDialog).pack(
+            side=tk.LEFT
+        )
+        self.editPrinterButton = ttk.Button(
+            actionFrame,
+            text="Edit Selected",
+            command=self._openEditPrinterDialog,
+            state=tk.DISABLED,
+        )
+        self.editPrinterButton.pack(side=tk.LEFT, padx=(8, 0))
+        self.sendTestStatusButton = ttk.Button(
+            actionFrame,
+            text="Send Test Status",
+            command=self.openManualStatusDialog,
+            state=tk.DISABLED,
+        )
+        self.sendTestStatusButton.pack(side=tk.LEFT, padx=8)
+        self.connectPrintersButton = ttk.Button(
+            actionFrame,
+            text="Connect Printers",
+            command=self.refreshPrintersNow,
+            state=tk.NORMAL,
+        )
+        self.connectPrintersButton.pack(side=tk.LEFT, padx=8)
+        actionFrame.columnconfigure(0, weight=1)
+
+        treeFrame = ttk.Frame(parent)
+        treeFrame.grid(row=2, column=0, sticky=tk.NSEW, padx=8, pady=(4, 8))
+        columns = (
+            "nickname",
+            "ipAddress",
+            "accessCode",
+            "serialNumber",
+            "brand",
+            "status",
+            "nozzleTemp",
+            "bedTemp",
+            "progress",
+        )
+        self.printerTree = ttk.Treeview(treeFrame, columns=columns, show="headings", selectmode="browse")
+        self.printerTree.heading("nickname", text="Nickname")
+        self.printerTree.heading("ipAddress", text="IP Address")
+        self.printerTree.heading("accessCode", text="Access Code")
+        self.printerTree.heading("serialNumber", text="Serial Number")
+        self.printerTree.heading("brand", text="Brand")
+        self.printerTree.heading("status", text="Status")
+        self.printerTree.heading("nozzleTemp", text="Nozzle Temp")
+        self.printerTree.heading("bedTemp", text="Bed Temp")
+        self.printerTree.heading("progress", text="Progress")
+        self.printerTree.column("nickname", width=120)
+        self.printerTree.column("ipAddress", width=110)
+        self.printerTree.column("accessCode", width=110)
+        self.printerTree.column("serialNumber", width=120)
+        self.printerTree.column("brand", width=100)
+        self.printerTree.column("status", width=100)
+        self.printerTree.column("nozzleTemp", width=110)
+        self.printerTree.column("bedTemp", width=100)
+        self.printerTree.column("progress", width=140)
+
+        scrollbar = ttk.Scrollbar(treeFrame, orient=tk.VERTICAL, command=self.printerTree.yview)
+        self.printerTree.configure(yscrollcommand=scrollbar.set)
+        self.printerTree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.printerTree.bind("<<TreeviewSelect>>", self._onPrinterSelection)
+
+        self._refreshPrinterList()
+
+    def _loadPrinters(self) -> list[Dict[str, Any]]:
+        try:
+            self.printerStoragePath.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as error:
+            logging.warning("Unable to prepare printer storage directory: %s", error)
+        if self.printerStoragePath.exists():
+            try:
+                with self.printerStoragePath.open("r", encoding="utf-8") as printerFile:
+                    loadedPrinters = json.load(printerFile)
+                if isinstance(loadedPrinters, list):
+                    sanitizedPrinters: list[Dict[str, Any]] = []
+                    for entry in loadedPrinters:
+                        if not isinstance(entry, dict):
+                            continue
+                        sanitizedPrinters.append(
+                            self._applyTelemetryDefaults(
+                                {
+                                    "nickname": str(entry.get("nickname", "")),
+                                    "ipAddress": str(entry.get("ipAddress", "")),
+                                    "accessCode": str(entry.get("accessCode", "")),
+                                    "serialNumber": str(entry.get("serialNumber", "")),
+                                    "brand": str(entry.get("brand", "")),
+                                    "status": str(entry.get("status", "")) or "Unknown",
+                                    "nozzleTemp": self._parseOptionalFloat(entry.get("nozzleTemp")),
+                                    "bedTemp": self._parseOptionalFloat(entry.get("bedTemp")),
+                                    "progressPercent": self._parseOptionalFloat(entry.get("progressPercent")),
+                                    "remainingTimeSeconds": self._parseOptionalInt(entry.get("remainingTimeSeconds")),
+                                    "gcodeState": self._parseOptionalString(entry.get("gcodeState")),
+                                    "statusBaseUrl": self._parseOptionalString(entry.get("statusBaseUrl")) or "",
+                                    "statusApiKey": self._parseOptionalString(entry.get("statusApiKey")) or "",
+                                    "statusRecipientId": self._parseOptionalString(entry.get("statusRecipientId")),
+                                    "manualStatusDefaults": entry.get("manualStatusDefaults"),
+                                }
+                            )
+                        )
+                    return sanitizedPrinters
+            except (OSError, json.JSONDecodeError) as error:
+                logging.warning("Unable to load printers from %s: %s", self.printerStoragePath, error)
+        return []
+
+    def _parseOptionalFloat(self, value: Any) -> Optional[float]:
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return float(value)
+        if isinstance(value, str):
+            candidate = value.strip().replace("°C", "")
+            if candidate:
+                try:
+                    return float(candidate)
+                except ValueError:
+                    return None
+        return None
+
+    def _parseOptionalInt(self, value: Any) -> Optional[int]:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float):
+            return int(value)
+        if isinstance(value, str):
+            candidate = (
+                value.strip()
+                .lower()
+                .replace("seconds", "")
+                .replace("second", "")
+                .replace("minutes", "")
+                .replace("minute", "")
+                .replace("hrs", "")
+                .replace("hr", "")
+                .replace("hours", "")
+                .replace("hour", "")
+                .replace("s", "")
+                .replace("m", "")
+                .replace("h", "")
+            )
+            candidate = candidate.strip()
+            if candidate:
+                try:
+                    return int(float(candidate))
+                except ValueError:
+                    return None
+        return None
+
+    def _parseOptionalString(self, value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            stripped = value.strip()
+            return stripped or None
+        return str(value)
+
+    def _applyTelemetryDefaults(self, printerDetails: Dict[str, Any]) -> Dict[str, Any]:
+        printerDetails["status"] = str(printerDetails.get("status", "")) or "Unknown"
+        printerDetails["nozzleTemp"] = self._parseOptionalFloat(printerDetails.get("nozzleTemp"))
+        printerDetails["bedTemp"] = self._parseOptionalFloat(printerDetails.get("bedTemp"))
+        printerDetails["progressPercent"] = self._parseOptionalFloat(printerDetails.get("progressPercent"))
+        printerDetails["remainingTimeSeconds"] = self._parseOptionalInt(
+            printerDetails.get("remainingTimeSeconds")
+        )
+        printerDetails["gcodeState"] = self._parseOptionalString(printerDetails.get("gcodeState"))
+        printerDetails["statusBaseUrl"] = self._parseOptionalString(
+            printerDetails.get("statusBaseUrl")
+        ) or ""
+        printerDetails["statusApiKey"] = self._parseOptionalString(
+            printerDetails.get("statusApiKey")
+        ) or ""
+        printerDetails["statusRecipientId"] = self._parseOptionalString(
+            printerDetails.get("statusRecipientId")
+        )
+        printerDetails["manualStatusDefaults"] = self._sanitizeManualStatusDefaults(
+            printerDetails.get("manualStatusDefaults")
+        )
+        return printerDetails
+
+    def _sanitizeManualStatusDefaults(self, value: Any) -> Dict[str, Any]:
+        sanitized: Dict[str, Any] = {}
+        if not isinstance(value, dict):
+            return sanitized
+
+        for field in ("publicKey", "objectName", "productName", "printJobId", "status"):
+            fieldValue = value.get(field)
+            if fieldValue is not None:
+                sanitized[field] = str(fieldValue).strip()
+
+        useAmsValue = value.get("useAms")
+        interpretedUseAms: Optional[bool]
+        if isinstance(useAmsValue, bool):
+            interpretedUseAms = useAmsValue
+        elif isinstance(useAmsValue, str):
+            normalized = useAmsValue.strip().lower()
+            if normalized in {"true", "1", "yes", "y", "on"}:
+                interpretedUseAms = True
+            elif normalized in {"false", "0", "no", "n", "off"}:
+                interpretedUseAms = False
+            else:
+                interpretedUseAms = None
+        elif isinstance(useAmsValue, (int, float)):
+            interpretedUseAms = bool(useAmsValue)
+        else:
+            interpretedUseAms = None
+        if interpretedUseAms is not None:
+            sanitized["useAms"] = interpretedUseAms
+
+        platesRequested = self._parseOptionalInt(value.get("platesRequested"))
+        if platesRequested is not None and platesRequested > 0:
+            sanitized["platesRequested"] = platesRequested
+
+        jobProgress = self._parseOptionalFloat(value.get("jobProgress"))
+        if jobProgress is not None and jobProgress >= 0:
+            sanitized["jobProgress"] = jobProgress
+
+        nozzleTemp = self._parseOptionalFloat(value.get("nozzleTemp"))
+        if nozzleTemp is not None:
+            sanitized["nozzleTemp"] = nozzleTemp
+
+        bedTemp = self._parseOptionalFloat(value.get("bedTemp"))
+        if bedTemp is not None:
+            sanitized["bedTemp"] = bedTemp
+
+        materialLevel = value.get("materialLevel")
+        if isinstance(materialLevel, dict):
+            sanitized["materialLevel"] = materialLevel
+
+        return sanitized
+
+    def _formatTemperature(self, value: Optional[float]) -> str:
+        if value is None:
+            return "-"
+        return f"{value:.1f}°C"
+
+    def _formatOptionalNumber(self, value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        if isinstance(value, (int, float)):
+            return ("%g" % float(value)).strip()
+        if isinstance(value, str):
+            return value.strip()
+        return str(value)
+
+    def _formatMaterialLevelForEntry(self, value: Any) -> str:
+        if isinstance(value, dict) and value:
+            try:
+                return json.dumps(value, ensure_ascii=False)
+            except (TypeError, ValueError):
+                return ""
+        return ""
+
+    def _formatDuration(self, seconds: int) -> str:
+        if seconds < 0:
+            return "-"
+        minutes, remainingSeconds = divmod(seconds, 60)
+        hours, minutes = divmod(minutes, 60)
+        segments: list[str] = []
+        if hours:
+            segments.append(f"{hours}h")
+        if minutes:
+            segments.append(f"{minutes}m")
+        if remainingSeconds and not hours:
+            segments.append(f"{remainingSeconds}s")
+        return " ".join(segments) if segments else "0s"
+
+    def _formatProgress(
+        self,
+        percent: Optional[float],
+        remainingSeconds: Optional[int],
+        state: Optional[str],
+    ) -> str:
+        if percent is None and remainingSeconds is None and not state:
+            return "-"
+        parts: list[str] = []
+        if percent is not None:
+            parts.append(f"{percent:.0f}%")
+        if remainingSeconds is not None:
+            parts.append(self._formatDuration(max(0, remainingSeconds)))
+        if state:
+            normalizedState = state.title() if state.isupper() else state
+            parts.append(normalizedState)
+        return " | ".join(parts)
+
+    def _savePrinters(self) -> None:
+        try:
+            self.printerStoragePath.parent.mkdir(parents=True, exist_ok=True)
+            with self.printerStoragePath.open("w", encoding="utf-8") as printerFile:
+                json.dump(self.printers, printerFile, ensure_ascii=False, indent=2)
+        except OSError as error:
+            logging.exception("Failed to save printers: %s", error)
+            messagebox.showerror("Printer Storage", f"Unable to save printers: {error}")
+
+    def _refreshPrinterList(self) -> None:
+        if not hasattr(self, "printerTree"):
+            return
+        for itemId in self.printerTree.get_children():
+            self.printerTree.delete(itemId)
+        searchTerm = self.printerSearchVar.get().strip().lower()
+        for index, printer in enumerate(self.printers):
+            nickname = printer.get("nickname", "")
+            ipAddress = printer.get("ipAddress", "")
+            if searchTerm and searchTerm not in nickname.lower() and searchTerm not in ipAddress.lower():
+                continue
+            nozzleTempDisplay = self._formatTemperature(self._parseOptionalFloat(printer.get("nozzleTemp")))
+            bedTempDisplay = self._formatTemperature(self._parseOptionalFloat(printer.get("bedTemp")))
+            progressDisplay = self._formatProgress(
+                self._parseOptionalFloat(printer.get("progressPercent")),
+                self._parseOptionalInt(printer.get("remainingTimeSeconds")),
+                self._parseOptionalString(printer.get("gcodeState")),
+            )
+            self.printerTree.insert(
+                "",
+                tk.END,
+                iid=str(index),
+                values=(
+                    nickname,
+                    ipAddress,
+                    printer.get("accessCode", ""),
+                    printer.get("serialNumber", ""),
+                    printer.get("brand", ""),
+                    printer.get("status", "Unknown"),
+                    nozzleTempDisplay,
+                    bedTempDisplay,
+                    progressDisplay,
+                ),
+            )
+        self._onPrinterSelection(None)
+
+    def _updateListenerRecipient(self, *_args: Any) -> None:
+        self.listenerRecipientId = self.recipientVar.get().strip() if hasattr(self, "recipientVar") else ""
+
+    def _updateListenerStatusApiKey(self, *_args: Any) -> None:
+        self.listenerStatusApiKey = (
+            self.statusApiKeyVar.get().strip() if hasattr(self, "statusApiKeyVar") else ""
+        )
+
+    def _clearPrinterSearch(self) -> None:
+        self.printerSearchVar.set("")
+
+    def _openAddPrinterDialog(self) -> None:
+        self._showPrinterDialog(
+            title="Add 3D Printer",
+            initialValues=None,
+            onSave=self._handleCreatePrinter,
+        )
+
+    def _openEditPrinterDialog(self) -> None:
+        selectedIndex = self._getSelectedPrinterIndex()
+        if selectedIndex is None:
+            return
+        self._showPrinterDialog(
+            title="Edit 3D Printer",
+            initialValues=self.printers[selectedIndex],
+            onSave=lambda updated: self._handleUpdatePrinter(selectedIndex, updated),
+        )
+
+    def openManualStatusDialog(self) -> None:
+        selectedIndex = self._getSelectedPrinterIndex()
+        if selectedIndex is None:
+            messagebox.showinfo("Printer Status", "Please select a printer first.")
+            return
+
+        printer = self.printers[selectedIndex]
+        manualDefaults = printer.get("manualStatusDefaults")
+        if not isinstance(manualDefaults, dict):
+            manualDefaults = {}
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Send Test Printer Status")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.resizable(False, False)
+        dialog.columnconfigure(0, weight=1)
+
+        baseUrlDefault = str(
+            printer.get("statusBaseUrl")
+            or getPrinterStatusEndpointUrl()
+            or self.baseUrlVar.get()
+            or ""
+        )
+        apiKeyDefault = str(printer.get("statusApiKey") or "")
+        recipientDefault = (
+            printer.get("statusRecipientId")
+            or (self.recipientVar.get().strip() if hasattr(self, "recipientVar") else "")
+        )
+
+        baseUrlVar = tk.StringVar(value=baseUrlDefault)
+        apiKeyVar = tk.StringVar(value=apiKeyDefault)
+        recipientVar = tk.StringVar(value=str(recipientDefault or ""))
+        printerIpVar = tk.StringVar(value=str(printer.get("ipAddress", "")))
+        serialVar = tk.StringVar(value=str(printer.get("serialNumber", "")))
+        publicKeyVar = tk.StringVar(value=self._formatOptionalNumber(manualDefaults.get("publicKey")))
+        accessCodeVar = tk.StringVar(value=str(printer.get("accessCode", "")))
+        objectNameVar = tk.StringVar(value=self._formatOptionalNumber(manualDefaults.get("objectName")))
+        productNameVar = tk.StringVar(value=self._formatOptionalNumber(manualDefaults.get("productName")))
+        printJobIdInitial = manualDefaults.get("printJobId") or str(uuid.uuid4())
+        printJobIdVar = tk.StringVar(value=self._formatOptionalNumber(printJobIdInitial))
+        useAmsVar = tk.BooleanVar(value=bool(manualDefaults.get("useAms")))
+        platesRequestedValue = manualDefaults.get("platesRequested") if manualDefaults.get("platesRequested") else 1
+        platesRequestedVar = tk.StringVar(value=self._formatOptionalNumber(platesRequestedValue))
+        statusDefault = manualDefaults.get("status") or str(printer.get("status", "idle")) or "idle"
+        statusVar = tk.StringVar(value=str(statusDefault).strip())
+        jobProgressVar = tk.StringVar(value=self._formatOptionalNumber(manualDefaults.get("jobProgress")))
+        nozzleTempVar = tk.StringVar(value=self._formatOptionalNumber(manualDefaults.get("nozzleTemp")))
+        bedTempVar = tk.StringVar(value=self._formatOptionalNumber(manualDefaults.get("bedTemp")))
+        materialLevelVar = tk.StringVar(value=self._formatMaterialLevelForEntry(manualDefaults.get("materialLevel")))
+        lastUpdateTimestampDefault = str(
+            manualDefaults.get("lastUpdateTimestamp")
+            or datetime.utcnow().isoformat(timespec="seconds") + "Z"
+        )
+        lastUpdateTimestampVar = tk.StringVar(value=lastUpdateTimestampDefault)
+        statusMessageVar = tk.StringVar(value="")
+
+        if not publicKeyVar.get():
+            publicKeyVar.set("MANUAL-KEY")
+        if not objectNameVar.get():
+            objectNameVar.set("manual_test_object")
+        if not productNameVar.get():
+            productNameVar.set("manual_product")
+        if not statusVar.get():
+            statusVar.set("idle")
+        if not platesRequestedVar.get():
+            platesRequestedVar.set("1")
+        if not jobProgressVar.get():
+            jobProgressVar.set("0")
+        if not materialLevelVar.get():
+            materialLevelVar.set(json.dumps({"filamentA": 100}, ensure_ascii=False))
+
+        connectionFrame = ttk.LabelFrame(dialog, text="Connection")
+        connectionFrame.grid(row=0, column=0, sticky=tk.EW, padx=12, pady=(12, 6))
+        connectionFrame.columnconfigure(1, weight=1)
+        ttk.Label(connectionFrame, text="Base URL:").grid(row=0, column=0, sticky=tk.W, padx=6, pady=4)
+        ttk.Entry(connectionFrame, textvariable=baseUrlVar, width=40).grid(
+            row=0, column=1, sticky=tk.EW, padx=6, pady=4
+        )
+        ttk.Label(connectionFrame, text="API Key:").grid(row=1, column=0, sticky=tk.W, padx=6, pady=4)
+        ttk.Entry(connectionFrame, textvariable=apiKeyVar, show="*", width=40).grid(
+            row=1, column=1, sticky=tk.EW, padx=6, pady=4
+        )
+        ttk.Label(connectionFrame, text="Recipient ID:").grid(row=2, column=0, sticky=tk.W, padx=6, pady=4)
+        ttk.Entry(connectionFrame, textvariable=recipientVar, width=40).grid(
+            row=2, column=1, sticky=tk.EW, padx=6, pady=4
+        )
+
+        identityFrame = ttk.LabelFrame(dialog, text="Printer Identity")
+        identityFrame.grid(row=1, column=0, sticky=tk.EW, padx=12, pady=6)
+        identityFrame.columnconfigure(1, weight=1)
+        ttk.Label(identityFrame, text="Printer IP:").grid(row=0, column=0, sticky=tk.W, padx=6, pady=4)
+        ttk.Entry(identityFrame, textvariable=printerIpVar, width=30).grid(
+            row=0, column=1, sticky=tk.EW, padx=6, pady=4
+        )
+        ttk.Label(identityFrame, text="Serial Number:").grid(row=1, column=0, sticky=tk.W, padx=6, pady=4)
+        ttk.Entry(identityFrame, textvariable=serialVar, width=30).grid(
+            row=1, column=1, sticky=tk.EW, padx=6, pady=4
+        )
+        ttk.Label(identityFrame, text="Public Key:").grid(row=2, column=0, sticky=tk.W, padx=6, pady=4)
+        ttk.Entry(identityFrame, textvariable=publicKeyVar, width=30).grid(
+            row=2, column=1, sticky=tk.EW, padx=6, pady=4
+        )
+        ttk.Label(identityFrame, text="Access Code:").grid(row=3, column=0, sticky=tk.W, padx=6, pady=4)
+        ttk.Entry(identityFrame, textvariable=accessCodeVar, width=30).grid(
+            row=3, column=1, sticky=tk.EW, padx=6, pady=4
+        )
+
+        jobFrame = ttk.LabelFrame(dialog, text="Job Details")
+        jobFrame.grid(row=2, column=0, sticky=tk.EW, padx=12, pady=6)
+        jobFrame.columnconfigure(1, weight=1)
+        ttk.Label(jobFrame, text="Object Name:").grid(row=0, column=0, sticky=tk.W, padx=6, pady=4)
+        ttk.Entry(jobFrame, textvariable=objectNameVar).grid(row=0, column=1, sticky=tk.EW, padx=6, pady=4)
+        ttk.Label(jobFrame, text="Product Name:").grid(row=1, column=0, sticky=tk.W, padx=6, pady=4)
+        ttk.Entry(jobFrame, textvariable=productNameVar).grid(row=1, column=1, sticky=tk.EW, padx=6, pady=4)
+        ttk.Label(jobFrame, text="Print Job ID:").grid(row=2, column=0, sticky=tk.W, padx=6, pady=4)
+        ttk.Entry(jobFrame, textvariable=printJobIdVar).grid(row=2, column=1, sticky=tk.EW, padx=6, pady=4)
+        ttk.Checkbutton(jobFrame, text="Use AMS", variable=useAmsVar).grid(
+            row=3, column=0, sticky=tk.W, padx=6, pady=4
+        )
+        ttk.Label(jobFrame, text="Plates Requested:").grid(row=3, column=1, sticky=tk.W, padx=6, pady=4)
+        ttk.Entry(jobFrame, textvariable=platesRequestedVar, width=10).grid(
+            row=3, column=2, sticky=tk.W, padx=6, pady=4
+        )
+        ttk.Label(jobFrame, text="Material Level (JSON):").grid(row=4, column=0, sticky=tk.W, padx=6, pady=4)
+        ttk.Entry(jobFrame, textvariable=materialLevelVar, width=48).grid(
+            row=4, column=1, columnspan=2, sticky=tk.EW, padx=6, pady=4
+        )
+
+        telemetryFrame = ttk.LabelFrame(dialog, text="Telemetry Overrides")
+        telemetryFrame.grid(row=3, column=0, sticky=tk.EW, padx=12, pady=6)
+        telemetryFrame.columnconfigure(1, weight=1)
+        statusOptions = ["idle", "printing", "paused", "pausing", "error", "finished", "completed", "offline"]
+        ttk.Label(telemetryFrame, text="Status:").grid(row=0, column=0, sticky=tk.W, padx=6, pady=4)
+        statusCombo = ttk.Combobox(telemetryFrame, textvariable=statusVar, values=statusOptions)
+        statusCombo.grid(row=0, column=1, sticky=tk.W, padx=6, pady=4)
+        ttk.Label(telemetryFrame, text="Last Update Timestamp:").grid(
+            row=1, column=0, sticky=tk.W, padx=6, pady=4
+        )
+        ttk.Entry(telemetryFrame, textvariable=lastUpdateTimestampVar, width=24).grid(
+            row=1, column=1, sticky=tk.W, padx=6, pady=4
+        )
+        ttk.Label(telemetryFrame, text="Job Progress (%):").grid(row=2, column=0, sticky=tk.W, padx=6, pady=4)
+        ttk.Entry(telemetryFrame, textvariable=jobProgressVar, width=10).grid(
+            row=2, column=1, sticky=tk.W, padx=6, pady=4
+        )
+        ttk.Label(telemetryFrame, text="Nozzle Temp (°C):").grid(row=3, column=0, sticky=tk.W, padx=6, pady=4)
+        ttk.Entry(telemetryFrame, textvariable=nozzleTempVar, width=10).grid(
+            row=3, column=1, sticky=tk.W, padx=6, pady=4
+        )
+        ttk.Label(telemetryFrame, text="Bed Temp (°C):").grid(row=4, column=0, sticky=tk.W, padx=6, pady=4)
+        ttk.Entry(telemetryFrame, textvariable=bedTempVar, width=10).grid(
+            row=4, column=1, sticky=tk.W, padx=6, pady=4
+        )
+
+        buttonFrame = ttk.Frame(dialog)
+        buttonFrame.grid(row=4, column=0, pady=8)
+
+        def buildRequestData() -> Dict[str, Any]:
+            baseUrlRaw = baseUrlVar.get().strip()
+            if not baseUrlRaw:
+                raise ValueError("Base URL is required.")
+            statusEndpointUrl = getPrinterStatusEndpointUrl()
+            if baseUrlRaw and baseUrlRaw != statusEndpointUrl:
+                try:
+                    buildBaseUrl(baseUrlRaw)
+                except ValueError as error:
+                    raise ValueError(f"Invalid base URL: {error}") from error
+            baseUrlVar.set(statusEndpointUrl)
+
+            apiKey = apiKeyVar.get().strip()
+            if not apiKey:
+                raise ValueError("API key is required.")
+
+            printerIpAddress = printerIpVar.get().strip()
+            if not printerIpAddress:
+                raise ValueError("Printer IP address is required.")
+
+            printerSerial = serialVar.get().strip()
+
+            publicKey = publicKeyVar.get().strip()
+            if not publicKey:
+                raise ValueError("Public key is required.")
+
+            accessCode = accessCodeVar.get().strip()
+
+            objectName = objectNameVar.get().strip()
+            if not objectName:
+                raise ValueError("Object name is required.")
+
+            productName = productNameVar.get().strip()
+            if not productName:
+                raise ValueError("Product name is required.")
+
+            printJobId = printJobIdVar.get().strip() or str(uuid.uuid4())
+
+            useAms = bool(useAmsVar.get())
+
+            platesRequested = self._parseOptionalInt(platesRequestedVar.get())
+            if platesRequested is None or platesRequested <= 0:
+                raise ValueError("Plates requested must be a positive integer.")
+
+            materialLevelText = materialLevelVar.get().strip()
+            if materialLevelText:
+                try:
+                    materialLevel = json.loads(materialLevelText)
+                except json.JSONDecodeError as error:
+                    raise ValueError(f"Material level must be valid JSON: {error.msg}") from error
+                if not isinstance(materialLevel, dict):
+                    raise ValueError("Material level JSON must describe an object.")
+            else:
+                materialLevel = {}
+
+            statusValue = statusVar.get().strip()
+            if not statusValue:
+                raise ValueError("Status is required.")
+
+            jobProgress = self._parseOptionalFloat(jobProgressVar.get())
+            if jobProgress is None or jobProgress < 0:
+                raise ValueError("Job progress must be a non-negative number.")
+            jobProgressValue = float(jobProgress)
+
+            lastUpdateTimestamp = lastUpdateTimestampVar.get().strip()
+            if not lastUpdateTimestamp:
+                lastUpdateTimestamp = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+                lastUpdateTimestampVar.set(lastUpdateTimestamp)
+            else:
+                try:
+                    datetime.strptime(lastUpdateTimestamp, "%Y-%m-%dT%H:%M:%SZ")
+                except ValueError as error:
+                    raise ValueError(
+                        "Last update timestamp must be in ISO 8601 format (YYYY-MM-DDTHH:MM:SSZ)."
+                    ) from error
+
+            nozzleTempValue = self._parseOptionalFloat(nozzleTempVar.get())
+            bedTempValue = self._parseOptionalFloat(bedTempVar.get())
+
+            recipientId = recipientVar.get().strip()
+            if recipientId == "":
+                recipientIdValue: Optional[str] = None
+            else:
+                recipientIdValue = recipientId
+
+            payload: Dict[str, Any] = {
+                "printerIpAddress": printerIpAddress,
+                "publicKey": publicKey,
+                "objectName": objectName,
+                "useAms": useAms,
+                "printJobId": printJobId,
+                "productName": productName,
+                "platesRequested": platesRequested,
+                "status": statusValue,
+                "jobProgress": jobProgressValue,
+                "materialLevel": materialLevel,
+                "lastUpdateTimestamp": lastUpdateTimestamp,
+            }
+
+            payload = addPrinterIdentityToPayload(payload, printerSerial, accessCode)
+            if recipientIdValue:
+                payload["recipientId"] = recipientIdValue
+            if nozzleTempValue is not None:
+                payload["nozzleTemp"] = nozzleTempValue
+            if bedTempValue is not None:
+                payload["bedTemp"] = bedTempValue
+
+            headers = {"X-API-Key": apiKey, "Content-Type": "application/json"}
+            statusUrl = statusEndpointUrl
+
+            manualDefaultsUpdate: Dict[str, Any] = {
+                "publicKey": publicKey,
+                "objectName": objectName,
+                "productName": productName,
+                "printJobId": printJobId,
+                "useAms": useAms,
+                "platesRequested": platesRequested,
+                "materialLevel": materialLevel,
+                "status": statusValue,
+                "jobProgress": jobProgressValue,
+                "lastUpdateTimestamp": lastUpdateTimestamp,
+            }
+            if nozzleTempValue is not None:
+                manualDefaultsUpdate["nozzleTemp"] = nozzleTempValue
+            if bedTempValue is not None:
+                manualDefaultsUpdate["bedTemp"] = bedTempValue
+
+            displayStatus = statusValue.title() if statusValue.islower() else statusValue
+
+            return {
+                "url": statusUrl,
+                "headers": headers,
+                "payload": payload,
+                "baseUrl": statusEndpointUrl,
+                "apiKey": apiKey,
+                "recipientId": recipientIdValue,
+                "manualDefaults": manualDefaultsUpdate,
+                "displayStatus": displayStatus,
+                "jobProgress": jobProgressValue,
+                "nozzleTemp": nozzleTempValue,
+                "bedTemp": bedTempValue,
+                "printerSerial": printerSerial or None,
+                "accessCode": accessCode or None,
+            }
+
+        def finalizeSend(success: bool, message: str, requestData: Optional[Dict[str, Any]]) -> None:
+            if success and requestData is not None:
+                printerRecord = dict(printer)
+                printerRecord["statusBaseUrl"] = requestData["baseUrl"]
+                printerRecord["statusApiKey"] = requestData["apiKey"]
+                printerRecord["statusRecipientId"] = requestData.get("recipientId") or ""
+                printerRecord["manualStatusDefaults"] = requestData["manualDefaults"]
+                displayStatus = requestData.get("displayStatus")
+                if displayStatus:
+                    printerRecord["status"] = displayStatus
+                jobProgressValue = requestData.get("jobProgress")
+                if isinstance(jobProgressValue, (int, float)):
+                    printerRecord["progressPercent"] = jobProgressValue
+                nozzleTempValue = requestData.get("nozzleTemp")
+                if nozzleTempValue is not None:
+                    printerRecord["nozzleTemp"] = nozzleTempValue
+                bedTempValue = requestData.get("bedTemp")
+                if bedTempValue is not None:
+                    printerRecord["bedTemp"] = bedTempValue
+                self.printers[selectedIndex] = self._applyTelemetryDefaults(printerRecord)
+                self._savePrinters()
+                self._refreshPrinterList()
+                statusMessageVar.set("Status update sent successfully.")
+                messagebox.showinfo(
+                    "Printer Status",
+                    f"Status sent successfully.\n{message or 'Printer status updated.'}",
+                    parent=dialog,
+                )
+                dialog.destroy()
+            else:
+                failureMessage = message or "Unknown error"
+                statusMessageVar.set(f"Failed to send status: {failureMessage}")
+                messagebox.showerror(
+                    "Printer Status",
+                    f"Failed to send status update.\n{failureMessage}",
+                    parent=dialog,
+                )
+                sendButton.config(state=tk.NORMAL)
+                cancelButton.config(state=tk.NORMAL)
+
+        def handleSend() -> None:
+            try:
+                requestData = buildRequestData()
+            except ValueError as error:
+                messagebox.showerror("Printer Status", str(error), parent=dialog)
+                return
+
+            statusMessageVar.set("Sending status update...")
+            sendButton.config(state=tk.DISABLED)
+            cancelButton.config(state=tk.DISABLED)
+
+            def worker() -> None:
+                try:
+                    response = requests.post(
+                        requestData["url"],
+                        headers=requestData["headers"],
+                        json=requestData["payload"],
+                        timeout=30,
+                    )
+                    response.raise_for_status()
+                    responseText = response.text.strip() or f"{response.status_code} {response.reason}"
+                    self.root.after(0, lambda: finalizeSend(True, responseText, requestData))
+                except requests.RequestException as requestError:
+                    errorMessage = str(requestError)
+                    self.root.after(0, lambda: finalizeSend(False, errorMessage, requestData))
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        sendButton = ttk.Button(buttonFrame, text="Send Status", command=handleSend)
+        sendButton.pack(side=tk.LEFT, padx=6)
+        cancelButton = ttk.Button(buttonFrame, text="Cancel", command=dialog.destroy)
+        cancelButton.pack(side=tk.LEFT, padx=6)
+
+        ttk.Label(dialog, textvariable=statusMessageVar, foreground="gray").grid(
+            row=5, column=0, padx=12, pady=(0, 12), sticky=tk.W
+        )
+
+        dialog.wait_window(dialog)
+
+    def _showPrinterDialog(
+        self,
+        *,
+        title: str,
+        initialValues: Optional[Dict[str, Any]],
+        onSave: Callable[[Dict[str, Any]], None],
+    ) -> None:
+        dialog = tk.Toplevel(self.root)
+        dialog.title(title)
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        for index in range(2):
+            dialog.columnconfigure(index, weight=1)
+
+        nicknameVar = tk.StringVar(value=(initialValues or {}).get("nickname", ""))
+        ipAddressVar = tk.StringVar(value=(initialValues or {}).get("ipAddress", ""))
+        accessCodeVar = tk.StringVar(value=(initialValues or {}).get("accessCode", ""))
+        serialNumberVar = tk.StringVar(value=(initialValues or {}).get("serialNumber", ""))
+        brandVar = tk.StringVar(value=(initialValues or {}).get("brand", ""))
+        statusBaseUrlVar = tk.StringVar(value=(initialValues or {}).get("statusBaseUrl", ""))
+        statusApiKeyVar = tk.StringVar(value=(initialValues or {}).get("statusApiKey", ""))
+        statusRecipientVar = tk.StringVar(value=(initialValues or {}).get("statusRecipientId", ""))
+        initialStatus = (initialValues or {}).get("status", "Unknown") or "Unknown"
+
+        ttk.Label(dialog, text="Nickname:").grid(row=0, column=0, sticky=tk.W, padx=12, pady=(12, 4))
+        ttk.Entry(dialog, textvariable=nicknameVar).grid(row=0, column=1, sticky=tk.EW, padx=12, pady=(12, 4))
+
+        ttk.Label(dialog, text="IP Address:").grid(row=1, column=0, sticky=tk.W, padx=12, pady=4)
+        ttk.Entry(dialog, textvariable=ipAddressVar).grid(row=1, column=1, sticky=tk.EW, padx=12, pady=4)
+
+        ttk.Label(dialog, text="Access Code:").grid(row=2, column=0, sticky=tk.W, padx=12, pady=4)
+        ttk.Entry(dialog, textvariable=accessCodeVar).grid(row=2, column=1, sticky=tk.EW, padx=12, pady=4)
+
+        ttk.Label(dialog, text="Serial Number:").grid(row=3, column=0, sticky=tk.W, padx=12, pady=4)
+        ttk.Entry(dialog, textvariable=serialNumberVar).grid(row=3, column=1, sticky=tk.EW, padx=12, pady=4)
+
+        ttk.Label(dialog, text="Brand:").grid(row=4, column=0, sticky=tk.W, padx=12, pady=4)
+        brandCombo = ttk.Combobox(
+            dialog,
+            textvariable=brandVar,
+            values=("", *self.printerBrandOptions),
+        )
+        brandCombo.grid(row=4, column=1, sticky=tk.EW, padx=12, pady=4)
+
+        ttk.Label(dialog, text="Status Base URL:").grid(row=5, column=0, sticky=tk.W, padx=12, pady=4)
+        ttk.Entry(dialog, textvariable=statusBaseUrlVar).grid(row=5, column=1, sticky=tk.EW, padx=12, pady=4)
+
+        ttk.Label(dialog, text="Status API Key:").grid(row=6, column=0, sticky=tk.W, padx=12, pady=4)
+        ttk.Entry(dialog, textvariable=statusApiKeyVar, show="*").grid(row=6, column=1, sticky=tk.EW, padx=12, pady=4)
+
+        ttk.Label(dialog, text="Status Recipient ID:").grid(row=7, column=0, sticky=tk.W, padx=12, pady=4)
+        ttk.Entry(dialog, textvariable=statusRecipientVar).grid(row=7, column=1, sticky=tk.EW, padx=12, pady=4)
+
+        ttk.Label(dialog, text="Status:").grid(row=8, column=0, sticky=tk.W, padx=12, pady=4)
+        ttk.Label(dialog, text=initialStatus).grid(row=8, column=1, sticky=tk.W, padx=12, pady=4)
+
+        statusInfoLabel = ttk.Label(
+            dialog,
+            text="Status is updated automatically based on telemetry.",
+        )
+        statusInfoLabel.grid(row=9, column=0, columnspan=2, sticky=tk.W, padx=12, pady=(0, 4))
+        statusInfoLabel.configure(foreground="gray")
+
+        buttonFrame = ttk.Frame(dialog)
+        buttonFrame.grid(row=10, column=0, columnspan=2, pady=12)
+        ttk.Button(
+            buttonFrame,
+            text="Save",
+            command=lambda: self._handlePrinterDialogSave(
+                dialog,
+                nicknameVar,
+                ipAddressVar,
+                accessCodeVar,
+                serialNumberVar,
+                brandVar,
+                statusBaseUrlVar,
+                statusApiKeyVar,
+                statusRecipientVar,
+                onSave,
+            ),
+        ).pack(side=tk.LEFT, padx=6)
+        ttk.Button(buttonFrame, text="Cancel", command=dialog.destroy).pack(side=tk.LEFT, padx=6)
+
+        dialog.wait_window(dialog)
+
+    def _handlePrinterDialogSave(
+        self,
+        dialog: tk.Toplevel,
+        nicknameVar: tk.StringVar,
+        ipAddressVar: tk.StringVar,
+        accessCodeVar: tk.StringVar,
+        serialNumberVar: tk.StringVar,
+        brandVar: tk.StringVar,
+        statusBaseUrlVar: tk.StringVar,
+        statusApiKeyVar: tk.StringVar,
+        statusRecipientVar: tk.StringVar,
+        onSave: Callable[[Dict[str, Any]], None],
+    ) -> None:
+        nickname = nicknameVar.get().strip()
+        ipAddress = ipAddressVar.get().strip()
+        accessCode = accessCodeVar.get().strip()
+        serialNumber = serialNumberVar.get().strip()
+        brand = brandVar.get().strip()
+        statusBaseUrl = statusBaseUrlVar.get().strip()
+        statusApiKey = statusApiKeyVar.get().strip()
+        statusRecipientId = statusRecipientVar.get().strip()
+
+        if not nickname or not ipAddress:
+            messagebox.showerror(
+                "Printer Details",
+                "Nickname and IP address are required.",
+                parent=dialog,
+            )
+            dialog.lift()
+            return
+
+        printerDetails = {
+            "nickname": nickname,
+            "ipAddress": ipAddress,
+            "accessCode": accessCode,
+            "serialNumber": serialNumber,
+            "brand": brand,
+            "statusBaseUrl": statusBaseUrl,
+            "statusApiKey": statusApiKey,
+            "statusRecipientId": statusRecipientId,
+        }
+
+        onSave(self._applyTelemetryDefaults(printerDetails))
+        dialog.destroy()
+
+    def _handleCreatePrinter(self, printerDetails: Dict[str, Any]) -> None:
+        self.printers.append(self._applyTelemetryDefaults(dict(printerDetails)))
+        self._savePrinters()
+        self._refreshPrinterList()
+        self._scheduleStatusRefresh(0)
+
+    def _handleUpdatePrinter(self, index: int, printerDetails: Dict[str, Any]) -> None:
+        existing = dict(self.printers[index]) if 0 <= index < len(self.printers) else {}
+        existing.update(printerDetails)
+        self.printers[index] = self._applyTelemetryDefaults(existing)
+        self._savePrinters()
+        self._refreshPrinterList()
+        self._scheduleStatusRefresh(0)
+
+    def _onPrinterSelection(self, event: object) -> None:  # noqa: ARG002 - required by Tk callback
+        state = tk.NORMAL if self._getSelectedPrinterIndex() is not None else tk.DISABLED
+        self.editPrinterButton.config(state=state)
+        if hasattr(self, "sendTestStatusButton"):
+            self.sendTestStatusButton.config(state=state)
+
+    def refreshPrintersNow(self) -> None:
+        if self.statusRefreshThread and self.statusRefreshThread.is_alive():
+            self.pendingImmediateStatusRefresh = True
+            return
+        if hasattr(self, "connectPrintersButton"):
+            self.connectPrintersButton.config(state=tk.DISABLED)
+        self._scheduleStatusRefresh(0)
+
+    def _getSelectedPrinterIndex(self) -> Optional[int]:
+        selection = self.printerTree.selection() if hasattr(self, "printerTree") else ()
+        if not selection:
+            return None
+        selectedId = selection[0]
+        try:
+            return int(selectedId)
+        except (TypeError, ValueError):
+            return None
+
+    def _scheduleStatusRefresh(self, delayMs: int) -> None:
+        if self.statusRefreshThread and self.statusRefreshThread.is_alive():
+            if delayMs == 0:
+                self.pendingImmediateStatusRefresh = True
+            return
+        self.pendingImmediateStatusRefresh = False
+        self.root.after(delayMs, self._refreshPrinterStatusesAsync)
+
+    def _refreshPrinterStatusesAsync(self) -> None:
+        if self.statusRefreshThread and self.statusRefreshThread.is_alive():
+            return
+        worker = threading.Thread(target=self._refreshPrinterStatusesWorker, daemon=True)
+        self.statusRefreshThread = worker
+        worker.start()
+
+    def _refreshPrinterStatusesWorker(self) -> None:
+        updates: list[Dict[str, Any]] = []
+        printersSnapshot = list(enumerate(list(self.printers)))
+        for index, printer in printersSnapshot:
+            ipAddress = str(printer.get("ipAddress", "")).strip()
+            if not ipAddress:
+                continue
+            telemetry = self._collectPrinterTelemetry(printer)
+            if not telemetry:
+                continue
+            pendingChanges: Dict[str, Any] = {}
+            currentDetails = self.printers[index] if 0 <= index < len(self.printers) else {}
+            for key, value in telemetry.items():
+                if currentDetails.get(key) != value:
+                    pendingChanges[key] = value
+            if pendingChanges:
+                if "status" in pendingChanges:
+                    logging.info(
+                        "Printer %s status changed from %s to %s",
+                        ipAddress,
+                        currentDetails.get("status", "Unknown"),
+                        pendingChanges["status"],
+                    )
+                    if pendingChanges.get("status") == "Online":
+                        try:
+                            self._sendAutomaticPrinterStatus(index, currentDetails, telemetry)
+                        except Exception:  # noqa: BLE001 - ensure telemetry thread continues running
+                            logging.exception(
+                                "Failed to send automatic Online status for printer %s", ipAddress
+                            )
+                updates.append({"index": index, "changes": pendingChanges})
+        if updates:
+            self.printerStatusQueue.put(("updates", updates))
+        self.printerStatusQueue.put(("complete", None))
+
+    def _collectPrinterTelemetry(self, printer: Dict[str, Any]) -> Dict[str, Any]:
+        ipAddress = str(printer.get("ipAddress", "")).strip()
+        availabilityStatus = self._probePrinterAvailability(ipAddress) if ipAddress else "Offline"
+        telemetry: Dict[str, Any] = {
+            "status": availabilityStatus,
+            "nozzleTemp": None,
+            "bedTemp": None,
+            "progressPercent": None,
+            "remainingTimeSeconds": None,
+            "gcodeState": None,
+        }
+        if availabilityStatus == "Offline":
+            return telemetry
+
+        serialNumber = self._parseOptionalString(printer.get("serialNumber"))
+        accessCode = self._parseOptionalString(printer.get("accessCode"))
+        brand = self._parseOptionalString(printer.get("brand"))
+
+        looksLikeBambu = brand is None or "bambu" in brand.lower()
+        if serialNumber and accessCode and mqtt is not None and looksLikeBambu:
+            try:
+                bambuTelemetry = self._fetchBambuTelemetry(ipAddress, serialNumber, accessCode)
+                if bambuTelemetry:
+                    telemetry.update(bambuTelemetry)
+            except Exception as error:  # noqa: BLE001 - telemetry is best-effort
+                logging.debug("Unable to fetch Bambu telemetry from %s: %s", ipAddress, error)
+
+        return telemetry
+
+    def _sendAutomaticPrinterStatus(
+        self,
+        printerIndex: int,
+        currentDetails: Dict[str, Any],
+        telemetry: Dict[str, Any],
+    ) -> None:
+        manualDefaults = currentDetails.get("manualStatusDefaults")
+        if not isinstance(manualDefaults, dict) or not manualDefaults:
+            logging.debug(
+                "Skipping automatic status update for %s because manual defaults are missing.",
+                currentDetails.get("nickname") or currentDetails.get("ipAddress") or printerIndex,
+            )
+            return
+
+        statusUrlCandidate = self._parseOptionalString(currentDetails.get("statusBaseUrl"))
+        statusUrl = statusUrlCandidate or getPrinterStatusEndpointUrl()
+
+        apiKeyCandidate = self._parseOptionalString(currentDetails.get("statusApiKey")) or ""
+        if not apiKeyCandidate:
+            apiKeyCandidate = getattr(self, "listenerStatusApiKey", "")
+        if not apiKeyCandidate:
+            logging.warning(
+                "Skipping automatic status update for %s because the API key is missing.",
+                currentDetails.get("nickname") or currentDetails.get("ipAddress") or printerIndex,
+            )
+            return
+
+        printerIpAddress = self._parseOptionalString(currentDetails.get("ipAddress")) or ""
+        if not printerIpAddress:
+            logging.warning(
+                "Unable to send automatic status update for printer index %s due to missing IP address.",
+                printerIndex,
+            )
+            return
+
+        payload = dict(manualDefaults)
+        payload["printerIpAddress"] = printerIpAddress
+        payload["status"] = "Online"
+
+        jobProgressCandidate: Any = telemetry.get("progressPercent")
+        if jobProgressCandidate is None:
+            jobProgressCandidate = manualDefaults.get("jobProgress")
+        jobProgressValue = self._parseOptionalFloat(jobProgressCandidate)
+        if jobProgressValue is not None and jobProgressValue >= 0:
+            payload["jobProgress"] = float(jobProgressValue)
+
+        nozzleTempValue = self._parseOptionalFloat(telemetry.get("nozzleTemp"))
+        if nozzleTempValue is not None:
+            payload["nozzleTemp"] = nozzleTempValue
+        elif payload.get("nozzleTemp") is None:
+            payload.pop("nozzleTemp", None)
+
+        bedTempValue = self._parseOptionalFloat(telemetry.get("bedTemp"))
+        if bedTempValue is not None:
+            payload["bedTemp"] = bedTempValue
+        elif payload.get("bedTemp") is None:
+            payload.pop("bedTemp", None)
+
+        remainingSecondsValue = self._parseOptionalInt(telemetry.get("remainingTimeSeconds"))
+        if remainingSecondsValue is not None and remainingSecondsValue >= 0:
+            payload["remainingTimeSeconds"] = remainingSecondsValue
+
+        gcodeStateValue = self._parseOptionalString(telemetry.get("gcodeState"))
+        if gcodeStateValue:
+            payload["gcodeState"] = gcodeStateValue
+
+        if not isinstance(payload.get("materialLevel"), dict):
+            payload["materialLevel"] = {}
+
+        payload["lastUpdateTimestamp"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+
+        recipientCandidate = getattr(self, "listenerRecipientId", "") or ""
+        if not recipientCandidate:
+            recipientCandidate = self._parseOptionalString(currentDetails.get("statusRecipientId")) or ""
+        if recipientCandidate:
+            payload["recipientId"] = recipientCandidate
+
+        payload = addPrinterIdentityToPayload(
+            payload,
+            self._parseOptionalString(currentDetails.get("serialNumber")),
+            self._parseOptionalString(currentDetails.get("accessCode")),
+        )
+
+        headers = {"X-API-Key": apiKeyCandidate, "Content-Type": "application/json"}
+        try:
+            response = requests.post(statusUrl, headers=headers, json=payload, timeout=15)
+            response.raise_for_status()
+        except requests.RequestException as error:
+            logging.warning(
+                "Automatic Online status update failed for %s: %s",
+                currentDetails.get("nickname") or printerIpAddress,
+                error,
+            )
+            return
+
+        logging.info(
+            "Automatic Online status update sent for %s: %s",
+            currentDetails.get("nickname") or printerIpAddress,
+            response.status_code,
+        )
+
+        manualDefaultsUpdate = dict(manualDefaults)
+        manualDefaultsUpdate["status"] = "Online"
+        manualDefaultsUpdate["lastUpdateTimestamp"] = payload["lastUpdateTimestamp"]
+        if jobProgressValue is not None and jobProgressValue >= 0:
+            manualDefaultsUpdate["jobProgress"] = float(jobProgressValue)
+        if nozzleTempValue is not None:
+            manualDefaultsUpdate["nozzleTemp"] = nozzleTempValue
+        if bedTempValue is not None:
+            manualDefaultsUpdate["bedTemp"] = bedTempValue
+
+        sanitizedDefaults = self._sanitizeManualStatusDefaults(manualDefaultsUpdate)
+
+        updates: Dict[str, Any] = {
+            "manualStatusDefaults": sanitizedDefaults,
+            "statusBaseUrl": statusUrl,
+        }
+        if not currentDetails.get("statusApiKey"):
+            updates["statusApiKey"] = apiKeyCandidate
+        if recipientCandidate:
+            updates["statusRecipientId"] = recipientCandidate
+
+        self.printerStatusQueue.put(("updates", [{"index": printerIndex, "changes": updates}]))
+
+        printerName = currentDetails.get("nickname") or printerIpAddress
+        logMessage = f"Sent automatic Online status for {printerName}."
+        self.logQueue.put(logMessage)
+
+    def _fetchBambuTelemetry(
+        self,
+        ipAddress: str,
+        serialNumber: str,
+        accessCode: str,
+        timeoutSeconds: float = 4.0,
+    ) -> Dict[str, Any]:
+        if mqtt is None:  # pragma: no cover - guarded by caller
+            return {}
+
+        topicReport = f"device/{serialNumber}/report"
+        topicRequest = f"device/{serialNumber}/request"
+        receivedTelemetry: Dict[str, Any] = {}
+        telemetryEvent = threading.Event()
+
+        callbackApiVersion = getattr(mqtt, "CallbackAPIVersion", None)
+        clientKwargs: Dict[str, Any] = {"protocol": mqtt.MQTTv311}  # type: ignore[attr-defined]
+        if callbackApiVersion is not None:
+            clientKwargs["callback_api_version"] = callbackApiVersion.VERSION2  # type: ignore[attr-defined]
+
+        telemetryLock = threading.Lock()
+
+        def mergeTelemetry(update: Dict[str, Any]) -> bool:
+            significantKeys = {"progressPercent", "remainingTimeSeconds", "nozzleTemp", "bedTemp", "gcodeState"}
+            hasChange = False
+            hasDetails = False
+            with telemetryLock:
+                for key, value in update.items():
+                    if key not in ("status", *significantKeys):
+                        continue
+                    if key != "status" and value is not None:
+                        hasDetails = True
+                    if receivedTelemetry.get(key) != value:
+                        receivedTelemetry[key] = value
+                        hasChange = True
+            if hasChange and (hasDetails or receivedTelemetry.get("status")):
+                return True
+            return False
+
+        def onConnect(
+            client: mqtt.Client,  # type: ignore[name-defined]
+            _userdata: Any,
+            _flags: Dict[str, Any],
+            reasonCode: Any,
+            *extraArgs: Any,
+        ) -> None:
+            isFailure = False
+            if getattr(reasonCode, "is_failure", None):
+                isFailure = bool(reasonCode.is_failure)
+            elif isinstance(reasonCode, int):
+                isFailure = reasonCode != 0
+
+            if isFailure:
+                receivedTelemetry["status"] = "Offline"
+                telemetryEvent.set()
+                return
+            client.subscribe(topicReport, qos=1)
+            commandsToSend = [
+                {"pushed": {"command": "get_status"}},
+                {"pushed": {"command": "pushall"}},
+                {"print": {"command": "getstate"}},
+            ]
+            for command in commandsToSend:
+                try:
+                    client.publish(topicRequest, json.dumps(command), qos=1)
+                except Exception:  # noqa: BLE001 - telemetry is best-effort
+                    continue
+
+        def onMessage(
+            _client: mqtt.Client,  # type: ignore[name-defined]
+            _userdata: Any,
+            message: Any,
+        ) -> None:
+            try:
+                payload = json.loads(message.payload.decode("utf-8"))
+            except Exception:  # noqa: BLE001 - ignore malformed payloads
+                return
+
+            def findKey(obj: Any, key: str) -> Any:
+                if isinstance(obj, dict):
+                    if key in obj:
+                        return obj[key]
+                    for nested in obj.values():
+                        result = findKey(nested, key)
+                        if result is not None:
+                            return result
+                elif isinstance(obj, list):
+                    for nested in obj:
+                        result = findKey(nested, key)
+                        if result is not None:
+                            return result
+                return None
+
+            statusPayload = {
+                "mc_percent": findKey(payload, "mc_percent"),
+                "gcode_state": findKey(payload, "gcode_state"),
+                "mc_remaining_time": findKey(payload, "mc_remaining_time"),
+                "nozzle_temper": findKey(payload, "nozzle_temper"),
+                "bed_temper": findKey(payload, "bed_temper"),
+            }
+            if mergeTelemetry(self._interpretBambuStatus(statusPayload)):
+                telemetryEvent.set()
+
+        client = mqtt.Client(**clientKwargs)  # type: ignore[name-defined]
+        client.username_pw_set("bblp", accessCode)
+        client.tls_set(cert_reqs=ssl.CERT_NONE)
+        client.tls_insecure_set(True)
+        client.on_connect = onConnect
+        client.on_message = onMessage
+
+        client.loop_start()
+        try:
+            client.connect(ipAddress, 8883, keepalive=30)
+            telemetryEvent.wait(timeoutSeconds)
+        finally:
+            client.loop_stop()
+            with contextlib.suppress(Exception):
+                client.disconnect()
+
+        return receivedTelemetry
+
+    def _interpretBambuStatus(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        percent = self._parseOptionalFloat(payload.get("mc_percent"))
+        remainingSeconds = self._parseOptionalInt(payload.get("mc_remaining_time"))
+        nozzleTemp = self._parseOptionalFloat(payload.get("nozzle_temper"))
+        bedTemp = self._parseOptionalFloat(payload.get("bed_temper"))
+        state = self._parseOptionalString(payload.get("gcode_state"))
+
+        status = self._mapBambuState(state, percent)
+
+        return {
+            "status": status,
+            "progressPercent": percent,
+            "remainingTimeSeconds": remainingSeconds,
+            "nozzleTemp": nozzleTemp,
+            "bedTemp": bedTemp,
+            "gcodeState": state,
+        }
+
+    def _mapBambuState(self, state: Optional[str], percent: Optional[float]) -> str:
+        normalized = state.strip().upper() if state else ""
+        mapping = {
+            "IDLE": "Idle",
+            "READY": "Idle",
+            "STANDBY": "Idle",
+            "PRINTING": "Printing",
+            "RUNNING": "Printing",
+            "PAUSE": "Paused",
+            "PAUSED": "Paused",
+            "FINISH": "Completed",
+            "FINISHED": "Completed",
+            "COMPLETED": "Completed",
+            "FAILED": "Error",
+            "FAIL": "Error",
+            "ERROR": "Error",
+            "OFFLINE": "Offline",
+        }
+        if normalized in mapping:
+            return mapping[normalized]
+        if normalized:
+            return normalized.title()
+        if percent is not None and percent > 0:
+            return "Printing"
+        return "Online"
+
+    def _probePrinterAvailability(self, ipAddress: str, timeoutSeconds: float = 2.0) -> str:
+        if not ipAddress:
+            return "Offline"
+        portsToTry = (8883, 443, 80)
+        for port in portsToTry:
+            try:
+                with contextlib.closing(socket.create_connection((ipAddress, port), timeoutSeconds)):
+                    return "Online"
+            except (OSError, ValueError):
+                continue
+        return "Offline"
+
+    def _processPrinterStatusUpdates(self) -> None:
+        try:
+            while True:
+                messageType, payload = self.printerStatusQueue.get_nowait()
+                if messageType == "updates":
+                    updatesPayload = payload if isinstance(payload, list) else []
+                    hasChanges = False
+                    for item in updatesPayload:
+                        if isinstance(item, dict):
+                            index = item.get("index")
+                            changes = item.get("changes")
+                            if (
+                                isinstance(index, int)
+                                and isinstance(changes, dict)
+                                and 0 <= index < len(self.printers)
+                            ):
+                                self.printers[index].update(changes)
+                                hasChanges = True
+                        elif isinstance(item, (tuple, list)) and len(item) == 2:
+                            indexCandidate, statusCandidate = item
+                            if (
+                                isinstance(indexCandidate, int)
+                                and 0 <= indexCandidate < len(self.printers)
+                            ):
+                                self.printers[indexCandidate]["status"] = str(statusCandidate)
+                                hasChanges = True
+                    if hasChanges:
+                        self._savePrinters()
+                        self._refreshPrinterList()
+                elif messageType == "complete":
+                    self.statusRefreshThread = None
+                    if hasattr(self, "connectPrintersButton"):
+                        self.connectPrintersButton.config(state=tk.NORMAL)
+                    delay = 0 if self.pendingImmediateStatusRefresh else self.statusRefreshIntervalMs
+                    self._scheduleStatusRefresh(delay)
+        except Empty:
+            pass
+        self.root.after(500, self._processPrinterStatusUpdates)
+
+    def _chooseOutputDir(self) -> None:
+        selectedDir = filedialog.askdirectory(title="Select Output Directory")
+        if selectedDir:
+            self.outputDirVar.set(selectedDir)
+
+    def _chooseLogFile(self) -> None:
+        selectedFile = filedialog.asksaveasfilename(
+            title="Select JSON Log File",
+            defaultextension=".json",
+            filetypes=(("JSON Files", "*.json"), ("All Files", "*.*")),
+        )
+        if selectedFile:
+            self.logFileVar.set(selectedFile)
+
+    def startListening(self) -> None:
+        if self.listenerThread and self.listenerThread.is_alive():
+            messagebox.showinfo("Listener", "Listener is already running.")
+            return
+
+        baseUrl = self.baseUrlVar.get().strip()
+        recipientId = self.recipientVar.get().strip()
+        outputDir = self.outputDirVar.get().strip()
+        logFile = self.logFileVar.get().strip()
+        pollInterval = max(5, int(self.pollIntervalVar.get()))
+
+        if not baseUrl or not recipientId:
+            messagebox.showerror("Missing Information", "Base URL and recipient ID are required.")
+            return
+
+        try:
+            ensureOutputDirectory(outputDir)
+        except OSError as error:
+            messagebox.showerror("Output Directory", f"Unable to prepare output directory: {error}")
+            return
+
+        self.logFilePath = Path(logFile).expanduser().resolve()
+        self.stopEvent = threading.Event()
+        self.listenerThread = threading.Thread(
+            target=self._runListener,
+            args=(baseUrl, recipientId, outputDir, pollInterval),
+            daemon=True,
+        )
+        self.listenerThread.start()
+        self._appendLogLine("Started listening...")
+        self.startButton.config(state=tk.DISABLED)
+        self.stopButton.config(state=tk.NORMAL)
+
+    def stopListening(self) -> None:
+        if self.stopEvent:
+            self.stopEvent.set()
+        if self.listenerThread and self.listenerThread.is_alive() and threading.current_thread() != self.listenerThread:
+            self.listenerThread.join(timeout=0.5)
+        self.listenerThread = None
+        self.stopEvent = None
+        self.startButton.config(state=tk.NORMAL)
+        self.stopButton.config(state=tk.DISABLED)
+        self._appendLogLine("Stopped listening.")
+
+    def _runListener(
+        self,
+        baseUrl: str,
+        recipientId: str,
+        outputDir: str,
+        pollInterval: int,
+    ) -> None:
+        try:
+            listenForFiles(
+                baseUrl,
+                recipientId,
+                outputDir,
+                pollInterval,
+                maxIterations=0,
+                onFileFetched=self._handleFetchedData,
+                stopEvent=self.stopEvent,
+                logFilePath=str(self.logFilePath) if self.logFilePath else None,
+            )
+        except Exception as error:  # noqa: BLE001 - surface exceptions to the GUI
+            logging.exception("Listener encountered an error: %s", error)
+            self.logQueue.put(f"Error: {error}")
+        finally:
+            self.logQueue.put("__LISTENER_STOPPED__")
+
+    def onFileDownloaded(self, path: Path, metadata: Dict[str, Any]) -> None:
+        printerConfig = pickPrinter(metadata)
+        if not printerConfig:
+            self.log("Ingen printer i printers.json – kan ikke sende.")
+            return
+
+        def resolveText(key: str) -> Optional[str]:
+            for source in (metadata, printerConfig):
+                value = source.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+            return None
+
+        def resolveBool(key: str, default: bool) -> bool:
+            for source in (metadata, printerConfig):
+                if key in source:
+                    interpreted = interpretBoolean(source[key])
+                    if interpreted is not None:
+                        return interpreted
+            return default
+
+        def resolveInt(key: str, default: Optional[int]) -> Optional[int]:
+            for source in (metadata, printerConfig):
+                if key in source:
+                    interpreted = interpretInteger(source[key])
+                    if interpreted is not None:
+                        return interpreted
+            return default
+
+        ipAddressValue = resolveText("ipAddress") or printerConfig.get("ipAddress")
+        serialValue = resolveText("serialNumber") or printerConfig.get("serialNumber")
+        accessCodeValue = resolveText("accessCode") or printerConfig.get("accessCode")
+
+        if not ipAddressValue or not accessCodeValue or not serialValue:
+            self.log("Mangler LAN-informasjon for valgt printer – hopper over sending.")
+            return
+
+        lanStrategyValue = resolveText("lanStrategy") or str(printerConfig.get("lanStrategy") or "legacy")
+        plateIndexValue = resolveInt("plateIndex", None)
+        if plateIndexValue is None:
+            plateIndexValue = 1
+        waitSecondsValue = resolveInt("waitSeconds", None)
+        if waitSecondsValue is None:
+            waitSecondsValue = 8
+
+        options = BambuPrintOptions(
+            ipAddress=str(ipAddressValue),
+            serialNumber=str(serialValue),
+            accessCode=str(accessCodeValue),
+            useAms=resolveBool("useAms", True),
+            bedLeveling=resolveBool("bedLeveling", True),
+            layerInspect=resolveBool("layerInspect", True),
+            flowCalibration=resolveBool("flowCalibration", False),
+            vibrationCalibration=resolveBool("vibrationCalibration", False),
+            secureConnection=resolveBool("secureConnection", False),
+            lanStrategy=lanStrategyValue,
+            plateIndex=plateIndexValue,
+            waitSeconds=waitSecondsValue,
+        )
+
+        def worker() -> None:
+            try:
+                self.log(f"Sender til Bambu: {path}")
+                sendBambuPrintJob(
+                    filePath=path,
+                    options=options,
+                    statusCallback=lambda status: (
+                        self.log(json.dumps(status)),
+                        postStatus(status, printerConfig),
+                    ),
+                )
+                self.log("Startkommando sendt.")
+            except Exception as error:  # noqa: BLE001 - surface errors to log
+                self.log(f"Feil ved sending: {error}")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _handleFetchedData(self, details: Dict[str, object]) -> None:
+        savedFile = details.get("savedFile") or details.get("fileName") or "metadata"
+        logMessage = f"Fetched file: {savedFile}"
+
+        statusDetails = details.get("productStatus")
+        if isinstance(statusDetails, dict):
+            availability = statusDetails.get("availabilityStatus")
+            downloaded = statusDetails.get("downloaded")
+            logMessage += f" | Status: {availability} (downloaded={downloaded})"
+
+        if isinstance(details.get("logFilePath"), str):
+            logMessage += f" | Metadata saved to {details['logFilePath']}"
+        elif self.logFilePath is not None:
+            try:
+                loggedPath = appendJsonLogEntry(self.logFilePath, details)
+                logMessage += f" | Metadata saved to {loggedPath}"
+            except Exception as error:  # noqa: BLE001 - ensure UI feedback on errors
+                logging.exception("Failed to append JSON log: %s", error)
+                logMessage += f" | Failed to write log: {error}"
+        self.logQueue.put(logMessage)
+
+        savedPathValue = details.get("savedFile")
+        if isinstance(savedPathValue, (str, Path)):
+            combinedMetadata: Dict[str, Any] = {}
+            for key in ("metadata", "unencryptedData", "decryptedData"):
+                source = details.get(key)
+                if isinstance(source, dict):
+                    combinedMetadata.update(source)
+            for key in ("serialNumber", "nickname", "ipAddress", "accessCode"):
+                if key not in combinedMetadata and key in details:
+                    combinedMetadata[key] = details[key]
+            self.onFileDownloaded(Path(savedPathValue), combinedMetadata)
+
+    def _appendLogLine(self, message: str) -> None:
+        self.logText.configure(state=tk.NORMAL)
+        self.logText.insert(tk.END, f"{message}\n")
+        self.logText.see(tk.END)
+        self.logText.configure(state=tk.DISABLED)
+
+    def _processLogQueue(self) -> None:
+        try:
+            while True:
+                message = self.logQueue.get_nowait()
+                if message == "__LISTENER_STOPPED__":
+                    self.listenerThread = None
+                    self.stopEvent = None
+                    self.startButton.config(state=tk.NORMAL)
+                    self.stopButton.config(state=tk.DISABLED)
+                    self._appendLogLine("Listener stopped.")
+                else:
+                    self._appendLogLine(message)
+        except Empty:
+            pass
+        self.root.after(200, self._processLogQueue)
+
+    def run(self) -> None:
+        try:
+            self.root.mainloop()
+        finally:
+            self.stopListening()
+
+
+def runGui() -> None:
+    app = ListenerGuiApp()
+    app.run()
+
+
+if __name__ == "__main__":
+    runGui()
