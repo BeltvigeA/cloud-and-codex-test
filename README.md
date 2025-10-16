@@ -109,6 +109,40 @@ LAN-klientens oppførsel
 * **Robusthet:** Hvis Firestore svarer med feilen «The query requires an index», logges feilen og klienten kjører en fallback-spørring uten `order_by`. Resultatet sorteres lokalt slik at GUI-et fortsatt viser kommandoer mens indeksen er under oppbygging.
 * **Fullføring:** `_completeCommandInFirestore` oppdaterer `status`, `completedAt` og eventuelle feilmeldinger.
 
+Integrasjon mot Base44
+----------------------
+
+Base44 er den eksterne tjenesten som forsyner systemet med printjobber og metadata for produktene. Når du bygger integrasjonen må du følge denne prosessen steg for steg:
+
+1. **Autentisering mot Base44:**
+   * Hent API-nøkkel fra Base44-administrasjonen og lagre den sikkert som `BASE44_API_KEY` i secrets store (for eksempel Secret Manager).
+   * Alle HTTP-kall sendes til `https://api.base44.com` med `Authorization: Bearer <BASE44_API_KEY>` og `Content-Type: application/json`.
+2. **Opprette en jobbrekvisisjon:**
+   * Send `POST /v1/print-jobs` til Base44 med følgende minimumsdata:
+     ```json
+     {
+       "recipientId": "RID123",
+       "printerSerial": "01P00A381200434",
+       "productId": "PROD-55",
+       "jobMetadata": {
+         "gcodeUrl": "https://storage.googleapis.com/.../file.gcode",
+         "estimatedPrintTimeSeconds": 5400
+       }
+     }
+     ```
+   * Base44 svarer med et JSON-objekt som inneholder `jobId`, `productId`, `status` og en `files`-liste. Lagre `jobId` i Firestore under `print_jobs` slik at både Cloud Run og LAN-klienten kan hente den senere.
+3. **Synkronisere filer til LAN-klienten:**
+   * For hver oppføring i `files`-listen fra Base44 må du opprette et dokument i `printer_commands` med `commandType` satt til `download` og en `metadata.fileUrl` som peker direkte til filen.
+   * Når LAN-klienten ser `download`-kommandoen, laster den ned filen og lagrer en lokal checksum. Oppdater dokumentet med `status="completed"` og legg til `metadata.downloadChecksum` for sporbarhet.
+4. **Starte print hos Base44 og i LAN-klienten:**
+   * Etter at alle filer er synkronisert send `POST /v1/print-jobs/{jobId}/start` til Base44 med den nøyaktige IP-adressen til skriveren (`printerIpAddress`) og den valgte preset-en (`printProfileId`).
+   * Samtidig oppretter Cloud Run et nytt dokument i `printer_commands` med `commandType="start"`, `metadata.jobId=<jobId>` og samme `printerIpAddress`. Dette sikrer at LAN-klienten starter printen lokalt i takt med Base44.
+5. **Rapportere status tilbake til Base44:**
+   * LAN-klienten samler status gjennom `_collectPrinterTelemetry` og publiserer det til Cloud Run via `updatePrinterStatus`.
+   * Cloud Run sender videre `POST /v1/print-jobs/{jobId}/status` til Base44 med felter som `progressPercent`, `bedTemp`, `nozzleTemp` og `lastEventAt`. På den måten holder Base44 dashboardet seg oppdatert.
+
+> **Merk:** Alle tidsstempler sendes i ISO 8601 (`YYYY-MM-DDTHH:MM:SSZ`) og alle numeriske verdier (temperaturer, prosenter, etc.) rapporteres i metriske enheter som forventet av Base44.
+
 Miljøvariabler (hurtigstart)
 ---------------------------
 
