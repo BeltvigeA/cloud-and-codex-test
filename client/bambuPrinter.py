@@ -2395,7 +2395,7 @@ def sendBambuPrintJob(
             else:
                 logPrintJob("ERROR", "connect_failed", method="bambu-connect")
         # ------------------------------------------------------------
-if options.useCloud and options.cloudUrl:
+        if options.useCloud and options.cloudUrl:
             payload = buildCloudJobPayload(
                 ip=options.ipAddress,
                 serial=options.serialNumber,
