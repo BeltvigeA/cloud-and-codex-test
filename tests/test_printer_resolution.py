@@ -57,6 +57,22 @@ def test_resolvePrinterDetails_preserves_lanStrategy_from_configuration():
     assert resolved["lanStrategy"] == "bambuApi"
 
 
+def test_resolvePrinterDetails_preserves_transport_preferences():
+    configuredPrinters = [
+        {
+            "serialNumber": "SN-0100",
+            "transport": "Bambu Connect",
+            "cloudUrl": "https://cloud.example.com",
+        }
+    ]
+    metadata = {"serialNumber": "SN-0100"}
+
+    resolved = resolvePrinterDetails(metadata, configuredPrinters)
+
+    assert resolved is not None
+    assert resolved["transport"] == "bambu_connect"
+
+
 def test_extractPrinterAssignment_prefers_decrypted_access_code_for_matching_serial():
     unencryptedData = {
         "printer": {

@@ -19,6 +19,27 @@ def createSampleThreeMf(targetPath: Path) -> None:
         archive.writestr("Metadata/plate_1.gcode", "G1 X0 Y0\n")
 
 
+def patchRequestsPost(monkeypatch: pytest.MonkeyPatch) -> None:
+    class DummyResponse:
+        status_code = 200
+
+        def raise_for_status(self) -> None:  # noqa: D401 - simple stub
+            """Pretend the request succeeded."""
+
+        @property
+        def text(self) -> str:
+            return ""
+
+        def json(self) -> dict[str, Any]:
+            return {}
+
+    def fakePost(*_args: Any, **_kwargs: Any) -> DummyResponse:
+        return DummyResponse()
+
+    monkeypatch.setattr(client.requests, "post", fakePost)
+    monkeypatch.setattr(bambuPrinter.requests, "post", fakePost)
+
+
 def test_dispatchBambuPrintExtractsSkippedObjects(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     samplePath = tmp_path / "sample.3mf"
     samplePath.write_bytes(b"dummy")
@@ -69,7 +90,7 @@ def test_dispatchBambuPrintExtractsSkippedObjects(tmp_path: Path, monkeypatch: p
         return {"remoteFile": "uploaded.3mf", "method": "lan"}
 
     monkeypatch.setattr(client, "sendBambuPrintJob", fakeSendBambuPrintJob)
-    monkeypatch.setattr(bambuPrinter.requests, "post", lambda *_args, **_kwargs: None)
+    patchRequestsPost(monkeypatch)
 
     result = client.dispatchBambuPrintIfPossible(
         baseUrl="https://example.com",
@@ -126,7 +147,7 @@ def test_dispatchBambuPrintIncludesPrinterDetailsInErrors(
         raise RuntimeError("Connection failed for endpoint 192.168.0.8:990")
 
     monkeypatch.setattr(client, "sendBambuPrintJob", fakeSendBambuPrintJob)
-    monkeypatch.setattr(bambuPrinter.requests, "post", lambda *_args, **_kwargs: None)
+    patchRequestsPost(monkeypatch)
 
     caplog.set_level(logging.ERROR)
 
@@ -188,6 +209,13 @@ def test_dispatchBambuPrintUsesBambulabsApiWhenConfigured(
 
     uploadCapture: dict[str, Any] = {}
 
+    class DummyUploadSession:
+        def __init__(self, *args: Any, **_kwargs: Any) -> None:
+            self.remoteName = "uploaded.3mf"
+
+        def close(self) -> None:
+            return None
+
     def fakeUploadViaBambulabsApi(
         *,
         ip: str,
@@ -203,20 +231,12 @@ def test_dispatchBambuPrintUsesBambulabsApiWhenConfigured(
         uploadCapture["accessCode"] = accessCode
         uploadCapture["localPathSuffix"] = Path(localPath).suffix
         uploadCapture["remoteName"] = remoteName
+        uploadCapture["startArgs"] = (remoteName, {"connectCamera": connectCamera})
 
-        class FakePrinter:
-            def __init__(self) -> None:
-                self.startArgs = None
-
-            def start_print(self, name: str, startArg: Any) -> None:
-                self.startArgs = (name, startArg)
-                uploadCapture["startArgs"] = self.startArgs
-
-        printer = FakePrinter()
-        session = bambuPrinter.BambuApiUploadSession(
-            printer=printer,
+        session = DummyUploadSession(
+            printer=object(),
             remoteName="uploaded.3mf",
-            connectCamera=False,
+            connectCamera=connectCamera,
             mqttStarted=True,
         )
         if returnPrinter:
@@ -227,10 +247,11 @@ def test_dispatchBambuPrintUsesBambulabsApiWhenConfigured(
     def failUploadViaFtps(**_kwargs: Any) -> str:
         raise AssertionError("uploadViaFtps should not be used when lanStrategy=bambuApi")
 
+    monkeypatch.setattr(bambuPrinter, "BambuApiUploadSession", DummyUploadSession, raising=False)
     monkeypatch.setattr(bambuPrinter, "uploadViaBambulabsApi", fakeUploadViaBambulabsApi)
     monkeypatch.setattr(bambuPrinter, "uploadViaFtps", failUploadViaFtps)
     monkeypatch.setattr(bambuPrinter, "startPrintViaMqtt", lambda **_kwargs: None)
-    monkeypatch.setattr(bambuPrinter.requests, "post", lambda *_args, **_kwargs: None)
+    patchRequestsPost(monkeypatch)
 
     result = client.dispatchBambuPrintIfPossible(
         baseUrl="https://example.com",
@@ -249,3 +270,195 @@ def test_dispatchBambuPrintUsesBambulabsApiWhenConfigured(
     assert uploadCapture["localPathSuffix"] == ".3mf"
     assert uploadCapture["remoteName"].endswith(".3mf")
     assert uploadCapture.get("startArgs") is not None
+
+
+def test_dispatchBambuPrintRejectsTransportMismatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    samplePath = tmp_path / "sample.3mf"
+    samplePath.write_bytes(b"dummy")
+
+    entryData = {
+        "savedFile": str(samplePath),
+        "printJobId": "job-123",
+        "unencryptedData": {
+            "printer": {
+                "printerSerial": "SERIAL555",
+                "ipAddress": "192.168.0.55",
+                "accessCode": "ACCESS",
+                "brand": "Bambu Lab",
+                "connectionMethod": "lan",
+            },
+            "job": {"transport": "bambu_connect"},
+        },
+        "decryptedData": {},
+    }
+
+    statusPayload = {
+        "fileName": "sample.3mf",
+        "lastRequestedAt": "2024-01-01T00:00:00Z",
+        "requestedMode": "full",
+        "success": True,
+        "printJobId": "job-123",
+    }
+
+    configuredPrinters = [
+        {
+            "serialNumber": "SERIAL555",
+            "ipAddress": "192.168.0.55",
+            "accessCode": "ACCESS",
+            "brand": "Bambu Lab",
+            "connectionMethod": "lan",
+        }
+    ]
+
+    patchRequestsPost(monkeypatch)
+    caplog.set_level(logging.WARNING)
+
+    result = client.dispatchBambuPrintIfPossible(
+        baseUrl="https://example.com",
+        productId="product-3",
+        recipientId="recipient-3",
+        entryData=entryData,
+        statusPayload=statusPayload,
+        configuredPrinters=configuredPrinters,
+    )
+
+    assert result is None
+    assert any(
+        "reason=transport_mismatch" in record.message
+        and "job-123" in record.message
+        and "SERIAL555" in record.message
+        for record in caplog.records
+    )
+
+
+def test_dispatchBambuPrintRejectsUnsupportedTransport(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    samplePath = tmp_path / "sample.3mf"
+    samplePath.write_bytes(b"dummy")
+
+    entryData = {
+        "savedFile": str(samplePath),
+        "printJobId": "job-124",
+        "unencryptedData": {
+            "printer": {
+                "printerSerial": "SERIAL556",
+                "ipAddress": "192.168.0.56",
+                "accessCode": "ACCESS",
+                "brand": "Bambu Lab",
+                "connectionMethod": "lan",
+            },
+            "job": {"transport": "octoprint"},
+        },
+        "decryptedData": {},
+    }
+
+    statusPayload = {
+        "fileName": "sample.3mf",
+        "lastRequestedAt": "2024-01-01T00:00:00Z",
+        "requestedMode": "full",
+        "success": True,
+        "printJobId": "job-124",
+    }
+
+    configuredPrinters = [
+        {
+            "serialNumber": "SERIAL556",
+            "ipAddress": "192.168.0.56",
+            "accessCode": "ACCESS",
+            "brand": "Bambu Lab",
+            "connectionMethod": "lan",
+        }
+    ]
+
+    patchRequestsPost(monkeypatch)
+    caplog.set_level(logging.WARNING)
+
+    result = client.dispatchBambuPrintIfPossible(
+        baseUrl="https://example.com",
+        productId="product-4",
+        recipientId="recipient-4",
+        entryData=entryData,
+        statusPayload=statusPayload,
+        configuredPrinters=configuredPrinters,
+    )
+
+    assert result is None
+    assert any(
+        "reason=unsupported_transport" in record.message
+        and "transport=octoprint" in record.message
+        and "job-124" in record.message
+        for record in caplog.records
+    )
+
+
+def test_dispatchBambuPrintRoutesBambuConnectViaCloud(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    samplePath = tmp_path / "sample.3mf"
+    samplePath.write_bytes(b"dummy")
+
+    entryData = {
+        "savedFile": str(samplePath),
+        "printJobId": "job-200",
+        "unencryptedData": {
+            "printer": {
+                "printerSerial": "SERIAL600",
+                "ipAddress": "192.168.0.60",
+                "accessCode": "ACCESS",
+                "brand": "Bambu Lab",
+                "transport": "bambu_connect",
+                "cloudUrl": "https://cloud.example.com",
+            },
+            "job": {"transport": "bambu_connect"},
+        },
+        "decryptedData": {"job": {"transport": "bambu_connect"}},
+    }
+
+    statusPayload = {
+        "fileName": "sample.3mf",
+        "lastRequestedAt": "2024-01-01T00:00:00Z",
+        "requestedMode": "full",
+        "success": True,
+        "printJobId": "job-200",
+    }
+
+    configuredPrinters = [
+        {
+            "serialNumber": "SERIAL600",
+            "ipAddress": "192.168.0.60",
+            "accessCode": "ACCESS",
+            "brand": "Bambu Lab",
+            "transport": "bambu_connect",
+            "cloudUrl": "https://cloud.example.com",
+            "useCloud": True,
+        }
+    ]
+
+    callCapture: dict[str, Any] = {}
+
+    def fakeSendBambuPrintJob(*, options: bambuPrinter.BambuPrintOptions, **kwargs: Any) -> dict[str, Any]:
+        callCapture["useCloud"] = options.useCloud
+        callCapture["transport"] = options.transport
+        callCapture["cloudUrl"] = options.cloudUrl
+        return {"remoteFile": "uploaded.3mf", "method": "cloud"}
+
+    monkeypatch.setattr(client, "sendBambuPrintJob", fakeSendBambuPrintJob)
+    patchRequestsPost(monkeypatch)
+
+    result = client.dispatchBambuPrintIfPossible(
+        baseUrl="https://example.com",
+        productId="product-5",
+        recipientId="recipient-5",
+        entryData=entryData,
+        statusPayload=statusPayload,
+        configuredPrinters=configuredPrinters,
+    )
+
+    assert result is not None
+    assert callCapture.get("useCloud") is True
+    assert callCapture.get("transport") == "bambu_connect"
+    assert callCapture.get("cloudUrl") == "https://cloud.example.com"
+    assert result["details"]["transport"] == "bambu_connect"
