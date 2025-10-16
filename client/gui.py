@@ -94,6 +94,20 @@ class ListenerGuiApp:
         self.root.title("Cloud Printer Listener")
         self.root.geometry("560x420")
 
+        self.bambuModelOptions = [
+            "X1 Carbon",
+            "X1E",
+            "X1",
+            "P1S",
+            "P1P",
+            "A1",
+            "A1 Mini",
+        ]
+        self.bambuModelCanonicalMap = {model.lower(): model for model in self.bambuModelOptions}
+        self.bambuConnectMethod = "bambu_connect"
+        self.defaultConnectionMethod = "octoprint"
+        self.connectionMethodOptions = [self.defaultConnectionMethod, self.bambuConnectMethod]
+
         self.logQueue: "Queue[str]" = Queue()
         self.listenerThread: Optional[threading.Thread] = None
         self.stopEvent: Optional[threading.Event] = None
@@ -264,6 +278,8 @@ class ListenerGuiApp:
             "accessCode",
             "serialNumber",
             "brand",
+            "bambuModel",
+            "connectionMethod",
             "status",
             "nozzleTemp",
             "bedTemp",
@@ -275,6 +291,8 @@ class ListenerGuiApp:
         self.printerTree.heading("accessCode", text="Access Code")
         self.printerTree.heading("serialNumber", text="Serial Number")
         self.printerTree.heading("brand", text="Brand")
+        self.printerTree.heading("bambuModel", text="Model")
+        self.printerTree.heading("connectionMethod", text="Connection")
         self.printerTree.heading("status", text="Status")
         self.printerTree.heading("nozzleTemp", text="Nozzle Temp")
         self.printerTree.heading("bedTemp", text="Bed Temp")
@@ -284,6 +302,8 @@ class ListenerGuiApp:
         self.printerTree.column("accessCode", width=110)
         self.printerTree.column("serialNumber", width=120)
         self.printerTree.column("brand", width=100)
+        self.printerTree.column("bambuModel", width=110)
+        self.printerTree.column("connectionMethod", width=120)
         self.printerTree.column("status", width=100)
         self.printerTree.column("nozzleTemp", width=110)
         self.printerTree.column("bedTemp", width=100)
@@ -319,6 +339,8 @@ class ListenerGuiApp:
                                     "accessCode": str(entry.get("accessCode", "")),
                                     "serialNumber": str(entry.get("serialNumber", "")),
                                     "brand": str(entry.get("brand", "")),
+                                    "bambuModel": self._parseOptionalString(entry.get("bambuModel")) or "",
+                                    "connectionMethod": self._parseOptionalString(entry.get("connectionMethod")),
                                     "status": str(entry.get("status", "")) or "Unknown",
                                     "nozzleTemp": self._parseOptionalFloat(entry.get("nozzleTemp")),
                                     "bedTemp": self._parseOptionalFloat(entry.get("bedTemp")),
@@ -389,6 +411,46 @@ class ListenerGuiApp:
         return str(value)
 
     def _applyTelemetryDefaults(self, printerDetails: Dict[str, Any]) -> Dict[str, Any]:
+        brandValue = self._parseOptionalString(printerDetails.get("brand")) or ""
+        printerDetails["brand"] = brandValue
+
+        bambuOptions = list(getattr(self, "bambuModelOptions", []))
+        bambuOptionsMap = getattr(self, "bambuModelCanonicalMap", {})
+        if not bambuOptionsMap and bambuOptions:
+            bambuOptionsMap = {model.lower(): model for model in bambuOptions}
+        bambuConnect = getattr(self, "bambuConnectMethod", "bambu_connect")
+        defaultTransport = getattr(self, "defaultConnectionMethod", "octoprint")
+
+        modelCandidate = self._parseOptionalString(printerDetails.get("bambuModel")) or ""
+        canonicalModel = bambuOptionsMap.get(modelCandidate.lower(), modelCandidate)
+        connectionCandidate = self._parseOptionalString(printerDetails.get("connectionMethod")) or ""
+        normalizedConnection = connectionCandidate.lower()
+        if normalizedConnection == "legacy":
+            normalizedConnection = bambuConnect
+
+        isBambuBrand = bool(brandValue and "bambu" in brandValue.lower())
+        if not isBambuBrand:
+            printerDetails["bambuModel"] = ""
+            printerDetails["connectionMethod"] = defaultTransport
+        else:
+            canonicalModel = bambuOptionsMap.get(modelCandidate.lower(), "")
+            if not canonicalModel and not modelCandidate and bambuOptions:
+                canonicalModel = bambuOptions[0]
+
+            supportedModels = set(bambuOptionsMap.keys()) or {option.lower() for option in bambuOptions}
+            normalizedModelKey = canonicalModel.lower() if canonicalModel else ""
+            isSupportedModel = bool(normalizedModelKey and normalizedModelKey in supportedModels)
+
+            if not isSupportedModel:
+                normalizedConnection = defaultTransport
+            elif normalizedConnection not in {defaultTransport, bambuConnect}:
+                normalizedConnection = bambuConnect
+
+            printerDetails["bambuModel"] = canonicalModel if isSupportedModel else ""
+            printerDetails["connectionMethod"] = (
+                bambuConnect if normalizedConnection == bambuConnect and isSupportedModel else defaultTransport
+            )
+
         printerDetails["status"] = str(printerDetails.get("status", "")) or "Unknown"
         printerDetails["nozzleTemp"] = self._parseOptionalFloat(printerDetails.get("nozzleTemp"))
         printerDetails["bedTemp"] = self._parseOptionalFloat(printerDetails.get("bedTemp"))
@@ -533,6 +595,7 @@ class ListenerGuiApp:
         for itemId in self.printerTree.get_children():
             self.printerTree.delete(itemId)
         searchTerm = self.printerSearchVar.get().strip().lower()
+        defaultTransport = getattr(self, "defaultConnectionMethod", "octoprint")
         for index, printer in enumerate(self.printers):
             nickname = printer.get("nickname", "")
             ipAddress = printer.get("ipAddress", "")
@@ -555,6 +618,8 @@ class ListenerGuiApp:
                     printer.get("accessCode", ""),
                     printer.get("serialNumber", ""),
                     printer.get("brand", ""),
+                    printer.get("bambuModel", ""),
+                    printer.get("connectionMethod", defaultTransport),
                     printer.get("status", "Unknown"),
                     nozzleTempDisplay,
                     bedTempDisplay,
@@ -993,6 +1058,8 @@ class ListenerGuiApp:
         accessCodeVar = tk.StringVar(value=(initialValues or {}).get("accessCode", ""))
         serialNumberVar = tk.StringVar(value=(initialValues or {}).get("serialNumber", ""))
         brandVar = tk.StringVar(value=(initialValues or {}).get("brand", ""))
+        bambuModelVar = tk.StringVar(value=(initialValues or {}).get("bambuModel", ""))
+        connectionMethodVar = tk.StringVar(value=(initialValues or {}).get("connectionMethod", ""))
         statusBaseUrlVar = tk.StringVar(value=(initialValues or {}).get("statusBaseUrl", ""))
         statusApiKeyVar = tk.StringVar(value=(initialValues or {}).get("statusApiKey", ""))
         statusRecipientVar = tk.StringVar(value=(initialValues or {}).get("statusRecipientId", ""))
@@ -1017,28 +1084,107 @@ class ListenerGuiApp:
             values=("", *self.printerBrandOptions),
         )
         brandCombo.grid(row=4, column=1, sticky=tk.EW, padx=12, pady=4)
+        brandCombo.configure(state="readonly")
 
-        ttk.Label(dialog, text="Status Base URL:").grid(row=5, column=0, sticky=tk.W, padx=12, pady=4)
-        ttk.Entry(dialog, textvariable=statusBaseUrlVar).grid(row=5, column=1, sticky=tk.EW, padx=12, pady=4)
+        ttk.Label(dialog, text="Bambu Model:").grid(row=5, column=0, sticky=tk.W, padx=12, pady=4)
+        bambuModelCombo = ttk.Combobox(
+            dialog,
+            textvariable=bambuModelVar,
+            values=("", *self.bambuModelOptions),
+            state="readonly",
+        )
+        bambuModelCombo.grid(row=5, column=1, sticky=tk.EW, padx=12, pady=4)
 
-        ttk.Label(dialog, text="Status API Key:").grid(row=6, column=0, sticky=tk.W, padx=12, pady=4)
-        ttk.Entry(dialog, textvariable=statusApiKeyVar, show="*").grid(row=6, column=1, sticky=tk.EW, padx=12, pady=4)
+        ttk.Label(dialog, text="Connection Method:").grid(row=6, column=0, sticky=tk.W, padx=12, pady=4)
+        connectionMethodCombo = ttk.Combobox(
+            dialog,
+            textvariable=connectionMethodVar,
+            state="readonly",
+        )
+        connectionMethodCombo.grid(row=6, column=1, sticky=tk.EW, padx=12, pady=4)
 
-        ttk.Label(dialog, text="Status Recipient ID:").grid(row=7, column=0, sticky=tk.W, padx=12, pady=4)
-        ttk.Entry(dialog, textvariable=statusRecipientVar).grid(row=7, column=1, sticky=tk.EW, padx=12, pady=4)
+        bambuConnect = getattr(self, "bambuConnectMethod", "bambu_connect")
+        defaultTransport = getattr(self, "defaultConnectionMethod", "octoprint")
 
-        ttk.Label(dialog, text="Status:").grid(row=8, column=0, sticky=tk.W, padx=12, pady=4)
-        ttk.Label(dialog, text=initialStatus).grid(row=8, column=1, sticky=tk.W, padx=12, pady=4)
+        def updateConnectionControls(*_args: Any) -> None:
+            brandValue = brandVar.get().strip()
+            normalizedBrand = brandValue.lower()
+            isBambuBrand = bool(normalizedBrand and "bambu" in normalizedBrand)
+
+            bambuOptionsMap = getattr(self, "bambuModelCanonicalMap", {})
+            bambuOptions = getattr(self, "bambuModelOptions", [])
+            if not bambuOptionsMap and bambuOptions:
+                bambuOptionsMap = {model.lower(): model for model in bambuOptions}
+
+            currentModel = bambuModelVar.get().strip()
+            canonicalModel = bambuOptionsMap.get(currentModel.lower(), currentModel)
+            if canonicalModel and canonicalModel != currentModel:
+                bambuModelVar.set(canonicalModel)
+                currentModel = canonicalModel
+
+            if not isBambuBrand:
+                if currentModel:
+                    bambuModelVar.set("")
+                bambuModelCombo.configure(state="disabled")
+                connectionMethodCombo.configure(state="disabled")
+                connectionMethodCombo.config(values=(defaultTransport,))
+                if connectionMethodVar.get().strip().lower() != defaultTransport:
+                    connectionMethodVar.set(defaultTransport)
+                return
+
+            bambuModelCombo.configure(state="readonly")
+            if not currentModel and bambuOptions:
+                bambuModelVar.set(bambuOptions[0])
+                currentModel = bambuOptions[0]
+
+            supportedModels = {key.lower() for key in bambuOptionsMap.keys()}
+            isSupportedModel = bool(currentModel and currentModel.lower() in supportedModels)
+
+            normalizedConnection = connectionMethodVar.get().strip().lower()
+            if normalizedConnection == "legacy":
+                connectionMethodVar.set(bambuConnect)
+                normalizedConnection = bambuConnect
+
+            if not isSupportedModel:
+                connectionMethodCombo.configure(state="readonly")
+                connectionMethodCombo.config(values=(defaultTransport,))
+                if normalizedConnection != defaultTransport:
+                    connectionMethodVar.set(defaultTransport)
+                return
+
+            connectionMethodCombo.configure(state="readonly")
+            availableTransports = (bambuConnect, defaultTransport)
+            connectionMethodCombo.config(values=availableTransports)
+            if normalizedConnection not in {transport.lower() for transport in availableTransports}:
+                connectionMethodVar.set(bambuConnect)
+
+        brandVar.trace_add("write", updateConnectionControls)
+        bambuModelVar.trace_add("write", updateConnectionControls)
+        initialTransports = tuple(getattr(self, "connectionMethodOptions", [defaultTransport, bambuConnect]))
+        connectionMethodCombo.config(values=initialTransports)
+        updateConnectionControls()
+
+        ttk.Label(dialog, text="Status Base URL:").grid(row=7, column=0, sticky=tk.W, padx=12, pady=4)
+        ttk.Entry(dialog, textvariable=statusBaseUrlVar).grid(row=7, column=1, sticky=tk.EW, padx=12, pady=4)
+
+        ttk.Label(dialog, text="Status API Key:").grid(row=8, column=0, sticky=tk.W, padx=12, pady=4)
+        ttk.Entry(dialog, textvariable=statusApiKeyVar, show="*").grid(row=8, column=1, sticky=tk.EW, padx=12, pady=4)
+
+        ttk.Label(dialog, text="Status Recipient ID:").grid(row=9, column=0, sticky=tk.W, padx=12, pady=4)
+        ttk.Entry(dialog, textvariable=statusRecipientVar).grid(row=9, column=1, sticky=tk.EW, padx=12, pady=4)
+
+        ttk.Label(dialog, text="Status:").grid(row=10, column=0, sticky=tk.W, padx=12, pady=4)
+        ttk.Label(dialog, text=initialStatus).grid(row=10, column=1, sticky=tk.W, padx=12, pady=4)
 
         statusInfoLabel = ttk.Label(
             dialog,
             text="Status is updated automatically based on telemetry.",
         )
-        statusInfoLabel.grid(row=9, column=0, columnspan=2, sticky=tk.W, padx=12, pady=(0, 4))
+        statusInfoLabel.grid(row=11, column=0, columnspan=2, sticky=tk.W, padx=12, pady=(0, 4))
         statusInfoLabel.configure(foreground="gray")
 
         buttonFrame = ttk.Frame(dialog)
-        buttonFrame.grid(row=10, column=0, columnspan=2, pady=12)
+        buttonFrame.grid(row=12, column=0, columnspan=2, pady=12)
         ttk.Button(
             buttonFrame,
             text="Save",
@@ -1049,6 +1195,8 @@ class ListenerGuiApp:
                 accessCodeVar,
                 serialNumberVar,
                 brandVar,
+                bambuModelVar,
+                connectionMethodVar,
                 statusBaseUrlVar,
                 statusApiKeyVar,
                 statusRecipientVar,
@@ -1067,6 +1215,8 @@ class ListenerGuiApp:
         accessCodeVar: tk.StringVar,
         serialNumberVar: tk.StringVar,
         brandVar: tk.StringVar,
+        bambuModelVar: tk.StringVar,
+        connectionMethodVar: tk.StringVar,
         statusBaseUrlVar: tk.StringVar,
         statusApiKeyVar: tk.StringVar,
         statusRecipientVar: tk.StringVar,
@@ -1077,6 +1227,8 @@ class ListenerGuiApp:
         accessCode = accessCodeVar.get().strip()
         serialNumber = serialNumberVar.get().strip()
         brand = brandVar.get().strip()
+        bambuModel = bambuModelVar.get().strip()
+        connectionMethod = connectionMethodVar.get().strip()
         statusBaseUrl = statusBaseUrlVar.get().strip()
         statusApiKey = statusApiKeyVar.get().strip()
         statusRecipientId = statusRecipientVar.get().strip()
@@ -1096,6 +1248,8 @@ class ListenerGuiApp:
             "accessCode": accessCode,
             "serialNumber": serialNumber,
             "brand": brand,
+            "bambuModel": bambuModel,
+            "connectionMethod": connectionMethod,
             "statusBaseUrl": statusBaseUrl,
             "statusApiKey": statusApiKey,
             "statusRecipientId": statusRecipientId,
