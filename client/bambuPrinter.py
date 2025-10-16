@@ -691,6 +691,7 @@ class BambuPrintOptions:
     plateIndex: Optional[int] = None
     waitSeconds: int = 8
     lanStrategy: str = "legacy"
+    transport: str = "lan"
 
 
 def normalizeRemoteFileName(name: str) -> str:

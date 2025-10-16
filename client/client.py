@@ -222,6 +222,63 @@ def normalizeTextValue(value: Any) -> Optional[str]:
     return candidate or None
 
 
+transportAliasMap = {
+    "bambuconnect": "bambu_connect",
+    "bambu_connect": "bambu_connect",
+    "bambu connect": "bambu_connect",
+    "cloud": "bambu_connect",
+    "legacy": "bambu_connect",
+    "lan": "lan",
+    "local": "lan",
+    "ethernet": "lan",
+    "wired": "lan",
+    "wifi": "lan",
+    "wireless": "lan",
+    "direct": "lan",
+}
+
+
+supportedTransportValues = {"lan", "bambu_connect"}
+
+
+def normalizeTransportPreference(value: Any) -> Optional[str]:
+    textValue = normalizeTextValue(value)
+    if textValue is None:
+        return None
+    normalized = textValue.replace("-", "_").replace(" ", "_").lower()
+    resolved = transportAliasMap.get(normalized, normalized)
+    return resolved or None
+
+
+def extractPreferredTransport(*sources: Any) -> Optional[str]:
+    def collect(value: Any, transports: List[str], fallbacks: List[str]) -> None:
+        if isinstance(value, dict):
+            if "transport" in value:
+                transportCandidate = normalizeTransportPreference(value.get("transport"))
+                if transportCandidate:
+                    transports.append(transportCandidate)
+            for nestedValue in value.values():
+                collect(nestedValue, transports, fallbacks)
+            for candidateKey in ("connectionMethod", "connectionMode"):
+                if candidateKey in value:
+                    candidateValue = normalizeTransportPreference(value.get(candidateKey))
+                    if candidateValue:
+                        fallbacks.append(candidateValue)
+        elif isinstance(value, list):
+            for item in value:
+                collect(item, transports, fallbacks)
+
+    for source in sources:
+        transports: List[str] = []
+        fallbacks: List[str] = []
+        collect(source, transports, fallbacks)
+        if transports:
+            return transports[0]
+        if fallbacks:
+            return fallbacks[0]
+    return None
+
+
 def normalizePrinterDetails(details: Dict[str, Any]) -> Dict[str, Any]:
     normalized: Dict[str, Any] = {}
     for rawKey, rawValue in details.items():
@@ -298,6 +355,15 @@ def normalizePrinterDetails(details: Dict[str, Any]) -> Dict[str, Any]:
             strategyValue = normalizeTextValue(rawValue)
             if strategyValue is not None:
                 normalized["lanStrategy"] = strategyValue
+        elif key in {"transport", "transportmethod", "transportpreference", "preferredtransport"}:
+            transportValue = normalizeTransportPreference(rawValue)
+            if transportValue is not None:
+                normalized["transport"] = transportValue
+        elif key in {"connectionmethod", "connectionmode", "connection"}:
+            connectionValue = normalizeTransportPreference(rawValue)
+            if connectionValue is not None:
+                normalized["connectionMethod"] = connectionValue
+                normalized.setdefault("transport", connectionValue)
     return normalized
 
 
@@ -690,6 +756,62 @@ def dispatchBambuPrintIfPossible(
         logging.warning("Downloaded file missing for printer dispatch: %s", filePath)
         return None
 
+    jobId = extractPrintJobId(entryData, entryData.get("productStatus"), statusPayload)
+    printerId = str(serialNumber or resolvedDetails.get("nickname") or "") or "unknown"
+
+    payloadTransport = extractPreferredTransport(entryData, statusPayload)
+    clientTransport = extractPreferredTransport(resolvedDetails)
+    useCloudConfigured = interpretBoolean(resolvedDetails.get("useCloud"))
+    if clientTransport is None:
+        clientTransport = "bambu_connect" if useCloudConfigured else "lan"
+    if clientTransport not in supportedTransportValues:
+        logging.warning(
+            "Bambu dispatch skipped job %s for printer %s: reason=%s transport=%s clientTransport=%s",
+            jobId or "unknown",
+            printerId,
+            "unsupported_transport",
+            payloadTransport or "unknown",
+            clientTransport or "unknown",
+        )
+        return None
+    if payloadTransport and payloadTransport not in supportedTransportValues:
+        logging.warning(
+            "Bambu dispatch skipped job %s for printer %s: reason=%s transport=%s clientTransport=%s",
+            jobId or "unknown",
+            printerId,
+            "unsupported_transport",
+            payloadTransport,
+            clientTransport,
+        )
+        return None
+    if payloadTransport and payloadTransport != clientTransport:
+        logging.warning(
+            "Bambu dispatch skipped job %s for printer %s: reason=%s transport=%s clientTransport=%s",
+            jobId or "unknown",
+            printerId,
+            "transport_mismatch",
+            payloadTransport,
+            clientTransport,
+        )
+        return None
+
+    selectedTransport = payloadTransport or clientTransport or "lan"
+    if selectedTransport == "bambu_connect" and not resolvedDetails.get("cloudUrl"):
+        logging.warning(
+            "Bambu dispatch skipped job %s for printer %s: reason=%s transport=%s clientTransport=%s",
+            jobId or "unknown",
+            printerId,
+            "unsupported_transport",
+            selectedTransport,
+            clientTransport,
+        )
+        return None
+
+    if selectedTransport == "bambu_connect":
+        resolvedDetails["useCloud"] = True
+    resolvedDetails.setdefault("transport", selectedTransport)
+    resolvedDetails.setdefault("connectionMethod", selectedTransport)
+
     def resolveBool(key: str, default: bool) -> bool:
         value = resolvedDetails.get(key)
         if value is None:
@@ -728,6 +850,7 @@ def dispatchBambuPrintIfPossible(
         plateIndex=resolveInt("plateIndex", None),
         waitSeconds=resolveInt("waitSeconds", 8) or 8,
         lanStrategy=str(resolvedDetails.get("lanStrategy") or "legacy"),
+        transport=selectedTransport,
     )
 
     printerDetails = {
@@ -736,11 +859,13 @@ def dispatchBambuPrintIfPossible(
         "brand": options.brand,
         "nickname": options.nickname,
         "useCloud": options.useCloud,
+        "transport": selectedTransport,
     }
 
     statusTemplate = dict(statusPayload)
     statusTemplate.pop("sent", None)
     statusTemplate.setdefault("recipientId", recipientId)
+    statusTemplate.setdefault("transport", selectedTransport)
 
     requiredStatusKeys = ("fileName", "lastRequestedAt", "requestedMode", "success")
     for requiredKey in requiredStatusKeys:
