@@ -737,16 +737,6 @@ def dispatchBambuPrintIfPossible(
     accessCode = resolvedDetails.get("accessCode")
     serialNumber = resolvedDetails.get("serialNumber")
 
-    if not ipAddress or not accessCode or not serialNumber:
-        logging.warning(
-            "Incomplete printer credentials for product %s (ip=%s, accessCode=%s, serial=%s)",
-            productId,
-            ipAddress,
-            bool(accessCode),
-            serialNumber,
-        )
-        return None
-
     try:
         filePath = Path(savedFile)
     except Exception:
@@ -796,10 +786,22 @@ def dispatchBambuPrintIfPossible(
         return None
 
     selectedTransport = payloadTransport or clientTransport or "lan"
+    useCloudActive = bool(useCloudConfigured)
     if selectedTransport == "bambu_connect":
         resolvedDetails["useCloud"] = True
+        useCloudActive = True
     resolvedDetails.setdefault("transport", selectedTransport)
     resolvedDetails.setdefault("connectionMethod", selectedTransport)
+
+    if (not ipAddress) or (not serialNumber) or (not accessCode and not useCloudActive):
+        logging.warning(
+            "Incomplete printer credentials for product %s (ip=%s, accessCode=%s, serial=%s)",
+            productId,
+            ipAddress,
+            bool(accessCode),
+            serialNumber,
+        )
+        return None
 
     def resolveBool(key: str, default: bool) -> bool:
         value = resolvedDetails.get(key)
@@ -821,10 +823,12 @@ def dispatchBambuPrintIfPossible(
         interpreted = interpretInteger(value)
         return interpreted if interpreted is not None else default
 
+    resolvedAccessCode = "" if accessCode in {None, ""} else str(accessCode)
+
     options = BambuPrintOptions(
         ipAddress=str(ipAddress),
         serialNumber=str(serialNumber),
-        accessCode=str(accessCode),
+        accessCode=resolvedAccessCode,
         brand=brand or "Bambu Lab",
         nickname=resolvedDetails.get("nickname") or resolvedDetails.get("printerName"),
         useCloud=resolveBool("useCloud", False),
