@@ -740,6 +740,10 @@ def _extractPlateIndex(plateElement: Any) -> Optional[str]:
     if plateElement is None:
         return None
     for metadataElement in plateElement.findall("metadata"):
+        if metadataElement.get("key") == "index":
+            return metadataElement.get("value")
+    return None
+
 
 def buildBambuConnectName(localPath: Path) -> str:
     base = localPath.name
@@ -751,9 +755,6 @@ def buildBambuConnectName(localPath: Path) -> str:
         base = m.group(1)
     base = re.sub(r"[^A-Za-z0-9]+", "", base) or "Model"
     return base + (suffix or ".3mf")
-        if metadataElement.get("key") == "index":
-            return metadataElement.get("value")
-    return None
 
 
 def _findObjectElement(plateElement: Any, *, identifyId: Optional[str], objectName: Optional[str]) -> Optional[Any]:
