@@ -106,7 +106,12 @@ class ListenerGuiApp:
         self.bambuModelCanonicalMap = {model.lower(): model for model in self.bambuModelOptions}
         self.bambuConnectMethod = "bambu_connect"
         self.defaultConnectionMethod = "octoprint"
-        self.connectionMethodOptions = [self.defaultConnectionMethod, self.bambuConnectMethod]
+        self.mqttConnectionMethod = "mqtt"
+        self.connectionMethodOptions = [
+            self.defaultConnectionMethod,
+            self.mqttConnectionMethod,
+            self.bambuConnectMethod,
+        ]
 
         self.logQueue: "Queue[str]" = Queue()
         self.listenerThread: Optional[threading.Thread] = None
@@ -420,6 +425,7 @@ class ListenerGuiApp:
             bambuOptionsMap = {model.lower(): model for model in bambuOptions}
         bambuConnect = getattr(self, "bambuConnectMethod", "bambu_connect")
         defaultTransport = getattr(self, "defaultConnectionMethod", "octoprint")
+        mqttTransport = getattr(self, "mqttConnectionMethod", "mqtt")
 
         modelCandidate = self._parseOptionalString(printerDetails.get("bambuModel")) or ""
         canonicalModel = bambuOptionsMap.get(modelCandidate.lower(), modelCandidate)
@@ -431,7 +437,9 @@ class ListenerGuiApp:
         isBambuBrand = bool(brandValue and "bambu" in brandValue.lower())
         if not isBambuBrand:
             printerDetails["bambuModel"] = ""
-            printerDetails["connectionMethod"] = defaultTransport
+            printerDetails["connectionMethod"] = (
+                mqttTransport if normalizedConnection == mqttTransport else defaultTransport
+            )
         else:
             canonicalModel = bambuOptionsMap.get(modelCandidate.lower(), "")
             if not canonicalModel and not modelCandidate and bambuOptions:
@@ -442,13 +450,15 @@ class ListenerGuiApp:
             isSupportedModel = bool(normalizedModelKey and normalizedModelKey in supportedModels)
 
             if not isSupportedModel:
-                normalizedConnection = defaultTransport
-            elif normalizedConnection not in {defaultTransport, bambuConnect}:
+                normalizedConnection = mqttTransport
+            elif normalizedConnection not in {mqttTransport, bambuConnect}:
                 normalizedConnection = bambuConnect
 
             printerDetails["bambuModel"] = canonicalModel if isSupportedModel else ""
             printerDetails["connectionMethod"] = (
-                bambuConnect if normalizedConnection == bambuConnect and isSupportedModel else defaultTransport
+                bambuConnect
+                if normalizedConnection == bambuConnect and isSupportedModel
+                else mqttTransport
             )
 
         printerDetails["status"] = str(printerDetails.get("status", "")) or "Unknown"
@@ -1105,6 +1115,7 @@ class ListenerGuiApp:
 
         bambuConnect = getattr(self, "bambuConnectMethod", "bambu_connect")
         defaultTransport = getattr(self, "defaultConnectionMethod", "octoprint")
+        mqttTransport = getattr(self, "mqttConnectionMethod", "mqtt")
 
         def updateConnectionControls(*_args: Any) -> None:
             brandValue = brandVar.get().strip()
@@ -1126,9 +1137,12 @@ class ListenerGuiApp:
                 if currentModel:
                     bambuModelVar.set("")
                 bambuModelCombo.configure(state="disabled")
-                connectionMethodCombo.configure(state="disabled")
-                connectionMethodCombo.config(values=(defaultTransport,))
-                if connectionMethodVar.get().strip().lower() != defaultTransport:
+                connectionMethodCombo.configure(state="readonly")
+                availableTransports = (defaultTransport, mqttTransport)
+                connectionMethodCombo.config(values=availableTransports)
+                if connectionMethodVar.get().strip().lower() not in {
+                    transport.lower() for transport in availableTransports
+                }:
                     connectionMethodVar.set(defaultTransport)
                 return
 
@@ -1147,20 +1161,22 @@ class ListenerGuiApp:
 
             if not isSupportedModel:
                 connectionMethodCombo.configure(state="readonly")
-                connectionMethodCombo.config(values=(defaultTransport,))
-                if normalizedConnection != defaultTransport:
-                    connectionMethodVar.set(defaultTransport)
+                connectionMethodCombo.config(values=(mqttTransport,))
+                if normalizedConnection != mqttTransport:
+                    connectionMethodVar.set(mqttTransport)
                 return
 
             connectionMethodCombo.configure(state="readonly")
-            availableTransports = (bambuConnect, defaultTransport)
+            availableTransports = (bambuConnect, mqttTransport)
             connectionMethodCombo.config(values=availableTransports)
             if normalizedConnection not in {transport.lower() for transport in availableTransports}:
                 connectionMethodVar.set(bambuConnect)
 
         brandVar.trace_add("write", updateConnectionControls)
         bambuModelVar.trace_add("write", updateConnectionControls)
-        initialTransports = tuple(getattr(self, "connectionMethodOptions", [defaultTransport, bambuConnect]))
+        initialTransports = tuple(
+            getattr(self, "connectionMethodOptions", [defaultTransport, mqttTransport, bambuConnect])
+        )
         connectionMethodCombo.config(values=initialTransports)
         updateConnectionControls()
 
