@@ -482,6 +482,11 @@ class ListenerGuiApp:
         printerDetails["manualStatusDefaults"] = self._sanitizeManualStatusDefaults(
             printerDetails.get("manualStatusDefaults")
         )
+
+        if printerDetails.get("connectionMethod") == bambuConnect:
+            printerDetails.setdefault("transport", "bambu_connect")
+            printerDetails.setdefault("useCloud", True)
+
         return printerDetails
 
     def _sanitizeManualStatusDefaults(self, value: Any) -> Dict[str, Any]:
@@ -1271,6 +1276,10 @@ class ListenerGuiApp:
             "statusApiKey": statusApiKey,
             "statusRecipientId": statusRecipientId,
         }
+
+        if connectionMethod == self.bambuConnectMethod:
+            printerDetails["transport"] = "bambu_connect"
+            printerDetails["useCloud"] = True
 
         onSave(self._applyTelemetryDefaults(printerDetails))
         dialog.destroy()
