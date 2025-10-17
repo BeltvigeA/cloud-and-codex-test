@@ -251,31 +251,56 @@ def normalizeTransportPreference(value: Any) -> Optional[str]:
 
 
 def extractPreferredTransport(*sources: Any) -> Optional[str]:
-    def collect(value: Any, transports: List[str], fallbacks: List[str]) -> None:
+    def normalizeContextKey(rawKey: Any) -> str:
+        return str(rawKey).replace("-", "").replace("_", "").lower()
+
+    def contextPriority(context: Tuple[Any, ...], *, fallback: bool = False) -> int:
+        normalizedContext = [normalizeContextKey(part) for part in context]
+        priority = 60
+        if any(part.endswith("job") or part == "job" for part in normalizedContext):
+            priority = 0
+        elif any(part.endswith("task") or part == "task" for part in normalizedContext):
+            priority = 10
+        elif any(part.startswith("printer") or part.endswith("printer") for part in normalizedContext):
+            priority = 40
+        priority -= min(len(context), 4)
+        if fallback:
+            priority += 100
+        return priority
+
+    def collect(
+        value: Any,
+        candidates: List[Tuple[int, int, str]],
+        context: Tuple[Any, ...],
+        counter: List[int],
+    ) -> None:
         if isinstance(value, dict):
             if "transport" in value:
                 transportCandidate = normalizeTransportPreference(value.get("transport"))
                 if transportCandidate:
-                    transports.append(transportCandidate)
-            for nestedValue in value.values():
-                collect(nestedValue, transports, fallbacks)
+                    candidates.append((contextPriority(context), counter[0], transportCandidate))
+                    counter[0] += 1
             for candidateKey in ("connectionMethod", "connectionMode"):
                 if candidateKey in value:
                     candidateValue = normalizeTransportPreference(value.get(candidateKey))
                     if candidateValue:
-                        fallbacks.append(candidateValue)
+                        candidates.append(
+                            (contextPriority(context, fallback=True), counter[0], candidateValue)
+                        )
+                        counter[0] += 1
+            for nestedKey, nestedValue in value.items():
+                collect(nestedValue, candidates, context + (nestedKey,), counter)
         elif isinstance(value, list):
-            for item in value:
-                collect(item, transports, fallbacks)
+            for index, item in enumerate(value):
+                collect(item, candidates, context + (index,), counter)
 
     for source in sources:
-        transports: List[str] = []
-        fallbacks: List[str] = []
-        collect(source, transports, fallbacks)
-        if transports:
-            return transports[0]
-        if fallbacks:
-            return fallbacks[0]
+        candidates: List[Tuple[int, int, str]] = []
+        counter = [0]
+        collect(source, candidates, tuple(), counter)
+        if candidates:
+            selected = min(candidates, key=lambda item: (item[0], item[1]))
+            return selected[2]
     return None
 
 

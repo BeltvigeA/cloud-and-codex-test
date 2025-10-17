@@ -40,6 +40,19 @@ def patchRequestsPost(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(bambuPrinter.requests, "post", fakePost)
 
 
+def test_extractPreferredTransport_prioritizes_job_transport() -> None:
+    payload = {
+        "unencryptedData": {
+            "printer": {"transport": "lan"},
+            "job": {"transport": "bambu_connect"},
+        }
+    }
+
+    result = client.extractPreferredTransport(payload)
+
+    assert result == "bambu_connect"
+
+
 def test_dispatchBambuPrintExtractsSkippedObjects(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     samplePath = tmp_path / "sample.3mf"
     samplePath.write_bytes(b"dummy")
