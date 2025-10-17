@@ -5,6 +5,9 @@ from __future__ import annotations
 import base64
 import importlib
 import io
+import webbrowser
+import sys
+import urllib.parse
 import json
 import os
 import re
@@ -45,6 +48,15 @@ else:
 logger = logging.getLogger(__name__)
 
 
+
+# Persistent dir for handing 3MF to Bambu Connect
+from pathlib import Path as _PathAlias
+PERSISTENT_FILES_DIR = _PathAlias.home() / ".printmaster" / "files"
+
+def _ensure_dir(path):
+    p = _PathAlias(path).expanduser().resolve()
+    p.mkdir(parents=True, exist_ok=True)
+    return p
 def makeTlsContext(insecure: bool = True) -> ssl.SSLContext:
     """Create a TLS context tuned for Bambu printers."""
 
@@ -728,6 +740,17 @@ def _extractPlateIndex(plateElement: Any) -> Optional[str]:
     if plateElement is None:
         return None
     for metadataElement in plateElement.findall("metadata"):
+
+def buildBambuConnectName(localPath: Path) -> str:
+    base = localPath.name
+    suffix = ""
+    if base.lower().endswith(".3mf"):
+        base, suffix = base[:-4], ".3mf"
+    m = re.match(r"^[0-9a-fA-F-]+_[0-9a-fA-F-]+_(.+)$", base)
+    if m:
+        base = m.group(1)
+    base = re.sub(r"[^A-Za-z0-9]+", "", base) or "Model"
+    return base + (suffix or ".3mf")
         if metadataElement.get("key") == "index":
             return metadataElement.get("value")
     return None
@@ -913,6 +936,45 @@ def sendBambuPrintJob(
                 paramPath = candidates[0]
 
         remoteName = buildRemoteFileName(workingPath)
+
+        # Bambu Connect hand-off (local client). Copy to persistent dir so temp isn't deleted.
+        if options.transport == "bambu_connect" and not options.cloudUrl:
+            destDir = _ensure_dir(PERSISTENT_FILES_DIR)
+            persistentPath = destDir / workingPath.name
+            try:
+                shutil.copy2(workingPath, persistentPath)
+            except Exception:
+                persistentPath.write_bytes(workingPath.read_bytes())
+            connectName = buildBambuConnectName(persistentPath)
+            uri = (
+                "bambu-connect://import-file?"
+                "path=" + urllib.parse.quote(str(persistentPath))
+                + "&name=" + urllib.parse.quote(connectName)
+                + "&version=1.0.0"
+            )
+            try:
+                if sys.platform.startswith("win"):
+                    os.startfile(uri)  # type: ignore[attr-defined]
+                else:
+                    webbrowser.open(uri)
+                if statusCallback:
+                    statusCallback({
+                        "status": "bambuConnectOpened",
+                        "uri": uri,
+                        "persistentPath": str(persistentPath),
+                        "name": connectName,
+                    })
+                return {
+                    "method": "bambu_connect",
+                    "uri": uri,
+                    "remoteFile": remoteName,
+                    "localFile": str(persistentPath),
+                    "paramPath": paramPath,
+                }
+            except Exception as e:
+                if statusCallback:
+                    statusCallback({"status": "error", "error": str(e)})
+                raise
         printerFileName = buildPrinterTransferFileName(workingPath)
 
         if skippedObjects:

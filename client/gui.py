@@ -42,6 +42,7 @@ from .client import (
     interpretBoolean,
     interpretInteger,
     listenForFiles,
+    extractPreferredTransport,
 )
 
 try:  # pragma: no cover - optional dependency in some test environments
@@ -1846,13 +1847,20 @@ class ListenerGuiApp:
                         return interpreted
             return default
 
+
+        # Determine transport and optional cloudUrl
+        selectedTransport = extractPreferredTransport(metadata, printerConfig) or (
+            "bambu_connect" if interpretBoolean(printerConfig.get("useCloud")) else "lan"
+        )
+        cloudUrlValue = (metadata.get("cloudUrl") or printerConfig.get("cloudUrl"))
         ipAddressValue = resolveText("ipAddress") or printerConfig.get("ipAddress")
         serialValue = resolveText("serialNumber") or printerConfig.get("serialNumber")
         accessCodeValue = resolveText("accessCode") or printerConfig.get("accessCode")
 
-        if not ipAddressValue or not accessCodeValue or not serialValue:
-            self.log("Mangler LAN-informasjon for valgt printer – hopper over sending.")
-            return
+        if selectedTransport != "bambu_connect":
+            if not ipAddressValue or not accessCodeValue or not serialValue:
+                self.log("Mangler LAN-informasjon for valgt printer – hopper over sending.")
+                return
 
         lanStrategyValue = resolveText("lanStrategy") or str(printerConfig.get("lanStrategy") or "legacy")
         plateIndexValue = resolveInt("plateIndex", None)
@@ -1875,6 +1883,9 @@ class ListenerGuiApp:
             lanStrategy=lanStrategyValue,
             plateIndex=plateIndexValue,
             waitSeconds=waitSecondsValue,
+            useCloud=(selectedTransport == "bambu_connect"),
+            cloudUrl=cloudUrlValue,
+            transport=selectedTransport,
         )
 
         def worker() -> None:

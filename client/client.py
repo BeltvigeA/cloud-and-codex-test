@@ -796,18 +796,7 @@ def dispatchBambuPrintIfPossible(
         return None
 
     selectedTransport = payloadTransport or clientTransport or "lan"
-    if selectedTransport == "bambu_connect" and not resolvedDetails.get("cloudUrl"):
-        logging.warning(
-            "Bambu dispatch skipped job %s for printer %s: reason=%s transport=%s clientTransport=%s",
-            jobId or "unknown",
-            printerId,
-            "unsupported_transport",
-            selectedTransport,
-            clientTransport,
-        )
-        return None
-
-    if selectedTransport == "bambu_connect":
+if selectedTransport == "bambu_connect":
         resolvedDetails["useCloud"] = True
     resolvedDetails.setdefault("transport", selectedTransport)
     resolvedDetails.setdefault("connectionMethod", selectedTransport)
