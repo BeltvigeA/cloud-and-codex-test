@@ -1088,7 +1088,8 @@ class ListenerGuiApp:
         ttk.Entry(dialog, textvariable=ipAddressVar).grid(row=1, column=1, sticky=tk.EW, padx=12, pady=4)
 
         ttk.Label(dialog, text="Access Code:").grid(row=2, column=0, sticky=tk.W, padx=12, pady=4)
-        ttk.Entry(dialog, textvariable=accessCodeVar).grid(row=2, column=1, sticky=tk.EW, padx=12, pady=4)
+        accessCodeEntry = ttk.Entry(dialog, textvariable=accessCodeVar)
+        accessCodeEntry.grid(row=2, column=1, sticky=tk.EW, padx=12, pady=4)
 
         ttk.Label(dialog, text="Serial Number:").grid(row=3, column=0, sticky=tk.W, padx=12, pady=4)
         ttk.Entry(dialog, textvariable=serialNumberVar).grid(row=3, column=1, sticky=tk.EW, padx=12, pady=4)
@@ -1133,6 +1134,15 @@ class ListenerGuiApp:
             if not bambuOptionsMap and bambuOptions:
                 bambuOptionsMap = {model.lower(): model for model in bambuOptions}
 
+            def updateAccessCodeState() -> None:
+                resolvedConnection = connectionMethodVar.get().strip().lower()
+                if resolvedConnection == str(bambuConnect).lower():
+                    if accessCodeVar.get():
+                        accessCodeVar.set("")
+                    accessCodeEntry.configure(state="disabled")
+                else:
+                    accessCodeEntry.configure(state="normal")
+
             currentModel = bambuModelVar.get().strip()
             canonicalModel = bambuOptionsMap.get(currentModel.lower(), currentModel)
             if canonicalModel and canonicalModel != currentModel:
@@ -1150,6 +1160,7 @@ class ListenerGuiApp:
                     transport.lower() for transport in availableTransports
                 }:
                     connectionMethodVar.set(defaultTransport)
+                updateAccessCodeState()
                 return
 
             bambuModelCombo.configure(state="readonly")
@@ -1170,6 +1181,7 @@ class ListenerGuiApp:
                 connectionMethodCombo.config(values=(mqttTransport,))
                 if normalizedConnection != mqttTransport:
                     connectionMethodVar.set(mqttTransport)
+                updateAccessCodeState()
                 return
 
             connectionMethodCombo.configure(state="readonly")
@@ -1177,6 +1189,7 @@ class ListenerGuiApp:
             connectionMethodCombo.config(values=availableTransports)
             if normalizedConnection not in {transport.lower() for transport in availableTransports}:
                 connectionMethodVar.set(bambuConnect)
+            updateAccessCodeState()
 
         brandVar.trace_add("write", updateConnectionControls)
         bambuModelVar.trace_add("write", updateConnectionControls)
@@ -1246,7 +1259,6 @@ class ListenerGuiApp:
     ) -> None:
         nickname = nicknameVar.get().strip()
         ipAddress = ipAddressVar.get().strip()
-        accessCode = accessCodeVar.get().strip()
         serialNumber = serialNumberVar.get().strip()
         brand = brandVar.get().strip()
         bambuModel = bambuModelVar.get().strip()
@@ -1254,6 +1266,12 @@ class ListenerGuiApp:
         statusBaseUrl = statusBaseUrlVar.get().strip()
         statusApiKey = statusApiKeyVar.get().strip()
         statusRecipientId = statusRecipientVar.get().strip()
+
+        accessCode = (
+            ""
+            if connectionMethod == self.bambuConnectMethod
+            else accessCodeVar.get().strip()
+        )
 
         if not nickname or not ipAddress:
             messagebox.showerror(
