@@ -1,3 +1,4 @@
+@ -1,1976 +0,0 @@
 """Simple GUI application for listening to channels and logging data to JSON."""
 
 from __future__ import annotations
