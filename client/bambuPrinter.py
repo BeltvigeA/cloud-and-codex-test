@@ -491,6 +491,7 @@ def startPrintViaMqtt(
     topicRequest = f"device/{serial}/request"
 
     connectionReady = Event()
+    firstStatusReceived = Event()
     connectionError: Optional[str] = None
     lastStatus: Dict[str, Any] = {}
     hmsWarningIssued = False
@@ -542,6 +543,8 @@ def startPrintViaMqtt(
         except Exception:
             return
 
+        firstStatusReceived.set()
+
         serialized = json.dumps(payload, ensure_ascii=False)
         if not hmsWarningIssued and "HMS_07FF-2000-0002-0004" in serialized:
             hmsWarningIssued = True
@@ -586,8 +589,13 @@ def startPrintViaMqtt(
         client.tls_set()
         client.tls_insecure_set(False)
 
+    def onDisconnect(clientObj: mqtt.Client, _userdata, rc):  # type: ignore[no-redef]
+        if rc != 0:
+            logger.warning(f"MQTT frakoblet uventet (rc={rc})")
+
     client.on_connect = onConnect
     client.on_message = onMessage
+    client.on_disconnect = onDisconnect
 
     try:
         client.connect(ip, port, keepalive=60)
@@ -601,55 +609,70 @@ def startPrintViaMqtt(
 
     client.loop_start()
 
-    if not connectionReady.wait(timeout=10):
+    try:
+        if not connectionReady.wait(timeout=10):
+            raise RuntimeError(f"Timed out waiting for MQTT connection to {serial}")
+
+        if connectionError:
+            raise RuntimeError(connectionError)
+
+        firstStatusReceived.wait(timeout=5)
+        if not firstStatusReceived.is_set():
+            logger.warning("Ingen status fra printer innen 5s etter MQTT-connect")
+
+        sequenceId = uuid.uuid4().hex
+        url = f"file:///sdcard/{sdFileName}"
+
+        payload = {
+            "print": {
+                "command": "project_file",
+                "sequence_id": sequenceId,
+                "url": url,
+                "use_ams": bool(useAms),
+                "bed_levelling": bool(bedLeveling),
+                "layer_inspect": bool(layerInspect),
+                "flow_cali": bool(flowCalibration),
+                "vibration_cali": bool(vibrationCalibration),
+            }
+        }
+        if paramPath:
+            payload["print"]["param"] = paramPath
+
+        printPayload = payload.get("print", {})
+        printPayload.pop("bed_leveling", None)
+        printPayload["bed_levelling"] = bool(bedLeveling)
+        printPayload.setdefault("project_id", "0")
+        printPayload.setdefault("profile_id", "0")
+        payload["print"] = printPayload
+
+        emitStatus(
+            {
+                "status": "starting",
+                "url": url,
+                "param": paramPath,
+                "useAms": bool(useAms),
+                "bedLeveling": bool(bedLeveling),
+                "layerInspect": bool(layerInspect),
+                "flowCalibration": bool(flowCalibration),
+                "vibrationCalibration": bool(vibrationCalibration),
+            }
+        )
+
+        payloadJson = json.dumps(payload)
+        publishInfo = client.publish(topicRequest, payloadJson, qos=1)
+        if publishInfo.rc != mqtt.MQTT_ERR_SUCCESS:
+            raise RuntimeError(f"MQTT publish feilet med rc={publishInfo.rc}")
+        publishInfo.wait_for_publish()
+        if not publishInfo.is_published():
+            raise RuntimeError("MQTT meldingen ble ikke bekreftet (QoS1 PUBACK mangler)")
+        logger.info("MQTT publish fullført (QoS1 ACK mottatt)")
+
+        timeoutDeadline = time.time() + max(waitSeconds, statusWarmupSeconds, 0)
+        while time.time() < timeoutDeadline:
+            time.sleep(0.5)
+    finally:
         client.loop_stop()
         client.disconnect()
-        raise RuntimeError(f"Timed out waiting for MQTT connection to {serial}")
-
-    if connectionError:
-        client.loop_stop()
-        client.disconnect()
-        raise RuntimeError(connectionError)
-
-    sequenceId = uuid.uuid4().hex
-    url = f"file:///sdcard/{sdFileName}"
-
-    payload = {
-        "print": {
-            "command": "project_file",
-            "sequence_id": sequenceId,
-            "url": url,
-            "use_ams": bool(useAms),
-            "bed_leveling": bool(bedLeveling),
-            "layer_inspect": bool(layerInspect),
-            "flow_cali": bool(flowCalibration),
-            "vibration_cali": bool(vibrationCalibration),
-        }
-    }
-    if paramPath:
-        payload["print"]["param"] = paramPath
-
-    emitStatus(
-        {
-            "status": "starting",
-            "url": url,
-            "param": paramPath,
-            "useAms": bool(useAms),
-            "bedLeveling": bool(bedLeveling),
-            "layerInspect": bool(layerInspect),
-            "flowCalibration": bool(flowCalibration),
-            "vibrationCalibration": bool(vibrationCalibration),
-        }
-    )
-
-    client.publish(topicRequest, json.dumps(payload), qos=1)
-
-    timeoutDeadline = time.time() + max(waitSeconds, statusWarmupSeconds, 0)
-    while time.time() < timeoutDeadline:
-        time.sleep(0.5)
-
-    client.loop_stop()
-    client.disconnect()
 
 
 
