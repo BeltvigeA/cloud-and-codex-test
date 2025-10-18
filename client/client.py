@@ -235,6 +235,8 @@ transportAliasMap = {
     "wifi": "lan",
     "wireless": "lan",
     "direct": "lan",
+    "mqtt": "lan",
+    "mqtt_lan": "lan"
 }
 
 
