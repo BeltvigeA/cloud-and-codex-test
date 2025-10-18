@@ -236,19 +236,21 @@ transportAliasMap = {
     "wireless": "lan",
     "direct": "lan",
     "mqtt": "lan",
-    "mqtt_lan": "lan"
+    "mqtt_lan": "lan",
 }
 
 
 supportedTransportValues = {"lan", "bambu_connect"}
 
 
-def normalizeTransportPreference(value: Any) -> Optional[str]:
+def normalizeTransportPreference(
+    value: Any, aliasMap: Dict[str, str] = transportAliasMap
+) -> Optional[str]:
     textValue = normalizeTextValue(value)
     if textValue is None:
         return None
     normalized = textValue.replace("-", "_").replace(" ", "_").lower()
-    resolved = transportAliasMap.get(normalized, normalized)
+    resolved = aliasMap.get(normalized, normalized)
     return resolved or None
 
 
@@ -751,11 +753,21 @@ def dispatchBambuPrintIfPossible(
     jobId = extractPrintJobId(entryData, entryData.get("productStatus"), statusPayload)
     printerId = str(serialNumber or resolvedDetails.get("nickname") or "") or "unknown"
 
-    payloadTransport = extractPreferredTransport(entryData, statusPayload)
-    clientTransport = extractPreferredTransport(resolvedDetails)
+    rawPayloadTransport = extractPreferredTransport(entryData, statusPayload)
+    rawClientTransport = extractPreferredTransport(resolvedDetails)
+    payloadTransport = normalizeTransportPreference(rawPayloadTransport)
+    clientTransport = normalizeTransportPreference(rawClientTransport)
+    logging.debug(
+        "Dispatch transports (normalized): payload=%s (raw=%s) client=%s (raw=%s)",
+        payloadTransport,
+        rawPayloadTransport,
+        clientTransport,
+        rawClientTransport,
+    )
     useCloudConfigured = interpretBoolean(resolvedDetails.get("useCloud"))
     if clientTransport is None:
         clientTransport = "bambu_connect" if useCloudConfigured else "lan"
+    clientTransport = normalizeTransportPreference(clientTransport)
     if clientTransport not in supportedTransportValues:
         logging.warning(
             "Bambu dispatch skipped job %s for printer %s: reason=%s transport=%s clientTransport=%s",
