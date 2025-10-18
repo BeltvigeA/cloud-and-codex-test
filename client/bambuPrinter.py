@@ -241,6 +241,11 @@ def uploadViaFtps(
         ftps.prot_p()
         ftps.set_pasv(True)
         ftps.voidcmd("TYPE I")
+        try:
+            ftps.sendcmd("SITE ENABLE_STOR")
+            logger.debug("FTPS: SITE ENABLE_STOR succeeded before upload")
+        except Exception as enableStorError:
+            logger.debug("FTPS: SITE ENABLE_STOR not required or failed: %s", enableStorError)
 
         fileName = os.path.basename(remoteName)
         fallbackSeedName = fileName
@@ -343,6 +348,11 @@ def uploadViaFtps(
         except error_perm as uploadError:
             if "550" not in str(uploadError):
                 raise
+            logger.warning(
+                "FTPS 550 on STOR %s; reactivating STOR and retrying: %s",
+                remoteName,
+                uploadError,
+            )
             reactivateStor(ftps)
             tryReenterSavedDirectory()
             try:
