@@ -41,6 +41,7 @@ class FakeRequest(SimpleNamespace):
         super().__init__(files={}, form={}, args={}, headers={})
         self._jsonPayload = None
         self.is_json = False
+        self.method = 'POST'
 
     def set_json(self, payload):
         self._jsonPayload = payload
@@ -393,6 +394,7 @@ def resetClients(monkeypatch):
     fakeRequest.args = {}
     fakeRequest.headers = {}
     fakeRequest.clear_json()
+    fakeRequest.method = 'POST'
     yield
 
 
@@ -2089,6 +2091,86 @@ def testQueuePrinterControlCommandRequiresPrinterIdentifier(monkeypatch):
     assert responseBody['ok'] is False
     assert responseBody['error_type'] == 'ValidationError'
     assert 'printerIpAddress or printerSerial' in responseBody['message']
+
+
+def testListPrinterControlCommandsReturnsPending(monkeypatch):
+    commandSnapshots = [
+        MockDocumentSnapshot(
+            'cmd-1',
+            {
+                'commandId': 'cmd-1',
+                'recipientId': 'recipient-123',
+                'printerSerial': 'SN-001',
+                'status': 'pending',
+            },
+        ),
+        MockDocumentSnapshot(
+            'cmd-2',
+            {
+                'commandId': 'cmd-2',
+                'recipientId': 'recipient-123',
+                'printerSerial': 'SN-001',
+                'status': 'completed',
+            },
+        ),
+        MockDocumentSnapshot(
+            'cmd-3',
+            {
+                'commandId': 'cmd-3',
+                'recipientId': 'recipient-123',
+                'printerSerial': 'SN-999',
+                'status': 'pending',
+            },
+        ),
+    ]
+
+    mockClients = main.ClientBundle(
+        storageClient=MockStorageClient(),
+        firestoreClient=MockFirestoreClient(documentSnapshots=commandSnapshots),
+        kmsClient=MockEncryptClient({'sensitive': 'value'}),
+        kmsKeyPath='projects/test/locations/test/keyRings/test/cryptoKeys/test',
+        gcsBucketName='test-bucket',
+    )
+
+    monkeypatch.setattr(main, 'getClients', lambda: mockClients)
+    monkeypatch.setattr(main, 'validPrinterApiKeys', {'control-key'})
+
+    fakeRequest.headers = {'X-API-Key': 'control-key'}
+    fakeRequest.args = {'recipientId': 'recipient-123', 'printerSerial': 'SN-001'}
+    fakeRequest.clear_json()
+    fakeRequest.method = 'GET'
+
+    responseBody, statusCode = main.queuePrinterControlCommand()
+
+    assert statusCode == 200
+    assert 'commands' in responseBody
+    assert len(responseBody['commands']) == 1
+    assert responseBody['commands'][0]['commandId'] == 'cmd-1'
+
+
+def testListPrinterControlCommandsRequiresParameters(monkeypatch):
+    monkeypatch.setattr(main, 'validPrinterApiKeys', {'control-key'})
+
+    fakeRequest.headers = {'X-API-Key': 'control-key'}
+    fakeRequest.args = {}
+    fakeRequest.clear_json()
+    fakeRequest.method = 'GET'
+
+    responseBody, statusCode = main.queuePrinterControlCommand()
+
+    assert statusCode == 400
+    assert responseBody['ok'] is False
+    assert responseBody['error_type'] == 'ValidationError'
+    assert 'recipientId' in responseBody['message']
+
+    fakeRequest.args = {'recipientId': 'recipient-123'}
+
+    responseBody, statusCode = main.queuePrinterControlCommand()
+
+    assert statusCode == 400
+    assert responseBody['ok'] is False
+    assert responseBody['error_type'] == 'ValidationError'
+    assert 'printerSerial or printerIpAddress' in responseBody['message']
 
 
 def testUploadFileReportsMissingEnvironment(monkeypatch):
