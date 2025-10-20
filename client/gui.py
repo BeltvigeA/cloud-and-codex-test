@@ -432,8 +432,11 @@ class ListenerGuiApp:
         canonicalModel = bambuOptionsMap.get(modelCandidate.lower(), modelCandidate)
         connectionCandidate = self._parseOptionalString(printerDetails.get("connectionMethod")) or ""
         normalizedConnection = connectionCandidate.lower()
+        wasLanConnection = normalizedConnection == "lan"
         if normalizedConnection == "legacy":
             normalizedConnection = bambuConnect
+        if wasLanConnection:
+            normalizedConnection = mqttTransport
 
         isBambuBrand = bool(brandValue and "bambu" in brandValue.lower())
         if not isBambuBrand:
@@ -456,11 +459,14 @@ class ListenerGuiApp:
                 normalizedConnection = bambuConnect
 
             printerDetails["bambuModel"] = canonicalModel if isSupportedModel else ""
-            printerDetails["connectionMethod"] = (
+            resolvedConnectionMethod = (
                 bambuConnect
                 if normalizedConnection == bambuConnect and isSupportedModel
                 else mqttTransport
             )
+            if wasLanConnection:
+                resolvedConnectionMethod = "lan"
+            printerDetails["connectionMethod"] = resolvedConnectionMethod
 
         printerDetails["status"] = str(printerDetails.get("status", "")) or "Unknown"
         printerDetails["nozzleTemp"] = self._parseOptionalFloat(printerDetails.get("nozzleTemp"))
@@ -486,6 +492,9 @@ class ListenerGuiApp:
         if printerDetails.get("connectionMethod") == bambuConnect:
             printerDetails.setdefault("transport", "bambu_connect")
             printerDetails.setdefault("useCloud", True)
+        elif printerDetails.get("connectionMethod") == "lan":
+            printerDetails.setdefault("transport", "lan")
+            printerDetails.setdefault("useCloud", False)
 
         return printerDetails
 
@@ -1175,6 +1184,9 @@ class ListenerGuiApp:
             if normalizedConnection == "legacy":
                 connectionMethodVar.set(bambuConnect)
                 normalizedConnection = bambuConnect
+            if normalizedConnection == "lan":
+                connectionMethodVar.set(mqttTransport)
+                normalizedConnection = mqttTransport
 
             if not isSupportedModel:
                 connectionMethodCombo.configure(state="readonly")
@@ -1193,6 +1205,7 @@ class ListenerGuiApp:
 
         brandVar.trace_add("write", updateConnectionControls)
         bambuModelVar.trace_add("write", updateConnectionControls)
+        connectionMethodVar.trace_add("write", lambda *_: updateConnectionControls())
         initialTransports = tuple(
             getattr(self, "connectionMethodOptions", [defaultTransport, mqttTransport, bambuConnect])
         )
@@ -1262,14 +1275,14 @@ class ListenerGuiApp:
         serialNumber = serialNumberVar.get().strip()
         brand = brandVar.get().strip()
         bambuModel = bambuModelVar.get().strip()
-        connectionMethod = connectionMethodVar.get().strip()
+        connectionMethod = connectionMethodVar.get().strip().lower()
         statusBaseUrl = statusBaseUrlVar.get().strip()
         statusApiKey = statusApiKeyVar.get().strip()
         statusRecipientId = statusRecipientVar.get().strip()
 
         accessCode = (
             ""
-            if connectionMethod == self.bambuConnectMethod
+            if connectionMethod == getattr(self, "bambuConnectMethod", "bambu_connect")
             else accessCodeVar.get().strip()
         )
 
@@ -1295,9 +1308,17 @@ class ListenerGuiApp:
             "statusRecipientId": statusRecipientId,
         }
 
-        if connectionMethod == self.bambuConnectMethod:
+        bambuConnect = getattr(self, "bambuConnectMethod", "bambu_connect")
+        mqttTransport = getattr(self, "mqttConnectionMethod", "mqtt")
+
+        if connectionMethod == bambuConnect:
+            printerDetails["connectionMethod"] = "bambu_connect"
             printerDetails["transport"] = "bambu_connect"
             printerDetails["useCloud"] = True
+        elif connectionMethod in {mqttTransport, "lan"}:
+            printerDetails["connectionMethod"] = "lan"
+            printerDetails["transport"] = "lan"
+            printerDetails["useCloud"] = False
 
         onSave(self._applyTelemetryDefaults(printerDetails))
         dialog.destroy()
