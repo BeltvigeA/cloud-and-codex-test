@@ -12,6 +12,7 @@ import threading
 import uuid
 from datetime import datetime
 from pathlib import Path
+from ipaddress import ip_address
 from queue import Empty, Queue
 from typing import Any, Callable, Dict, Optional
 
@@ -2102,23 +2103,69 @@ class ListenerGuiApp:
             "bambu_connect" if interpretBoolean(printerConfig.get("useCloud")) else "lan"
         )
         cloudUrlValue = (metadata.get("cloudUrl") or printerConfig.get("cloudUrl"))
-        def _norm_str(v: object) -> str:
-            s = str(v).strip() if v is not None else ""
-            return "" if s.lower() in {"", "none", "null"} else s
 
-        # Preferer metadata kun hvis det faktisk er en gyldig streng
-        metaIp    = _norm_str(metadata.get("ipAddress"))
-        metaSn    = _norm_str(metadata.get("serialNumber"))
-        metaAcc   = _norm_str(metadata.get("accessCode"))
+        def normalizeString(value: object) -> str:
+            stringValue = str(value).strip() if value is not None else ""
+            return "" if stringValue.lower() in {"", "none", "null"} else stringValue
 
-        ipAddressValue  = metaIp or _norm_str(printerConfig.get("ipAddress"))
-        serialValue     = metaSn or _norm_str(printerConfig.get("serialNumber"))
-        accessCodeValue = metaAcc or _norm_str(printerConfig.get("accessCode"))
+        metadataIp = normalizeString(
+            metadata.get("printer_ip") or metadata.get("ipAddress")
+        )
+        metadataSerial = normalizeString(
+            metadata.get("printer_serial") or metadata.get("serialNumber")
+        )
+        metadataAccessCode = normalizeString(
+            metadata.get("printer_access_code") or metadata.get("accessCode")
+        )
+
+        configuredIp = normalizeString(printerConfig.get("ipAddress"))
+        configuredSerial = normalizeString(printerConfig.get("serialNumber"))
+        configuredAccessCode = normalizeString(printerConfig.get("accessCode"))
+
+        if metadataSerial:
+            if not configuredSerial:
+                self.log(
+                    "Printer i printers.json mangler serienummer – kan ikke bekrefte metadata, avbryter."
+                )
+                return
+            if metadataSerial != configuredSerial:
+                self.log(
+                    "Printer mismatch (metadata serial="
+                    f"{metadataSerial}, valgt serial={configuredSerial}) – avbryter."
+                )
+                return
+
+        ipAddressValue = metadataIp or configuredIp
+        serialValue = metadataSerial or configuredSerial
+        accessCodeValue = metadataAccessCode or configuredAccessCode
+
+        def isValidIp(ipValue: str) -> bool:
+            try:
+                ip_address(ipValue)
+                return True
+            except ValueError:
+                return False
 
         if selectedTransport != "bambu_connect":
+            self.log(
+                "LAN creds: ip="
+                f"{ipAddressValue!r}, serial={serialValue!r}, access={'OK' if accessCodeValue else 'MISSING'}"
+            )
             if not ipAddressValue or not accessCodeValue or not serialValue:
-                self.log(f"Mangler LAN-informasjon: ip={ipAddressValue!r}, serial={serialValue!r}, access={'OK' if accessCodeValue else 'MISSING'} – hopper over sending.")
+                self.log(
+                    "Mangler LAN-informasjon: ip="
+                    f"{ipAddressValue!r}, serial={serialValue!r}, access={'OK' if accessCodeValue else 'MISSING'} – hopper over sending."
+                )
                 return
+            if metadataIp:
+                if not isValidIp(metadataIp):
+                    self.log(f"Ugyldig IP i metadata: {metadataIp!r} – avbryter.")
+                    return
+                if configuredIp and configuredIp != metadataIp:
+                    self.log(
+                        f"IP mismatch (metadata {metadataIp} != valgt {configuredIp}) – avbryter."
+                    )
+                    return
 
         lanStrategyValue = resolveText("lanStrategy") or str(printerConfig.get("lanStrategy") or "legacy")
         plateIndexValue = resolveInt("plateIndex", None)
