@@ -520,23 +520,25 @@ class ListenerGuiApp:
             if fieldValue is not None:
                 sanitized[field] = str(fieldValue).strip()
 
-        useAmsValue = value.get("useAms")
-        interpretedUseAms: Optional[bool]
-        if isinstance(useAmsValue, bool):
-            interpretedUseAms = useAmsValue
-        elif isinstance(useAmsValue, str):
-            normalized = useAmsValue.strip().lower()
-            if normalized in {"true", "1", "yes", "y", "on"}:
-                interpretedUseAms = True
-            elif normalized in {"false", "0", "no", "n", "off"}:
-                interpretedUseAms = False
+        if "useAms" in value:
+            useAmsValue = value.get("useAms")
+            interpretedUseAms: Optional[bool]
+            if isinstance(useAmsValue, bool):
+                interpretedUseAms = useAmsValue
+            elif isinstance(useAmsValue, (int, float)):
+                interpretedUseAms = bool(useAmsValue)
+            elif isinstance(useAmsValue, str):
+                normalized = useAmsValue.strip().lower()
+                if normalized in {"true", "1", "yes", "y", "on"}:
+                    interpretedUseAms = True
+                elif normalized in {"false", "0", "no", "n", "off"}:
+                    interpretedUseAms = False
+                elif normalized in {"auto", "", "none", "null"}:
+                    interpretedUseAms = None
+                else:
+                    interpretedUseAms = None
             else:
                 interpretedUseAms = None
-        elif isinstance(useAmsValue, (int, float)):
-            interpretedUseAms = bool(useAmsValue)
-        else:
-            interpretedUseAms = None
-        if interpretedUseAms is not None:
             sanitized["useAms"] = interpretedUseAms
 
         platesRequested = self._parseOptionalInt(value.get("platesRequested"))
@@ -850,7 +852,14 @@ class ListenerGuiApp:
         productNameVar = tk.StringVar(value=self._formatOptionalNumber(manualDefaults.get("productName")))
         printJobIdInitial = manualDefaults.get("printJobId") or str(uuid.uuid4())
         printJobIdVar = tk.StringVar(value=self._formatOptionalNumber(printJobIdInitial))
-        useAmsVar = tk.BooleanVar(value=bool(manualDefaults.get("useAms")))
+        manualUseAms = manualDefaults.get("useAms")
+        if manualUseAms is True:
+            initialUseAms = "True"
+        elif manualUseAms is False:
+            initialUseAms = "False"
+        else:
+            initialUseAms = "Auto"
+        useAmsVar = tk.StringVar(value=initialUseAms)
         platesRequestedValue = manualDefaults.get("platesRequested") if manualDefaults.get("platesRequested") else 1
         platesRequestedVar = tk.StringVar(value=self._formatOptionalNumber(platesRequestedValue))
         statusDefault = manualDefaults.get("status") or str(printer.get("status", "idle")) or "idle"
@@ -926,16 +935,27 @@ class ListenerGuiApp:
         ttk.Entry(jobFrame, textvariable=productNameVar).grid(row=1, column=1, sticky=tk.EW, padx=6, pady=4)
         ttk.Label(jobFrame, text="Print Job ID:").grid(row=2, column=0, sticky=tk.W, padx=6, pady=4)
         ttk.Entry(jobFrame, textvariable=printJobIdVar).grid(row=2, column=1, sticky=tk.EW, padx=6, pady=4)
-        ttk.Checkbutton(jobFrame, text="Use AMS", variable=useAmsVar).grid(
-            row=3, column=0, sticky=tk.W, padx=6, pady=4
+        ttk.Label(jobFrame, text="Use AMS:").grid(row=3, column=0, sticky=tk.W, padx=6, pady=4)
+        useAmsOptions = ("Auto", "True", "False")
+        useAmsCombo = ttk.Combobox(jobFrame, textvariable=useAmsVar, values=useAmsOptions, state="readonly", width=8)
+        useAmsCombo.grid(row=3, column=1, sticky=tk.W, padx=6, pady=4)
+        useAmsHelp = ttk.Label(
+            jobFrame,
+            text=(
+                "Auto velger AMS når jobben krever AMS, ellers spole. "
+                "Hvis skriver sier ‘trekk ut filament’ for AMS-jobb, forsøker vi automatisk på nytt med AMS av."
+            ),
+            wraplength=360,
         )
-        ttk.Label(jobFrame, text="Plates Requested:").grid(row=3, column=1, sticky=tk.W, padx=6, pady=4)
+        useAmsHelp.grid(row=4, column=0, columnspan=3, sticky=tk.W, padx=6, pady=(0, 6))
+        useAmsHelp.configure(foreground="gray")
+        ttk.Label(jobFrame, text="Plates Requested:").grid(row=5, column=0, sticky=tk.W, padx=6, pady=4)
         ttk.Entry(jobFrame, textvariable=platesRequestedVar, width=10).grid(
-            row=3, column=2, sticky=tk.W, padx=6, pady=4
+            row=5, column=1, sticky=tk.W, padx=6, pady=4
         )
-        ttk.Label(jobFrame, text="Material Level (JSON):").grid(row=4, column=0, sticky=tk.W, padx=6, pady=4)
+        ttk.Label(jobFrame, text="Material Level (JSON):").grid(row=6, column=0, sticky=tk.W, padx=6, pady=4)
         ttk.Entry(jobFrame, textvariable=materialLevelVar, width=48).grid(
-            row=4, column=1, columnspan=2, sticky=tk.EW, padx=6, pady=4
+            row=6, column=1, columnspan=2, sticky=tk.EW, padx=6, pady=4
         )
 
         telemetryFrame = ttk.LabelFrame(dialog, text="Telemetry Overrides")
@@ -1005,7 +1025,13 @@ class ListenerGuiApp:
 
             printJobId = printJobIdVar.get().strip() or str(uuid.uuid4())
 
-            useAms = bool(useAmsVar.get())
+            selectedUseAms = useAmsVar.get().strip().lower()
+            if selectedUseAms == "true":
+                useAms: Optional[bool] = True
+            elif selectedUseAms == "false":
+                useAms = False
+            else:
+                useAms = None
 
             platesRequested = self._parseOptionalInt(platesRequestedVar.get())
             if platesRequested is None or platesRequested <= 0:
@@ -2047,6 +2073,21 @@ class ListenerGuiApp:
                         return interpreted
             return default
 
+        def resolveUseAms(default: Optional[bool] = None) -> Optional[bool]:
+            for source in (metadata, printerConfig):
+                if "useAms" in source:
+                    value = source["useAms"]
+                    if isinstance(value, bool):
+                        return value
+                    if isinstance(value, str):
+                        normalized = value.strip().lower()
+                        if normalized in {"auto", "", "none", "null"}:
+                            return None
+                    interpreted = interpretBoolean(value)
+                    if interpreted is not None:
+                        return interpreted
+            return default
+
         def resolveInt(key: str, default: Optional[int]) -> Optional[int]:
             for source in (metadata, printerConfig):
                 if key in source:
@@ -2082,7 +2123,7 @@ class ListenerGuiApp:
             ipAddress=str(ipAddressValue),
             serialNumber=str(serialValue),
             accessCode=str(accessCodeValue),
-            useAms=resolveBool("useAms", True),
+            useAms=resolveUseAms(),
             bedLeveling=resolveBool("bedLeveling", True),
             layerInspect=resolveBool("layerInspect", True),
             flowCalibration=resolveBool("flowCalibration", False),
