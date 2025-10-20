@@ -451,6 +451,158 @@ def loadConfiguredPrinters(configPath: Optional[Union[str, Path]] = None) -> Lis
     return printers
 
 
+def saveConfiguredPrinters(
+    printerEntries: List[Dict[str, Any]],
+    configPath: Optional[Union[str, Path]] = None,
+) -> Path:
+    """Persist printers.json with pretty formatting."""
+
+    resolvedPath = (
+        Path(configPath).expanduser() if configPath else Path.home() / ".printmaster" / "printers.json"
+    )
+    resolvedPath.parent.mkdir(parents=True, exist_ok=True)
+    with resolvedPath.open("w", encoding="utf-8") as handle:
+        json.dump(printerEntries, handle, ensure_ascii=False, indent=2)
+    logging.info("Saved printer configuration to %s", resolvedPath)
+    return resolvedPath
+
+
+def _extractText(source: Dict[str, Any], *keys: str) -> Optional[str]:
+    for key in keys:
+        value = source.get(key)
+        if isinstance(value, str):
+            candidate = value.strip()
+            if candidate:
+                return candidate
+    return None
+
+
+def upsertPrinterFromJob(entryData: Dict[str, Any]) -> Optional[Path]:
+    """Update ~/.printmaster/printers.json based on a single job payload."""
+
+    if not isinstance(entryData, dict):
+        return None
+
+    unencryptedPayload = entryData.get("unencryptedData") or {}
+    decryptedPayload = entryData.get("decryptedData") or {}
+    if not isinstance(unencryptedPayload, dict):
+        unencryptedPayload = {}
+    if not isinstance(decryptedPayload, dict):
+        decryptedPayload = {}
+
+    serialNumber = (
+        _extractText(decryptedPayload, "printer_serial")
+        or _extractText(entryData, "serialNumber", "serial_number", "serial")
+        or _extractText(unencryptedPayload, "serial_number", "serialNumber")
+    )
+    if not serialNumber:
+        return None
+
+    ipAddress = (
+        _extractText(decryptedPayload, "printer_ip")
+        or _extractText(entryData, "ipAddress")
+        or _extractText(unencryptedPayload, "ipAddress")
+    )
+    nickname = _extractText(unencryptedPayload, "printer_name") or _extractText(entryData, "nickname")
+    transportRaw = _extractText(unencryptedPayload, "transport") or _extractText(entryData, "transport")
+    transportNormalized = normalizeTransportPreference(transportRaw)
+    logging.debug(
+        "Job transport %r normalized to %r for printer %s",
+        transportRaw,
+        transportNormalized,
+        serialNumber,
+    )
+
+    connectionUpdates: Dict[str, Any] = {}
+    writeAccessCode = False
+    if transportNormalized == "bambu_connect":
+        connectionUpdates = {
+            "connectionMethod": "bambu_connect",
+            "transport": "bambu_connect",
+            "useCloud": True,
+        }
+    elif transportNormalized == "lan":
+        connectionUpdates = {
+            "connectionMethod": "lan",
+            "transport": "lan",
+            "useCloud": False,
+        }
+        writeAccessCode = True
+
+    accessCode = _extractText(decryptedPayload, "printer_access_code") or _extractText(entryData, "accessCode")
+
+    printerEntries = loadConfiguredPrinters()
+    matchedIndex: Optional[int] = None
+
+    for index, printer in enumerate(printerEntries):
+        existingSerial = str(printer.get("serialNumber", "")).strip()
+        if existingSerial == serialNumber:
+            matchedIndex = index
+            break
+
+    if matchedIndex is None and nickname:
+        loweredNickname = nickname.lower()
+        for index, printer in enumerate(printerEntries):
+            printerNickname = str(printer.get("nickname", "")).strip().lower()
+            if printerNickname and printerNickname == loweredNickname:
+                matchedIndex = index
+                break
+
+    if matchedIndex is None and ipAddress:
+        for index, printer in enumerate(printerEntries):
+            printerIp = str(printer.get("ipAddress", "")).strip()
+            if printerIp and printerIp == ipAddress:
+                matchedIndex = index
+                break
+
+    if matchedIndex is None:
+        bambuModel = _extractText(
+            unencryptedPayload,
+            "bambuModel",
+            "bambu_model",
+            "printerModel",
+            "printer_model",
+        )
+        newEntry: Dict[str, Any] = {
+            "serialNumber": serialNumber,
+            "nickname": nickname or serialNumber,
+            "brand": "Bambu Lab",
+        }
+        if bambuModel:
+            newEntry["bambuModel"] = bambuModel
+        if ipAddress:
+            newEntry["ipAddress"] = ipAddress
+        printerEntries.append(newEntry)
+        matchedIndex = len(printerEntries) - 1
+        updatedEntry = dict(newEntry)
+    else:
+        updatedEntry = dict(printerEntries[matchedIndex])
+
+    if ipAddress:
+        updatedEntry["ipAddress"] = ipAddress
+    for key, value in connectionUpdates.items():
+        updatedEntry[key] = value
+    if writeAccessCode and accessCode:
+        updatedEntry["accessCode"] = accessCode
+    updatedEntry["serialNumber"] = serialNumber
+    if nickname:
+        existingNickname = str(updatedEntry.get("nickname") or "").strip()
+        if not existingNickname:
+            updatedEntry["nickname"] = nickname
+
+    printerEntries[matchedIndex] = updatedEntry
+    savedPath = saveConfiguredPrinters(printerEntries)
+    logging.info(
+        "Auto-updated printer %s: ip=%s connectionMethod=%s transport=%s useCloud=%s",
+        serialNumber,
+        ipAddress,
+        updatedEntry.get("connectionMethod"),
+        updatedEntry.get("transport"),
+        updatedEntry.get("useCloud"),
+    )
+    return savedPath
+
+
 def resolvePrinterDetails(
     metadata: Dict[str, Any],
     configuredPrinters: List[Dict[str, Any]],
@@ -1816,6 +1968,11 @@ def listenForFiles(
                     entryData["productRecord"] = updatedRecord
 
                     if fetchResult is not None:
+                        # Oppdater lokal printers.json fra denne jobben (IP/transport/access code)
+                        try:
+                            upsertPrinterFromJob(fetchResult)
+                        except Exception as error:
+                            logging.warning("Failed to update printer defaults from job: %s", error)
                         dispatchResult = dispatchBambuPrintIfPossible(
                             baseUrl=baseUrl,
                             productId=productId,
