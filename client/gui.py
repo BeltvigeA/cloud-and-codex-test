@@ -33,6 +33,7 @@ def addPrinterIdentityToPayload(
 
 from .bambuPrinter import BambuPrintOptions, postStatus, sendBambuPrintJob
 from .status_subscriber import BambuStatusSubscriber
+from .command_controller import CommandWorker
 from .client import (
     appendJsonLogEntry,
     buildBaseUrl,
@@ -143,6 +144,7 @@ class ListenerGuiApp:
             logger=logging.getLogger(__name__),
         )
         self.lastLiveStatusAlerts: Dict[str, str] = {}
+        self.commandWorkers: Dict[str, CommandWorker] = {}
 
         self._buildLayout()
         self.root.after(200, self._processLogQueue)
@@ -2055,11 +2057,61 @@ class ListenerGuiApp:
         activeLanPrinters = self._collectActiveLanPrinters()
         if activeLanPrinters:
             self.statusSubscriber.startAll(activeLanPrinters)
+        self._startCommandWorkers()
 
     def _stopStatusSubscribers(self) -> None:
         if self.statusSubscriber:
             self.statusSubscriber.stopAll()
         self.lastLiveStatusAlerts.clear()
+        self._stopCommandWorkers()
+
+    def _startCommandWorkers(self) -> None:
+        if not self.liveStatusEnabledVar.get():
+            return
+        if not self.listenerThread or not self.listenerThread.is_alive():
+            return
+        activeLanPrinters = self._collectActiveLanPrinters()
+        activeSerials: set[str] = set()
+        for printer in activeLanPrinters:
+            serialNumber = str(printer.get("serialNumber") or "").strip()
+            ipAddress = str(printer.get("ipAddress") or "").strip()
+            accessCode = str(printer.get("accessCode") or "").strip()
+            if not (serialNumber and ipAddress and accessCode):
+                continue
+            activeSerials.add(serialNumber)
+            if serialNumber in self.commandWorkers:
+                continue
+            try:
+                worker = CommandWorker(
+                    serial=serialNumber,
+                    ipAddress=ipAddress,
+                    accessCode=accessCode,
+                    nickname=printer.get("nickname"),
+                )
+                worker.start()
+                self.commandWorkers[serialNumber] = worker
+                self.log(f"Command worker started for {serialNumber} ({ipAddress})")
+            except Exception as error:
+                self.log(f"Failed to start command worker for {serialNumber}: {error}")
+        for serialNumber, worker in list(self.commandWorkers.items()):
+            if serialNumber in activeSerials:
+                continue
+            try:
+                worker.stop()
+                self.log(f"Command worker stopped for {serialNumber}")
+            except Exception as error:
+                self.log(f"Failed to stop command worker for {serialNumber}: {error}")
+            finally:
+                self.commandWorkers.pop(serialNumber, None)
+
+    def _stopCommandWorkers(self) -> None:
+        for serialNumber, worker in list(self.commandWorkers.items()):
+            try:
+                worker.stop()
+                self.log(f"Command worker stopped for {serialNumber}")
+            except Exception as error:
+                self.log(f"Failed to stop command worker for {serialNumber}: {error}")
+        self.commandWorkers.clear()
 
     def _handleLiveStatusToggle(self) -> None:
         if not self.liveStatusEnabledVar.get():
