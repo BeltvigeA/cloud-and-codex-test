@@ -533,9 +533,6 @@ class BambuStatusSubscriber:
         return updatePayload, updateComparable, errorPayload, errorComparable
 
     def _resolveBase44ApiKey(self, printerConfig: Dict[str, Any]) -> str:
-        candidate = self._coerceString(printerConfig.get("statusApiKey"))
-        if candidate:
-            return candidate
         envCandidate = os.getenv("BASE44_API_KEY", "").strip()
         return envCandidate
 
@@ -547,10 +544,6 @@ class BambuStatusSubscriber:
         os.environ[key] = value
 
     def _resolveRecipientId(self, printerConfig: Dict[str, Any]) -> Optional[str]:
-        for key in ("statusRecipientId", "recipientId"):
-            candidate = self._coerceString(printerConfig.get(key))
-            if candidate:
-                return candidate
         envCandidate = os.getenv("BASE44_RECIPIENT_ID", "").strip()
         if envCandidate:
             return envCandidate

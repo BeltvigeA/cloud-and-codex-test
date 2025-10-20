@@ -383,9 +383,6 @@ class ListenerGuiApp:
                                     "progressPercent": self._parseOptionalFloat(entry.get("progressPercent")),
                                     "remainingTimeSeconds": self._parseOptionalInt(entry.get("remainingTimeSeconds")),
                                     "gcodeState": self._parseOptionalString(entry.get("gcodeState")),
-                                    "statusBaseUrl": self._parseOptionalString(entry.get("statusBaseUrl")) or "",
-                                    "statusApiKey": self._parseOptionalString(entry.get("statusApiKey")) or "",
-                                    "statusRecipientId": self._parseOptionalString(entry.get("statusRecipientId")),
                                     "manualStatusDefaults": entry.get("manualStatusDefaults"),
                                 }
                             )
@@ -506,15 +503,9 @@ class ListenerGuiApp:
             printerDetails.get("remainingTimeSeconds")
         )
         printerDetails["gcodeState"] = self._parseOptionalString(printerDetails.get("gcodeState"))
-        printerDetails["statusBaseUrl"] = self._parseOptionalString(
-            printerDetails.get("statusBaseUrl")
-        ) or ""
-        printerDetails["statusApiKey"] = self._parseOptionalString(
-            printerDetails.get("statusApiKey")
-        ) or ""
-        printerDetails["statusRecipientId"] = self._parseOptionalString(
-            printerDetails.get("statusRecipientId")
-        )
+        for base44Key in ("statusBaseUrl", "statusApiKey", "statusRecipientId"):
+            if base44Key in printerDetails:
+                printerDetails.pop(base44Key, None)
         printerDetails["manualStatusDefaults"] = self._sanitizeManualStatusDefaults(
             printerDetails.get("manualStatusDefaults")
         )
@@ -797,9 +788,6 @@ class ListenerGuiApp:
             "serialNumber": sanitizedRecord.get("serialNumber", ""),
             "brand": sanitizedRecord.get("brand", ""),
             "bambuModel": sanitizedRecord.get("bambuModel", ""),
-            "statusBaseUrl": sanitizedRecord.get("statusBaseUrl", ""),
-            "statusApiKey": sanitizedRecord.get("statusApiKey", ""),
-            "statusRecipientId": sanitizedRecord.get("statusRecipientId", ""),
         }
 
         for key, value in mapping.items():
@@ -869,15 +857,13 @@ class ListenerGuiApp:
         dialog.columnconfigure(0, weight=1)
 
         baseUrlDefault = str(
-            printer.get("statusBaseUrl")
-            or getPrinterStatusEndpointUrl()
-            or self.baseUrlVar.get()
-            or ""
+            getPrinterStatusEndpointUrl() or self.baseUrlVar.get() or ""
         )
-        apiKeyDefault = str(printer.get("statusApiKey") or "")
+        apiKeyDefault = (
+            self.statusApiKeyVar.get().strip() if hasattr(self, "statusApiKeyVar") else ""
+        )
         recipientDefault = (
-            printer.get("statusRecipientId")
-            or (self.recipientVar.get().strip() if hasattr(self, "recipientVar") else "")
+            self.recipientVar.get().strip() if hasattr(self, "recipientVar") else ""
         )
 
         baseUrlVar = tk.StringVar(value=baseUrlDefault)
@@ -1180,9 +1166,6 @@ class ListenerGuiApp:
         def finalizeSend(success: bool, message: str, requestData: Optional[Dict[str, Any]]) -> None:
             if success and requestData is not None:
                 printerRecord = dict(printer)
-                printerRecord["statusBaseUrl"] = requestData["baseUrl"]
-                printerRecord["statusApiKey"] = requestData["apiKey"]
-                printerRecord["statusRecipientId"] = requestData.get("recipientId") or ""
                 printerRecord["manualStatusDefaults"] = requestData["manualDefaults"]
                 displayStatus = requestData.get("displayStatus")
                 if displayStatus:
@@ -1278,9 +1261,16 @@ class ListenerGuiApp:
         brandVar = tk.StringVar(value=(initialValues or {}).get("brand", ""))
         bambuModelVar = tk.StringVar(value=(initialValues or {}).get("bambuModel", ""))
         connectionMethodVar = tk.StringVar(value=(initialValues or {}).get("connectionMethod", ""))
-        statusBaseUrlVar = tk.StringVar(value=(initialValues or {}).get("statusBaseUrl", ""))
-        statusApiKeyVar = tk.StringVar(value=(initialValues or {}).get("statusApiKey", ""))
-        statusRecipientVar = tk.StringVar(value=(initialValues or {}).get("statusRecipientId", ""))
+        statusBaseUrlDefault = getPrinterStatusEndpointUrl() or self.baseUrlVar.get().strip() or ""
+        statusApiKeyDefault = (
+            self.statusApiKeyVar.get().strip() if hasattr(self, "statusApiKeyVar") else ""
+        )
+        statusRecipientDefault = (
+            self.recipientVar.get().strip() if hasattr(self, "recipientVar") else ""
+        )
+        statusBaseUrlVar = tk.StringVar(value=statusBaseUrlDefault)
+        statusApiKeyVar = tk.StringVar(value=statusApiKeyDefault)
+        statusRecipientVar = tk.StringVar(value=statusRecipientDefault)
         initialStatus = (initialValues or {}).get("status", "Unknown") or "Unknown"
 
         ttk.Label(dialog, text="Nickname:").grid(row=0, column=0, sticky=tk.W, padx=12, pady=(12, 4))
@@ -1422,9 +1412,6 @@ class ListenerGuiApp:
                 "brand": brandVar,
                 "bambuModel": bambuModelVar,
                 "connectionMethod": connectionMethodVar,
-                "statusBaseUrl": statusBaseUrlVar,
-                "statusApiKey": statusApiKeyVar,
-                "statusRecipientId": statusRecipientVar,
             },
             "accessEntry": accessCodeEntry,
             "updateControls": updateConnectionControls,
@@ -1438,26 +1425,52 @@ class ListenerGuiApp:
             trackedVar.trace_add("write", lambda *_: self._updateActivePrinterDialogIdentifiers())
 
         ttk.Label(dialog, text="Status Base URL:").grid(row=7, column=0, sticky=tk.W, padx=12, pady=4)
-        ttk.Entry(dialog, textvariable=statusBaseUrlVar).grid(row=7, column=1, sticky=tk.EW, padx=12, pady=4)
+        ttk.Entry(dialog, textvariable=statusBaseUrlVar, state="readonly").grid(
+            row=7, column=1, sticky=tk.EW, padx=12, pady=4
+        )
 
         ttk.Label(dialog, text="Status API Key:").grid(row=8, column=0, sticky=tk.W, padx=12, pady=4)
-        ttk.Entry(dialog, textvariable=statusApiKeyVar, show="*").grid(row=8, column=1, sticky=tk.EW, padx=12, pady=4)
+        ttk.Entry(dialog, textvariable=statusApiKeyVar, show="*", state="readonly").grid(
+            row=8, column=1, sticky=tk.EW, padx=12, pady=4
+        )
 
         ttk.Label(dialog, text="Status Recipient ID:").grid(row=9, column=0, sticky=tk.W, padx=12, pady=4)
-        ttk.Entry(dialog, textvariable=statusRecipientVar).grid(row=9, column=1, sticky=tk.EW, padx=12, pady=4)
+        ttk.Entry(dialog, textvariable=statusRecipientVar, state="readonly").grid(
+            row=9, column=1, sticky=tk.EW, padx=12, pady=4
+        )
 
-        ttk.Label(dialog, text="Status:").grid(row=10, column=0, sticky=tk.W, padx=12, pady=4)
-        ttk.Label(dialog, text=initialStatus).grid(row=10, column=1, sticky=tk.W, padx=12, pady=4)
+        ttk.Label(
+            dialog,
+            text="Recipient, API key og URL styres fra Listener-panelet.",
+        ).grid(row=10, column=0, columnspan=2, sticky=tk.W, padx=12, pady=(0, 4))
+        statusLabelRow = 11
+        statusInfoLabelRow = 12
+
+        ttk.Label(dialog, text=f"Status: {initialStatus}").grid(
+            row=statusLabelRow,
+            column=0,
+            columnspan=2,
+            sticky=tk.W,
+            padx=12,
+            pady=4,
+        )
 
         statusInfoLabel = ttk.Label(
             dialog,
             text="Status is updated automatically based on telemetry.",
         )
-        statusInfoLabel.grid(row=11, column=0, columnspan=2, sticky=tk.W, padx=12, pady=(0, 4))
+        statusInfoLabel.grid(
+            row=statusInfoLabelRow,
+            column=0,
+            columnspan=2,
+            sticky=tk.W,
+            padx=12,
+            pady=(0, 4),
+        )
         statusInfoLabel.configure(foreground="gray")
 
         buttonFrame = ttk.Frame(dialog)
-        buttonFrame.grid(row=12, column=0, columnspan=2, pady=12)
+        buttonFrame.grid(row=statusInfoLabelRow + 1, column=0, columnspan=2, pady=12)
         ttk.Button(
             buttonFrame,
             text="Save",
@@ -1470,9 +1483,6 @@ class ListenerGuiApp:
                 brandVar,
                 bambuModelVar,
                 connectionMethodVar,
-                statusBaseUrlVar,
-                statusApiKeyVar,
-                statusRecipientVar,
                 onSave,
             ),
         ).pack(side=tk.LEFT, padx=6)
@@ -1490,9 +1500,6 @@ class ListenerGuiApp:
         brandVar: tk.StringVar,
         bambuModelVar: tk.StringVar,
         connectionMethodVar: tk.StringVar,
-        statusBaseUrlVar: tk.StringVar,
-        statusApiKeyVar: tk.StringVar,
-        statusRecipientVar: tk.StringVar,
         onSave: Callable[[Dict[str, Any]], None],
     ) -> None:
         nickname = nicknameVar.get().strip()
@@ -1501,10 +1508,6 @@ class ListenerGuiApp:
         brand = brandVar.get().strip()
         bambuModel = bambuModelVar.get().strip()
         connectionMethod = connectionMethodVar.get().strip().lower()
-        statusBaseUrl = statusBaseUrlVar.get().strip()
-        statusApiKey = statusApiKeyVar.get().strip()
-        statusRecipientId = statusRecipientVar.get().strip()
-
         accessCode = (
             ""
             if connectionMethod == getattr(self, "bambuConnectMethod", "bambu_connect")
@@ -1528,9 +1531,6 @@ class ListenerGuiApp:
             "brand": brand,
             "bambuModel": bambuModel,
             "connectionMethod": connectionMethod,
-            "statusBaseUrl": statusBaseUrl,
-            "statusApiKey": statusApiKey,
-            "statusRecipientId": statusRecipientId,
         }
 
         bambuConnect = getattr(self, "bambuConnectMethod", "bambu_connect")
@@ -1679,12 +1679,17 @@ class ListenerGuiApp:
             )
             return
 
-        statusUrlCandidate = self._parseOptionalString(currentDetails.get("statusBaseUrl"))
-        statusUrl = statusUrlCandidate or getPrinterStatusEndpointUrl()
+        statusUrl = getPrinterStatusEndpointUrl()
+        if not statusUrl:
+            logging.warning(
+                "Skipping automatic status update for %s because the status endpoint is undefined.",
+                currentDetails.get("nickname") or currentDetails.get("ipAddress") or printerIndex,
+            )
+            return
 
-        apiKeyCandidate = self._parseOptionalString(currentDetails.get("statusApiKey")) or ""
-        if not apiKeyCandidate:
-            apiKeyCandidate = getattr(self, "listenerStatusApiKey", "")
+        apiKeyCandidate = (
+            getattr(self, "listenerStatusApiKey", "") or os.getenv("BASE44_API_KEY", "").strip()
+        )
         if not apiKeyCandidate:
             logging.warning(
                 "Skipping automatic status update for %s because the API key is missing.",
@@ -1736,11 +1741,18 @@ class ListenerGuiApp:
 
         payload["lastUpdateTimestamp"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
 
-        recipientCandidate = getattr(self, "listenerRecipientId", "") or ""
+        recipientCandidate = (
+            getattr(self, "listenerRecipientId", "")
+            or os.getenv("BASE44_RECIPIENT_ID", "").strip()
+        )
         if not recipientCandidate:
-            recipientCandidate = self._parseOptionalString(currentDetails.get("statusRecipientId")) or ""
-        if recipientCandidate:
-            payload["recipientId"] = recipientCandidate
+            logging.warning(
+                "Skipping automatic status update for %s because the recipient ID is missing.",
+                currentDetails.get("nickname") or printerIpAddress or printerIndex,
+            )
+            return
+
+        payload["recipientId"] = recipientCandidate
 
         payload = addPrinterIdentityToPayload(
             payload,
@@ -1780,12 +1792,7 @@ class ListenerGuiApp:
 
         updates: Dict[str, Any] = {
             "manualStatusDefaults": sanitizedDefaults,
-            "statusBaseUrl": statusUrl,
         }
-        if not currentDetails.get("statusApiKey"):
-            updates["statusApiKey"] = apiKeyCandidate
-        if recipientCandidate:
-            updates["statusRecipientId"] = recipientCandidate
 
         self.printerStatusQueue.put(("updates", [{"index": printerIndex, "changes": updates}]))
 
@@ -2024,23 +2031,12 @@ class ListenerGuiApp:
             accessCode = str(printer.get("accessCode") or "").strip()
             if not ipAddress or not serialNumber or not accessCode:
                 continue
-            statusApiKey = str(printer.get("statusApiKey") or "").strip()
-            if not statusApiKey:
-                fallbackApiKey = self.listenerStatusApiKey or os.getenv("BASE44_API_KEY", "")
-                statusApiKey = fallbackApiKey.strip()
-            statusRecipientId = str(printer.get("statusRecipientId") or "").strip()
-            if not statusRecipientId:
-                fallbackRecipient = self.listenerRecipientId or os.getenv("BASE44_RECIPIENT_ID", "")
-                statusRecipientId = (fallbackRecipient or "").strip()
             active.append(
                 {
                     "ipAddress": ipAddress,
                     "serialNumber": serialNumber,
                     "accessCode": accessCode,
                     "nickname": printer.get("nickname"),
-                    "statusBaseUrl": printer.get("statusBaseUrl"),
-                    "statusApiKey": statusApiKey,
-                    "statusRecipientId": statusRecipientId,
                     "brand": printer.get("brand"),
                 }
             )
@@ -2198,6 +2194,12 @@ class ListenerGuiApp:
         if not baseUrl or not recipientId:
             messagebox.showerror("Missing Information", "Base URL and recipient ID are required.")
             return
+
+        self.listenerRecipientId = recipientId
+        self.listenerStatusApiKey = (
+            self.statusApiKeyVar.get().strip() if hasattr(self, "statusApiKeyVar") else ""
+        )
+        self._applyBase44Environment()
 
         try:
             ensureOutputDirectory(outputDir)
