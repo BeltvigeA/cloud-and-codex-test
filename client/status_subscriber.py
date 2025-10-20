@@ -311,10 +311,28 @@ class BambuStatusSubscriber:
         )
         remainingTimeSeconds = self._coerceInt(remainingCandidate)
 
-        nozzleCandidate = self._findValue(sources, {"nozzle_temper", "nozzleTemp", "nozzle_temperature"})
+        nozzleCandidate = self._findValue(
+            sources,
+            {
+                "nozzle_temper",
+                "nozzleTemp",
+                "nozzle_temperature",
+                "nozzle_current_temper",
+                "nozzle",
+            },
+        )
         nozzleTemp = self._coerceFloat(nozzleCandidate)
 
-        bedCandidate = self._findValue(sources, {"bed_temper", "bedTemp", "bed_temperature"})
+        bedCandidate = self._findValue(
+            sources,
+            {
+                "bed_temper",
+                "bedTemp",
+                "bed_temperature",
+                "bed_current_temper",
+                "bed",
+            },
+        )
         bedTemp = self._coerceFloat(bedCandidate)
 
         fanCandidate = self._findValue(

@@ -575,7 +575,11 @@ class ListenerGuiApp:
     def _formatTemperature(self, value: Optional[float]) -> str:
         if value is None:
             return "-"
-        return f"{value:.1f}°C"
+        try:
+            numericValue = float(value)
+        except (TypeError, ValueError):
+            return "-"
+        return f"{numericValue:.1f}°C"
 
     def _formatOptionalNumber(self, value: Any) -> str:
         if value is None:
