@@ -137,7 +137,7 @@ class CommandWorker:
                 try:
                     commands = self._pollCommands()
                 except Exception as error:
-                    log.debug("Control poll failed for %s: %s", self.serial, error)
+                    log.warning("Control poll failed for %s: %s", self.serial, error)
                     commands = []
                 for command in commands:
                     commandId = str(command.get("commandId") or "").strip()
@@ -182,7 +182,16 @@ class CommandWorker:
         commands = data.get("commands") if isinstance(data, dict) else []
         if not isinstance(commands, list):
             return []
-        return [command for command in commands if isinstance(command, dict)]
+        normalized = [command for command in commands if isinstance(command, dict)]
+        if normalized:
+            commandIds = [str(entry.get("commandId")) for entry in normalized]
+            log.info(
+                "Fetched %d command(s) for %s: %s",
+                len(normalized),
+                self.serial,
+                ", ".join(commandIds),
+            )
+        return normalized
 
     def _acknowledgeCommand(
         self,
@@ -248,6 +257,10 @@ class CommandWorker:
             sendMethod(gcode)
 
         def sendControlPayload(payload: Dict[str, Any]) -> None:
+            controlMethod = getattr(printer, "send_control", None)
+            if callable(controlMethod):
+                controlMethod(payload)
+                return
             if hasattr(printer, "publish"):
                 printer.publish(payload)
                 return
@@ -262,74 +275,88 @@ class CommandWorker:
                 return
             raise RuntimeError("No available transport to publish control payload")
 
-        if commandType == "heat":
+        normalizedType = commandType.replace("-", "_")
+
+        if normalizedType in {"heat", "setheat"}:
             nozzleTemp = metadata.get("nozzleTemp")
             bedTemp = metadata.get("bedTemp")
             if nozzleTemp is None and bedTemp is None:
                 raise ValueError("heat requires nozzleTemp and/or bedTemp")
             if nozzleTemp is not None:
-                sendGcode(f"M104 S{float(nozzleTemp):.0f}")
+                sendGcode(f"M104 S{int(float(nozzleTemp))}")
             if bedTemp is not None:
-                sendGcode(f"M140 S{float(bedTemp):.0f}")
+                sendGcode(f"M140 S{int(float(bedTemp))}")
             message = f"Heating nozzle={nozzleTemp} bed={bedTemp}"
-        elif commandType == "cooldown":
+        elif normalizedType in {"cool", "cooldown"}:
             sendGcode("M104 S0")
             sendGcode("M140 S0")
-            message = "Cooldown initiated"
-        elif commandType == "pause":
-            if hasattr(printer, "pause_print"):
-                printer.pause_print()
+            message = "Cooling started"
+        elif normalizedType in {"pause", "resume", "stop"}:
+            commandPayload = {"command": normalizedType}
+            methodName = f"{normalizedType}_print"
+            directMethod = getattr(printer, methodName, None)
+            if callable(directMethod):
+                directMethod()
             else:
-                sendControlPayload({"print": {"command": "pause"}})
-            message = "Print paused"
-        elif commandType == "resume":
-            if hasattr(printer, "resume_print"):
-                printer.resume_print()
-            else:
-                sendControlPayload({"print": {"command": "resume"}})
-            message = "Print resumed"
-        elif commandType == "stop":
-            if hasattr(printer, "stop_print"):
-                printer.stop_print()
-            else:
-                sendControlPayload({"print": {"command": "stop"}})
-            message = "Print stopped"
-        elif commandType == "setfan":
+                sendControlPayload(commandPayload)
+            statusMessages = {"pause": "Paused", "resume": "Resumed", "stop": "Stopped"}
+            message = statusMessages.get(normalizedType, normalizedType.capitalize())
+        elif normalizedType == "camera_on":
+            sendControlPayload({"command": "camera", "param": {"on": True}})
+            message = "Camera enabled"
+        elif normalizedType == "camera_off":
+            sendControlPayload({"command": "camera", "param": {"on": False}})
+            message = "Camera disabled"
+        elif normalizedType in {"light_on", "lightoff", "light_off", "lighton"}:
+            isOn = normalizedType in {"light_on", "lighton"}
+            sendControlPayload({"command": "light", "param": {"on": isOn}})
+            message = "Light on" if isOn else "Light off"
+        elif normalizedType in {"speed", "setspeed"}:
+            percentValue = float(metadata.get("percent", 100))
+            clamped = max(10, min(300, int(round(percentValue))))
+            sendGcode(f"M220 S{clamped}")
+            message = f"Speed set to {clamped}%"
+        elif normalizedType in {"fan", "setfan"}:
             percentValue = float(metadata.get("percent", 0))
             pwmValue = max(0, min(255, int(round(percentValue * 255.0 / 100.0))))
             sendGcode(f"M106 S{pwmValue}")
             message = f"Fan set to {percentValue}%"
-        elif commandType == "setspeed":
-            percentValue = float(metadata.get("percent", 100))
-            clamped = max(10, min(300, int(round(percentValue))))
-            sendGcode(f"M220 S{clamped}")
-            message = f"Speed override set to {clamped}%"
-        elif commandType == "setflow":
+        elif normalizedType in {"flow", "setflow"}:
             percentValue = float(metadata.get("percent", 100))
             clamped = max(50, min(200, int(round(percentValue))))
             sendGcode(f"M221 S{clamped}")
-            message = f"Flow override set to {clamped}%"
-        elif commandType == "home":
+            message = f"Flow set to {clamped}%"
+        elif normalizedType == "home":
             sendGcode("G28")
             message = "Homing"
-        elif commandType == "jog":
-            axis = str(metadata.get("axis") or "X").upper()
-            distance = float(metadata.get("distance", 0))
-            feedrate = float(metadata.get("feedrate", 1200))
-            if axis not in {"X", "Y", "Z", "E"}:
-                raise ValueError("jog axis must be X, Y, Z, or E")
-            sendGcode("G91")
-            sendGcode(f"G0 {axis}{distance} F{int(feedrate)}")
-            sendGcode("G90")
-            message = f"Jogged {axis}{distance} at F{int(feedrate)}"
-        elif commandType == "sendgcode":
+        elif normalizedType in {"move", "jog"}:
+            axisParts: list[str] = []
+            for axisKey in ("x", "y", "z", "e"):
+                if axisKey in metadata and metadata[axisKey] is not None:
+                    axisParts.append(f"{axisKey.upper()}{float(metadata[axisKey])}")
+            feedrate = metadata.get("feedrate")
+            if feedrate is not None:
+                axisParts.append(f"F{int(float(feedrate))}")
+            if not axisParts:
+                raise ValueError("move requires at least one axis or feedrate")
+            sendGcode("G1 " + " ".join(axisParts))
+            message = "Moved"
+        elif normalizedType == "load_filament":
+            slotValue = int(metadata.get("slot", 1))
+            sendControlPayload({"command": "load_filament", "param": {"slot": slotValue}})
+            message = f"Load filament slot {slotValue}"
+        elif normalizedType == "unload_filament":
+            slotValue = int(metadata.get("slot", 1))
+            sendControlPayload({"command": "unload_filament", "param": {"slot": slotValue}})
+            message = f"Unload filament slot {slotValue}"
+        elif normalizedType == "sendgcode":
             gcodeValue = metadata.get("gcode")
             if not gcodeValue:
                 raise ValueError("sendGcode requires metadata.gcode")
             sendGcode(str(gcodeValue))
             message = "G-code sent"
         else:
-            raise NotImplementedError(f"Unsupported commandType: {commandType}")
+            raise ValueError(f"Unsupported commandType: {commandType}")
 
         return "completed", message
 
