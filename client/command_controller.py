@@ -5,6 +5,7 @@ import logging
 import os
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -15,7 +16,8 @@ try:  # pragma: no cover - optional dependency resolved at runtime
 except Exception:  # pragma: no cover - surfaced through logs and callbacks
     bambuApi = None
 
-from .client import getPrinterControlEndpointUrl
+from . import bambuPrinter
+from .client import buildBaseUrl, defaultBaseUrl, getPrinterControlEndpointUrl
 
 log = logging.getLogger(__name__)
 
@@ -105,7 +107,15 @@ class CommandWorker:
         self.apiKeyValue = (apiKey or os.getenv("BASE44_API_KEY", "")).strip()
         self.recipientIdValue = (recipientId or os.getenv("BASE44_RECIPIENT_ID", "")).strip()
         self.controlBaseUrl = (baseUrl or os.getenv("PRINTER_BACKEND_BASE_URL", "")).strip()
-        self.controlEndpointUrl = getPrinterControlEndpointUrl(self.controlBaseUrl or None)
+        baseCandidate = self.controlBaseUrl or defaultBaseUrl
+        try:
+            self.controlBaseUrl = buildBaseUrl(baseCandidate)
+        except Exception:
+            log.debug("Invalid control base URL %s – falling back to default", baseCandidate, exc_info=True)
+            self.controlBaseUrl = buildBaseUrl(defaultBaseUrl)
+        self.controlEndpointUrl = getPrinterControlEndpointUrl(self.controlBaseUrl)
+        self.controlAckUrl = f"{self.controlBaseUrl}/control/ack"
+        self.controlResultUrl = f"{self.controlBaseUrl}/control/result"
         self.pollIntervalSeconds = max(
             2.0,
             float(pollInterval) if pollInterval is not None else CONTROL_POLL_SECONDS,
@@ -138,41 +148,61 @@ class CommandWorker:
                     log.warning("Control poll failed for %s: %s", self.serial, error)
                     commands = []
                 for command in commands:
-                    commandId = str(command.get("commandId") or "").strip()
-                    if not commandId:
-                        continue
-                    if not _reserveCommand(commandId):
-                        continue
-                    try:
-                        printer = self._connectPrinter()
-                        status, message = self._executeCommand(printer, command)
-                        self._acknowledgeCommand(commandId, status, message=message)
-                        _finalizeCommand(commandId, status)
-                        log.info("Command %s on %s: %s", commandId, self.serial, status)
-                    except Exception as error:
-                        errorMessage = f"{type(error).__name__}: {error}"
-                        log.warning("Command %s failed on %s: %s", commandId, self.serial, errorMessage)
-                        try:
-                            self._acknowledgeCommand(commandId, "failed", error=errorMessage)
-                        except Exception:
-                            log.debug("Unable to acknowledge failure for %s", commandId, exc_info=True)
-                        _finalizeCommand(commandId, "failed")
+                    self._processCommand(command)
                 self._stopEvent.wait(self.pollIntervalSeconds)
         finally:
             log.info("CommandWorker stopped for %s", self.serial)
 
+    def _processCommand(self, command: Dict[str, Any]) -> None:
+        commandId = str(command.get("commandId") or "").strip()
+        if not commandId:
+            return
+        if not _reserveCommand(commandId):
+            return
+
+        try:
+            self._sendCommandAck(commandId, "processing")
+        except UnsupportedControlEndpointError as error:
+            log.warning("ACK endpoint unavailable for %s: %s", commandId, error)
+        except Exception as error:  # noqa: BLE001 - log but continue executing command
+            log.warning("Failed to acknowledge command %s: %s", commandId, error)
+
+        try:
+            printer = self._connectPrinter()
+            status, message = self._executeCommand(printer, command)
+        except Exception as error:
+            errorMessage = f"{type(error).__name__}: {error}"
+            log.warning("Command %s failed on %s: %s", commandId, self.serial, errorMessage)
+            try:
+                self._sendCommandResult(commandId, "failed", errorMessage=errorMessage)
+            except UnsupportedControlEndpointError as resultError:
+                log.warning("RESULT endpoint unavailable for %s: %s", commandId, resultError)
+            except Exception:
+                log.debug("Unable to submit failed result for %s", commandId, exc_info=True)
+            _finalizeCommand(commandId, "failed")
+            return
+
+        try:
+            self._sendCommandResult(commandId, status, message=message)
+        except UnsupportedControlEndpointError as resultError:
+            log.warning("RESULT endpoint unavailable for %s: %s", commandId, resultError)
+        except Exception:
+            log.debug("Unable to submit result for %s", commandId, exc_info=True)
+        _finalizeCommand(commandId, status)
+        log.info("Command %s on %s: %s", commandId, self.serial, status)
+
     def _pollCommands(self) -> List[Dict[str, Any]]:
         if not self.apiKeyValue or not self.recipientIdValue:
             raise RuntimeError("Missing API key or recipientId for CommandWorker")
-        payload = {
+        params = {
             "recipientId": self.recipientIdValue,
             "printerSerial": self.serial,
             "printerIpAddress": self.ipAddress,
         }
         headers = {"Content-Type": "application/json", "X-API-Key": self.apiKeyValue}
-        response = requests.post(
+        response = requests.get(
             self.controlEndpointUrl,
-            json=payload,
+            params=params,
             headers=headers,
             timeout=CONNECT_TIMEOUT_SECONDS,
         )
@@ -180,7 +210,12 @@ class CommandWorker:
         if not response.content:
             return []
         data = response.json()
-        commands = data.get("commands") if isinstance(data, dict) else []
+        if isinstance(data, list):
+            commands = data
+        elif isinstance(data, dict):
+            commands = data.get("commands", [])
+        else:
+            commands = []
         if not isinstance(commands, list):
             return []
         normalized = [command for command in commands if isinstance(command, dict)]
@@ -194,35 +229,56 @@ class CommandWorker:
             )
         return normalized
 
-    def _acknowledgeCommand(
+    def _sendCommandAck(self, commandId: str, status: str) -> bool:
+        if not self.apiKeyValue or not self.recipientIdValue:
+            raise RuntimeError("Missing API key or recipientId for CommandWorker")
+        payload = {
+            "recipientId": self.recipientIdValue,
+            "printerSerial": self.serial,
+            "printerIpAddress": self.ipAddress,
+            "commandId": commandId,
+            "status": status,
+            "startedAt": _isoTimestamp(),
+        }
+        log.debug("Sending ACK for %s via %s", commandId, self.controlAckUrl)
+        return self._postControlPayload(self.controlAckUrl, payload, "ack")
+
+    def _sendCommandResult(
         self,
         commandId: str,
         status: str,
         *,
         message: Optional[str] = None,
-        error: Optional[str] = None,
+        errorMessage: Optional[str] = None,
     ) -> None:
         if not self.apiKeyValue or not self.recipientIdValue:
             raise RuntimeError("Missing API key or recipientId for CommandWorker")
-        ackPayload: Dict[str, Any] = {
+        payload: Dict[str, Any] = {
             "recipientId": self.recipientIdValue,
             "printerSerial": self.serial,
-            "ack": {
-                "commandId": commandId,
-                "success": status == "completed",
-                "message": str(message or error or status),
-            },
+            "printerIpAddress": self.ipAddress,
+            "commandId": commandId,
+            "status": status,
+            "finishedAt": _isoTimestamp(),
         }
-        if error:
-            ackPayload["ack"]["error"] = str(error)
+        if message:
+            payload["message"] = str(message)
+        if errorMessage:
+            payload["errorMessage"] = str(errorMessage)
+        log.debug("Sending RESULT for %s via %s", commandId, self.controlResultUrl)
+        self._postControlPayload(self.controlResultUrl, payload, "result")
+
+    def _postControlPayload(self, url: str, payload: Dict[str, Any], action: str) -> bool:
         headers = {"Content-Type": "application/json", "X-API-Key": self.apiKeyValue}
-        response = requests.post(
-            self.controlEndpointUrl,
-            json=ackPayload,
-            headers=headers,
-            timeout=CONNECT_TIMEOUT_SECONDS,
-        )
-        response.raise_for_status()
+        try:
+            response = requests.post(url, json=payload, headers=headers, timeout=CONNECT_TIMEOUT_SECONDS)
+            response.raise_for_status()
+        except requests.HTTPError as error:  # pragma: no cover - HTTP path validated via tests
+            statusCode = getattr(error.response, "status_code", None)
+            if statusCode in {404, 405}:
+                raise UnsupportedControlEndpointError(f"/{action}") from error
+            raise
+        return True
 
     def _connectPrinter(self) -> Any:
         if bambuApi is None:
@@ -235,6 +291,12 @@ class CommandWorker:
             if connectMethod is None:
                 raise RuntimeError("bambulabs_api.Printer is missing connect/mqtt_start")
             connectMethod()
+            waitForReady = getattr(bambuPrinter, "_waitForMqttReady", None)
+            if callable(waitForReady):
+                try:
+                    waitForReady(printer, timeout=30.0)
+                except Exception:
+                    log.debug("Printer MQTT readiness wait failed", exc_info=True)
             self._printerInstance = printer
             return printer
 
@@ -255,22 +317,38 @@ class CommandWorker:
         metadata = command.get("metadata") or {}
         message = ""
 
+        def callPrinterMethod(name: str, *args: Any, **kwargs: Any) -> None:
+            method = getattr(printer, name, None)
+            if callable(method):
+                method(*args, **kwargs)
+                return
+            fallbackNames = {"cancel_print": ["stop_print"]}.get(name, [])
+            for fallbackName in fallbackNames:
+                fallbackMethod = getattr(printer, fallbackName, None)
+                if callable(fallbackMethod):
+                    fallbackMethod(*args, **kwargs)
+                    return
+            raise RuntimeError(f"Printer method {name} is unavailable")
+
         def sendGcode(gcode: str) -> None:
-            sendMethod = getattr(printer, "send_gcode", None)
-            if sendMethod is None:
-                raise RuntimeError("send_gcode is unavailable in bambulabs_api")
-            sendMethod(gcode)
+            sender = getattr(printer, "send_gcode", None)
+            if callable(sender):
+                sender(gcode)
+                return
+            raise RuntimeError("send_gcode is unavailable in bambulabs_api")
 
         def sendControlPayload(payload: Dict[str, Any]) -> None:
             controlMethod = getattr(printer, "send_control", None)
             if callable(controlMethod):
                 controlMethod(payload)
                 return
-            if hasattr(printer, "publish"):
-                printer.publish(payload)
+            publishMethod = getattr(printer, "publish", None)
+            if callable(publishMethod):
+                publishMethod(payload)
                 return
-            if hasattr(printer, "send_request"):
-                printer.send_request(payload)
+            sendRequest = getattr(printer, "send_request", None)
+            if callable(sendRequest):
+                sendRequest(payload)
                 return
             mqttClient = getattr(printer, "_mqtt_client", None)
             if mqttClient is not None:
@@ -288,80 +366,154 @@ class CommandWorker:
             if nozzleTemp is None and bedTemp is None:
                 raise ValueError("heat requires nozzleTemp and/or bedTemp")
             if nozzleTemp is not None:
-                sendGcode(f"M104 S{int(float(nozzleTemp))}")
+                try:
+                    callPrinterMethod("set_nozzle_temperature", float(nozzleTemp))
+                except RuntimeError:
+                    sendGcode(f"M104 S{int(float(nozzleTemp))}")
             if bedTemp is not None:
-                sendGcode(f"M140 S{int(float(bedTemp))}")
+                try:
+                    callPrinterMethod("set_bed_temperature", float(bedTemp))
+                except RuntimeError:
+                    sendGcode(f"M140 S{int(float(bedTemp))}")
             message = f"Heating nozzle={nozzleTemp} bed={bedTemp}"
         elif normalizedType in {"cool", "cooldown"}:
-            sendGcode("M104 S0")
-            sendGcode("M140 S0")
+            try:
+                callPrinterMethod("set_nozzle_temperature", 0)
+                callPrinterMethod("set_bed_temperature", 0)
+            except RuntimeError:
+                sendGcode("M104 S0")
+                sendGcode("M140 S0")
             message = "Cooling started"
-        elif normalizedType in {"pause", "resume", "stop"}:
-            commandPayload = {"command": normalizedType}
-            methodName = f"{normalizedType}_print"
-            directMethod = getattr(printer, methodName, None)
-            if callable(directMethod):
-                directMethod()
-            else:
-                sendControlPayload(commandPayload)
-            statusMessages = {"pause": "Paused", "resume": "Resumed", "stop": "Stopped"}
-            message = statusMessages.get(normalizedType, normalizedType.capitalize())
+        elif normalizedType in {"pause", "resume", "stop", "stop_print", "cancel"}:
+            methodMap = {
+                "pause": "pause_print",
+                "resume": "resume_print",
+                "stop": "stop_print",
+                "stop_print": "stop_print",
+                "cancel": "cancel_print",
+            }
+            methodName = methodMap.get(normalizedType, normalizedType)
+            try:
+                callPrinterMethod(methodName)
+            except RuntimeError:
+                sendControlPayload({"command": normalizedType})
+            statusMessages = {
+                "pause": "Paused",
+                "resume": "Resumed",
+                "stop": "Stopped",
+                "stop_print": "Stopped",
+                "cancel": "Cancelled",
+            }
+            message = statusMessages.get(normalizedType, normalizedType.replace("_", " ").title())
         elif normalizedType == "camera_on":
-            sendControlPayload({"command": "camera", "param": {"on": True}})
+            try:
+                callPrinterMethod("camera_on")
+            except RuntimeError:
+                sendControlPayload({"command": "camera", "param": {"on": True}})
             message = "Camera enabled"
         elif normalizedType == "camera_off":
-            sendControlPayload({"command": "camera", "param": {"on": False}})
+            try:
+                callPrinterMethod("camera_off")
+            except RuntimeError:
+                sendControlPayload({"command": "camera", "param": {"on": False}})
             message = "Camera disabled"
-        elif normalizedType in {"light_on", "lightoff", "light_off", "lighton"}:
-            isOn = normalizedType in {"light_on", "lighton"}
-            sendControlPayload({"command": "light", "param": {"on": isOn}})
-            message = "Light on" if isOn else "Light off"
-        elif normalizedType in {"speed", "setspeed"}:
-            percentValue = float(metadata.get("percent", 100))
-            clamped = max(10, min(300, int(round(percentValue))))
-            sendGcode(f"M220 S{clamped}")
-            message = f"Speed set to {clamped}%"
-        elif normalizedType in {"fan", "setfan"}:
-            percentValue = float(metadata.get("percent", 0))
-            pwmValue = max(0, min(255, int(round(percentValue * 255.0 / 100.0))))
-            sendGcode(f"M106 S{pwmValue}")
+        elif normalizedType in {"set_speed", "speed", "setspeed"}:
+            percentValue = metadata.get("percent") or metadata.get("speedPercent")
+            if percentValue is None:
+                raise ValueError("set_speed requires percent metadata")
+            try:
+                callPrinterMethod("set_print_speed_factor", float(percentValue))
+            except RuntimeError:
+                clamped = max(10, min(300, int(round(float(percentValue)))))
+                sendGcode(f"M220 S{clamped}")
+                percentValue = clamped
+            message = f"Speed set to {percentValue}%"
+        elif normalizedType in {"set_fan", "fan", "setfan"}:
+            percentValue = metadata.get("percent") or metadata.get("fanPercent")
+            if percentValue is None:
+                raise ValueError("set_fan requires percent metadata")
+            try:
+                callPrinterMethod("set_fan_speed", float(percentValue))
+            except RuntimeError:
+                pwmValue = max(0, min(255, int(round(float(percentValue) * 255.0 / 100.0))))
+                sendGcode(f"M106 S{pwmValue}")
             message = f"Fan set to {percentValue}%"
-        elif normalizedType in {"flow", "setflow"}:
-            percentValue = float(metadata.get("percent", 100))
-            clamped = max(50, min(200, int(round(percentValue))))
-            sendGcode(f"M221 S{clamped}")
-            message = f"Flow set to {clamped}%"
-        elif normalizedType == "home":
-            sendGcode("G28")
-            message = "Homing"
-        elif normalizedType in {"move", "jog"}:
-            axisParts: list[str] = []
-            for axisKey in ("x", "y", "z", "e"):
-                if axisKey in metadata and metadata[axisKey] is not None:
-                    axisParts.append(f"{axisKey.upper()}{float(metadata[axisKey])}")
-            feedrate = metadata.get("feedrate")
-            if feedrate is not None:
-                axisParts.append(f"F{int(float(feedrate))}")
-            if not axisParts:
-                raise ValueError("move requires at least one axis or feedrate")
-            sendGcode("G1 " + " ".join(axisParts))
-            message = "Moved"
-        elif normalizedType == "load_filament":
-            slotValue = int(metadata.get("slot", 1))
-            sendControlPayload({"command": "load_filament", "param": {"slot": slotValue}})
-            message = f"Load filament slot {slotValue}"
-        elif normalizedType == "unload_filament":
-            slotValue = int(metadata.get("slot", 1))
-            sendControlPayload({"command": "unload_filament", "param": {"slot": slotValue}})
-            message = f"Unload filament slot {slotValue}"
-        elif normalizedType == "sendgcode":
-            gcodeValue = metadata.get("gcode")
-            if not gcodeValue:
-                raise ValueError("sendGcode requires metadata.gcode")
-            sendGcode(str(gcodeValue))
-            message = "G-code sent"
+        elif normalizedType == "start_print":
+            fileName = metadata.get("fileName")
+            if not fileName:
+                raise ValueError("start_print requires metadata.fileName")
+            plateIndex = metadata.get("plateIndex")
+            paramPath = metadata.get("paramPath")
+            useAms = metadata.get("useAms")
+            try:
+                callPrinterMethod("start_print", str(fileName), plateIndex or paramPath, use_ams=useAms)
+                message = "Print started"
+            except RuntimeError:
+                options = bambuPrinter.BambuPrintOptions(
+                    ipAddress=self.ipAddress,
+                    serialNumber=self.serial,
+                    accessCode=self.accessCode,
+                    useAms=useAms,
+                    plateIndex=plateIndex,
+                )
+                result = bambuPrinter.startPrintViaApi(
+                    ip=self.ipAddress,
+                    serial=self.serial,
+                    accessCode=self.accessCode,
+                    uploaded_name=str(fileName),
+                    plate_index=plateIndex,
+                    param_path=paramPath,
+                    options=options,
+                    job_metadata=metadata if isinstance(metadata, dict) else None,
+                )
+                acknowledged = result.get("acknowledged")
+                message = (
+                    f"Print started (acknowledged={acknowledged})"
+                    if acknowledged is not None
+                    else "Print started"
+                )
+        elif normalizedType in {"home", "light_on", "light_off", "lightoff", "lighton", "move", "jog", "load_filament", "unload_filament", "sendgcode"}:
+            if normalizedType == "home":
+                sendGcode("G28")
+                message = "Homing"
+            elif normalizedType in {"move", "jog"}:
+                axisParts: List[str] = []
+                for axisKey in ("x", "y", "z", "e"):
+                    if axisKey in metadata and metadata[axisKey] is not None:
+                        axisParts.append(f"{axisKey.upper()}{float(metadata[axisKey])}")
+                feedrate = metadata.get("feedrate")
+                if feedrate is not None:
+                    axisParts.append(f"F{int(float(feedrate))}")
+                if not axisParts:
+                    raise ValueError("move requires at least one axis or feedrate")
+                sendGcode("G1 " + " ".join(axisParts))
+                message = "Moved"
+            elif normalizedType == "sendgcode":
+                gcodeValue = metadata.get("gcode")
+                if not gcodeValue:
+                    raise ValueError("sendGcode requires metadata.gcode")
+                sendGcode(str(gcodeValue))
+                message = "G-code sent"
+            elif normalizedType in {"light_on", "lightoff", "light_off", "lighton"}:
+                isOn = normalizedType in {"light_on", "lighton"}
+                sendControlPayload({"command": "light", "param": {"on": isOn}})
+                message = "Light on" if isOn else "Light off"
+            elif normalizedType in {"load_filament", "unload_filament"}:
+                slotValue = int(metadata.get("slot", 1))
+                commandName = "load_filament" if normalizedType == "load_filament" else "unload_filament"
+                sendControlPayload({"command": commandName, "param": {"slot": slotValue}})
+                message = ("Load" if commandName == "load_filament" else "Unload") + f" filament slot {slotValue}"
         else:
             raise ValueError(f"Unsupported commandType: {commandType}")
 
         return "completed", message
+
+
+def _isoTimestamp() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+class UnsupportedControlEndpointError(RuntimeError):
+    """Raised when the backend does not expose the expected control endpoint."""
+
 
