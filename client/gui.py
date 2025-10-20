@@ -32,6 +32,7 @@ def addPrinterIdentityToPayload(
     return payload
 
 from .bambuPrinter import BambuPrintOptions, postStatus, sendBambuPrintJob
+from .status_subscriber import BambuStatusSubscriber
 from .client import (
     appendJsonLogEntry,
     buildBaseUrl,
@@ -96,6 +97,7 @@ class ListenerGuiApp:
         self.root = tk.Tk()
         self.root.title("Cloud Printer Listener")
         self.root.geometry("560x420")
+        self.root.protocol("WM_DELETE_WINDOW", self._handleWindowClose)
 
         self.bambuModelOptions = [
             "X1 Carbon",
@@ -132,6 +134,14 @@ class ListenerGuiApp:
         self.listenerStatusApiKey = ""
 
         self.activePrinterDialog: Optional[Dict[str, Any]] = None
+
+        self.liveStatusEnabledVar = tk.BooleanVar(value=True)
+        self.statusSubscriber = BambuStatusSubscriber(
+            onUpdate=self._onPrinterStatusUpdate,
+            onError=self._onPrinterStatusError,
+            logger=logging.getLogger(__name__),
+        )
+        self.lastLiveStatusAlerts: Dict[str, str] = {}
 
         self._buildLayout()
         self.root.after(200, self._processLogQueue)
@@ -211,6 +221,12 @@ class ListenerGuiApp:
         self.startButton.pack(side=tk.LEFT, padx=6)
         self.stopButton = ttk.Button(buttonFrame, text="Stop", command=self.stopListening, state=tk.DISABLED)
         self.stopButton.pack(side=tk.LEFT, padx=6)
+        ttk.Checkbutton(
+            buttonFrame,
+            text="Subscribe live status",
+            variable=self.liveStatusEnabledVar,
+            command=self._handleLiveStatusToggle,
+        ).pack(side=tk.LEFT, padx=6)
 
         ttk.Label(parent, text="Event Log:").grid(row=7, column=0, sticky=tk.W, **paddingOptions)
         self.logText = tk.Text(parent, height=10, state=tk.DISABLED)
@@ -701,6 +717,8 @@ class ListenerGuiApp:
             self.printers = self._loadPrinters()
             self._refreshPrinterList()
             self._maybeRefreshActivePrinterDialog(updatedRecord)
+            if self.liveStatusEnabledVar.get() and self.listenerThread and self.listenerThread.is_alive():
+                self._startStatusSubscribers()
 
         try:
             self.root.after(0, refreshUi)
@@ -1971,6 +1989,158 @@ class ListenerGuiApp:
             pass
         self.root.after(500, self._processPrinterStatusUpdates)
 
+    def _collectActiveLanPrinters(self) -> list[Dict[str, Any]]:
+        active: list[Dict[str, Any]] = []
+        for printer in self.printers:
+            if not isinstance(printer, dict):
+                continue
+            connection = str(
+                printer.get("transport") or printer.get("connectionMethod") or ""
+            ).strip().lower()
+            if connection != "lan":
+                continue
+            ipAddress = str(printer.get("ipAddress") or "").strip()
+            serialNumber = str(printer.get("serialNumber") or "").strip()
+            accessCode = str(printer.get("accessCode") or "").strip()
+            if not ipAddress or not serialNumber or not accessCode:
+                continue
+            active.append(
+                {
+                    "ipAddress": ipAddress,
+                    "serialNumber": serialNumber,
+                    "accessCode": accessCode,
+                    "nickname": printer.get("nickname"),
+                    "statusBaseUrl": printer.get("statusBaseUrl"),
+                    "statusApiKey": printer.get("statusApiKey"),
+                    "statusRecipientId": printer.get("statusRecipientId"),
+                    "brand": printer.get("brand"),
+                }
+            )
+        return active
+
+    def _startStatusSubscribers(self) -> None:
+        if not self.liveStatusEnabledVar.get():
+            return
+        if not self.statusSubscriber:
+            return
+        activeLanPrinters = self._collectActiveLanPrinters()
+        if activeLanPrinters:
+            self.statusSubscriber.startAll(activeLanPrinters)
+
+    def _stopStatusSubscribers(self) -> None:
+        if self.statusSubscriber:
+            self.statusSubscriber.stopAll()
+        self.lastLiveStatusAlerts.clear()
+
+    def _handleLiveStatusToggle(self) -> None:
+        if not self.liveStatusEnabledVar.get():
+            self._stopStatusSubscribers()
+        else:
+            if self.listenerThread and self.listenerThread.is_alive():
+                self._startStatusSubscribers()
+
+    def _onPrinterStatusUpdate(self, status: Dict[str, Any], printerConfig: Dict[str, Any]) -> None:
+        statusCopy = dict(status)
+        printerConfigCopy = dict(printerConfig)
+        try:
+            postStatus(statusCopy, printerConfigCopy)
+        except Exception:
+            logging.debug("Failed to post status from subscriber", exc_info=True)
+
+        try:
+            self.root.after(0, lambda: self._applyLiveStatusUpdate(statusCopy, printerConfigCopy))
+        except Exception:
+            logging.exception("Unable to schedule GUI update for printer status")
+
+    def _onPrinterStatusError(self, message: str, printerConfig: Dict[str, Any]) -> None:
+        printerCopy = dict(printerConfig)
+        accessCode = str(printerCopy.get("accessCode") or "")
+        safeMessage = message.replace(accessCode, "***") if accessCode else message
+        serial = str(printerCopy.get("serialNumber") or "")
+        ipAddress = str(printerCopy.get("ipAddress") or "")
+        identifier = serial or ipAddress or "unknown"
+        logEntry = f"Status error for {identifier}: {safeMessage}"
+        self.logQueue.put(logEntry)
+
+        def showWarning() -> None:
+            try:
+                messagebox.showwarning("Printer Status", logEntry, parent=self.root)
+            except Exception:
+                logging.exception("Failed to show status warning dialog")
+
+        try:
+            self.root.after(0, showWarning)
+        except Exception:
+            logging.exception("Unable to schedule status warning dialog")
+
+    def _applyLiveStatusUpdate(self, status: Dict[str, Any], printerConfig: Dict[str, Any]) -> None:
+        serial = str(printerConfig.get("serialNumber") or status.get("printerSerial") or "").strip()
+        if not serial:
+            return
+
+        mappedStatus = self._mapBambuState(
+            self._parseOptionalString(status.get("gcodeState") or status.get("state")),
+            status.get("progressPercent") if isinstance(status.get("progressPercent"), (int, float)) else None,
+        )
+
+        updated = False
+        for printer in self.printers:
+            if not isinstance(printer, dict):
+                continue
+            if str(printer.get("serialNumber") or "").strip() != serial:
+                continue
+            printer["status"] = mappedStatus
+            if "gcodeState" in status:
+                printer["gcodeState"] = status.get("gcodeState")
+            if status.get("progressPercent") is not None:
+                printer["progressPercent"] = status.get("progressPercent")
+            if status.get("remainingTimeSeconds") is not None:
+                printer["remainingTimeSeconds"] = status.get("remainingTimeSeconds")
+            if status.get("nozzleTemp") is not None:
+                printer["nozzleTemp"] = status.get("nozzleTemp")
+            if status.get("bedTemp") is not None:
+                printer["bedTemp"] = status.get("bedTemp")
+            updated = True
+            break
+
+        if updated:
+            self._refreshPrinterList()
+
+        alertCode = str(status.get("hmsCode") or "").strip()
+        alertMessage = str(status.get("errorMessage") or "").strip()
+        if alertCode or alertMessage:
+            alertKey = f"{alertCode}|{alertMessage}"
+            previousAlert = self.lastLiveStatusAlerts.get(serial)
+            if previousAlert != alertKey:
+                self.lastLiveStatusAlerts[serial] = alertKey
+                self._showPrinterAlert(serial, printerConfig, alertCode, alertMessage)
+        else:
+            self.lastLiveStatusAlerts.pop(serial, None)
+
+    def _showPrinterAlert(
+        self,
+        serial: str,
+        printerConfig: Dict[str, Any],
+        hmsCode: Optional[str],
+        errorMessage: Optional[str],
+    ) -> None:
+        printerName = printerConfig.get("nickname") or serial
+        details: list[str] = []
+        if hmsCode:
+            details.append(f"HMS code: {hmsCode}")
+        if errorMessage:
+            details.append(errorMessage)
+        if not details:
+            details.append("Printer reported an issue.")
+        messageText = "\n".join(details)
+        logEntry = f"Alert for {printerName}: {messageText}"
+        self.logQueue.put(logEntry)
+
+        try:
+            messagebox.showwarning(f"Printer Alert - {printerName}", messageText, parent=self.root)
+        except Exception:
+            logging.exception("Failed to display printer alert dialog")
+
     def _chooseOutputDir(self) -> None:
         selectedDir = filedialog.askdirectory(title="Select Output Directory")
         if selectedDir:
@@ -2017,8 +2187,11 @@ class ListenerGuiApp:
         self._appendLogLine("Started listening...")
         self.startButton.config(state=tk.DISABLED)
         self.stopButton.config(state=tk.NORMAL)
+        if self.liveStatusEnabledVar.get():
+            self._startStatusSubscribers()
 
     def stopListening(self) -> None:
+        self._stopStatusSubscribers()
         if self.stopEvent:
             self.stopEvent.set()
         if self.listenerThread and self.listenerThread.is_alive() and threading.current_thread() != self.listenerThread:
@@ -2270,6 +2443,15 @@ class ListenerGuiApp:
             self.root.mainloop()
         finally:
             self.stopListening()
+
+    def _handleWindowClose(self) -> None:
+        try:
+            self.stopListening()
+        finally:
+            try:
+                self.root.destroy()
+            except Exception:
+                logging.exception("Failed to destroy root window")
 
 
 def runGui() -> None:
