@@ -24,6 +24,24 @@ defaultBaseUrl = "https://printer-backend-934564650450.europe-west1.run.app"
 defaultFilesDirectory = Path.home() / ".printmaster" / "files"
 
 
+printersConfigChangedListeners: List[Callable[[Dict[str, Any], Path], None]] = []
+
+
+def registerPrintersConfigChangedListener(
+    listener: Callable[[Dict[str, Any], Path], None]
+) -> None:
+    if listener not in printersConfigChangedListeners:
+        printersConfigChangedListeners.append(listener)
+
+
+def _notifyPrintersConfigChanged(updatedRecord: Dict[str, Any], storagePath: Path) -> None:
+    for listener in list(printersConfigChangedListeners):
+        try:
+            listener(updatedRecord, storagePath)
+        except Exception:  # noqa: BLE001 - log and continue notifying listeners
+            logging.exception("Printers config change listener failed")
+
+
 def getPrinterStatusEndpointUrl() -> str:
     return "https://print-flow-pro-eb683cc6.base44.app/api/apps/68b61486e7c52405eb683cc6/functions/updatePrinterStatus"
 
@@ -582,7 +600,9 @@ def upsertPrinterFromJob(entryData: Dict[str, Any]) -> Optional[Path]:
         updatedEntry["ipAddress"] = ipAddress
     for key, value in connectionUpdates.items():
         updatedEntry[key] = value
-    if writeAccessCode and accessCode:
+    if transportNormalized == "bambu_connect":
+        updatedEntry["accessCode"] = ""
+    elif writeAccessCode and accessCode:
         updatedEntry["accessCode"] = accessCode
     updatedEntry["serialNumber"] = serialNumber
     if nickname:
@@ -592,6 +612,7 @@ def upsertPrinterFromJob(entryData: Dict[str, Any]) -> Optional[Path]:
 
     printerEntries[matchedIndex] = updatedEntry
     savedPath = saveConfiguredPrinters(printerEntries)
+    _notifyPrintersConfigChanged(updatedEntry, savedPath)
     logging.info(
         "Auto-updated printer %s: ip=%s connectionMethod=%s transport=%s useCloud=%s",
         serialNumber,

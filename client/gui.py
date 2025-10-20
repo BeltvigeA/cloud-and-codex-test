@@ -43,6 +43,7 @@ from .client import (
     interpretInteger,
     listenForFiles,
     extractPreferredTransport,
+    registerPrintersConfigChangedListener,
 )
 
 try:  # pragma: no cover - optional dependency in some test environments
@@ -129,10 +130,13 @@ class ListenerGuiApp:
         self.listenerRecipientId = ""
         self.listenerStatusApiKey = ""
 
+        self.activePrinterDialog: Optional[Dict[str, Any]] = None
+
         self._buildLayout()
         self.root.after(200, self._processLogQueue)
         self.root.after(200, self._processPrinterStatusUpdates)
         self._scheduleStatusRefresh(0)
+        self._registerPrintersConfigListener()
 
     def log(self, message: str) -> None:
         self.logQueue.put(str(message))
@@ -323,6 +327,12 @@ class ListenerGuiApp:
 
         self._refreshPrinterList()
 
+    def _registerPrintersConfigListener(self) -> None:
+        try:
+            registerPrintersConfigChangedListener(self._handlePrintersConfigChange)
+        except Exception:
+            logging.exception("Failed to register printers config listener")
+
     def _loadPrinters(self) -> list[Dict[str, Any]]:
         try:
             self.printerStoragePath.parent.mkdir(parents=True, exist_ok=True)
@@ -347,6 +357,8 @@ class ListenerGuiApp:
                                     "brand": str(entry.get("brand", "")),
                                     "bambuModel": self._parseOptionalString(entry.get("bambuModel")) or "",
                                     "connectionMethod": self._parseOptionalString(entry.get("connectionMethod")),
+                                    "transport": self._parseOptionalString(entry.get("transport")),
+                                    "useCloud": interpretBoolean(entry.get("useCloud")),
                                     "status": str(entry.get("status", "")) or "Unknown",
                                     "nozzleTemp": self._parseOptionalFloat(entry.get("nozzleTemp")),
                                     "bedTemp": self._parseOptionalFloat(entry.get("bedTemp")),
@@ -633,6 +645,12 @@ class ListenerGuiApp:
                 self._parseOptionalInt(printer.get("remainingTimeSeconds")),
                 self._parseOptionalString(printer.get("gcodeState")),
             )
+            connectionDisplay = str(
+                printer.get("transport")
+                or printer.get("connectionMethod")
+                or defaultTransport
+            )
+
             self.printerTree.insert(
                 "",
                 tk.END,
@@ -644,7 +662,7 @@ class ListenerGuiApp:
                     printer.get("serialNumber", ""),
                     printer.get("brand", ""),
                     printer.get("bambuModel", ""),
-                    printer.get("connectionMethod", defaultTransport),
+                    connectionDisplay,
                     printer.get("status", "Unknown"),
                     nozzleTempDisplay,
                     bedTempDisplay,
@@ -660,6 +678,116 @@ class ListenerGuiApp:
         self.listenerStatusApiKey = (
             self.statusApiKeyVar.get().strip() if hasattr(self, "statusApiKeyVar") else ""
         )
+
+    def _updateActivePrinterDialogIdentifiers(self) -> None:
+        dialogInfo = getattr(self, "activePrinterDialog", None)
+        if not isinstance(dialogInfo, dict):
+            return
+        variableMap = dialogInfo.get("vars", {})
+        identifiers: set[str] = set()
+        for key in ("serialNumber", "nickname", "ipAddress"):
+            variable = variableMap.get(key)
+            if isinstance(variable, tk.StringVar):
+                normalized = variable.get().strip().lower()
+                if normalized:
+                    identifiers.add(normalized)
+        dialogInfo["identifiers"] = identifiers
+
+    def _handlePrintersConfigChange(self, updatedRecord: Dict[str, Any], _storagePath: Path) -> None:
+        def refreshUi() -> None:
+            self.printers = self._loadPrinters()
+            self._refreshPrinterList()
+            self._maybeRefreshActivePrinterDialog(updatedRecord)
+
+        try:
+            self.root.after(0, refreshUi)
+        except Exception:
+            logging.exception("Failed to refresh printers after configuration update")
+
+    def _maybeRefreshActivePrinterDialog(self, updatedRecord: Optional[Dict[str, Any]]) -> None:
+        if not updatedRecord:
+            return
+        dialogInfo = getattr(self, "activePrinterDialog", None)
+        if not isinstance(dialogInfo, dict) or not dialogInfo.get("isEdit"):
+            return
+        dialog = dialogInfo.get("dialog")
+        if dialog is None or not dialog.winfo_exists():
+            self.activePrinterDialog = None
+            return
+
+        recordIdentifiers: set[str] = set()
+        for fieldName in ("serialNumber", "nickname", "ipAddress"):
+            value = updatedRecord.get(fieldName)
+            if isinstance(value, str):
+                normalized = value.strip().lower()
+                if normalized:
+                    recordIdentifiers.add(normalized)
+
+        if not recordIdentifiers:
+            return
+
+        dialogIdentifiers = set(dialogInfo.get("identifiers") or [])
+        if not dialogIdentifiers:
+            self._updateActivePrinterDialogIdentifiers()
+            dialogIdentifiers = set(dialogInfo.get("identifiers") or [])
+
+        if not dialogIdentifiers.intersection(recordIdentifiers):
+            return
+
+        self._populateActivePrinterDialog(dict(updatedRecord))
+
+    def _populateActivePrinterDialog(self, printerRecord: Dict[str, Any]) -> None:
+        dialogInfo = getattr(self, "activePrinterDialog", None)
+        if not isinstance(dialogInfo, dict):
+            return
+        dialog = dialogInfo.get("dialog")
+        if dialog is None or not dialog.winfo_exists():
+            self.activePrinterDialog = None
+            return
+
+        variableMap = dialogInfo.get("vars", {})
+        recordCopy = dict(printerRecord)
+        sanitizedRecord = self._applyTelemetryDefaults(recordCopy)
+
+        mapping = {
+            "nickname": sanitizedRecord.get("nickname", ""),
+            "ipAddress": sanitizedRecord.get("ipAddress", ""),
+            "accessCode": sanitizedRecord.get("accessCode", ""),
+            "serialNumber": sanitizedRecord.get("serialNumber", ""),
+            "brand": sanitizedRecord.get("brand", ""),
+            "bambuModel": sanitizedRecord.get("bambuModel", ""),
+            "statusBaseUrl": sanitizedRecord.get("statusBaseUrl", ""),
+            "statusApiKey": sanitizedRecord.get("statusApiKey", ""),
+            "statusRecipientId": sanitizedRecord.get("statusRecipientId", ""),
+        }
+
+        for key, value in mapping.items():
+            variable = variableMap.get(key)
+            if isinstance(variable, tk.StringVar):
+                variable.set(str(value or ""))
+
+        connectionVariable = variableMap.get("connectionMethod")
+        resolvedConnection = str(
+            sanitizedRecord.get("transport")
+            or sanitizedRecord.get("connectionMethod")
+            or ""
+        )
+        if resolvedConnection.lower() == "lan":
+            resolvedConnection = getattr(self, "mqttConnectionMethod", "mqtt")
+        if isinstance(connectionVariable, tk.StringVar):
+            connectionVariable.set(resolvedConnection)
+
+        accessCodeVariable = variableMap.get("accessCode")
+        if isinstance(accessCodeVariable, tk.StringVar):
+            accessCodeVariable.set(str(mapping["accessCode"]))
+
+        updateControls = dialogInfo.get("updateControls")
+        if callable(updateControls):
+            updateControls()
+
+        dialogInfo["transport"] = sanitizedRecord.get("transport")
+        dialogInfo["useCloud"] = sanitizedRecord.get("useCloud")
+        self._updateActivePrinterDialogIdentifiers()
 
     def _clearPrinterSearch(self) -> None:
         self.printerSearchVar.set("")
@@ -1148,9 +1276,9 @@ class ListenerGuiApp:
                 if resolvedConnection == str(bambuConnect).lower():
                     if accessCodeVar.get():
                         accessCodeVar.set("")
-                    accessCodeEntry.configure(state="disabled")
+                    accessCodeEntry.configure(state=tk.DISABLED)
                 else:
-                    accessCodeEntry.configure(state="normal")
+                    accessCodeEntry.configure(state=tk.NORMAL)
 
             currentModel = bambuModelVar.get().strip()
             canonicalModel = bambuOptionsMap.get(currentModel.lower(), currentModel)
@@ -1211,6 +1339,38 @@ class ListenerGuiApp:
         )
         connectionMethodCombo.config(values=initialTransports)
         updateConnectionControls()
+
+        def handleDialogDestroyed(event: Any) -> None:
+            if event.widget is dialog and isinstance(getattr(self, "activePrinterDialog", None), dict):
+                if self.activePrinterDialog.get("dialog") is dialog:
+                    self.activePrinterDialog = None
+
+        dialog.bind("<Destroy>", handleDialogDestroyed)
+
+        self.activePrinterDialog = {
+            "dialog": dialog,
+            "vars": {
+                "nickname": nicknameVar,
+                "ipAddress": ipAddressVar,
+                "accessCode": accessCodeVar,
+                "serialNumber": serialNumberVar,
+                "brand": brandVar,
+                "bambuModel": bambuModelVar,
+                "connectionMethod": connectionMethodVar,
+                "statusBaseUrl": statusBaseUrlVar,
+                "statusApiKey": statusApiKeyVar,
+                "statusRecipientId": statusRecipientVar,
+            },
+            "accessEntry": accessCodeEntry,
+            "updateControls": updateConnectionControls,
+            "isEdit": bool(initialValues),
+            "transport": (initialValues or {}).get("transport"),
+            "useCloud": (initialValues or {}).get("useCloud"),
+        }
+        self._updateActivePrinterDialogIdentifiers()
+
+        for trackedVar in (nicknameVar, ipAddressVar, serialNumberVar):
+            trackedVar.trace_add("write", lambda *_: self._updateActivePrinterDialogIdentifiers())
 
         ttk.Label(dialog, text="Status Base URL:").grid(row=7, column=0, sticky=tk.W, padx=12, pady=4)
         ttk.Entry(dialog, textvariable=statusBaseUrlVar).grid(row=7, column=1, sticky=tk.EW, padx=12, pady=4)
