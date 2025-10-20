@@ -2073,6 +2073,12 @@ class ListenerGuiApp:
         if not self.listenerThread or not self.listenerThread.is_alive():
             return
         self._applyBase44Environment()
+        controlBaseUrlCandidate = self.baseUrlVar.get().strip() or defaultBaseUrl
+        try:
+            controlBaseUrl = buildBaseUrl(controlBaseUrlCandidate)
+        except ValueError:
+            controlBaseUrl = buildBaseUrl(defaultBaseUrl)
+        pollIntervalSeconds = max(3.0, float(max(1, int(self.pollIntervalVar.get()))) / 2.0)
         activeLanPrinters = self._collectActiveLanPrinters()
         activeSerials: set[str] = set()
         for printer in activeLanPrinters:
@@ -2090,6 +2096,10 @@ class ListenerGuiApp:
                     ipAddress=ipAddress,
                     accessCode=accessCode,
                     nickname=printer.get("nickname"),
+                    apiKey=self.listenerStatusApiKey,
+                    recipientId=self.listenerRecipientId,
+                    baseUrl=controlBaseUrl,
+                    pollInterval=pollIntervalSeconds,
                 )
                 worker.start()
                 self.commandWorkers[serialNumber] = worker
@@ -2259,7 +2269,7 @@ class ListenerGuiApp:
         self.listenerStatusApiKey = (
             self.statusApiKeyVar.get().strip() if hasattr(self, "statusApiKeyVar") else ""
         )
-        # Sørg for at miljøvariabler er satt før bakgrunnstråder starter.
+        # Gjør API- og mottakerverdier tilgjengelig for alle bakgrunnstråder.
         self._applyBase44Environment()
 
         try:

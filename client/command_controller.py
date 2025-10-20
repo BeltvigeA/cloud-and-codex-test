@@ -15,12 +15,9 @@ try:  # pragma: no cover - optional dependency resolved at runtime
 except Exception:  # pragma: no cover - surfaced through logs and callbacks
     bambuApi = None
 
-from .base44_client import BASE44_FUNCTIONS_BASE
+from .client import getPrinterControlEndpointUrl
 
 log = logging.getLogger(__name__)
-
-CONTROL_FUNCTION_URL = f"{BASE44_FUNCTIONS_BASE}/control"
-ACK_FUNCTION_URL = f"{BASE44_FUNCTIONS_BASE}/ackPrinterCommand"
 
 CONTROL_POLL_SECONDS = float(os.getenv("CONTROL_POLL_SEC", "3"))
 CONNECT_TIMEOUT_SECONDS = 10.0
@@ -30,20 +27,6 @@ CACHE_FILE_PATH = CACHE_DIRECTORY / "command-cache.json"
 
 _cacheData: Optional[Dict[str, Any]] = None
 _cacheLock = threading.Lock()
-
-
-def _buildHeaders() -> Dict[str, str]:
-    apiKey = os.getenv("BASE44_API_KEY", "").strip()
-    if not apiKey:
-        raise RuntimeError("BASE44_API_KEY is missing")
-    return {"Content-Type": "application/json", "X-API-Key": apiKey}
-
-
-def _resolveRecipientId() -> str:
-    recipientId = os.getenv("BASE44_RECIPIENT_ID", "").strip()
-    if not recipientId:
-        raise RuntimeError("BASE44_RECIPIENT_ID is missing")
-    return recipientId
 
 
 def _ensureCacheLoaded() -> Dict[str, Any]:
@@ -106,6 +89,10 @@ class CommandWorker:
         ipAddress: str,
         accessCode: str,
         nickname: Optional[str] = None,
+        apiKey: Optional[str] = None,
+        recipientId: Optional[str] = None,
+        baseUrl: Optional[str] = None,
+        pollInterval: Optional[float] = None,
     ) -> None:
         self.serial = serial
         self.ipAddress = ipAddress
@@ -115,6 +102,17 @@ class CommandWorker:
         self._thread: Optional[threading.Thread] = None
         self._printerInstance: Optional[Any] = None
         self._printerLock = threading.Lock()
+        self.apiKeyValue = (apiKey or os.getenv("BASE44_API_KEY", "")).strip()
+        self.recipientIdValue = (recipientId or os.getenv("BASE44_RECIPIENT_ID", "")).strip()
+        self.controlBaseUrl = (baseUrl or os.getenv("PRINTER_BACKEND_BASE_URL", "")).strip()
+        self.controlEndpointUrl = getPrinterControlEndpointUrl(self.controlBaseUrl or None)
+        self.pollIntervalSeconds = max(
+            2.0,
+            float(pollInterval) if pollInterval is not None else CONTROL_POLL_SECONDS,
+        )
+        log.debug(
+            "CommandWorker configured for %s using control endpoint %s", self.serial, self.controlEndpointUrl
+        )
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -159,20 +157,23 @@ class CommandWorker:
                         except Exception:
                             log.debug("Unable to acknowledge failure for %s", commandId, exc_info=True)
                         _finalizeCommand(commandId, "failed")
-                self._stopEvent.wait(CONTROL_POLL_SECONDS)
+                self._stopEvent.wait(self.pollIntervalSeconds)
         finally:
             log.info("CommandWorker stopped for %s", self.serial)
 
     def _pollCommands(self) -> List[Dict[str, Any]]:
+        if not self.apiKeyValue or not self.recipientIdValue:
+            raise RuntimeError("Missing API key or recipientId for CommandWorker")
         payload = {
-            "recipientId": _resolveRecipientId(),
+            "recipientId": self.recipientIdValue,
             "printerSerial": self.serial,
             "printerIpAddress": self.ipAddress,
         }
+        headers = {"Content-Type": "application/json", "X-API-Key": self.apiKeyValue}
         response = requests.post(
-            CONTROL_FUNCTION_URL,
+            self.controlEndpointUrl,
             json=payload,
-            headers=_buildHeaders(),
+            headers=headers,
             timeout=CONNECT_TIMEOUT_SECONDS,
         )
         response.raise_for_status()
@@ -201,20 +202,24 @@ class CommandWorker:
         message: Optional[str] = None,
         error: Optional[str] = None,
     ) -> None:
-        payload: Dict[str, Any] = {
-            "recipientId": _resolveRecipientId(),
+        if not self.apiKeyValue or not self.recipientIdValue:
+            raise RuntimeError("Missing API key or recipientId for CommandWorker")
+        ackPayload: Dict[str, Any] = {
+            "recipientId": self.recipientIdValue,
             "printerSerial": self.serial,
-            "commandId": commandId,
-            "status": status,
+            "ack": {
+                "commandId": commandId,
+                "success": status == "completed",
+                "message": str(message or error or status),
+            },
         }
-        if message:
-            payload["message"] = message
         if error:
-            payload["errorMessage"] = error
+            ackPayload["ack"]["error"] = str(error)
+        headers = {"Content-Type": "application/json", "X-API-Key": self.apiKeyValue}
         response = requests.post(
-            ACK_FUNCTION_URL,
-            json=payload,
-            headers=_buildHeaders(),
+            self.controlEndpointUrl,
+            json=ackPayload,
+            headers=headers,
             timeout=CONNECT_TIMEOUT_SECONDS,
         )
         response.raise_for_status()
