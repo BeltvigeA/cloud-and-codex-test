@@ -1348,6 +1348,14 @@ def sendBambuPrintJob(
         if skippedObjects:
             applySkippedObjectsToArchive(workingPath, skippedObjects)
 
+        startStrategy = (options.startStrategy or "api").lower()
+        useApiStrategy = startStrategy == "api" and bambulabsApi is not None
+
+        if useApiStrategy:
+            if lanStrategy != "bambuapi":
+                logger.info("Forcing bambulabs_api upload because startStrategy=api")
+            lanStrategy = "bambuapi"
+
         if options.useCloud and options.cloudUrl:
             useAmsForCloud = resolvedUseAms if resolvedUseAms is not None else True
             payload = buildCloudJobPayload(
@@ -1370,6 +1378,8 @@ def sendBambuPrintJob(
                 statusCallback({"status": "cloudAccepted", "response": response})
             return {"method": "cloud", "remoteFile": remoteName, "paramPath": paramPath, "response": response}
 
+        uploadedName: Optional[str] = None
+
         if lanStrategy == "bambuapi":
             uploadedName = uploadViaBambulabsApi(
                 ip=options.ipAddress,
@@ -1379,13 +1389,30 @@ def sendBambuPrintJob(
                 remoteName=printerFileName,
             )
         else:
-            uploadedName = uploadViaFtps(
-                ip=options.ipAddress,
-                accessCode=options.accessCode,
-                localPath=workingPath,
-                remoteName=printerFileName,
-                insecureTls=not options.secureConnection,
-            )
+            try:
+                uploadedName = uploadViaFtps(
+                    ip=options.ipAddress,
+                    accessCode=options.accessCode,
+                    localPath=workingPath,
+                    remoteName=printerFileName,
+                    insecureTls=not options.secureConnection,
+                )
+            except Exception as error:
+                is550 = (isinstance(error, error_perm) and "550" in str(error)) or (" 550" in str(error))
+                if is550 and bambulabsApi is not None:
+                    logger.info(
+                        "FTPS 550 under opplasting – faller tilbake til bambulabs_api for %s",
+                        options.serialNumber,
+                    )
+                    uploadedName = uploadViaBambulabsApi(
+                        ip=options.ipAddress,
+                        serial=options.serialNumber,
+                        accessCode=options.accessCode,
+                        localPath=workingPath,
+                        remoteName=printerFileName,
+                    )
+                else:
+                    raise
 
         if statusCallback:
             statusCallback(
@@ -1447,7 +1474,7 @@ def sendBambuPrintJob(
             elif startStrategy == "api":
                 logger.info("Falling back to MQTT start for %s", options.serialNumber)
 
-            useAmsForMqtt = resolvedUseAms if isinstance(resolvedUseAms, bool) else True
+            useAmsForMqtt = resolvedUseAms if isinstance(resolvedUseAms, bool) else False
             if statusCallback and useApiStrategy:
                 statusCallback(
                     {
