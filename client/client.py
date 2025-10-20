@@ -335,6 +335,8 @@ def normalizePrinterDetails(details: Dict[str, Any]) -> Dict[str, Any]:
             interpreted = interpretBoolean(rawValue)
             if interpreted is not None:
                 normalized["useAms"] = interpreted
+            elif isinstance(rawValue, str) and rawValue.strip().lower() in {"auto", "none", "null"}:
+                normalized["useAms"] = None
         elif key == "bedleveling":
             interpreted = interpretBoolean(rawValue)
             if interpreted is not None:
@@ -1001,6 +1003,21 @@ def dispatchBambuPrintIfPossible(
             return bool(value)
         return interpreted
 
+    def resolveUseAms(default: Optional[bool] = None) -> Optional[bool]:
+        value = resolvedDetails.get("useAms")
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"auto", "none", "null", ""}:
+                return None
+        interpreted = interpretBoolean(value)
+        if interpreted is None:
+            return default
+        return interpreted
+
     def resolveInt(key: str, default: Optional[int]) -> Optional[int]:
         value = resolvedDetails.get(key)
         if value is None:
@@ -1021,7 +1038,7 @@ def dispatchBambuPrintIfPossible(
         useCloud=resolveBool("useCloud", False),
         cloudUrl=resolvedDetails.get("cloudUrl"),
         cloudTimeout=resolveInt("cloudTimeout", 180) or 180,
-        useAms=resolveBool("useAms", True),
+        useAms=resolveUseAms(),
         bedLeveling=resolveBool("bedLeveling", True),
         layerInspect=resolveBool("layerInspect", True),
         flowCalibration=resolveBool("flowCalibration", False),

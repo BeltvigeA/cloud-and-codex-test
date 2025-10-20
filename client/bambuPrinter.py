@@ -24,7 +24,7 @@ import logging
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Event
-from typing import Any, BinaryIO, Callable, Dict, Iterable, List, Optional, Sequence
+from typing import Any, BinaryIO, Callable, Dict, Iterable, List, Optional, Sequence, Literal
 
 from urllib.parse import urljoin
 
@@ -727,7 +727,7 @@ class BambuPrintOptions:
     useCloud: bool = False
     cloudUrl: Optional[str] = None
     cloudTimeout: int = 180
-    useAms: bool = True
+    useAms: Optional[bool] = None
     bedLeveling: bool = True
     layerInspect: bool = True
     flowCalibration: bool = False
@@ -737,6 +737,335 @@ class BambuPrintOptions:
     waitSeconds: int = 8
     lanStrategy: str = "legacy"
     transport: str = "lan"
+    spoolMode: bool = False
+    startStrategy: Literal["api", "mqtt"] = "api"
+
+
+def _waitForMqttReady(apiPrinter: Any, timeout: float = 30.0, poll: float = 0.5) -> tuple[Any, Any]:
+    """Wait until the printer reports a stable MQTT state."""
+
+    deadline = time.monotonic() + max(timeout, 0.0)
+    lastSnapshot: Optional[tuple[Any, Any]] = None
+    consecutiveStable = 0
+    lastError: Optional[BaseException] = None
+
+    while time.monotonic() < deadline:
+        try:
+            state = apiPrinter.get_state()
+            percentage = apiPrinter.get_percentage()
+            lastError = None
+        except Exception as error:  # pragma: no cover - depends on SDK behaviour
+            logger.debug("Waiting for MQTT readiness failed: %s", error)
+            lastError = error
+            consecutiveStable = 0
+            time.sleep(max(poll, 0.05))
+            continue
+
+        snapshot = (state, percentage)
+        if snapshot == lastSnapshot:
+            consecutiveStable += 1
+        else:
+            consecutiveStable = 1
+            lastSnapshot = snapshot
+
+        if consecutiveStable >= 2:
+            return snapshot
+
+        time.sleep(max(poll, 0.05))
+
+    message = "Timed out waiting for printer MQTT readiness"
+    if lastError:
+        message = f"{message}: {lastError}"
+    raise TimeoutError(message)
+
+
+def _normalizeMetadataKey(key: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", key.lower())
+
+
+def _findMetadataValue(container: Any, keyNames: Iterable[str]) -> Any:
+    normalizedTargets = { _normalizeMetadataKey(name) for name in keyNames }
+
+    def _search(value: Any) -> Any:
+        if isinstance(value, dict):
+            for itemKey, itemValue in value.items():
+                normalizedKey = _normalizeMetadataKey(str(itemKey))
+                if normalizedKey in normalizedTargets:
+                    return itemValue
+                result = _search(itemValue)
+                if result is not None:
+                    return result
+        elif isinstance(value, (list, tuple, set)):
+            for item in value:
+                result = _search(item)
+                if result is not None:
+                    return result
+        return None
+
+    return _search(container)
+
+
+def _metadataContainsKey(container: Any, keyNames: Iterable[str]) -> bool:
+    normalizedTargets = {_normalizeMetadataKey(name) for name in keyNames}
+
+    def _search(value: Any) -> bool:
+        if isinstance(value, dict):
+            for itemKey, itemValue in value.items():
+                normalizedKey = _normalizeMetadataKey(str(itemKey))
+                if normalizedKey in normalizedTargets:
+                    return True
+                if _search(itemValue):
+                    return True
+        elif isinstance(value, (list, tuple, set)):
+            for item in value:
+                if _search(item):
+                    return True
+        return False
+
+    return _search(container)
+
+
+def _interpretFlexibleBoolean(value: Any) -> Optional[bool]:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"auto", "", "none", "null"}:
+            return None
+        if normalized in {"true", "1", "yes", "y", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "n", "off"}:
+            return False
+    return None
+
+
+def resolveUseAmsAuto(
+    options: BambuPrintOptions,
+    jobMetadata: Optional[Dict[str, Any]],
+    localPath: Optional[Path],
+) -> Optional[bool]:
+    """Determine the effective use_ams flag based on options and metadata."""
+
+    if isinstance(options.useAms, bool):
+        return options.useAms
+
+    if options.spoolMode:
+        return False
+
+    if localPath and localPath.suffix.lower() == ".gcode":
+        return False
+
+    if jobMetadata:
+        quickPrint = _findMetadataValue(jobMetadata, {"isquickprint"})
+        quickPrintBool = _interpretFlexibleBoolean(quickPrint) if quickPrint is not None else None
+        if quickPrintBool:
+            return False
+
+        hasAmsConfigurationKey = _metadataContainsKey(jobMetadata, {"amsconfiguration", "amsconfig"})
+        amsConfiguration = _findMetadataValue(jobMetadata, {"amsconfiguration", "amsconfig"})
+        if hasAmsConfigurationKey and amsConfiguration is None:
+            return False
+        if isinstance(amsConfiguration, dict):
+            if amsConfiguration.get("enabled") is False:
+                return False
+            if amsConfiguration:
+                return True
+        elif amsConfiguration:
+            return True
+
+        useAmsHint = _findMetadataValue(jobMetadata, {"useams"})
+        interpretedHint = _interpretFlexibleBoolean(useAmsHint) if useAmsHint is not None else None
+        if interpretedHint is not None:
+            return interpretedHint
+
+    return None
+
+
+def _stringifyStatusFragment(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, bytes):
+        try:
+            return value.decode("utf-8", errors="ignore")
+        except Exception:  # pragma: no cover - defensive
+            return ""
+    if isinstance(value, (int, float, bool)):
+        return str(value)
+    if isinstance(value, dict):
+        return " ".join(_stringifyStatusFragment(item) for item in value.values())
+    if isinstance(value, (list, tuple, set)):
+        return " ".join(_stringifyStatusFragment(item) for item in value)
+    return str(value)
+
+
+def _looksLikeAmsFilamentConflict(statusPayload: Any) -> bool:
+    text = _stringifyStatusFragment(statusPayload).lower()
+    if not text:
+        return False
+    conflictMarkers = (
+        "hms_07ff-2000-0002-0004",
+        "pull out filament",
+        "remove filament",
+        "filament in hotend",
+    )
+    return any(marker in text for marker in conflictMarkers)
+
+
+def _extractStateText(statePayload: Any) -> Optional[str]:
+    if statePayload is None:
+        return None
+    if isinstance(statePayload, str):
+        return statePayload
+    if isinstance(statePayload, dict):
+        for key in ("state", "gcode_state", "sub_state", "printer_state"):
+            if key in statePayload:
+                nested = statePayload[key]
+                if isinstance(nested, (dict, list, tuple)):
+                    extracted = _extractStateText(nested)
+                    if extracted:
+                        return extracted
+                elif nested:
+                    return str(nested)
+        return None
+    return str(statePayload)
+
+
+def _stateSuggestsPrinting(stateText: Optional[str]) -> bool:
+    if not stateText:
+        return False
+    normalized = stateText.lower()
+    return any(keyword in normalized for keyword in ("heat", "warm", "print", "run", "prepare", "busy"))
+
+
+def startPrintViaApi(
+    *,
+    ip: str,
+    serial: str,
+    accessCode: str,
+    uploaded_name: str,
+    plate_index: Optional[int],
+    param_path: Optional[str],
+    options: BambuPrintOptions,
+    job_metadata: Optional[Dict[str, Any]] = None,
+    ack_timeout_sec: float = 60.0,
+) -> Dict[str, Any]:
+    """Start a print using bambulabs_api.Printer with acknowledgement handling."""
+
+    if bambulabsApi is None:
+        raise RuntimeError("bambulabs_api is required for API start strategy")
+
+    printerClass = getattr(bambulabsApi, "Printer", None)
+    if printerClass is None:
+        raise RuntimeError("bambulabs_api.Printer class is unavailable")
+
+    printer = printerClass(ip, accessCode, serial)
+    startParam = plate_index if plate_index is not None else param_path
+    resolvedUseAms = resolveUseAmsAuto(options, job_metadata, None)
+
+    paramDescription = startParam if startParam is not None else "<default>"
+    logger.info(
+        "Starting print via API for %s: file=%s param=%s use_ams=%s",
+        serial,
+        uploaded_name,
+        paramDescription,
+        resolvedUseAms,
+    )
+
+    connectMethod = getattr(printer, "mqtt_start", None) or getattr(printer, "connect", None)
+    if connectMethod:
+        connectMethod()
+
+    _waitForMqttReady(printer, timeout=30.0)
+
+    def _collectStatus() -> Dict[str, Any]:
+        snapshot: Dict[str, Any] = {"state": None, "gcodeState": None, "percentage": None}
+        try:
+            statePayload = printer.get_state()
+            snapshot["rawState"] = statePayload
+            snapshot["state"] = _extractStateText(statePayload)
+        except Exception as error:  # pragma: no cover - depends on SDK behaviour
+            snapshot["stateError"] = error
+        try:
+            gcodeStateGetter = getattr(printer, "get_gcode_state", None)
+            if callable(gcodeStateGetter):
+                snapshot["gcodeState"] = gcodeStateGetter()
+        except Exception as error:  # pragma: no cover - depends on SDK behaviour
+            snapshot["gcodeStateError"] = error
+        try:
+            snapshot["percentage"] = printer.get_percentage()
+        except Exception as error:  # pragma: no cover - depends on SDK behaviour
+            snapshot["percentageError"] = error
+        return snapshot
+
+    def _awaitAcknowledgement(timeoutSeconds: float) -> tuple[bool, Dict[str, Any]]:
+        acknowledgementDeadline = time.monotonic() + max(timeoutSeconds, 0.0)
+        lastSnapshot: Dict[str, Any] = {}
+        acknowledged = False
+        while time.monotonic() < acknowledgementDeadline:
+            snapshot = _collectStatus()
+            lastSnapshot = snapshot
+            percentage = snapshot.get("percentage")
+            stateText = snapshot.get("state")
+            gcodeState = snapshot.get("gcodeState")
+            if (isinstance(percentage, (int, float)) and percentage > 0) or _stateSuggestsPrinting(stateText) or _stateSuggestsPrinting(
+                gcodeState if isinstance(gcodeState, str) else None
+            ):
+                acknowledged = True
+                break
+            time.sleep(1.0)
+        return acknowledged, lastSnapshot
+
+    def _start(useAmsValue: Optional[bool]) -> tuple[bool, Dict[str, Any], float]:
+        startTime = time.monotonic()
+        printer.start_print(uploaded_name, startParam, use_ams=useAmsValue)
+        acknowledged, lastSnapshot = _awaitAcknowledgement(ack_timeout_sec)
+        elapsed = time.monotonic() - startTime
+        return acknowledged, lastSnapshot, elapsed
+
+    fallbackTriggered = False
+    finalUseAms = resolvedUseAms
+
+    try:
+        acknowledged, snapshot, elapsed = _start(resolvedUseAms)
+        conflictDetected = _looksLikeAmsFilamentConflict(snapshot)
+        if (resolvedUseAms is None) and (conflictDetected or not acknowledged):
+            logger.warning(
+                "API start detected possible AMS filament conflict for %s – retrying with use_ams=False",
+                serial,
+            )
+            fallbackTriggered = True
+            finalUseAms = False
+            try:
+                printer.stop_print()
+            except Exception:  # pragma: no cover - best effort stop
+                logger.debug("stop_print failed during AMS retry", exc_info=True)
+            acknowledged, snapshot, elapsed = _start(False)
+        logger.info(
+            "API start acknowledgement for %s: acknowledged=%s state=%s gcodeState=%s pct=%s in %.1fs",
+            serial,
+            acknowledged,
+            snapshot.get("state"),
+            snapshot.get("gcodeState"),
+            snapshot.get("percentage"),
+            elapsed,
+        )
+        return {
+            "acknowledged": acknowledged,
+            "state": snapshot.get("state"),
+            "gcodeState": snapshot.get("gcodeState"),
+            "percentage": snapshot.get("percentage"),
+            "useAms": finalUseAms,
+            "fallbackTriggered": fallbackTriggered,
+        }
+    finally:
+        try:
+            printer.disconnect()
+        except Exception:  # pragma: no cover - best effort cleanup
+            pass
 
 
 def normalizeRemoteFileName(name: str) -> str:
@@ -929,6 +1258,7 @@ def sendBambuPrintJob(
     options: BambuPrintOptions,
     statusCallback: Optional[Callable[[Dict[str, Any]], None]] = None,
     skippedObjects: Optional[Sequence[Dict[str, Any]]] = None,
+    jobMetadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Upload a file and start a Bambu print job."""
 
@@ -970,6 +1300,7 @@ def sendBambuPrintJob(
                 paramPath = candidates[0]
 
         remoteName = buildRemoteFileName(workingPath)
+        resolvedUseAms = resolveUseAmsAuto(options, jobMetadata, resolvedPath)
 
         # Bambu Connect hand-off (local client). Copy to persistent dir so temp isn't deleted.
         if options.transport == "bambu_connect" and not options.cloudUrl:
@@ -992,12 +1323,14 @@ def sendBambuPrintJob(
                 else:
                     webbrowser.open(uri)
                 if statusCallback:
-                    statusCallback({
-                        "status": "bambuConnectOpened",
-                        "uri": uri,
-                        "persistentPath": str(persistentPath),
-                        "name": connectName,
-                    })
+                    statusCallback(
+                        {
+                            "status": "bambuConnectOpened",
+                            "uri": uri,
+                            "persistentPath": str(persistentPath),
+                            "name": connectName,
+                        }
+                    )
                 return {
                     "method": "bambu_connect",
                     "uri": uri,
@@ -1005,16 +1338,18 @@ def sendBambuPrintJob(
                     "localFile": str(persistentPath),
                     "paramPath": paramPath,
                 }
-            except Exception as e:
+            except Exception as error:
                 if statusCallback:
-                    statusCallback({"status": "error", "error": str(e)})
+                    statusCallback({"status": "error", "error": str(error)})
                 raise
+
         printerFileName = buildPrinterTransferFileName(workingPath)
 
         if skippedObjects:
             applySkippedObjectsToArchive(workingPath, skippedObjects)
 
         if options.useCloud and options.cloudUrl:
+            useAmsForCloud = resolvedUseAms if resolvedUseAms is not None else True
             payload = buildCloudJobPayload(
                 ip=options.ipAddress,
                 serial=options.serialNumber,
@@ -1022,7 +1357,7 @@ def sendBambuPrintJob(
                 safeName=remoteName,
                 paramPath=paramPath,
                 plateIndex=plateIndex,
-                useAms=options.useAms,
+                useAms=useAmsForCloud,
                 bedLeveling=options.bedLeveling,
                 layerInspect=options.layerInspect,
                 flowCalibration=options.flowCalibration,
@@ -1062,27 +1397,96 @@ def sendBambuPrintJob(
                 }
             )
 
-        startPrintViaMqtt(
-            ip=options.ipAddress,
-            serial=options.serialNumber,
-            accessCode=options.accessCode,
-            sdFileName=uploadedName,
-            paramPath=paramPath,
-            useAms=options.useAms,
-            bedLeveling=options.bedLeveling,
-            layerInspect=options.layerInspect,
-            flowCalibration=options.flowCalibration,
-            vibrationCalibration=options.vibrationCalibration,
-            insecureTls=not options.secureConnection,
-            waitSeconds=options.waitSeconds,
-            statusCallback=statusCallback,
-        )
+        startStrategy = (options.startStrategy or "api").lower()
+        useApiStrategy = startStrategy == "api" and bambulabsApi is not None
+        startingEvent = {
+            "status": "starting",
+            "param": paramPath,
+            "remoteFile": uploadedName,
+            "useAms": resolvedUseAms,
+            "method": "api" if useApiStrategy else "mqtt",
+        }
+        if statusCallback:
+            statusCallback(startingEvent)
+
+        apiResult: Optional[Dict[str, Any]] = None
+        if useApiStrategy:
+            try:
+                apiResult = startPrintViaApi(
+                    ip=options.ipAddress,
+                    serial=options.serialNumber,
+                    accessCode=options.accessCode,
+                    uploaded_name=uploadedName,
+                    plate_index=plateIndex,
+                    param_path=paramPath,
+                    options=options,
+                    job_metadata=jobMetadata,
+                    ack_timeout_sec=max(float(options.waitSeconds), 1.0),
+                )
+                if statusCallback:
+                    statusCallback(
+                        {
+                            "status": "started",
+                            "method": "api",
+                            "acknowledged": apiResult.get("acknowledged") if apiResult else False,
+                            "state": apiResult.get("state") if apiResult else None,
+                            "gcodeState": apiResult.get("gcodeState") if apiResult else None,
+                            "percentage": apiResult.get("percentage") if apiResult else None,
+                            "useAms": apiResult.get("useAms") if apiResult else resolvedUseAms,
+                            "fallback": apiResult.get("fallbackTriggered") if apiResult else False,
+                        }
+                    )
+            except Exception as error:
+                logger.warning("API start failed for %s: %s", options.serialNumber, error, exc_info=True)
+                if statusCallback:
+                    statusCallback({"status": "apiStartFailed", "error": str(error)})
+
+        if apiResult is None:
+            if startStrategy == "api" and bambulabsApi is None:
+                logger.warning("bambulabs_api not available – falling back to MQTT start for %s", options.serialNumber)
+            elif startStrategy == "api":
+                logger.info("Falling back to MQTT start for %s", options.serialNumber)
+
+            useAmsForMqtt = resolvedUseAms if isinstance(resolvedUseAms, bool) else True
+            if statusCallback and useApiStrategy:
+                statusCallback(
+                    {
+                        "status": "starting",
+                        "method": "mqtt",
+                        "param": paramPath,
+                        "remoteFile": uploadedName,
+                        "useAms": useAmsForMqtt,
+                    }
+                )
+
+            startPrintViaMqtt(
+                ip=options.ipAddress,
+                serial=options.serialNumber,
+                accessCode=options.accessCode,
+                sdFileName=uploadedName,
+                paramPath=paramPath,
+                useAms=useAmsForMqtt,
+                bedLeveling=options.bedLeveling,
+                layerInspect=options.layerInspect,
+                flowCalibration=options.flowCalibration,
+                vibrationCalibration=options.vibrationCalibration,
+                insecureTls=not options.secureConnection,
+                waitSeconds=options.waitSeconds,
+                statusCallback=statusCallback,
+            )
+
+            startMethodResult = "mqtt"
+        else:
+            startMethodResult = "api"
 
         return {
             "method": "lan",
             "remoteFile": uploadedName,
             "originalRemoteFile": remoteName,
             "paramPath": paramPath,
+            "useAms": apiResult.get("useAms") if apiResult else (resolvedUseAms if isinstance(resolvedUseAms, bool) else None),
+            "api": apiResult,
+            "startMethod": startMethodResult,
         }
 
 
@@ -1106,6 +1510,7 @@ __all__ = [
     "postStatus",
     "sendBambuPrintJob",
     "sendPrintJobViaCloud",
+    "startPrintViaApi",
     "startPrintViaMqtt",
     "summarizeStatusMessages",
     "uploadViaFtps",
