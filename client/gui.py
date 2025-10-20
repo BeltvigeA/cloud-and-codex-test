@@ -2102,13 +2102,22 @@ class ListenerGuiApp:
             "bambu_connect" if interpretBoolean(printerConfig.get("useCloud")) else "lan"
         )
         cloudUrlValue = (metadata.get("cloudUrl") or printerConfig.get("cloudUrl"))
-        ipAddressValue = resolveText("ipAddress") or printerConfig.get("ipAddress")
-        serialValue = resolveText("serialNumber") or printerConfig.get("serialNumber")
-        accessCodeValue = resolveText("accessCode") or printerConfig.get("accessCode")
+        def _norm_str(v: object) -> str:
+            s = str(v).strip() if v is not None else ""
+            return "" if s.lower() in {"", "none", "null"} else s
+
+        # Preferer metadata kun hvis det faktisk er en gyldig streng
+        metaIp    = _norm_str(metadata.get("ipAddress"))
+        metaSn    = _norm_str(metadata.get("serialNumber"))
+        metaAcc   = _norm_str(metadata.get("accessCode"))
+
+        ipAddressValue  = metaIp or _norm_str(printerConfig.get("ipAddress"))
+        serialValue     = metaSn or _norm_str(printerConfig.get("serialNumber"))
+        accessCodeValue = metaAcc or _norm_str(printerConfig.get("accessCode"))
 
         if selectedTransport != "bambu_connect":
             if not ipAddressValue or not accessCodeValue or not serialValue:
-                self.log("Mangler LAN-informasjon for valgt printer – hopper over sending.")
+                self.log(f"Mangler LAN-informasjon: ip={ipAddressValue!r}, serial={serialValue!r}, access={'OK' if accessCodeValue else 'MISSING'} – hopper over sending.")
                 return
 
         lanStrategyValue = resolveText("lanStrategy") or str(printerConfig.get("lanStrategy") or "legacy")
@@ -2120,9 +2129,9 @@ class ListenerGuiApp:
             waitSecondsValue = 8
 
         options = BambuPrintOptions(
-            ipAddress=str(ipAddressValue),
-            serialNumber=str(serialValue),
-            accessCode=str(accessCodeValue),
+            ipAddress=ipAddressValue,
+            serialNumber=serialValue,
+            accessCode=accessCodeValue,
             useAms=resolveUseAms(),
             bedLeveling=resolveBool("bedLeveling", True),
             layerInspect=resolveBool("layerInspect", True),
