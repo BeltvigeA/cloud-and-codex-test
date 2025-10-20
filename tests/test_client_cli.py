@@ -301,8 +301,8 @@ def testStatusCommandBuildsEndpointFromBaseUrl(
     arguments = client.parseArguments()
 
     assert client.buildBaseUrl(arguments.baseUrl) == expected
-    assert client.getPrinterStatusEndpointUrl(arguments.baseUrl) == f"{expected}/printer-status"
-    assert client.getPrinterStatusEndpointUrl(expected) == f"{expected}/printer-status"
+    assert client.getPrinterStatusEndpointUrl(arguments.baseUrl) == f"{expected}/status"
+    assert client.getPrinterStatusEndpointUrl(expected) == f"{expected}/status"
     assert arguments.recipientId is None
 
 
@@ -338,7 +338,7 @@ def testPerformStatusUpdatesUsesProvidedBaseUrl(monkeypatch: pytest.MonkeyPatch)
         numUpdates=1,
     )
 
-    assert postedUrls == ["https://printer-status.example.com/printer-status"]
+    assert postedUrls == ["https://printer-status.example.com/status"]
 
 
 def testGenerateStatusPayloadIncludesRecipientId() -> None:

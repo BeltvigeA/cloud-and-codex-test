@@ -42,8 +42,16 @@ def _notifyPrintersConfigChanged(updatedRecord: Dict[str, Any], storagePath: Pat
             logging.exception("Printers config change listener failed")
 
 
-def getPrinterStatusEndpointUrl() -> str:
-    return "https://print-flow-pro-eb683cc6.base44.app/api/apps/68b61486e7c52405eb683cc6/functions/updatePrinterStatus"
+def getPrinterStatusEndpointUrl(baseUrl: Optional[str] = None) -> str:
+    """Resolve the status endpoint for printer updates."""
+    sanitizedBaseUrl = buildBaseUrl(baseUrl or defaultBaseUrl)
+    return f"{sanitizedBaseUrl}/status"
+
+
+def getPrinterControlEndpointUrl(baseUrl: Optional[str] = None) -> str:
+    """Resolve the control endpoint for printer commands."""
+    sanitizedBaseUrl = buildBaseUrl(baseUrl or defaultBaseUrl)
+    return f"{sanitizedBaseUrl}/control"
 
 
 def configureLogging() -> None:
@@ -2060,7 +2068,7 @@ def performStatusUpdates(
     numUpdates: int,
     recipientId: Optional[str] = None,
 ) -> None:
-    statusUrl = getPrinterStatusEndpointUrl()
+    statusUrl = getPrinterStatusEndpointUrl(baseUrl)
     session = requests.Session()
     headers = {"X-API-Key": apiKey, "Content-Type": "application/json"}
 
