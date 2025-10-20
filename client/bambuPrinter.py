@@ -948,6 +948,29 @@ def _stateSuggestsPrinting(stateText: Optional[str]) -> bool:
     return any(keyword in normalized for keyword in ("heat", "warm", "print", "run", "prepare", "busy"))
 
 
+def looksLikeAmsFilamentConflict(statusPayload: Any) -> bool:
+    """Public helper for detecting AMS filament conflicts in status payloads."""
+
+    return _looksLikeAmsFilamentConflict(statusPayload)
+
+
+def extractStateText(statePayload: Any) -> Optional[str]:
+    """Public helper mirroring the internal state text extraction logic."""
+
+    return _extractStateText(statePayload)
+
+
+def safeDisconnectPrinter(printer: Any) -> None:
+    """Disconnect from the printer while ignoring benign SDK exceptions."""
+
+    disconnectMethod = getattr(printer, "disconnect", None)
+    if disconnectMethod:
+        try:
+            disconnectMethod()
+        except Exception:  # pragma: no cover - defensive against camera thread state
+            logger.debug("bambulabs_api disconnect raised (ignored)", exc_info=True)
+
+
 def startPrintViaApi(
     *,
     ip: str,
