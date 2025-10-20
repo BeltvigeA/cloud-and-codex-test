@@ -925,15 +925,17 @@ class ListenerGuiApp:
         connectionFrame.grid(row=0, column=0, sticky=tk.EW, padx=12, pady=(12, 6))
         connectionFrame.columnconfigure(1, weight=1)
         ttk.Label(connectionFrame, text="Base URL:").grid(row=0, column=0, sticky=tk.W, padx=6, pady=4)
-        ttk.Entry(connectionFrame, textvariable=baseUrlVar, width=40).grid(
+        ttk.Entry(connectionFrame, textvariable=baseUrlVar, width=40, state="readonly").grid(
             row=0, column=1, sticky=tk.EW, padx=6, pady=4
         )
         ttk.Label(connectionFrame, text="API Key:").grid(row=1, column=0, sticky=tk.W, padx=6, pady=4)
-        ttk.Entry(connectionFrame, textvariable=apiKeyVar, show="*", width=40).grid(
+        ttk.Entry(
+            connectionFrame, textvariable=apiKeyVar, show="*", width=40, state="readonly"
+        ).grid(
             row=1, column=1, sticky=tk.EW, padx=6, pady=4
         )
         ttk.Label(connectionFrame, text="Recipient ID:").grid(row=2, column=0, sticky=tk.W, padx=6, pady=4)
-        ttk.Entry(connectionFrame, textvariable=recipientVar, width=40).grid(
+        ttk.Entry(connectionFrame, textvariable=recipientVar, width=40, state="readonly").grid(
             row=2, column=1, sticky=tk.EW, padx=6, pady=4
         )
 
@@ -2070,6 +2072,7 @@ class ListenerGuiApp:
             return
         if not self.listenerThread or not self.listenerThread.is_alive():
             return
+        self._applyBase44Environment()
         activeLanPrinters = self._collectActiveLanPrinters()
         activeSerials: set[str] = set()
         for printer in activeLanPrinters:
@@ -2251,10 +2254,12 @@ class ListenerGuiApp:
             messagebox.showerror("Missing Information", "Base URL and recipient ID are required.")
             return
 
+        # Bruk samme Recipient ID og API-key for status- og command-arbeidere.
         self.listenerRecipientId = recipientId
         self.listenerStatusApiKey = (
             self.statusApiKeyVar.get().strip() if hasattr(self, "statusApiKeyVar") else ""
         )
+        # Sørg for at miljøvariabler er satt før bakgrunnstråder starter.
         self._applyBase44Environment()
 
         try:
@@ -2271,11 +2276,14 @@ class ListenerGuiApp:
             daemon=True,
         )
         self.listenerThread.start()
-        self._appendLogLine("Started listening...")
+        self._appendLogLine("Started listening.")
         self.startButton.config(state=tk.DISABLED)
         self.stopButton.config(state=tk.NORMAL)
         if self.liveStatusEnabledVar.get():
-            self._startStatusSubscribers()
+            try:
+                self._startStatusSubscribers()
+            except Exception:  # pragma: no cover - defensive logging
+                logging.exception("Failed to start live status subscribers")
 
     def stopListening(self) -> None:
         self._stopStatusSubscribers()
