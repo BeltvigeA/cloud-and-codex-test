@@ -420,14 +420,21 @@ def uploadViaBambulabsApi(
         raise RuntimeError("Unable to locate an upload method on bambulabs_api.Printer")
 
     try:
-        try:
-            uploadMethod(str(localPath), remoteName)
-        except TypeError:
-            uploadMethod(str(localPath))
+        # bambulabs_api 2.6.x expects a binary file handle rather than a path string
+        with open(localPath, "rb") as fileHandle:
+            try:
+                uploadMethod(fileHandle, remoteName)
+            except TypeError:
+                fileHandle.seek(0)
+                uploadMethod(fileHandle)
     finally:
         disconnectMethod = getattr(printer, "disconnect", None)
         if disconnectMethod:
-            disconnectMethod()
+            try:
+                disconnectMethod()
+            except Exception:
+                # Camera thread may not have been started; ignore spurious disconnect errors
+                logger.debug("bambulabs_api disconnect raised (ignored)", exc_info=True)
 
     return remoteName
 
@@ -963,7 +970,8 @@ def startPrintViaApi(
         raise RuntimeError("bambulabs_api.Printer class is unavailable")
 
     printer = printerClass(ip, accessCode, serial)
-    startParam = plate_index if plate_index is not None else param_path
+    # Prefer explicit gcode parameter when available; otherwise fall back to plate index
+    startParam = param_path if param_path is not None else plate_index
     resolvedUseAms = resolveUseAmsAuto(options, job_metadata, None)
 
     paramDescription = startParam if startParam is not None else "<default>"
