@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import importlib
 import logging
+import os
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Iterable, List, Optional, Set
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
+
+import requests
 
 from .bambuPrinter import extractStateText, looksLikeAmsFilamentConflict, safeDisconnectPrinter
+from .base44_client import postReportError, postUpdateStatus
 
 
 try:  # pragma: no cover - dependency handled dynamically in tests
@@ -52,6 +56,7 @@ class BambuStatusSubscriber:
         self._threads: Dict[str, threading.Thread] = {}
         self._stops: Dict[str, threading.Event] = {}
         self._lock = threading.Lock()
+        self.defaultRecipientId = os.getenv("BASE44_RECIPIENT_ID", "").strip()
 
     def startAll(self, printers: Iterable[Dict[str, Any]]) -> None:
         """Start worker threads for each printer configuration."""
@@ -72,6 +77,8 @@ class BambuStatusSubscriber:
             sanitizedMessage = "Missing printer credentials (ip/serial/access)"
             self.onError(sanitizedMessage, dict(printerConfig))
             return
+
+        self.defaultRecipientId = os.getenv("BASE44_RECIPIENT_ID", "").strip()
 
         with self._lock:
             if serial in self._stops:
@@ -140,13 +147,63 @@ class BambuStatusSubscriber:
             try:
                 printerInstance = _printerClass(ipAddress, accessCode, serial)
                 self._connectPrinter(printerInstance)
+                printerMetadata = self._fetchPrinterMetadata(printerInstance)
+                lastBase44Comparable: Optional[Dict[str, Any]] = None
+                lastBase44Emit = 0.0
+                lastErrorComparable: Optional[Dict[str, Any]] = None
+                lastErrorEmit = 0.0
 
                 while not stopEvent.is_set():
-                    statusPayload = self._collectSnapshot(printerInstance, printerConfig)
+                    resolvedApiKey = self._resolveBase44ApiKey(printerConfig)
+                    if resolvedApiKey:
+                        self._ensureEnvironmentValue("BASE44_API_KEY", resolvedApiKey)
+
+                    statusPayload = self._collectSnapshot(printerInstance, printerConfig, printerMetadata)
                     statusPayload["printerSerial"] = serial
                     statusPayload["printerIp"] = ipAddress
                     statusPayload["nickname"] = nickname
                     statusPayload["status"] = statusPayload.get("status") or "update"
+
+                    base44Package = self._buildBase44Payloads(statusPayload, printerConfig, resolvedApiKey)
+                    if base44Package is not None:
+                        (
+                            updatePayload,
+                            updateComparable,
+                            errorPayload,
+                            errorComparable,
+                        ) = base44Package
+
+                        if updatePayload and updateComparable is not None:
+                            shouldSendUpdate = False
+                            if self._payloadsDiffer(lastBase44Comparable, updateComparable):
+                                shouldSendUpdate = True
+                            elif time.monotonic() - lastBase44Emit >= self.heartbeatInterval:
+                                shouldSendUpdate = True
+
+                            if shouldSendUpdate:
+                                try:
+                                    postUpdateStatus(updatePayload)
+                                except Exception as error:
+                                    self._logBase44Failure("update", error)
+                                else:
+                                    lastBase44Comparable = dict(updateComparable)
+                                    lastBase44Emit = time.monotonic()
+
+                        if errorPayload and errorComparable is not None:
+                            shouldSendError = False
+                            if self._payloadsDiffer(lastErrorComparable, errorComparable):
+                                shouldSendError = True
+                            elif time.monotonic() - lastErrorEmit >= self.heartbeatInterval:
+                                shouldSendError = True
+
+                            if shouldSendError:
+                                try:
+                                    postReportError(errorPayload)
+                                except Exception as error:
+                                    self._logBase44Failure("error", error)
+                                else:
+                                    lastErrorComparable = dict(errorComparable)
+                                    lastErrorEmit = time.monotonic()
 
                     emitNow = False
                     if lastSnapshot is None:
@@ -185,7 +242,12 @@ class BambuStatusSubscriber:
             except Exception as error:  # pragma: no cover - surface via callbacks
                 raise RuntimeError(f"Unable to connect printer: {error}") from error
 
-    def _collectSnapshot(self, printer: Any, printerConfig: Dict[str, Any]) -> Dict[str, Any]:
+    def _collectSnapshot(
+        self,
+        printer: Any,
+        printerConfig: Dict[str, Any],
+        printerMetadata: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         statePayload: Any = None
         percentagePayload: Any = None
         gcodePayload: Any = None
@@ -207,7 +269,13 @@ class BambuStatusSubscriber:
             except Exception as error:  # pragma: no cover - depends on SDK behaviour
                 self.log.debug("get_gcode_state failed", exc_info=error)
 
-        snapshot = self._normalizeSnapshot(statePayload, percentagePayload, gcodePayload, printerConfig)
+        snapshot = self._normalizeSnapshot(
+            statePayload,
+            percentagePayload,
+            gcodePayload,
+            printerConfig,
+            printerMetadata,
+        )
         return snapshot
 
     def _normalizeSnapshot(
@@ -216,8 +284,13 @@ class BambuStatusSubscriber:
         percentagePayload: Any,
         gcodePayload: Any,
         printerConfig: Dict[str, Any],
+        printerMetadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        sources = [payload for payload in (statePayload, percentagePayload, gcodePayload) if payload is not None]
+        sources = [
+            payload
+            for payload in (statePayload, percentagePayload, gcodePayload, printerMetadata)
+            if payload is not None
+        ]
 
         gcodeState = self._coerceString(gcodePayload)
         if not gcodeState:
@@ -244,11 +317,52 @@ class BambuStatusSubscriber:
         bedCandidate = self._findValue(sources, {"bed_temper", "bedTemp", "bed_temperature"})
         bedTemp = self._coerceFloat(bedCandidate)
 
+        fanCandidate = self._findValue(
+            sources,
+            {
+                "fan_speed",
+                "fanSpeed",
+                "cooling_fan_speed",
+                "chamber_fan_speed",
+                "fan_gear",
+                "fan",
+            },
+        )
+        fanSpeedPercent = self._normalizePercentage(fanCandidate)
+
+        printSpeedCandidate = self._findValue(
+            sources,
+            {"print_speed", "printSpeed", "speed", "speed_level", "speed_multiplier"},
+        )
+        printSpeed = self._coerceFloat(printSpeedCandidate)
+
+        filamentCandidate = self._findValue(
+            sources,
+            {
+                "filament_used",
+                "filamentUsed",
+                "filament_consumed",
+                "filament_length",
+                "filament_weight",
+            },
+        )
+        filamentUsed = self._coerceFloat(filamentCandidate)
+
+        jobCandidate = self._findValue(
+            sources,
+            {"job_id", "task_id", "current_job_id", "print_id", "jobId"},
+        )
+        currentJobId = self._coerceString(jobCandidate)
+
+        firmwareVersion = self._extractFirmwareVersion(sources)
+
         stateText = extractStateText(statePayload) or gcodeState or ""
         hmsCode = self._extractHmsCode(sources)
         errorMessage = self._extractErrorMessage(sources)
+        hasAmsConflict = False
         if not hmsCode and looksLikeAmsFilamentConflict(statePayload):
             hmsCode = "HMS_07FF-2000-0002-0004"
+            hasAmsConflict = True
             if not errorMessage:
                 errorMessage = "Possible AMS filament conflict"
 
@@ -260,11 +374,327 @@ class BambuStatusSubscriber:
             "nozzleTemp": nozzleTemp,
             "bedTemp": bedTemp,
             "remainingTimeSeconds": remainingTimeSeconds,
+            "fanSpeedPercent": fanSpeedPercent,
+            "printSpeed": printSpeed,
+            "filamentUsed": filamentUsed,
+            "currentJobId": currentJobId,
+            "firmwareVersion": firmwareVersion,
             "hmsCode": hmsCode,
             "errorMessage": errorMessage,
+            "hasAmsConflict": hasAmsConflict,
+            "rawStatePayload": statePayload,
+            "rawPercentagePayload": percentagePayload,
+            "rawGcodePayload": gcodePayload,
+            "printerMetadata": printerMetadata,
         }
 
         return normalized
+
+    def _normalizePercentage(self, value: Any) -> Optional[float]:
+        numeric = self._coerceFloat(value)
+        if numeric is None:
+            return None
+        if numeric < 0:
+            return 0.0
+        if numeric <= 1.0:
+            numeric *= 100.0
+        elif 1.0 < numeric <= 255.0 and numeric > 100.0:
+            numeric = (numeric / 255.0) * 100.0
+        return max(0.0, min(numeric, 100.0))
+
+    def _fetchPrinterMetadata(self, printer: Any) -> Dict[str, Any]:
+        metadata: Dict[str, Any] = {}
+        for methodName in ("get_info", "get_printer_info", "printer_info"):
+            infoGetter = getattr(printer, methodName, None)
+            if callable(infoGetter):
+                try:
+                    infoPayload = infoGetter()
+                    if infoPayload:
+                        metadata.setdefault("info", infoPayload)
+                        break
+                except Exception as error:  # pragma: no cover - depends on SDK behaviour
+                    self.log.debug("%s failed", methodName, exc_info=error)
+
+        for methodName in ("get_version", "get_firmware_version"):
+            versionGetter = getattr(printer, methodName, None)
+            if callable(versionGetter):
+                try:
+                    firmwarePayload = versionGetter()
+                    if firmwarePayload:
+                        metadata.setdefault("firmware", firmwarePayload)
+                        break
+                except Exception as error:  # pragma: no cover - depends on SDK behaviour
+                    self.log.debug("%s failed", methodName, exc_info=error)
+
+        firmwareAttribute = getattr(printer, "firmware_version", None)
+        if firmwareAttribute:
+            metadata.setdefault("firmware", firmwareAttribute)
+
+        return metadata
+
+    def _extractFirmwareVersion(self, sources: Iterable[Any]) -> Optional[str]:
+        firmwareCandidate = self._findValue(
+            sources,
+            {
+                "firmware_version",
+                "firmwareVersion",
+                "firmware",
+                "fw_ver",
+                "fwVersion",
+                "software_version",
+            },
+        )
+        textCandidate = self._coerceString(firmwareCandidate)
+        if textCandidate:
+            return textCandidate
+
+        for source in sources:
+            if isinstance(source, dict):
+                for key, value in source.items():
+                    normalizedKey = self._normalizeKey(key)
+                    if "firmware" in normalizedKey:
+                        textValue = self._coerceString(value)
+                        if textValue:
+                            return textValue
+        return None
+
+    def _buildBase44Payloads(
+        self,
+        snapshot: Dict[str, Any],
+        printerConfig: Dict[str, Any],
+        apiKey: Optional[str],
+    ) -> Optional[Tuple[Dict[str, Any], Dict[str, Any], Optional[Dict[str, Any]], Optional[Dict[str, Any]]]]:
+        ipAddress = str(printerConfig.get("ipAddress") or "").strip()
+        recipientId = self._resolveRecipientId(printerConfig)
+        resolvedApiKey = apiKey or self._resolveBase44ApiKey(printerConfig)
+        if not ipAddress or not recipientId or not resolvedApiKey:
+            return None
+
+        status, isErrorState, combinedErrorMessage = self._deriveStatusAttributes(snapshot)
+
+        optionalFields: Dict[str, Any] = {}
+        progressValue = self._coerceFloat(snapshot.get("progressPercent"))
+        if progressValue is not None:
+            optionalFields["jobProgress"] = max(0, min(100, int(round(progressValue))))
+
+        jobId = self._coerceString(snapshot.get("currentJobId"))
+        if jobId:
+            optionalFields["currentJobId"] = jobId
+
+        bedTemp = self._coerceFloat(snapshot.get("bedTemp"))
+        if bedTemp is not None:
+            optionalFields["bedTemp"] = bedTemp
+
+        nozzleTemp = self._coerceFloat(snapshot.get("nozzleTemp"))
+        if nozzleTemp is not None:
+            optionalFields["nozzleTemp"] = nozzleTemp
+
+        fanSpeed = self._coerceFloat(snapshot.get("fanSpeedPercent"))
+        if fanSpeed is not None:
+            optionalFields["fanSpeed"] = max(0, min(100, int(round(fanSpeed))))
+
+        printSpeed = self._coerceFloat(snapshot.get("printSpeed"))
+        if printSpeed is not None:
+            optionalFields["printSpeed"] = max(0, int(round(printSpeed)))
+
+        filamentUsed = self._coerceFloat(snapshot.get("filamentUsed"))
+        if filamentUsed is not None:
+            optionalFields["filamentUsed"] = filamentUsed
+
+        remainingSeconds = self._coerceInt(snapshot.get("remainingTimeSeconds"))
+        if remainingSeconds is not None:
+            optionalFields["timeRemaining"] = max(0, remainingSeconds)
+
+        firmwareVersion = self._coerceString(snapshot.get("firmwareVersion"))
+        if firmwareVersion:
+            optionalFields["firmwareVersion"] = firmwareVersion
+
+        updatePayload: Dict[str, Any] = {
+            "recipientId": recipientId,
+            "printerIpAddress": ipAddress,
+            "status": status,
+        }
+        if combinedErrorMessage:
+            updatePayload["errorMessage"] = combinedErrorMessage
+        updatePayload.update(optionalFields)
+        updateComparable = {key: value for key, value in updatePayload.items() if key != "lastUpdateTimestamp"}
+
+        errorPayload: Optional[Dict[str, Any]] = None
+        errorComparable: Optional[Dict[str, Any]] = None
+        if isErrorState:
+            errorPayload = {
+                "recipientId": recipientId,
+                "printerIpAddress": ipAddress,
+                "errorMessage": combinedErrorMessage or "Unknown error",
+            }
+            errorPayload.update(optionalFields)
+            errorComparable = dict(errorPayload)
+
+        return updatePayload, updateComparable, errorPayload, errorComparable
+
+    def _resolveBase44ApiKey(self, printerConfig: Dict[str, Any]) -> str:
+        candidate = self._coerceString(printerConfig.get("statusApiKey"))
+        if candidate:
+            return candidate
+        envCandidate = os.getenv("BASE44_API_KEY", "").strip()
+        return envCandidate
+
+    def _ensureEnvironmentValue(self, key: str, value: str) -> None:
+        if not value:
+            return
+        if os.getenv(key) == value:
+            return
+        os.environ[key] = value
+
+    def _resolveRecipientId(self, printerConfig: Dict[str, Any]) -> Optional[str]:
+        for key in ("statusRecipientId", "recipientId"):
+            candidate = self._coerceString(printerConfig.get(key))
+            if candidate:
+                return candidate
+        envCandidate = os.getenv("BASE44_RECIPIENT_ID", "").strip()
+        if envCandidate:
+            return envCandidate
+        return self.defaultRecipientId or None
+
+    def _deriveStatusAttributes(self, snapshot: Dict[str, Any]) -> Tuple[str, bool, Optional[str]]:
+        stateText = self._coerceString(snapshot.get("state"))
+        gcodeState = self._coerceString(snapshot.get("gcodeState"))
+        progressPercent = self._coerceFloat(snapshot.get("progressPercent"))
+        hmsCode = self._coerceString(snapshot.get("hmsCode"))
+        errorMessage = self._coerceString(snapshot.get("errorMessage"))
+        hasAmsConflict = bool(snapshot.get("hasAmsConflict"))
+
+        offline = self._isOfflineSnapshot(snapshot, stateText, gcodeState)
+        paused = self._looksPaused(stateText, gcodeState)
+        printing = self._looksPrinting(stateText, gcodeState, progressPercent)
+
+        errorIndicators = False
+        for text in (stateText, gcodeState):
+            if text and any(keyword in text.lower() for keyword in ("error", "fault", "jam", "alarm")):
+                errorIndicators = True
+                break
+        if hmsCode:
+            errorIndicators = True
+        if errorMessage:
+            errorIndicators = True
+        if hasAmsConflict:
+            errorIndicators = True
+
+        status = "idle"
+        if offline:
+            status = "offline"
+        elif errorIndicators:
+            status = "error"
+        elif paused:
+            status = "paused"
+        elif printing:
+            status = "printing"
+
+        combinedErrorMessage = self._composeErrorMessage(errorMessage, hmsCode, hasAmsConflict)
+        isErrorState = status == "error" or hasAmsConflict
+        return status, isErrorState, combinedErrorMessage
+
+    def _composeErrorMessage(
+        self,
+        errorMessage: Optional[str],
+        hmsCode: Optional[str],
+        hasAmsConflict: bool,
+    ) -> Optional[str]:
+        text = self._coerceString(errorMessage)
+        code = self._coerceString(hmsCode)
+        if code:
+            if text:
+                if code not in text:
+                    text = f"{text} ({code})"
+            else:
+                text = code
+        if hasAmsConflict and not text:
+            text = "Possible AMS filament conflict"
+        return text
+
+    def _isOfflineSnapshot(
+        self,
+        snapshot: Dict[str, Any],
+        stateText: Optional[str],
+        gcodeState: Optional[str],
+    ) -> bool:
+        rawState = snapshot.get("rawStatePayload")
+        rawGcode = snapshot.get("rawGcodePayload")
+        rawPercentage = snapshot.get("rawPercentagePayload")
+        if rawState is None and rawGcode is None and rawPercentage is None:
+            return True
+        for text in (stateText, gcodeState):
+            if text and any(keyword in text.lower() for keyword in ("offline", "disconnected", "unreachable")):
+                return True
+        return False
+
+    def _looksPaused(self, stateText: Optional[str], gcodeState: Optional[str]) -> bool:
+        for text in (stateText, gcodeState):
+            if text and any(keyword in text.lower() for keyword in ("pause", "paused", "pausing")):
+                return True
+        return False
+
+    def _looksPrinting(
+        self,
+        stateText: Optional[str],
+        gcodeState: Optional[str],
+        progressPercent: Optional[float],
+    ) -> bool:
+        if progressPercent is not None and progressPercent > 0.1:
+            return True
+        for text in (stateText, gcodeState):
+            if not text:
+                continue
+            lowered = text.lower()
+            if any(
+                keyword in lowered
+                for keyword in (
+                    "print",
+                    "warm",
+                    "heat",
+                    "prepare",
+                    "start",
+                    "running",
+                    "busy",
+                    "working",
+                )
+            ):
+                if any(stop in lowered for stop in ("finish", "completed", "complete", "idle", "standby")):
+                    continue
+                return True
+        return False
+
+    def _payloadsDiffer(
+        self,
+        previous: Optional[Dict[str, Any]],
+        current: Dict[str, Any],
+    ) -> bool:
+        if previous is None:
+            return True
+        keys = set(previous.keys()) | set(current.keys())
+        for key in keys:
+            if self._valuesDiffer(previous.get(key), current.get(key)):
+                return True
+        return False
+
+    def _logBase44Failure(self, operation: str, error: Exception) -> None:
+        if isinstance(error, requests.HTTPError):
+            response = error.response
+            statusCode = getattr(response, "status_code", "unknown")
+            bodyText = None
+            if response is not None:
+                try:
+                    bodyText = response.text
+                except Exception:  # pragma: no cover - defensive logging
+                    bodyText = None
+            if bodyText:
+                self.log.warning("Base44 %s request failed (%s): %s", operation, statusCode, bodyText)
+            else:
+                self.log.warning("Base44 %s request failed (%s)", operation, statusCode)
+        elif isinstance(error, requests.RequestException):
+            self.log.warning("Base44 %s request failed: %s", operation, error)
+        else:
+            self.log.warning("Base44 %s request failed: %s", operation, error)
 
     def _extractHmsCode(self, sources: List[Any]) -> Optional[str]:
         candidate = self._findValue(sources, {"hms", "hms_code", "error_code", "print_error_code"})
@@ -354,6 +784,7 @@ class BambuStatusSubscriber:
             return float(value)
         if isinstance(value, str):
             candidate = value.strip().replace("°c", "").replace("°", "")
+            candidate = candidate.replace("%", "").replace("rpm", "")
             if candidate:
                 try:
                     return float(candidate)

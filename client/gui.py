@@ -132,6 +132,7 @@ class ListenerGuiApp:
 
         self.listenerRecipientId = ""
         self.listenerStatusApiKey = ""
+        self._managedEnvKeys: set[str] = set()
 
         self.activePrinterDialog: Optional[Dict[str, Any]] = None
 
@@ -690,13 +691,32 @@ class ListenerGuiApp:
             )
         self._onPrinterSelection(None)
 
+    def _applyBase44Environment(self) -> None:
+        recipientValue = self.listenerRecipientId.strip()
+        if recipientValue:
+            os.environ["BASE44_RECIPIENT_ID"] = recipientValue
+            self._managedEnvKeys.add("BASE44_RECIPIENT_ID")
+        elif "BASE44_RECIPIENT_ID" in self._managedEnvKeys:
+            os.environ.pop("BASE44_RECIPIENT_ID", None)
+            self._managedEnvKeys.discard("BASE44_RECIPIENT_ID")
+
+        apiKeyValue = self.listenerStatusApiKey.strip()
+        if apiKeyValue:
+            os.environ["BASE44_API_KEY"] = apiKeyValue
+            self._managedEnvKeys.add("BASE44_API_KEY")
+        elif "BASE44_API_KEY" in self._managedEnvKeys:
+            os.environ.pop("BASE44_API_KEY", None)
+            self._managedEnvKeys.discard("BASE44_API_KEY")
+
     def _updateListenerRecipient(self, *_args: Any) -> None:
         self.listenerRecipientId = self.recipientVar.get().strip() if hasattr(self, "recipientVar") else ""
+        self._applyBase44Environment()
 
     def _updateListenerStatusApiKey(self, *_args: Any) -> None:
         self.listenerStatusApiKey = (
             self.statusApiKeyVar.get().strip() if hasattr(self, "statusApiKeyVar") else ""
         )
+        self._applyBase44Environment()
 
     def _updateActivePrinterDialogIdentifiers(self) -> None:
         dialogInfo = getattr(self, "activePrinterDialog", None)
@@ -2004,6 +2024,14 @@ class ListenerGuiApp:
             accessCode = str(printer.get("accessCode") or "").strip()
             if not ipAddress or not serialNumber or not accessCode:
                 continue
+            statusApiKey = str(printer.get("statusApiKey") or "").strip()
+            if not statusApiKey:
+                fallbackApiKey = self.listenerStatusApiKey or os.getenv("BASE44_API_KEY", "")
+                statusApiKey = fallbackApiKey.strip()
+            statusRecipientId = str(printer.get("statusRecipientId") or "").strip()
+            if not statusRecipientId:
+                fallbackRecipient = self.listenerRecipientId or os.getenv("BASE44_RECIPIENT_ID", "")
+                statusRecipientId = (fallbackRecipient or "").strip()
             active.append(
                 {
                     "ipAddress": ipAddress,
@@ -2011,8 +2039,8 @@ class ListenerGuiApp:
                     "accessCode": accessCode,
                     "nickname": printer.get("nickname"),
                     "statusBaseUrl": printer.get("statusBaseUrl"),
-                    "statusApiKey": printer.get("statusApiKey"),
-                    "statusRecipientId": printer.get("statusRecipientId"),
+                    "statusApiKey": statusApiKey,
+                    "statusRecipientId": statusRecipientId,
                     "brand": printer.get("brand"),
                 }
             )
@@ -2023,6 +2051,7 @@ class ListenerGuiApp:
             return
         if not self.statusSubscriber:
             return
+        self._applyBase44Environment()
         activeLanPrinters = self._collectActiveLanPrinters()
         if activeLanPrinters:
             self.statusSubscriber.startAll(activeLanPrinters)
