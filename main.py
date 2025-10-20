@@ -1598,9 +1598,12 @@ def listPendingFiles(recipientId: str):
         return jsonify({'error': 'Internal server error'}), 500
 
 
-@app.route('/control', methods=['POST'])
+@app.route('/control', methods=['POST', 'GET'])
 def queuePrinterControlCommand():
     logging.info('Received request to /control')
+
+    if getattr(request, 'method', 'GET').upper() == 'GET':
+        return _listPendingPrinterControlCommands()
 
     apiKeyError = ensureValidApiKey()
     if apiKeyError:
@@ -1742,6 +1745,77 @@ def queuePrinterControlCommand():
     }
 
     return makeJsonResponse(responsePayload, 202)
+
+
+def _listPendingPrinterControlCommands():
+    apiKeyError = ensureValidApiKey()
+    if apiKeyError:
+        return apiKeyError
+
+    queryArgs = getattr(request, 'args', {}) or {}
+
+    recipientId = queryArgs.get('recipientId')
+    if not isinstance(recipientId, str) or not recipientId.strip():
+        logging.warning('Missing or invalid recipientId when listing printer commands.')
+        return makeErrorResponse(400, 'ValidationError', 'recipientId query parameter is required')
+    sanitizedRecipientId = recipientId.strip()
+
+    printerSerialValue = queryArgs.get('printerSerial')
+    printerSerial = None
+    if printerSerialValue is not None:
+        if not isinstance(printerSerialValue, str) or not printerSerialValue.strip():
+            logging.warning('Invalid printerSerial parameter provided when listing commands.')
+            return makeErrorResponse(400, 'ValidationError', 'printerSerial must be a non-empty string')
+        printerSerial = printerSerialValue.strip()
+
+    printerIpValue = queryArgs.get('printerIpAddress')
+    printerIpAddress = None
+    if printerIpValue is not None:
+        if not isinstance(printerIpValue, str) or not printerIpValue.strip():
+            logging.warning('Invalid printerIpAddress parameter provided when listing commands.')
+            return makeErrorResponse(400, 'ValidationError', 'printerIpAddress must be a non-empty string')
+        printerIpAddress = printerIpValue.strip()
+
+    if not printerSerial and not printerIpAddress:
+        logging.warning('Printer command poll missing printer identifiers.')
+        return makeErrorResponse(
+            400,
+            'ValidationError',
+            'printerSerial or printerIpAddress query parameter is required',
+        )
+
+    clients, clientError = _loadClientsOrError()
+    if clientError:
+        return clientError
+
+    firestoreClient = clients.firestoreClient
+    commandCollection = firestoreClient.collection(firestoreCollectionPrinterCommands)
+
+    query = commandCollection.where('status', '==', 'pending').where('recipientId', '==', sanitizedRecipientId)
+    if printerSerial:
+        query = query.where('printerSerial', '==', printerSerial)
+    if printerIpAddress:
+        query = query.where('printerIpAddress', '==', printerIpAddress)
+
+    try:
+        documents = list(query.stream())
+    except Exception as error:  # pylint: disable=broad-except
+        logging.exception('Failed to fetch pending printer control commands.')
+        return makeErrorResponse(
+            500,
+            'ServerError',
+            'Failed to fetch pending printer control commands',
+            str(error),
+        )
+
+    commands: List[Dict[str, object]] = []
+    for document in documents:
+        commandData = document.to_dict() or {}
+        if 'commandId' not in commandData:
+            commandData['commandId'] = getattr(document, 'id', None)
+        commands.append(commandData)
+
+    return makeJsonResponse({'commands': commands}, 200)
 
 
 @app.route('/debug/listPendingCommands', methods=['POST'])
