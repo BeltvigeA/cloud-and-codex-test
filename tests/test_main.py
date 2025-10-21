@@ -2339,6 +2339,169 @@ def testListPrinterControlCommandsRejectsEmptyPrinterSerial(monkeypatch):
     assert 'printerSerial' in responseBody['message']
 
 
+def testAcknowledgePrinterControlCommandUpdatesStatus(monkeypatch):
+    updateRecorder = {'set': None, 'update': []}
+    commandSnapshot = MockDocumentSnapshot(
+        'cmd-ack',
+        {
+            'commandId': 'cmd-ack',
+            'recipientId': 'recipient-123',
+            'printerSerial': 'SN-001',
+            'status': 'pending',
+        },
+    )
+    mockClients = main.ClientBundle(
+        storageClient=MockStorageClient(),
+        firestoreClient=MockFirestoreClient(
+            documentSnapshot=commandSnapshot, updateRecorder=updateRecorder
+        ),
+        kmsClient=MockEncryptClient({'sensitive': 'value'}),
+        kmsKeyPath='projects/test/locations/test/keyRings/test/cryptoKeys/test',
+        gcsBucketName='test-bucket',
+    )
+
+    monkeypatch.setattr(main, 'getClients', lambda: mockClients)
+    monkeypatch.setattr(main, 'validPrinterApiKeys', {'control-key'})
+
+    fakeRequest.headers = {'X-API-Key': 'control-key'}
+    fakeRequest.args = {}
+    fakeRequest.set_json({
+        'commandId': 'cmd-ack',
+        'recipientId': 'recipient-123',
+        'printerSerial': 'SN-001',
+    })
+
+    responseBody, statusCode = main.acknowledgePrinterControlCommand()
+
+    assert statusCode == 200
+    assert responseBody['ok'] is True
+    assert updateRecorder['update'], 'Expected Firestore update for acknowledgement'
+    ackUpdate = updateRecorder['update'][0]
+    assert ackUpdate['status'] == 'processing'
+    assert ackUpdate['acknowledgedAt'] is firestoreModule.SERVER_TIMESTAMP
+    assert ackUpdate['startedAt'] is firestoreModule.SERVER_TIMESTAMP
+
+    fakeRequest.clear_json()
+    fakeRequest.method = 'GET'
+    fakeRequest.headers = {'X-API-Key': 'control-key'}
+    fakeRequest.args = {'recipientId': 'recipient-123', 'printerSerial': 'SN-001'}
+
+    responseBody, statusCode = main.queuePrinterControlCommand()
+
+    assert statusCode == 200
+    assert responseBody['commands'] == []
+
+
+def testAcknowledgePrinterControlCommandValidatesRecipient(monkeypatch):
+    commandSnapshot = MockDocumentSnapshot(
+        'cmd-ack',
+        {
+            'commandId': 'cmd-ack',
+            'recipientId': 'recipient-123',
+            'status': 'pending',
+        },
+    )
+    mockClients = main.ClientBundle(
+        storageClient=MockStorageClient(),
+        firestoreClient=MockFirestoreClient(documentSnapshot=commandSnapshot),
+        kmsClient=MockEncryptClient({'sensitive': 'value'}),
+        kmsKeyPath='projects/test/locations/test/keyRings/test/cryptoKeys/test',
+        gcsBucketName='test-bucket',
+    )
+
+    monkeypatch.setattr(main, 'getClients', lambda: mockClients)
+    monkeypatch.setattr(main, 'validPrinterApiKeys', {'control-key'})
+
+    fakeRequest.headers = {'X-API-Key': 'control-key'}
+    fakeRequest.args = {}
+    fakeRequest.set_json({'commandId': 'cmd-ack', 'recipientId': 'recipient-999'})
+
+    responseBody, statusCode = main.acknowledgePrinterControlCommand()
+
+    assert statusCode == 403
+    assert responseBody['ok'] is False
+    assert responseBody['error_type'] == 'ForbiddenError'
+
+
+def testSubmitPrinterControlResultStoresMessage(monkeypatch):
+    updateRecorder = {'set': None, 'update': []}
+    commandSnapshot = MockDocumentSnapshot(
+        'cmd-result',
+        {
+            'commandId': 'cmd-result',
+            'recipientId': 'recipient-123',
+            'status': 'processing',
+        },
+    )
+    mockClients = main.ClientBundle(
+        storageClient=MockStorageClient(),
+        firestoreClient=MockFirestoreClient(
+            documentSnapshot=commandSnapshot, updateRecorder=updateRecorder
+        ),
+        kmsClient=MockEncryptClient({'sensitive': 'value'}),
+        kmsKeyPath='projects/test/locations/test/keyRings/test/cryptoKeys/test',
+        gcsBucketName='test-bucket',
+    )
+
+    monkeypatch.setattr(main, 'getClients', lambda: mockClients)
+    monkeypatch.setattr(main, 'validPrinterApiKeys', {'control-key'})
+
+    fakeRequest.headers = {'X-API-Key': 'control-key'}
+    fakeRequest.args = {}
+    fakeRequest.set_json(
+        {
+            'commandId': 'cmd-result',
+            'recipientId': 'recipient-123',
+            'status': 'completed',
+            'message': 'All done',
+        }
+    )
+
+    responseBody, statusCode = main.submitPrinterControlResult()
+
+    assert statusCode == 200
+    assert responseBody['ok'] is True
+    assert updateRecorder['update'], 'Expected Firestore update for result submission'
+    resultUpdate = updateRecorder['update'][0]
+    assert resultUpdate['status'] == 'completed'
+    assert resultUpdate['finishedAt'] is firestoreModule.SERVER_TIMESTAMP
+    assert resultUpdate['message'] == 'All done'
+    assert 'errorMessage' not in resultUpdate
+
+    fakeRequest.clear_json()
+    fakeRequest.method = 'GET'
+    fakeRequest.headers = {'X-API-Key': 'control-key'}
+    fakeRequest.args = {'recipientId': 'recipient-123'}
+
+    responseBody, statusCode = main.queuePrinterControlCommand()
+
+    assert statusCode == 200
+    assert responseBody['commands'] == []
+
+
+def testSubmitPrinterControlResultMissingCommandReturnsNotFound(monkeypatch):
+    emptyClient = main.ClientBundle(
+        storageClient=MockStorageClient(),
+        firestoreClient=MockFirestoreClient(),
+        kmsClient=MockEncryptClient({'sensitive': 'value'}),
+        kmsKeyPath='projects/test/locations/test/keyRings/test/cryptoKeys/test',
+        gcsBucketName='test-bucket',
+    )
+
+    monkeypatch.setattr(main, 'getClients', lambda: emptyClient)
+    monkeypatch.setattr(main, 'validPrinterApiKeys', {'control-key'})
+
+    fakeRequest.headers = {'X-API-Key': 'control-key'}
+    fakeRequest.args = {}
+    fakeRequest.set_json({'commandId': 'missing', 'status': 'failed'})
+
+    responseBody, statusCode = main.submitPrinterControlResult()
+
+    assert statusCode == 404
+    assert responseBody['ok'] is False
+    assert responseBody['error_type'] == 'NotFound'
+
+
 def testUploadFileReportsMissingEnvironment(monkeypatch):
     def raiseMissing():
         raise main.MissingEnvironmentError(['GCP_PROJECT_ID'])
