@@ -2124,9 +2124,12 @@ def testListPrinterControlCommandsReturnsPending(monkeypatch):
         ),
     ]
 
+    updateRecorder = {'set': None, 'update': []}
     mockClients = main.ClientBundle(
         storageClient=MockStorageClient(),
-        firestoreClient=MockFirestoreClient(documentSnapshots=commandSnapshots),
+        firestoreClient=MockFirestoreClient(
+            documentSnapshots=commandSnapshots, updateRecorder=updateRecorder
+        ),
         kmsClient=MockEncryptClient({'sensitive': 'value'}),
         kmsKeyPath='projects/test/locations/test/keyRings/test/cryptoKeys/test',
         gcsBucketName='test-bucket',
@@ -2146,6 +2149,17 @@ def testListPrinterControlCommandsReturnsPending(monkeypatch):
     assert 'commands' in responseBody
     assert len(responseBody['commands']) == 1
     assert responseBody['commands'][0]['commandId'] == 'cmd-1'
+    assert responseBody['commands'][0]['status'] == 'reserved'
+    assert responseBody['commands'][0]['claimedByRecipient'] == 'recipient-123'
+    assert responseBody['commands'][0]['claimedByPrinterSerial'] == 'SN-001'
+    assert 'claimedByPrinterIpAddress' not in responseBody['commands'][0]
+
+    assert len(updateRecorder['update']) == 1
+    updatePayload = updateRecorder['update'][0]
+    assert updatePayload['status'] == 'reserved'
+    assert updatePayload['claimedByRecipient'] == 'recipient-123'
+    assert updatePayload['claimedByPrinterSerial'] == 'SN-001'
+    assert 'claimedByPrinterIpAddress' not in updatePayload
 
 
 def testListPrinterControlCommandsIgnoresPrinterIpAddressForFiltering(monkeypatch):
@@ -2171,9 +2185,12 @@ def testListPrinterControlCommandsIgnoresPrinterIpAddressForFiltering(monkeypatc
         ),
     ]
 
+    updateRecorder = {'set': None, 'update': []}
     mockClients = main.ClientBundle(
         storageClient=MockStorageClient(),
-        firestoreClient=MockFirestoreClient(documentSnapshots=commandSnapshots),
+        firestoreClient=MockFirestoreClient(
+            documentSnapshots=commandSnapshots, updateRecorder=updateRecorder
+        ),
         kmsClient=MockEncryptClient({'sensitive': 'value'}),
         kmsKeyPath='projects/test/locations/test/keyRings/test/cryptoKeys/test',
         gcsBucketName='test-bucket',
@@ -2196,6 +2213,61 @@ def testListPrinterControlCommandsIgnoresPrinterIpAddressForFiltering(monkeypatc
     assert statusCode == 200
     assert 'commands' in responseBody
     assert [item['commandId'] for item in responseBody['commands']] == ['cmd-serial']
+    assert responseBody['commands'][0]['status'] == 'reserved'
+    assert responseBody['commands'][0]['claimedByRecipient'] == 'recipient-123'
+    assert responseBody['commands'][0]['claimedByPrinterSerial'] == 'SN-001'
+    assert responseBody['commands'][0]['claimedByPrinterIpAddress'] == '10.0.0.5'
+
+    assert len(updateRecorder['update']) == 1
+    updatePayload = updateRecorder['update'][0]
+    assert updatePayload['status'] == 'reserved'
+    assert updatePayload['claimedByRecipient'] == 'recipient-123'
+    assert updatePayload['claimedByPrinterSerial'] == 'SN-001'
+    assert updatePayload['claimedByPrinterIpAddress'] == '10.0.0.5'
+
+
+def testListPrinterControlCommandsSkipsCommandsClaimedPreviously(monkeypatch):
+    commandSnapshots = [
+        MockDocumentSnapshot(
+            'cmd-1',
+            {
+                'commandId': 'cmd-1',
+                'recipientId': 'recipient-123',
+                'printerSerial': 'SN-777',
+                'status': 'pending',
+            },
+        ),
+    ]
+
+    updateRecorder = {'set': None, 'update': []}
+    mockClients = main.ClientBundle(
+        storageClient=MockStorageClient(),
+        firestoreClient=MockFirestoreClient(
+            documentSnapshots=commandSnapshots, updateRecorder=updateRecorder
+        ),
+        kmsClient=MockEncryptClient({'sensitive': 'value'}),
+        kmsKeyPath='projects/test/locations/test/keyRings/test/cryptoKeys/test',
+        gcsBucketName='test-bucket',
+    )
+
+    monkeypatch.setattr(main, 'getClients', lambda: mockClients)
+    monkeypatch.setattr(main, 'validPrinterApiKeys', {'control-key'})
+
+    fakeRequest.headers = {'X-API-Key': 'control-key'}
+    fakeRequest.args = {'recipientId': 'recipient-123', 'printerSerial': 'SN-777'}
+    fakeRequest.clear_json()
+    fakeRequest.method = 'GET'
+
+    firstResponse, firstStatus = main.queuePrinterControlCommand()
+    assert firstStatus == 200
+    assert len(firstResponse['commands']) == 1
+    assert firstResponse['commands'][0]['status'] == 'reserved'
+
+    fakeRequest.method = 'GET'
+    secondResponse, secondStatus = main.queuePrinterControlCommand()
+    assert secondStatus == 200
+    assert secondResponse['commands'] == []
+    assert len(updateRecorder['update']) == 1
 
 
 def testListPrinterControlCommandsFiltersBySerial(monkeypatch):
