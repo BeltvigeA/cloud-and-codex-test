@@ -27,6 +27,14 @@ except ImportError:  # pragma: no cover - fallback when google-auth is unavailab
     Request = None  # type: ignore[assignment]
 from google.cloud import firestore, kms_v1, storage
 try:  # pragma: no cover - optional dependency handling
+    from google.cloud.firestore import transactional as firestoreTransactional
+except ImportError:  # pragma: no cover - fallback for environments without firestore.transactional
+    try:
+        from google.cloud.firestore_v1 import transactional as firestoreTransactional
+    except ImportError:  # pragma: no cover - provide no-op decorator when transactional is unavailable
+        def firestoreTransactional(function):
+            return function
+try:  # pragma: no cover - optional dependency handling
     from google.cloud import secretmanager
 except ImportError:  # pragma: no cover - fallback when secret manager is unavailable in tests
     secretmanager = None  # type: ignore[assignment]
@@ -1747,6 +1755,90 @@ def queuePrinterControlCommand():
     return makeJsonResponse(responsePayload, 202)
 
 
+def _to_jsonable(value):
+    if value is None:
+        return None
+
+    if isinstance(value, dict):
+        sanitized = {}
+        for key, rawValue in value.items():
+            valueTypeName = type(rawValue).__name__
+            if valueTypeName.endswith('Sentinel'):
+                continue
+            sanitized[key] = _to_jsonable(rawValue)
+        return sanitized
+
+    if isinstance(value, list):
+        return [_to_jsonable(item) for item in value]
+
+    import datetime as _dt
+
+    if isinstance(value, _dt.datetime):
+        timestampValue = value
+        if timestampValue.tzinfo is None:
+            timestampValue = timestampValue.replace(tzinfo=timezone.utc)
+        return timestampValue.astimezone(timezone.utc).isoformat()
+
+    try:  # pragma: no cover - DocumentReference may be unavailable in some test environments
+        from google.cloud.firestore_v1 import DocumentReference as _DocumentReference
+
+        if isinstance(value, _DocumentReference):
+            return value.path
+    except Exception:  # pylint: disable=broad-except
+        pass
+
+    if isinstance(value, (bytes, bytearray)):
+        import base64
+
+        return base64.b64encode(value).decode('ascii')
+
+    if isinstance(value, tuple):
+        return [_to_jsonable(item) for item in value]
+
+    return value
+
+
+def _parseExpirationTimestampValue(rawValue):
+    if isinstance(rawValue, datetime):
+        expiration = rawValue
+    elif isinstance(rawValue, str):
+        expiration = parseIso8601Timestamp(rawValue)
+    else:
+        expiration = None
+
+    if expiration is None:
+        return None
+
+    if expiration.tzinfo is None:
+        expiration = expiration.replace(tzinfo=timezone.utc)
+
+    return expiration.astimezone(timezone.utc)
+
+
+@firestoreTransactional
+def _claimPrinterCommand(transaction, documentReference, recipientId, claimUpdate, currentTime):
+    snapshot = documentReference.get(transaction=transaction)
+    commandData = snapshot.to_dict() or {}
+
+    if commandData.get('recipientId') != recipientId:
+        return False, None
+
+    if commandData.get('status') not in (None, 'queued'):
+        return False, None
+
+    expirationTime = _parseExpirationTimestampValue(commandData.get('expiresAt'))
+    if expirationTime is not None and expirationTime <= currentTime:
+        expirationUpdate = {
+            'status': 'expired',
+            'expiredAt': firestore.SERVER_TIMESTAMP,
+        }
+        transaction.update(documentReference, expirationUpdate)
+        return False, None
+
+    transaction.update(documentReference, claimUpdate)
+    return True, commandData
+
+
 def _listPendingPrinterControlCommands():
     apiKeyError = ensureValidApiKey()
     if apiKeyError:
@@ -1788,6 +1880,15 @@ def _listPendingPrinterControlCommands():
             return makeErrorResponse(400, 'ValidationError', 'printerId must be a non-empty string when provided')
         sanitizedPrinterId = printerIdValue.strip()
 
+    limitValue = queryArgs.get('limit')
+    limitSize = 25
+    if limitValue is not None:
+        try:
+            limitSize = max(1, int(limitValue))
+        except (TypeError, ValueError):
+            logging.warning('Invalid limit parameter provided when listing commands.')
+            return makeErrorResponse(400, 'ValidationError', 'limit must be a positive integer')
+
     clients, clientError = _loadClientsOrError()
     if clientError:
         return clientError
@@ -1795,14 +1896,28 @@ def _listPendingPrinterControlCommands():
     firestoreClient = clients.firestoreClient
     commandCollection = firestoreClient.collection(firestoreCollectionPrinterCommands)
 
-    query = commandCollection.where('status', '==', 'pending').where(
-        'recipientId', '==', sanitizedRecipientId
+    logging.info(
+        'Checking pending commands for recipient %s (limit=%d)',
+        sanitizedRecipientId,
+        limitSize,
     )
+
+    baseQuery = (
+        commandCollection.where('recipientId', '==', sanitizedRecipientId)
+        .where('status', 'in', [None, 'queued'])
+        .order_by('createdAt')
+        .limit(limitSize)
+    )
+
     if sanitizedPrinterSerial is not None:
-        query = query.where('printerSerial', '==', sanitizedPrinterSerial)
+        baseQuery = baseQuery.where('printerSerial', '==', sanitizedPrinterSerial)
+    if printerIpAddress is not None:
+        baseQuery = baseQuery.where('printerIpAddress', '==', printerIpAddress)
+    if sanitizedPrinterId is not None:
+        baseQuery = baseQuery.where('printerId', '==', sanitizedPrinterId)
 
     try:
-        documents = list(query.stream())
+        documents = list(baseQuery.stream())
     except Exception as error:  # pylint: disable=broad-except
         logging.exception('Failed to fetch pending printer control commands.')
         return makeErrorResponse(
@@ -1812,116 +1927,97 @@ def _listPendingPrinterControlCommands():
             str(error),
         )
 
-    commands: List[Dict[str, object]] = []
     currentTime = datetime.now(timezone.utc)
+    claimedCommands: List[Dict[str, object]] = []
+
     for document in documents:
+        documentId = getattr(document, 'id', None)
         commandData = document.to_dict() or {}
-        commandId = commandData.get('commandId') or getattr(document, 'id', None)
-        if not commandId:
+
+        commandId = commandData.get('commandId') or documentId
+        if not commandId or documentId is None:
             logging.warning('Skipping printer control command without a commandId during claiming.')
             continue
 
-        commandDocument = commandCollection.document(commandId)
-        expiresAtValue = commandData.get('expiresAt')
-        expirationTime: Optional[datetime] = None
-        if isinstance(expiresAtValue, datetime):
-            expirationTime = expiresAtValue
-        elif isinstance(expiresAtValue, str):
-            expirationTime = parseIso8601Timestamp(expiresAtValue)
-
-        if expirationTime is not None:
-            if expirationTime.tzinfo is None:
-                expirationTime = expirationTime.replace(tzinfo=timezone.utc)
-            expirationTime = expirationTime.astimezone(timezone.utc)
-
-            if expirationTime <= currentTime:
-                expirationUpdate = {
-                    'status': 'expired',
-                    'expiredAt': firestore.SERVER_TIMESTAMP,
-                }
-                try:
-                    commandDocument.update(expirationUpdate)
-                except Exception:  # pylint: disable=broad-except
-                    logging.exception(
-                        'Failed to mark printer control command %s as expired.', commandId
-                    )
-                logEvent(
-                    'command_expired',
-                    commandId=commandId,
-                    recipientId=sanitizedRecipientId,
-                    printerSerial=commandData.get('printerSerial'),
-                    expiresAt=expirationTime.isoformat(),
-                )
-                continue
-        claimMetadata: Dict[str, object] = {
-            'status': 'reserved',
-            'claimedAt': firestore.SERVER_TIMESTAMP,
-            'claimedByRecipient': sanitizedRecipientId,
-        }
-        if sanitizedPrinterSerial:
-            claimMetadata['claimedByPrinterSerial'] = sanitizedPrinterSerial
-        if printerIpAddress:
-            claimMetadata['claimedByPrinterIpAddress'] = printerIpAddress
-        if sanitizedPrinterId:
-            claimMetadata['claimedByPrinterId'] = sanitizedPrinterId
-
-        claimedCommand: Optional[Dict[str, object]] = None
-
-        try:
-            with firestoreClient.transaction() as transaction:
-                snapshotCandidateRaw = transaction.get(commandDocument)
-                snapshotCandidate = snapshotCandidateRaw
-                if snapshotCandidate is None or not hasattr(snapshotCandidate, 'to_dict'):
-                    try:
-                        snapshotIterator = iter(snapshotCandidateRaw)
-                    except TypeError:
-                        snapshotCandidate = None
-                    else:
-                        snapshotCandidate = next(snapshotIterator, None)
-
-                if snapshotCandidate is None or not hasattr(snapshotCandidate, 'to_dict'):
-                    logging.warning(
-                        'Skipping printer control command %s because transaction returned %s.',
-                        commandId,
-                        type(snapshotCandidateRaw).__name__
-                        if snapshotCandidateRaw is not None
-                        else 'None',
-                    )
-                    continue
-
-                currentData = snapshotCandidate.to_dict() or {}
-                if currentData.get('status') != 'pending':
-                    continue
-
-                transaction.update(commandDocument, claimMetadata)
-                claimedCommand = {**currentData, **claimMetadata}
-        except Exception as error:  # pylint: disable=broad-except
-            logging.exception(
-                'Failed to reserve printer control command %s within transaction.', commandId
-            )
-
-        if claimedCommand is None:
+        expirationTime = _parseExpirationTimestampValue(commandData.get('expiresAt'))
+        if expirationTime is not None and expirationTime <= currentTime:
             try:
-                if commandData.get('status') != 'pending':
-                    continue
-
-                commandDocument.update(claimMetadata)
-                claimedCommand = {**commandData, **claimMetadata}
-            except Exception as error:  # pylint: disable=broad-except
-                logging.exception('Failed to reserve printer control command %s.', commandId)
-                continue
-
-        if claimedCommand is None:
+                document.reference.update(
+                    {'status': 'expired', 'expiredAt': firestore.SERVER_TIMESTAMP}
+                )
+            except Exception:  # pylint: disable=broad-except
+                logging.exception(
+                    'Failed to mark printer control command %s as expired.', commandId
+                )
+            logEvent(
+                'command_expired',
+                commandId=commandId,
+                recipientId=sanitizedRecipientId,
+                printerSerial=commandData.get('printerSerial'),
+                expiresAt=expirationTime.isoformat(),
+            )
             continue
 
-        if 'commandId' not in claimedCommand:
-            claimedCommand['commandId'] = commandId
-        if printerIpAddress and 'printerIpAddress' not in claimedCommand:
-            claimedCommand['printerIpAddress'] = printerIpAddress
+        claimUpdate: Dict[str, object] = {
+            'status': 'reserved',
+            'claimedByRecipient': sanitizedRecipientId,
+            'claimedAt': firestore.SERVER_TIMESTAMP,
+        }
+        if sanitizedPrinterSerial:
+            claimUpdate['claimedByPrinterSerial'] = sanitizedPrinterSerial
+        if printerIpAddress:
+            claimUpdate['claimedByPrinterIpAddress'] = printerIpAddress
+        if sanitizedPrinterId:
+            claimUpdate['claimedByPrinterId'] = sanitizedPrinterId
 
-        commands.append(claimedCommand)
+        try:
+            succeeded, snapshotData = _claimPrinterCommand(
+                firestoreClient.transaction(),
+                document.reference,
+                sanitizedRecipientId,
+                claimUpdate,
+                currentTime,
+            )
+        except GoogleAPICallError as error:
+            logging.debug(
+                'Transaction error while claiming printer control command %s: %s',
+                commandId,
+                error,
+            )
+            continue
+        except Exception as error:  # pylint: disable=broad-except
+            logging.exception(
+                'Unexpected error while claiming printer control command %s.',
+                commandId,
+            )
+            continue
 
-    return makeJsonResponse({'commands': commands}, 200)
+        if not succeeded or snapshotData is None:
+            continue
+
+        responsePayload = {**snapshotData}
+        responsePayload['status'] = 'reserved'
+        responsePayload['claimedByRecipient'] = sanitizedRecipientId
+        if sanitizedPrinterSerial:
+            responsePayload['claimedByPrinterSerial'] = sanitizedPrinterSerial
+        if printerIpAddress:
+            responsePayload['claimedByPrinterIpAddress'] = printerIpAddress
+        if sanitizedPrinterId:
+            responsePayload['claimedByPrinterId'] = sanitizedPrinterId
+
+        responsePayload['commandId'] = commandId
+
+        claimedCommands.append(_to_jsonable(responsePayload))
+        logging.debug('Claimed printer control command %s.', commandId)
+
+    logging.info(
+        'Recipient %s: fetched=%d, claimed=%d',
+        sanitizedRecipientId,
+        len(documents),
+        len(claimedCommands),
+    )
+
+    return makeJsonResponse({'commands': claimedCommands}, 200)
 
 
 def _loadPrinterCommandDocument(commandId: str):
