@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import sys
+import time
 from typing import Any, Dict, List, Optional
 
 import pytest
@@ -174,4 +175,52 @@ def testProcessUnsupportedCommandReportsFailure(monkeypatch: pytest.MonkeyPatch)
     assert finalized == [("bad", "failed")]
     assert resultCalls and resultCalls[0]["status"] == "failed"
     assert "Unsupported" in (resultCalls[0]["errorMessage"] or "")
+
+
+def testRecipientModeProcessesEnqueuedCommands(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CONTROL_POLL_MODE", "recipient")
+
+    processed: List[Dict[str, Any]] = []
+
+    class FakeRouter:
+        def __init__(self) -> None:
+            self.registered: Optional[CommandWorker] = None
+            self.unregistered: List[str] = []
+
+        def registerWorker(self, worker: CommandWorker) -> None:
+            self.registered = worker
+
+        def unregisterWorker(self, serial: str) -> None:
+            self.unregistered.append(serial)
+
+    fakeRouter = FakeRouter()
+    monkeypatch.setattr(
+        "client.command_controller._registerRecipientRouter",
+        lambda recipientId, pollInterval: fakeRouter,
+    )
+
+    worker = CommandWorker(
+        serial="SERIAL-R",
+        ipAddress="10.0.0.30",
+        accessCode="code",
+        apiKey="api-key",
+        recipientId="recipient-R",
+        baseUrl="https://example.com",
+        pollInterval=0.05,
+    )
+
+    def fakeProcess(self: CommandWorker, command: Dict[str, Any]) -> None:
+        processed.append(command)
+        self._stopEvent.set()
+
+    monkeypatch.setattr(CommandWorker, "_processCommand", fakeProcess)
+
+    worker.start()
+    worker.enqueueCommand({"commandId": "cmd-recipient"})
+    time.sleep(0.2)
+    worker.stop()
+
+    assert processed and processed[0]["commandId"] == "cmd-recipient"
+    assert fakeRouter.registered is worker
+    assert "SERIAL-R" in fakeRouter.unregistered
 
