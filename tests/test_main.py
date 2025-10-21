@@ -2162,6 +2162,83 @@ def testListPrinterControlCommandsReturnsPending(monkeypatch):
     assert 'claimedByPrinterIpAddress' not in updatePayload
 
 
+def testListPrinterControlCommandsHandlesGeneratorTransaction(monkeypatch):
+    commandSnapshots = [
+        MockDocumentSnapshot(
+            'cmd-generator',
+            {
+                'commandId': 'cmd-generator',
+                'recipientId': 'recipient-123',
+                'printerSerial': 'SN-777',
+                'status': 'pending',
+            },
+        )
+    ]
+
+    updateRecorder = {'set': None, 'update': []}
+    mockFirestoreClient = MockFirestoreClient(
+        documentSnapshots=commandSnapshots, updateRecorder=updateRecorder
+    )
+    mockClients = main.ClientBundle(
+        storageClient=MockStorageClient(),
+        firestoreClient=mockFirestoreClient,
+        kmsClient=MockEncryptClient({'sensitive': 'value'}),
+        kmsKeyPath='projects/test/locations/test/keyRings/test/cryptoKeys/test',
+        gcsBucketName='test-bucket',
+    )
+
+    class GeneratorMockTransaction(MockTransaction):
+        def get(self, documentReference):
+            snapshot = documentReference.get(transaction=None)
+
+            def snapshotGenerator():
+                yield snapshot
+
+            return snapshotGenerator()
+
+    def generatorTransaction(self):
+        return GeneratorMockTransaction(self.documentStore, self.updateRecorder)
+
+    originalDocumentGet = MockDocument.get
+
+    def generatorDocumentGet(self, transaction=None):  # pylint: disable=unused-argument
+        if transaction is not None:
+            return transaction.get(self)
+        return originalDocumentGet(self, transaction=transaction)
+
+    monkeypatch.setattr(MockFirestoreClient, 'transaction', generatorTransaction)
+    monkeypatch.setattr(MockDocument, 'get', generatorDocumentGet)
+    monkeypatch.setattr(main, 'getClients', lambda: mockClients)
+    monkeypatch.setattr(main, 'validPrinterApiKeys', {'control-key'})
+
+    fakeRequest.headers = {'X-API-Key': 'control-key'}
+    fakeRequest.args = {
+        'recipientId': 'recipient-123',
+        'printerSerial': 'SN-777',
+        'printerIpAddress': '192.168.1.50',
+    }
+    fakeRequest.clear_json()
+    fakeRequest.method = 'GET'
+
+    responseBody, statusCode = main.queuePrinterControlCommand()
+
+    assert statusCode == 200
+    assert responseBody['commands']
+    reservedCommand = responseBody['commands'][0]
+    assert reservedCommand['commandId'] == 'cmd-generator'
+    assert reservedCommand['status'] == 'reserved'
+    assert reservedCommand['claimedByRecipient'] == 'recipient-123'
+    assert reservedCommand['claimedByPrinterSerial'] == 'SN-777'
+    assert reservedCommand['claimedByPrinterIpAddress'] == '192.168.1.50'
+
+    assert len(updateRecorder['update']) == 1
+    updatePayload = updateRecorder['update'][0]
+    assert updatePayload['status'] == 'reserved'
+    assert updatePayload['claimedByRecipient'] == 'recipient-123'
+    assert updatePayload['claimedByPrinterSerial'] == 'SN-777'
+    assert updatePayload['claimedByPrinterIpAddress'] == '192.168.1.50'
+
+
 def testListPrinterControlCommandsIgnoresPrinterIpAddressForFiltering(monkeypatch):
     commandSnapshots = [
         MockDocumentSnapshot(
