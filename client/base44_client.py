@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -84,18 +85,22 @@ def listPendingCommandsForRecipient(recipientId: str, limit: Optional[int] = Non
     if not response.content:
         return []
     payload = response.json()
+    commandCount: Optional[int] = 0
     try:
-        commandCount = 0
         if isinstance(payload, list):
             commandCount = len(payload)
         elif isinstance(payload, dict):
             items = payload.get("items") or payload.get("commands")
             if isinstance(items, list):
                 commandCount = len(items)
-        if commandCount:
-            log.debug("Pending commands fetched for %s: %d", recipientId, commandCount)
+            elif isinstance(payload.get("metadata"), list):
+                commandCount = len(payload.get("metadata", []))
+        else:
+            commandCount = 0
     except Exception:
-        pass
+        commandCount = None
+    if commandCount is not None and _shouldLogPendingCount(recipientId):
+        log.info("Pending commands fetched for %s: %d", recipientId, commandCount)
     if isinstance(payload, dict):
         items = payload.get("items") or payload.get("commands")
         if isinstance(items, list):
@@ -130,3 +135,14 @@ def postCommandResult(commandId: str, success: bool, message: Optional[str] = No
     response = requests.post(url, json=body, headers=_buildHeaders(), timeout=10)
     response.raise_for_status()
     log.debug("RESULT sent for %s (success=%s)", commandId, success)
+_pendingCommandLogLock = threading.Lock()
+_pendingCommandLogCounters: Dict[str, int] = {}
+
+
+def _shouldLogPendingCount(recipientId: str) -> bool:
+    key = recipientId or "unknown"
+    with _pendingCommandLogLock:
+        currentCount = _pendingCommandLogCounters.get(key, 0) + 1
+        _pendingCommandLogCounters[key] = currentCount
+    return currentCount == 1 or currentCount % 50 == 0
+

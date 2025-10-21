@@ -34,6 +34,14 @@ def registerPrintersConfigChangedListener(
         printersConfigChangedListeners.append(listener)
 
 
+def _forceRecipientCommandPoll(recipientId: str) -> None:
+    try:
+        from .command_controller import force_recipient_poll as _forceRecipientPoll
+    except ImportError:
+        return
+    _forceRecipientPoll(recipientId)
+
+
 def _notifyPrintersConfigChanged(updatedRecord: Dict[str, Any], storagePath: Path) -> None:
     for listener in list(printersConfigChangedListeners):
         try:
@@ -1816,14 +1824,15 @@ def listenForFiles(
         while True:
             if stopEvent and stopEvent.is_set():
                 break
+            logging.info("Checking for pending print jobs for recipient %s.", recipientId)
             pendingFiles = fetchPendingFiles(baseUrl, recipientId)
             if pendingFiles is None:
                 logging.warning("Unable to retrieve pending files; will retry after delay.")
             elif not pendingFiles:
-                logging.info("No pending files for recipient %s.", recipientId)
+                logging.info("No pending print jobs for recipient %s.", recipientId)
             else:
                 logging.info(
-                    "Found %d pending file(s) for recipient %s.", len(pendingFiles), recipientId
+                    "Found %d pending print jobs for recipient %s.", len(pendingFiles), recipientId
                 )
                 for pendingFile in pendingFiles:
                     fetchToken = pendingFile.get("fetchToken")
@@ -2046,6 +2055,7 @@ def listenForFiles(
                     if fetchResult is not None and onFileFetched:
                         onFileFetched(entryData)
 
+            _forceRecipientCommandPoll(recipientId)
             iteration += 1
             if maxIterations and iteration >= maxIterations:
                 break

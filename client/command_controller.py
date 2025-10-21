@@ -27,7 +27,16 @@ from .client import buildBaseUrl, defaultBaseUrl, getPrinterControlEndpointUrl
 
 log = logging.getLogger(__name__)
 
-CONTROL_POLL_SECONDS = float(os.getenv("CONTROL_POLL_SEC", "3"))
+
+def _resolveControlPollSeconds() -> float:
+    try:
+        value = float(os.getenv("CONTROL_POLL_SEC", "3"))
+    except ValueError:
+        value = 3.0
+    return max(3.0, value)
+
+
+CONTROL_POLL_SECONDS = _resolveControlPollSeconds()
 CONNECT_TIMEOUT_SECONDS = 10.0
 
 CACHE_DIRECTORY = Path(os.path.expanduser("~/.printmaster"))
@@ -39,11 +48,20 @@ _cacheLock = threading.Lock()
 
 def _determinePollMode() -> str:
     candidate = (os.getenv("CONTROL_POLL_MODE", "recipient") or "recipient").strip().lower()
-    return candidate if candidate in {"printer", "recipient"} else "recipient"
+    if candidate == "printer":
+        global _printerModeWarningEmitted
+        if not _printerModeWarningEmitted:
+            log.warning(
+                "CONTROL_POLL_MODE=printer is deprecated; falling back to legacy per-printer polling."
+            )
+            _printerModeWarningEmitted = True
+        return "printer"
+    return "recipient"
 
 
 _recipientRouters: Dict[str, "RecipientCommandRouter"] = {}
 _recipientRoutersLock = threading.Lock()
+_printerModeWarningEmitted = False
 
 
 def _registerRecipientRouter(recipientId: str, pollInterval: float) -> "RecipientCommandRouter":
@@ -110,7 +128,7 @@ def _collectIpCandidates(command: Dict[str, Any], metadata: Dict[str, Any]) -> L
 class RecipientCommandRouter:
     def __init__(self, recipientId: str, pollInterval: float) -> None:
         self.recipientId = recipientId
-        self.pollIntervalSeconds = max(2.0, float(pollInterval))
+        self.pollIntervalSeconds = max(3.0, float(pollInterval))
         self._lock = threading.Lock()
         self._workers: Dict[str, "CommandWorker"] = {}
         self._stopEvent = threading.Event()
@@ -131,7 +149,7 @@ class RecipientCommandRouter:
             value = float(pollInterval)
         except (TypeError, ValueError):
             value = self.pollIntervalSeconds
-        self.pollIntervalSeconds = max(2.0, value)
+        self.pollIntervalSeconds = max(3.0, value)
 
     def registerWorker(self, worker: "CommandWorker") -> None:
         with self._lock:
@@ -149,6 +167,50 @@ class RecipientCommandRouter:
         with self._lock:
             return dict(self._workers)
 
+    def pollOnce(
+        self,
+        workers: Optional[Dict[str, "CommandWorker"]] = None,
+        *,
+        suppressCheckLog: bool = False,
+    ) -> None:
+        activeWorkers = workers if workers is not None else self._snapshotWorkers()
+        if not activeWorkers:
+            return
+        if not suppressCheckLog:
+            log.info("Checking for pending commands for recipient %s.", self.recipientId)
+        try:
+            commands = listPendingCommandsForRecipient(self.recipientId)
+            self._pollErrorCount = 0
+        except Exception as error:  # noqa: BLE001 - log and continue
+            self._pollErrorCount += 1
+            if self._pollErrorCount == 1 or self._pollErrorCount % 50 == 0:
+                log.warning("Control poll failed for recipient %s: %s", self.recipientId, error)
+            return
+        if not commands:
+            log.info("No pending commands for recipient %s.", self.recipientId)
+            return
+        log.info(
+            "Fetched %d pending commands for recipient %s.",
+            len(commands),
+            self.recipientId,
+        )
+        for command in commands:
+            metadata = _normalizeCommandMetadata(command)
+            worker = self._selectWorker(activeWorkers, command, metadata)
+            if worker is not None:
+                commandIdValue = str(command.get("commandId") or "")
+                if commandIdValue:
+                    log.debug("Routing command %s → %s", commandIdValue, worker.serial)
+                worker.enqueueCommand(command)
+            else:
+                log.info(
+                    "No local target for command %s (meta=%s)",
+                    command.get("commandId"),
+                    metadata,
+                )
+
+    poll_once = pollOnce
+
     def _run(self) -> None:
         log.info("Recipient command poller started for %s", self.recipientId)
         try:
@@ -158,29 +220,9 @@ class RecipientCommandRouter:
                     if self._stopEvent.wait(1.0):
                         break
                     continue
-                try:
-                    commands = listPendingCommandsForRecipient(self.recipientId)
-                    self._pollErrorCount = 0
-                except Exception as error:  # noqa: BLE001 - log and continue
-                    self._pollErrorCount += 1
-                    if self._pollErrorCount == 1 or self._pollErrorCount % 50 == 0:
-                        log.warning("Recipient poll failed for %s: %s", self.recipientId, error)
-                    commands = []
-                for command in commands:
-                    metadata = _normalizeCommandMetadata(command)
-                    worker = self._selectWorker(workers, command, metadata)
-                    if worker is not None:
-                        commandIdValue = str(command.get("commandId") or "")
-                        if commandIdValue:
-                            log.debug("Routing command %s → %s", commandIdValue, worker.serial)
-                        worker.enqueueCommand(command)
-                    else:
-                        log.info(
-                            "No command worker found for command %s (meta=%s)",
-                            command.get("commandId"),
-                            metadata,
-                        )
-                self._stopEvent.wait(self.pollIntervalSeconds)
+                self.pollOnce(workers, suppressCheckLog=False)
+                if self._stopEvent.wait(self.pollIntervalSeconds):
+                    break
         finally:
             log.info("Recipient command poller stopped for %s", self.recipientId)
             _unregisterRecipientRouter(self.recipientId, self)
@@ -291,7 +333,7 @@ class CommandWorker:
         self.pollErrorCount = 0
         self.pollLogEvery = 50
         self.pollIntervalSeconds = max(
-            2.0,
+            3.0,
             float(pollInterval) if pollInterval is not None else CONTROL_POLL_SECONDS,
         )
         self.pollMode = _determinePollMode()
@@ -766,6 +808,21 @@ class CommandWorker:
             raise ValueError(f"Unsupported commandType: {commandType}")
 
         return "completed", message
+
+
+def forceRecipientPoll(recipientId: str) -> None:
+    normalized = str(recipientId or "").strip()
+    if not normalized:
+        return
+    log.info("Triggering immediate command poll for recipient %s.", normalized)
+    with _recipientRoutersLock:
+        router = _recipientRouters.get(normalized)
+    if router is None or not router.isActive:
+        return
+    router.pollOnce(suppressCheckLog=False)
+
+
+force_recipient_poll = forceRecipientPoll
 
 
 def _isoTimestamp() -> str:
