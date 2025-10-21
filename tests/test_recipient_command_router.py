@@ -80,9 +80,6 @@ def test_register_worker_routes_backlog(caplog: pytest.LogCaptureFixture) -> Non
         def enqueueCommand(self, command: Dict[str, Any]) -> None:
             enqueued.append(command)
 
-        def matchesIp(self, _ip: str) -> bool:
-            return False
-
     caplog.set_level(logging.DEBUG)
     router.registerWorker(FakeWorker("SER-MATCH"))
 
@@ -90,3 +87,31 @@ def test_register_worker_routes_backlog(caplog: pytest.LogCaptureFixture) -> Non
     assert [command["commandId"] for command in router._backlog] == ["cmd-200"]
     assert any("Routing queued command cmd-100" in message for message in caplog.messages)
     assert any("No local target for command cmd-200 yet (kept in queue)" in message for message in caplog.messages)
+
+
+def test_router_ignores_commands_without_matching_serial(caplog: pytest.LogCaptureFixture) -> None:
+    router = _buildRouter()
+    router._backlog = [
+        {"commandId": "cmd-300", "metadata": {"printerIpAddress": "192.168.1.2"}},
+        {"commandId": "cmd-400", "metadata": {"serial": "SER-OTHER"}},
+    ]
+
+    class FakeWorker:
+        def __init__(self) -> None:
+            self.serial = "SER-REGISTERED"
+            self.received: List[Dict[str, Any]] = []
+
+        def enqueueCommand(self, command: Dict[str, Any]) -> None:
+            self.received.append(command)
+
+    worker = FakeWorker()
+
+    caplog.set_level(logging.DEBUG)
+    router.registerWorker(worker)
+
+    assert worker.received == []
+    assert [command["commandId"] for command in router._backlog] == ["cmd-300", "cmd-400"]
+    assert any(
+        "No local target for command cmd-300 yet (kept in queue)" in message
+        for message in caplog.messages
+    )
