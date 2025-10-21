@@ -1761,10 +1761,16 @@ def _listPendingPrinterControlCommands():
     sanitizedRecipientId = recipientId.strip()
 
     printerSerialValue = queryArgs.get('printerSerial')
-    if not isinstance(printerSerialValue, str) or not printerSerialValue.strip():
-        logging.warning('Missing or invalid printerSerial when listing printer commands.')
-        return makeErrorResponse(400, 'ValidationError', 'printerSerial query parameter is required')
-    sanitizedPrinterSerial = printerSerialValue.strip()
+    sanitizedPrinterSerial: Optional[str] = None
+    if printerSerialValue is not None:
+        if not isinstance(printerSerialValue, str) or not printerSerialValue.strip():
+            logging.warning('Invalid printerSerial provided when listing printer commands.')
+            return makeErrorResponse(
+                400,
+                'ValidationError',
+                'printerSerial must be a non-empty string when provided',
+            )
+        sanitizedPrinterSerial = printerSerialValue.strip()
 
     printerIpAddress = None
     if 'printerIpAddress' in queryArgs:
@@ -1781,11 +1787,11 @@ def _listPendingPrinterControlCommands():
     firestoreClient = clients.firestoreClient
     commandCollection = firestoreClient.collection(firestoreCollectionPrinterCommands)
 
-    query = (
-        commandCollection.where('status', '==', 'pending')
-        .where('recipientId', '==', sanitizedRecipientId)
-        .where('printerSerial', '==', sanitizedPrinterSerial)
+    query = commandCollection.where('status', '==', 'pending').where(
+        'recipientId', '==', sanitizedRecipientId
     )
+    if sanitizedPrinterSerial is not None:
+        query = query.where('printerSerial', '==', sanitizedPrinterSerial)
 
     try:
         documents = list(query.stream())
