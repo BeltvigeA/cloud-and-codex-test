@@ -30,9 +30,9 @@ log = logging.getLogger(__name__)
 
 def _resolveControlPollSeconds() -> float:
     try:
-        value = float(os.getenv("CONTROL_POLL_SEC", "3"))
+        value = float(os.getenv("CONTROL_POLL_SEC", "15"))
     except ValueError:
-        value = 3.0
+        value = 15.0
     return max(3.0, value)
 
 
@@ -131,6 +131,7 @@ class RecipientCommandRouter:
         self.pollIntervalSeconds = max(3.0, float(pollInterval))
         self._lock = threading.Lock()
         self._workers: Dict[str, "CommandWorker"] = {}
+        self._backlog: List[Dict[str, Any]] = []
         self._stopEvent = threading.Event()
         self._thread = threading.Thread(
             target=self._run,
@@ -154,6 +155,12 @@ class RecipientCommandRouter:
     def registerWorker(self, worker: "CommandWorker") -> None:
         with self._lock:
             self._workers[worker.serial] = worker
+            if not self._backlog:
+                return
+            pendingCommands = self._backlog
+            self._backlog = []
+            workersSnapshot = dict(self._workers)
+        self._routeCommands(pendingCommands, workersSnapshot, queued=True)
 
     def unregisterWorker(self, serial: str) -> None:
         shouldStop = False
@@ -173,9 +180,6 @@ class RecipientCommandRouter:
         *,
         suppressCheckLog: bool = False,
     ) -> None:
-        activeWorkers = workers if workers is not None else self._snapshotWorkers()
-        if not activeWorkers:
-            return
         if not suppressCheckLog:
             log.info("Checking for pending commands for recipient %s.", self.recipientId)
         try:
@@ -188,26 +192,32 @@ class RecipientCommandRouter:
             return
         if not commands:
             log.info("No pending commands for recipient %s.", self.recipientId)
-            return
-        log.info(
-            "Fetched %d pending commands for recipient %s.",
-            len(commands),
-            self.recipientId,
-        )
-        for command in commands:
-            metadata = _normalizeCommandMetadata(command)
-            worker = self._selectWorker(activeWorkers, command, metadata)
-            if worker is not None:
-                commandIdValue = str(command.get("commandId") or "")
-                if commandIdValue:
-                    log.debug("Routing command %s → %s", commandIdValue, worker.serial)
-                worker.enqueueCommand(command)
-            else:
-                log.info(
-                    "No local target for command %s (meta=%s)",
-                    command.get("commandId"),
-                    metadata,
-                )
+        else:
+            log.info(
+                "Fetched %d pending commands for recipient %s.",
+                len(commands),
+                self.recipientId,
+            )
+        with self._lock:
+            workersSnapshot = dict(workers) if workers is not None else dict(self._workers)
+            backlogCommands = list(self._backlog)
+            if not commands and not backlogCommands:
+                return
+            if not workersSnapshot:
+                if commands:
+                    self._backlog.extend(commands)
+                    log.info(
+                        "Queued %d pending commands for recipient %s (no active printers yet).",
+                        len(commands),
+                        self.recipientId,
+                    )
+                return
+            commandsToRoute = backlogCommands
+            if commands:
+                commandsToRoute.extend(commands)
+            self._backlog = []
+        if commandsToRoute:
+            self._routeCommands(commandsToRoute, workersSnapshot, queued=False)
 
     poll_once = pollOnce
 
@@ -216,10 +226,6 @@ class RecipientCommandRouter:
         try:
             while not self._stopEvent.is_set():
                 workers = self._snapshotWorkers()
-                if not workers:
-                    if self._stopEvent.wait(1.0):
-                        break
-                    continue
                 self.pollOnce(workers, suppressCheckLog=False)
                 if self._stopEvent.wait(self.pollIntervalSeconds):
                     break
@@ -243,6 +249,34 @@ class RecipientCommandRouter:
                 if any(worker.matchesIp(ip) for ip in ipCandidates):
                     return worker
         return None
+
+    def _routeCommands(
+        self,
+        commands: List[Dict[str, Any]],
+        workers: Dict[str, "CommandWorker"],
+        *,
+        queued: bool,
+    ) -> None:
+        unrouted: List[Dict[str, Any]] = []
+        for command in commands:
+            metadata = _normalizeCommandMetadata(command)
+            worker = self._selectWorker(workers, command, metadata)
+            commandIdValue = str(command.get("commandId") or "")
+            if worker is not None:
+                if commandIdValue:
+                    messagePrefix = "Routing queued command" if queued else "Routing command"
+                    log.debug("%s %s → %s", messagePrefix, commandIdValue, worker.serial)
+                worker.enqueueCommand(command)
+            else:
+                log.info(
+                    "No local target for command %s yet (kept in queue) meta=%s",
+                    command.get("commandId"),
+                    metadata,
+                )
+                unrouted.append(command)
+        if unrouted:
+            with self._lock:
+                self._backlog.extend(unrouted)
 
 
 def _ensureCacheLoaded() -> Dict[str, Any]:
