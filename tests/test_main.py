@@ -2148,6 +2148,46 @@ def testListPrinterControlCommandsReturnsPending(monkeypatch):
     assert responseBody['commands'][0]['commandId'] == 'cmd-1'
 
 
+def testListPrinterControlCommandsMatchesEitherIdentifier(monkeypatch):
+    commandSnapshots = [
+        MockDocumentSnapshot(
+            'cmd-serial',
+            {
+                'commandId': 'cmd-serial',
+                'recipientId': 'recipient-123',
+                'printerSerial': 'SN-001',
+                'status': 'pending',
+            },
+        ),
+    ]
+
+    mockClients = main.ClientBundle(
+        storageClient=MockStorageClient(),
+        firestoreClient=MockFirestoreClient(documentSnapshots=commandSnapshots),
+        kmsClient=MockEncryptClient({'sensitive': 'value'}),
+        kmsKeyPath='projects/test/locations/test/keyRings/test/cryptoKeys/test',
+        gcsBucketName='test-bucket',
+    )
+
+    monkeypatch.setattr(main, 'getClients', lambda: mockClients)
+    monkeypatch.setattr(main, 'validPrinterApiKeys', {'control-key'})
+
+    fakeRequest.headers = {'X-API-Key': 'control-key'}
+    fakeRequest.args = {
+        'recipientId': 'recipient-123',
+        'printerSerial': 'SN-001',
+        'printerIpAddress': '10.0.0.5',
+    }
+    fakeRequest.clear_json()
+    fakeRequest.method = 'GET'
+
+    responseBody, statusCode = main.queuePrinterControlCommand()
+
+    assert statusCode == 200
+    assert 'commands' in responseBody
+    assert [item['commandId'] for item in responseBody['commands']] == ['cmd-serial']
+
+
 def testListPrinterControlCommandsRequiresParameters(monkeypatch):
     monkeypatch.setattr(main, 'validPrinterApiKeys', {'control-key'})
 
