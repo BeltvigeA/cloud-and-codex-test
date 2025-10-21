@@ -125,6 +125,35 @@ def test_listenForFiles_performs_fetch_when_handshake_requires_download(
     assert statusPayload["sent"] is False
 
 
+def test_listenForFiles_triggers_force_command_poll(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(client, "fetchPendingFiles", lambda *_args, **_kwargs: [])
+
+    forceCalls: List[str] = []
+
+    def fakeForcePoll(recipientId: str) -> None:
+        forceCalls.append(recipientId)
+
+    monkeypatch.setattr(client, "_forceRecipientCommandPoll", fakeForcePoll)
+
+    databasePath = tmp_path / "force-command.db"
+    database = client.LocalDatabase(databasePath)
+    try:
+        client.listenForFiles(
+            "https://example.com",
+            "recipient-force",
+            str(tmp_path),
+            pollInterval=0,
+            maxIterations=1,
+            database=database,
+        )
+    finally:
+        database.close()
+
+    assert forceCalls == ["recipient-force"]
+
+
 def test_listenForFiles_skips_fetch_when_handshake_opts_out(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
