@@ -111,20 +111,6 @@ def _collectSerialCandidates(command: Dict[str, Any], metadata: Dict[str, Any]) 
     return candidates
 
 
-def _collectIpCandidates(command: Dict[str, Any], metadata: Dict[str, Any]) -> List[str]:
-    candidates: List[str] = []
-    for container in (metadata, command):
-        if not isinstance(container, dict):
-            continue
-        for key in ("printerIpAddress", "ip", "ipAddress"):
-            value = container.get(key)
-            if isinstance(value, str):
-                normalized = value.strip()
-                if normalized and normalized not in candidates:
-                    candidates.append(normalized)
-    return candidates
-
-
 class RecipientCommandRouter:
     def __init__(self, recipientId: str, pollInterval: float) -> None:
         self.recipientId = recipientId
@@ -243,11 +229,6 @@ class RecipientCommandRouter:
             worker = workers.get(serial)
             if worker is not None:
                 return worker
-        ipCandidates = _collectIpCandidates(command, metadata)
-        if ipCandidates:
-            for worker in workers.values():
-                if any(worker.matchesIp(ip) for ip in ipCandidates):
-                    return worker
         return None
 
     def _routeCommands(
@@ -501,10 +482,6 @@ class CommandWorker:
                 log.debug("Enqueued command %s → %s", commandIdValue, self.serial)
         except Exception:
             log.debug("Unable to enqueue command %s", command.get("commandId"), exc_info=True)
-
-    def matchesIp(self, candidateIp: str) -> bool:
-        normalized = candidateIp.strip()
-        return bool(normalized) and normalized == (self.ipAddress or "").strip()
 
     def _drainQueue(self) -> None:
         if self._commandQueue is None:
