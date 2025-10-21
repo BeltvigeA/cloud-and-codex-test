@@ -17,7 +17,7 @@ import requests
 
 from .database import LocalDatabase
 from .persistence import storePrintSummary
-from .bambuPrinter import BambuPrintOptions, postStatus, sendBambuPrintJob
+from .bambuPrinter import BambuPrintOptions, deleteRemoteFile, postStatus, sendBambuPrintJob
 
 
 defaultBaseUrl = "https://printer-backend-934564650450.europe-west1.run.app"
@@ -1093,14 +1093,56 @@ def dispatchBambuPrintIfPossible(
     reporter = createPrinterStatusReporter(baseUrl, productId, recipientId, statusTemplate, printerDetails)
 
     statusEvents: List[Dict[str, Any]] = []
+    completionEvents = {"completed", "complete", "finish", "finished", "idle"}
+    lastRemoteFile: Optional[str] = None
+    deleteTriggered = False
 
     def capture(event: Dict[str, Any]) -> None:
+        nonlocal lastRemoteFile, deleteTriggered
         normalized = dict(event)
         if "event" not in normalized and normalized.get("status"):
             normalized.setdefault("event", normalized["status"])
         statusEvents.append(normalized)
         reporter(normalized)
         postStatus(normalized, resolvedDetails)
+
+        remoteCandidate = normalized.get("remoteFile") or normalized.get("remote_file") or normalized.get("file")
+        if isinstance(remoteCandidate, str) and remoteCandidate.strip():
+            lastRemoteFile = remoteCandidate.strip()
+
+        eventName = normalized.get("event") or normalized.get("status")
+        if deleteTriggered or not isinstance(eventName, str):
+            return
+        if eventName.strip().lower() not in completionEvents:
+            return
+        remoteTarget = normalized.get("remoteFile") or lastRemoteFile
+        if not isinstance(remoteTarget, str) or not remoteTarget.strip():
+            deleteTriggered = True
+            return
+        if not options.ipAddress or not options.accessCode:
+            logging.info(
+                "Skip delete for remote file %s on %s: missing connection details",
+                remoteTarget,
+                options.serialNumber,
+            )
+            deleteTriggered = True
+            return
+        printerCredentials = {
+            "ipAddress": options.ipAddress,
+            "accessCode": options.accessCode,
+            "serialNumber": options.serialNumber,
+        }
+        try:
+            if deleteRemoteFile(printerCredentials, remoteTarget):
+                logging.info("Deleted remote file %s on %s", remoteTarget, options.serialNumber)
+            else:
+                logging.info("Skip delete for remote file %s on %s", remoteTarget, options.serialNumber)
+        except Exception:
+            logging.info(
+                "Skip delete for remote file %s on %s", remoteTarget, options.serialNumber, exc_info=True
+            )
+        finally:
+            deleteTriggered = True
 
     capture({"event": "dispatching", "message": f"Dispatching print job to {options.nickname or options.serialNumber}"})
 

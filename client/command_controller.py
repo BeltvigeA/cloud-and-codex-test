@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import queue
+import re
 import threading
 import time
 from datetime import datetime, timezone
@@ -22,6 +23,7 @@ from .base44_client import (
     acknowledgeCommand,
     listPendingCommandsForRecipient,
     postCommandResult,
+    postReportError,
 )
 from .client import buildBaseUrl, defaultBaseUrl, getPrinterControlEndpointUrl
 
@@ -357,6 +359,18 @@ class CommandWorker:
         self.pollMode = _determinePollMode()
         self._commandQueue: Optional[queue.Queue] = None
         self._router: Optional[RecipientCommandRouter] = None
+        self._statusThread: Optional[threading.Thread] = None
+        self._statusStopEvent = threading.Event()
+        self._statusLock = threading.Lock()
+        self._lastStatus: Dict[str, Any] = {}
+        self._lastRawStatus: Optional[Dict[str, Any]] = None
+        self._lastRemoteFile: Optional[str] = None
+        self._lastProgressBucket: Optional[int] = None
+        self._lastStatusTimestamp: float = 0.0
+        self._statusWarningLogged = False
+        self._jobActive = False
+        self._lastErrorCodeReported: Optional[str] = None
+        self._printErrorCodeUnsupportedLogged = False
         log.debug(
             "CommandWorker configured for %s using control endpoint %s", self.serial, self.controlEndpointUrl
         )
@@ -384,6 +398,7 @@ class CommandWorker:
             self._router.unregisterWorker(self.serial)
             self._router = None
         self._drainQueue()
+        self._stopStatusMonitor()
         self._disconnectPrinter()
 
     def _run(self) -> None:
@@ -455,6 +470,18 @@ class CommandWorker:
         except Exception as error:
             errorMessage = f"{type(error).__name__}: {error}"
             log.warning("Command %s failed on %s: %s", commandId, self.serial, errorMessage)
+            printerRef = self._printerInstance
+            if printerRef is not None:
+                self._collectAndReportBambuError(
+                    printerRef,
+                    {
+                        "event": {
+                            "commandId": commandId,
+                            "error": errorMessage,
+                            "commandType": command.get("commandType"),
+                        }
+                    },
+                )
             try:
                 self._sendCommandResult(commandId, "failed", errorMessage=errorMessage)
             except UnsupportedControlEndpointError as resultError:
@@ -471,7 +498,11 @@ class CommandWorker:
         except Exception:
             log.debug("Unable to submit result for %s", commandId, exc_info=True)
         _finalizeCommand(commandId, status)
-        log.info("Command %s on %s: %s", commandId, self.serial, status)
+        progressSuffix = self._buildProgressSuffix()
+        if progressSuffix:
+            log.info("Command %s on %s: %s (%s)", commandId, self.serial, status, progressSuffix)
+        else:
+            log.info("Command %s on %s: %s", commandId, self.serial, status)
 
     def enqueueCommand(self, command: Dict[str, Any]) -> None:
         if self.pollMode != "recipient":
@@ -612,6 +643,7 @@ class CommandWorker:
                     waitForReady(printer, timeout=30.0)
                 except Exception:
                     log.debug("Printer MQTT readiness wait failed", exc_info=True)
+            self._ensureStatusMonitor(printer)
             self._printerInstance = printer
             return printer
 
@@ -619,6 +651,7 @@ class CommandWorker:
         with self._printerLock:
             if self._printerInstance is None:
                 return
+            self._stopStatusMonitor()
             try:
                 if hasattr(self._printerInstance, "disconnect"):
                     self._printerInstance.disconnect()
@@ -626,6 +659,371 @@ class CommandWorker:
                 log.debug("Error while disconnecting printer %s", self.serial, exc_info=True)
             finally:
                 self._printerInstance = None
+
+    def _ensureStatusMonitor(self, printer: Any) -> None:
+        if self._statusThread and self._statusThread.is_alive():
+            return
+        self._statusStopEvent.clear()
+        self._statusWarningLogged = False
+        self._lastStatusTimestamp = 0.0
+        self._statusThread = threading.Thread(
+            target=self._statusMonitorLoop,
+            name=f"CommandWorkerStatus-{self.serial}",
+            args=(printer,),
+            daemon=True,
+        )
+        self._statusThread.start()
+
+    def _stopStatusMonitor(self) -> None:
+        self._statusStopEvent.set()
+        if self._statusThread and self._statusThread.is_alive():
+            self._statusThread.join(timeout=2.0)
+        self._statusThread = None
+
+    def _statusMonitorLoop(self, printer: Any) -> None:
+        startTime = time.monotonic()
+        while not self._statusStopEvent.is_set():
+            try:
+                snapshot = self._collectPrinterStatusSnapshot(printer)
+                if snapshot:
+                    self._handlePrinterStatus(snapshot)
+            except Exception:
+                log.debug("Printer status collection failed for %s", self.serial, exc_info=True)
+            if not self._statusWarningLogged:
+                elapsed = time.monotonic() - startTime
+                if elapsed >= 10.0 and self._lastStatusTimestamp <= 0:
+                    log.warning(
+                        "No printer status received within %.1fs after connect for %s", elapsed, self.serial
+                    )
+                    self._statusWarningLogged = True
+            self._statusStopEvent.wait(1.0)
+
+    def _collectPrinterStatusSnapshot(self, printer: Any) -> Dict[str, Any]:
+        sources: List[Any] = []
+
+        def collectFromTarget(target: Any, accessors: List[str]) -> None:
+            for accessor in accessors:
+                attribute = getattr(target, accessor, None)
+                if attribute is None:
+                    continue
+                try:
+                    value = attribute() if callable(attribute) else attribute
+                except Exception:
+                    continue
+                if value is not None:
+                    sources.append(value)
+                    break
+
+        collectFromTarget(printer, ["get_state", "get_current_state"])
+        collectFromTarget(printer, ["get_percentage", "current_layer_num"])
+        collectFromTarget(printer, ["get_time", "get_remaining_time"])
+        collectFromTarget(printer, ["gcode", "get_gcode_state"])
+        mqttClient = getattr(printer, "mqtt_client", None)
+        if mqttClient is not None:
+            collectFromTarget(
+                mqttClient,
+                ["get_printer_state", "get_current_state", "get_last_print_percentage", "get_remaining_time"],
+            )
+            collectFromTarget(mqttClient, ["subtask_name"])
+
+        snapshot: Dict[str, Any] = {"statusSources": sources}
+        for candidate in sources:
+            if isinstance(candidate, dict):
+                snapshot.setdefault("rawStatus", candidate)
+                break
+        return snapshot
+
+    @staticmethod
+    def _normalizeKeyName(name: Any) -> str:
+        return "".join(character for character in str(name).lower() if character.isalnum())
+
+    @classmethod
+    def _searchStatusValue(cls, payload: Any, normalizedKeys: set[str]) -> Any:
+        if isinstance(payload, dict):
+            for key, value in payload.items():
+                normalizedKey = cls._normalizeKeyName(key)
+                if normalizedKey in normalizedKeys:
+                    return value
+                nested = cls._searchStatusValue(value, normalizedKeys)
+                if nested is not None:
+                    return nested
+        elif isinstance(payload, (list, tuple)):
+            for item in payload:
+                nested = cls._searchStatusValue(item, normalizedKeys)
+                if nested is not None:
+                    return nested
+        return None
+
+    @classmethod
+    def _extractStatusValue(cls, sources: List[Any], aliases: List[str]) -> Any:
+        normalizedAliases = {cls._normalizeKeyName(alias) for alias in aliases}
+        for source in sources:
+            value = cls._searchStatusValue(source, normalizedAliases)
+            if value is not None:
+                return value
+        return None
+
+    @staticmethod
+    def _coerceIntValue(value: Any) -> Optional[int]:
+        if isinstance(value, bool):
+            return int(value)
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float):
+            return int(round(value))
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                return None
+            match = re.search(r"-?\d+(?:\.\d+)?", stripped)
+            if match:
+                try:
+                    return int(round(float(match.group(0))))
+                except Exception:
+                    return None
+        return None
+
+    @staticmethod
+    def _coerceFloatValue(value: Any) -> Optional[float]:
+        if isinstance(value, bool):
+            return float(value)
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                return None
+            match = re.search(r"-?\d+(?:\.\d+)?", stripped)
+            if match:
+                try:
+                    return float(match.group(0))
+                except Exception:
+                    return None
+        return None
+
+    @staticmethod
+    def _coerceStringValue(value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            stripped = value.strip()
+            return stripped or None
+        return str(value)
+
+    def _normalizeStatusSnapshot(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        sources: List[Any] = []
+        if isinstance(payload, dict):
+            sources.append(payload)
+            statusSources = payload.get("statusSources")
+            if isinstance(statusSources, list):
+                sources.extend(statusSources)
+            rawCandidate = payload.get("rawStatus")
+            if rawCandidate is not None:
+                sources.append(rawCandidate)
+        elif payload is not None:
+            sources.append(payload)
+
+        if not sources:
+            return {}
+
+        percentValue = self._extractStatusValue(
+            sources,
+            ["mc_percent", "progress", "percentage", "progresspercent", "last_print_percentage"],
+        )
+        remainingValue = self._extractStatusValue(
+            sources,
+            ["mc_remaining_time", "remaining_time", "remainingtimeseconds", "eta", "remainingtime"],
+        )
+        gcodeValue = self._extractStatusValue(sources, ["gcode_state", "gcodestate", "subtask_name", "subtaskname"])
+        jobStateValue = self._extractStatusValue(
+            sources,
+            ["job_state", "jobstate", "printer_state", "print_state", "state"],
+        )
+        remoteFileValue = self._extractStatusValue(
+            sources,
+            ["remote_file", "remotefile", "file", "filename", "sd_filename", "sdfilename"],
+        )
+
+        normalized: Dict[str, Any] = {}
+        percentInt = self._coerceIntValue(percentValue)
+        if percentInt is not None:
+            normalized["mc_percent"] = max(0, min(100, percentInt))
+        remainingInt = self._coerceIntValue(remainingValue)
+        if remainingInt is not None:
+            normalized["mc_remaining_time"] = max(0, remainingInt)
+        gcodeText = self._coerceStringValue(gcodeValue)
+        if gcodeText:
+            normalized["gcode_state"] = gcodeText
+        jobStateText = self._coerceStringValue(jobStateValue)
+        if jobStateText:
+            normalized["job_state"] = jobStateText
+        remoteFileText = self._coerceStringValue(remoteFileValue)
+        if remoteFileText:
+            normalized["remoteFile"] = remoteFileText
+
+        rawSource = None
+        for source in sources:
+            if isinstance(source, dict):
+                rawSource = source
+                break
+        if rawSource is not None:
+            normalized["rawStatus"] = rawSource
+        return normalized
+
+    def _handlePrinterStatus(self, payload: Dict[str, Any]) -> None:
+        if not isinstance(payload, dict):
+            return
+        normalized = self._normalizeStatusSnapshot(payload)
+        if not normalized:
+            return
+        rawStatus = normalized.pop("rawStatus", None)
+        with self._statusLock:
+            self._lastStatus = dict(normalized)
+            if isinstance(rawStatus, dict):
+                self._lastRawStatus = dict(rawStatus)
+            elif isinstance(payload, dict):
+                self._lastRawStatus = dict(payload)
+            self._lastStatusTimestamp = time.monotonic()
+        remoteFile = normalized.get("remoteFile")
+        if remoteFile:
+            self._lastRemoteFile = remoteFile
+        self._logProgressIfNeeded(normalized)
+        self._checkForCompletion(normalized)
+        self._checkForPrinterError(normalized)
+
+    def _logProgressIfNeeded(self, status: Dict[str, Any]) -> None:
+        percent = status.get("mc_percent")
+        if percent is None:
+            return
+        bucket = 10 if percent >= 100 else percent // 10
+        if bucket == self._lastProgressBucket:
+            return
+        self._lastProgressBucket = bucket
+        state = status.get("gcode_state") or status.get("job_state")
+        if state:
+            log.info("Progress %s%% on %s (%s)", percent, self.serial, state)
+        else:
+            log.info("Progress %s%% on %s", percent, self.serial)
+
+    def _checkForCompletion(self, status: Dict[str, Any]) -> None:
+        percent = status.get("mc_percent")
+        state = (status.get("gcode_state") or status.get("job_state") or "").lower()
+        completedStates = {"finish", "finished", "completed", "idle", "complete"}
+        isComplete = bool(percent == 100 or state in completedStates)
+        if not isComplete:
+            if percent not in {None, 0}:
+                self._jobActive = True
+            return
+        if self._jobActive:
+            self._jobActive = False
+            log.info("Print completed on %s — ready for next job", self.serial)
+            self._deleteRemoteFile()
+
+    def _checkForPrinterError(self, status: Dict[str, Any]) -> None:
+        printer = self._printerInstance
+        if printer is None:
+            return
+        code = self._readPrinterErrorCode(printer)
+        if code is None:
+            return
+        normalizedCode = str(code).strip()
+        if not normalizedCode or normalizedCode in {"0", "0000"}:
+            return
+        if normalizedCode == self._lastErrorCodeReported:
+            return
+        context = {"event": status, "status": status}
+        self._collectAndReportBambuError(printer, context)
+        self._lastErrorCodeReported = normalizedCode
+
+    def _deleteRemoteFile(self) -> None:
+        remoteFile = self._lastRemoteFile
+        if not remoteFile:
+            return
+        printer = self._printerInstance
+        if printer is None:
+            return
+        try:
+            deleteHelper = getattr(bambuPrinter, "deleteRemoteFile", None)
+            if callable(deleteHelper):
+                if deleteHelper(printer, remoteFile):
+                    log.info("Deleted remote file %s on %s", remoteFile, self.serial)
+                else:
+                    log.info("Skip delete for remote file %s on %s", remoteFile, self.serial)
+        except Exception:
+            log.info("Skip delete for remote file %s on %s", remoteFile, self.serial, exc_info=True)
+        finally:
+            self._lastRemoteFile = None
+
+    def _readPrinterErrorCode(self, printer: Any) -> Optional[Any]:
+        for target in (printer, getattr(printer, "mqtt_client", None)):
+            if target is None:
+                continue
+            accessor = getattr(target, "print_error_code", None)
+            if accessor is None:
+                continue
+            try:
+                return accessor() if callable(accessor) else accessor
+            except Exception:
+                continue
+        if not self._printErrorCodeUnsupportedLogged:
+            log.info("Printer %s does not expose print_error_code", self.serial)
+            self._printErrorCodeUnsupportedLogged = True
+        return None
+
+    def _copyLastStatus(self) -> Dict[str, Any]:
+        with self._statusLock:
+            return dict(self._lastStatus)
+
+    def _buildProgressSuffix(self) -> Optional[str]:
+        lastStatus = self._copyLastStatus()
+        if not lastStatus:
+            return None
+        segments: List[str] = []
+        percent = lastStatus.get("mc_percent")
+        if percent is not None:
+            segments.append(f"{percent}%")
+        state = lastStatus.get("gcode_state") or lastStatus.get("job_state")
+        if state:
+            segments.append(str(state))
+        remaining = lastStatus.get("mc_remaining_time")
+        if remaining is not None:
+            segments.append(f"ETA {remaining}s")
+        return " | ".join(segments) if segments else None
+
+    def _collectAndReportBambuError(self, printer: Any, context: Dict[str, Any]) -> None:
+        if printer is None:
+            return
+        try:
+            codeValue = self._readPrinterErrorCode(printer)
+            if codeValue is None:
+                return
+            normalizedCode = str(codeValue).strip()
+            if not normalizedCode or normalizedCode in {"0", "0000"}:
+                return
+            payload: Dict[str, Any] = {
+                "printerSerial": self.serial,
+                "printerIpAddress": self.ipAddress,
+                "recipientId": self.recipientIdValue or None,
+                "errorCode": normalizedCode,
+                "timestamp": _isoTimestamp(),
+            }
+            lastStatus = self._copyLastStatus()
+            if lastStatus:
+                payload["gcodeState"] = lastStatus.get("gcode_state") or lastStatus.get("job_state")
+                if lastStatus.get("mc_percent") is not None:
+                    payload["progressPercent"] = lastStatus.get("mc_percent")
+            rawEvent = context.get("event")
+            if rawEvent is None and isinstance(self._lastRawStatus, dict):
+                rawEvent = self._lastRawStatus
+            if rawEvent is not None:
+                payload["printerEvent"] = rawEvent
+            if normalizedCode.upper().startswith("HMS_"):
+                payload["hmsCode"] = normalizedCode
+            postReportError(payload)
+            log.error("Bambu error on %s: code=%s state=%s", self.serial, normalizedCode, payload.get("gcodeState"))
+            self._lastErrorCodeReported = normalizedCode
+        except Exception:
+            log.debug("Error while reporting Bambu failure for %s", self.serial, exc_info=True)
 
     def _executeCommand(self, printer: Any, command: Dict[str, Any]) -> Tuple[str, str]:
         commandType = str(command.get("commandType") or "").strip().lower()
@@ -787,6 +1185,11 @@ class CommandWorker:
                     if acknowledged is not None
                     else "Print started"
                 )
+            self._jobActive = True
+            try:
+                self._lastRemoteFile = str(fileName)
+            except Exception:
+                self._lastRemoteFile = None
         elif normalizedType in {"home", "light_on", "light_off", "lightoff", "lighton", "move", "jog", "load_filament", "unload_filament", "sendgcode"}:
             if normalizedType == "home":
                 sendGcode("G28")
