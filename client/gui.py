@@ -2078,7 +2078,8 @@ class ListenerGuiApp:
             controlBaseUrl = buildBaseUrl(controlBaseUrlCandidate)
         except ValueError:
             controlBaseUrl = buildBaseUrl(defaultBaseUrl)
-        pollIntervalSeconds = max(3.0, float(max(1, int(self.pollIntervalVar.get()))) / 2.0)
+        # Use the value as configured in the UI without reducing it internally.
+        pollIntervalSeconds = max(3.0, float(max(1, int(self.pollIntervalVar.get()))))
         activeLanPrinters = self._collectActiveLanPrinters()
         activeSerials: set[str] = set()
         for printer in activeLanPrinters:

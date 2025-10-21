@@ -170,6 +170,9 @@ class RecipientCommandRouter:
                     metadata = _normalizeCommandMetadata(command)
                     worker = self._selectWorker(workers, command, metadata)
                     if worker is not None:
+                        commandIdValue = str(command.get("commandId") or "")
+                        if commandIdValue:
+                            log.debug("Routing command %s → %s", commandIdValue, worker.serial)
                         worker.enqueueCommand(command)
                     else:
                         log.info(
@@ -358,6 +361,9 @@ class CommandWorker:
                     command = queueRef.get(timeout=self.pollIntervalSeconds)
                 except queue.Empty:
                     continue
+                commandIdValue = str(command.get("commandId") or "")
+                if commandIdValue:
+                    log.debug("Dequeued command %s → %s", commandIdValue, self.serial)
                 self._processCommand(command)
         finally:
             log.info("CommandWorker stopped for %s [recipient-mode]", self.serial)
@@ -373,7 +379,8 @@ class CommandWorker:
         if not _reserveCommand(commandId):
             return
 
-        _normalizeCommandMetadata(command)
+        metadata = _normalizeCommandMetadata(command)
+        log.debug("Processing command %s (metadata=%s)", commandId, metadata)
 
         try:
             self._sendCommandAck(commandId, "processing")
@@ -413,6 +420,9 @@ class CommandWorker:
             self._commandQueue = queue.Queue()
         try:
             self._commandQueue.put_nowait(command)
+            commandIdValue = str(command.get("commandId") or "")
+            if commandIdValue:
+                log.debug("Enqueued command %s → %s", commandIdValue, self.serial)
         except Exception:
             log.debug("Unable to enqueue command %s", command.get("commandId"), exc_info=True)
 
@@ -494,7 +504,9 @@ class CommandWorker:
         errorMessage: Optional[str] = None,
     ) -> None:
         if self.pollMode == "recipient":
-            success = status.lower() == "completed"
+            statusValue = str(status or "").lower()
+            successStatusSet = {"completed", "success", "ok", "done"}
+            success = statusValue in successStatusSet
             detail = str(message or errorMessage or "") or None
             postCommandResult(commandId, success, detail)
             return
