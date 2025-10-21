@@ -10,7 +10,7 @@ from requests import HTTPError
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from client.command_controller import CommandWorker
+from client.command_controller import CommandWorker, _normalizeCommandMetadata
 
 
 class DummyResponse:
@@ -223,4 +223,43 @@ def testRecipientModeProcessesEnqueuedCommands(monkeypatch: pytest.MonkeyPatch) 
     assert processed and processed[0]["commandId"] == "cmd-recipient"
     assert fakeRouter.registered is worker
     assert "SERIAL-R" in fakeRouter.unregistered
+
+
+def testNormalizeCommandMetadataParsesJson() -> None:
+    command = {"commandId": "cmd-json", "metadata": "{\"printerSerial\": \"SER-JSON\"}"}
+    metadata = _normalizeCommandMetadata(command)
+    assert isinstance(metadata, dict)
+    assert metadata.get("printerSerial") == "SER-JSON"
+    assert isinstance(command["metadata"], dict)
+
+
+def testRecipientModeResultMapsSuccessStatuses(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CONTROL_POLL_MODE", "recipient")
+
+    captured: List[tuple[str, bool, Optional[str]]] = []
+
+    def fakePostResult(commandId: str, success: bool, message: Optional[str] = None) -> None:
+        captured.append((commandId, success, message))
+
+    monkeypatch.setattr("client.command_controller.postCommandResult", fakePostResult)
+
+    worker = CommandWorker(
+        serial="SER-SUCCESS",
+        ipAddress="10.0.0.40",
+        accessCode="code",
+        apiKey="api-key",
+        recipientId="recipient-success",
+        baseUrl="https://example.com",
+    )
+
+    for status in ["completed", "success", "ok", "done", "failed"]:
+        worker._sendCommandResult(f"cmd-{status}", status, message="details")
+
+    assert captured[:4] == [
+        ("cmd-completed", True, "details"),
+        ("cmd-success", True, "details"),
+        ("cmd-ok", True, "details"),
+        ("cmd-done", True, "details"),
+    ]
+    assert captured[4] == ("cmd-failed", False, "details")
 
