@@ -1780,6 +1780,14 @@ def _listPendingPrinterControlCommands():
             return makeErrorResponse(400, 'ValidationError', 'printerIpAddress must be a non-empty string')
         printerIpAddress = printerIpValue.strip()
 
+    printerIdValue = queryArgs.get('printerId')
+    sanitizedPrinterId: Optional[str] = None
+    if printerIdValue is not None:
+        if not isinstance(printerIdValue, str) or not printerIdValue.strip():
+            logging.warning('Invalid printerId parameter provided when listing commands.')
+            return makeErrorResponse(400, 'ValidationError', 'printerId must be a non-empty string when provided')
+        sanitizedPrinterId = printerIdValue.strip()
+
     clients, clientError = _loadClientsOrError()
     if clientError:
         return clientError
@@ -1807,11 +1815,64 @@ def _listPendingPrinterControlCommands():
     commands: List[Dict[str, object]] = []
     for document in documents:
         commandData = document.to_dict() or {}
-        if 'commandId' not in commandData:
-            commandData['commandId'] = getattr(document, 'id', None)
-        if printerIpAddress and 'printerIpAddress' not in commandData:
-            commandData['printerIpAddress'] = printerIpAddress
-        commands.append(commandData)
+        commandId = commandData.get('commandId') or getattr(document, 'id', None)
+        if not commandId:
+            logging.warning('Skipping printer control command without a commandId during claiming.')
+            continue
+
+        commandDocument = commandCollection.document(commandId)
+        try:
+            transaction = firestoreClient.transaction()
+        except Exception as error:  # pylint: disable=broad-except
+            logging.exception('Failed to start transaction when reserving command %s.', commandId)
+            transaction = None
+
+        claimMetadata: Dict[str, object] = {
+            'status': 'reserved',
+            'claimedAt': firestore.SERVER_TIMESTAMP,
+            'claimedByRecipient': sanitizedRecipientId,
+        }
+        if sanitizedPrinterSerial:
+            claimMetadata['claimedByPrinterSerial'] = sanitizedPrinterSerial
+        if printerIpAddress:
+            claimMetadata['claimedByPrinterIpAddress'] = printerIpAddress
+        if sanitizedPrinterId:
+            claimMetadata['claimedByPrinterId'] = sanitizedPrinterId
+
+        claimedCommand: Optional[Dict[str, object]] = None
+
+        if transaction is not None:
+            try:
+                currentSnapshot = transaction.get(commandDocument)
+                currentData = currentSnapshot.to_dict() or {}
+                if currentData.get('status') != 'pending':
+                    transaction.commit()
+                    continue
+                transaction.update(commandDocument, claimMetadata)
+                transaction.commit()
+                claimedCommand = {**currentData, **claimMetadata}
+            except Exception as error:  # pylint: disable=broad-except
+                logging.exception(
+                    'Failed to reserve printer control command %s within transaction.', commandId
+                )
+                continue
+        else:
+            try:
+                commandDocument.update(claimMetadata)
+                claimedCommand = {**commandData, **claimMetadata}
+            except Exception as error:  # pylint: disable=broad-except
+                logging.exception('Failed to reserve printer control command %s.', commandId)
+                continue
+
+        if claimedCommand is None:
+            continue
+
+        if 'commandId' not in claimedCommand:
+            claimedCommand['commandId'] = commandId
+        if printerIpAddress and 'printerIpAddress' not in claimedCommand:
+            claimedCommand['printerIpAddress'] = printerIpAddress
+
+        commands.append(claimedCommand)
 
     return makeJsonResponse({'commands': commands}, 200)
 
