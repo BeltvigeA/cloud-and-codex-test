@@ -82,6 +82,13 @@ class DummyFirestoreClient:
 firestoreModule.Client = DummyFirestoreClient
 firestoreV1Module = ModuleType('google.cloud.firestore_v1')
 firestoreV1Module.DELETE_FIELD = object()
+
+
+class DummyDocumentSnapshot:
+    pass
+
+
+firestoreV1Module.DocumentSnapshot = DummyDocumentSnapshot
 storageModule = ModuleType('google.cloud.storage')
 
 
@@ -218,11 +225,16 @@ class MockEncryptClient:
 
 
 class MockDocument:
+    instances = []
+
     def __init__(self, documentStore, docId, updateRecorder, addRecorder):
         self.documentStore = documentStore
         self.docId = docId
         self.updateRecorder = updateRecorder
         self.addRecorder = addRecorder
+        self.lastTransaction = None
+        self.lastSnapshot = None
+        self.__class__.instances.append(self)
 
     def set(self, metadata):
         self.documentStore[self.docId] = metadata
@@ -239,10 +251,15 @@ class MockDocument:
         self.updateRecorder['update'].append(payload)
 
     def get(self, transaction=None):  # pylint: disable=unused-argument
+        if transaction is not None:
+            self.lastTransaction = transaction
         metadata = self.documentStore.get(self.docId)
         if metadata is None:
-            return MockDocumentSnapshot(self.docId, None, exists=False)
-        return MockDocumentSnapshot(self.docId, metadata)
+            snapshot = MockDocumentSnapshot(self.docId, None, exists=False)
+        else:
+            snapshot = MockDocumentSnapshot(self.docId, metadata)
+        self.lastSnapshot = snapshot
+        return snapshot
 
     def collection(self, _name):
         return MockCollection([], self.documentStore, self.updateRecorder, self.addRecorder)
@@ -365,7 +382,7 @@ class MockFirestoreClient:
         ]
 
 
-class MockDocumentSnapshot:
+class MockDocumentSnapshot(firestoreV1Module.DocumentSnapshot):
     def __init__(self, docId, metadata, exists=True):
         self.id = docId
         self._metadata = metadata
@@ -389,6 +406,7 @@ def resetClients(monkeypatch):
     )
 
     monkeypatch.setattr(main, 'getClients', lambda: defaultBundle)
+    MockDocument.instances = []
     fakeRequest.files = {}
     fakeRequest.form = {}
     fakeRequest.args = {}
@@ -2409,6 +2427,53 @@ def testListPrinterControlCommandsRejectsEmptyPrinterSerial(monkeypatch):
     assert responseBody['ok'] is False
     assert responseBody['error_type'] == 'ValidationError'
     assert 'printerSerial' in responseBody['message']
+
+
+def testListPrinterControlCommandsReservesPendingCommands(monkeypatch):
+    updateRecorder = {'set': None, 'update': []}
+    commandSnapshot = MockDocumentSnapshot(
+        'cmd-reserve',
+        {
+            'commandId': 'cmd-reserve',
+            'recipientId': 'recipient-123',
+            'printerSerial': 'SN-001',
+            'status': 'pending',
+        },
+    )
+    mockClients = main.ClientBundle(
+        storageClient=MockStorageClient(),
+        firestoreClient=MockFirestoreClient(
+            documentSnapshot=commandSnapshot, updateRecorder=updateRecorder
+        ),
+        kmsClient=MockEncryptClient({'sensitive': 'value'}),
+        kmsKeyPath='projects/test/locations/test/keyRings/test/cryptoKeys/test',
+        gcsBucketName='test-bucket',
+    )
+
+    monkeypatch.setattr(main, 'getClients', lambda: mockClients)
+    monkeypatch.setattr(main, 'validPrinterApiKeys', {'control-key'})
+
+    fakeRequest.headers = {'X-API-Key': 'control-key'}
+    fakeRequest.args = {'recipientId': 'recipient-123', 'printerSerial': 'SN-001'}
+    fakeRequest.clear_json()
+    fakeRequest.method = 'GET'
+
+    responseBody, statusCode = main.queuePrinterControlCommand()
+
+    assert statusCode == 200
+    reservedCommands = responseBody['commands']
+    assert len(reservedCommands) == 1
+    reservedCommand = reservedCommands[0]
+    assert reservedCommand['commandId'] == 'cmd-reserve'
+    assert reservedCommand['status'] == 'reserved'
+    assert updateRecorder['update'], 'Expected command reservation to write an update'
+    reserveUpdate = updateRecorder['update'][0]
+    assert reserveUpdate['status'] == 'reserved'
+    assert reserveUpdate['claimedByRecipient'] == 'recipient-123'
+    assert MockDocument.instances, 'Expected MockDocument to be instantiated during reservation'
+    documentReference = MockDocument.instances[-1]
+    assert documentReference.lastTransaction is not None
+    assert isinstance(documentReference.lastSnapshot, MockDocumentSnapshot)
 
 
 def testAcknowledgePrinterControlCommandUpdatesStatus(monkeypatch):
