@@ -2488,6 +2488,90 @@ def testListPrinterControlCommandsReservesPendingCommands(monkeypatch):
     assert isinstance(documentReference.lastSnapshot, MockDocumentSnapshot)
 
 
+def testListPendingPrinterCommandsSkipsExpiredCommands(monkeypatch):
+    monkeypatch.setattr(main, 'validPrinterApiKeys', set())
+
+    fakeRequest.headers = {}
+    fakeRequest.args = {
+        'recipientId': 'recipient-123',
+        'printerSerial': 'SN-001',
+        'printerIpAddress': '192.168.1.50',
+        'printerId': 'printer-ABC',
+    }
+    fakeRequest.clear_json()
+    fakeRequest.method = 'GET'
+
+    expiredTimestamp = datetime.now(timezone.utc) - timedelta(minutes=5)
+    expiredCommandSnapshot = MockDocumentSnapshot(
+        'cmd-expired',
+        {
+            'commandId': 'cmd-expired',
+            'status': 'pending',
+            'recipientId': 'recipient-123',
+            'printerSerial': 'SN-001',
+            'expiresAt': expiredTimestamp,
+        },
+    )
+    updateRecorder = {'set': None, 'update': []}
+    mockFirestoreClient = MockFirestoreClient(
+        documentSnapshots=[expiredCommandSnapshot],
+        updateRecorder=updateRecorder,
+    )
+    fakeClients = SimpleNamespace(firestoreClient=mockFirestoreClient)
+    monkeypatch.setattr(main, '_loadClientsOrError', lambda: (fakeClients, None))
+
+    responseBody, statusCode = main._listPendingPrinterControlCommands()
+
+    assert statusCode == 200
+    assert responseBody == {'commands': []}
+    assert updateRecorder['update'], 'Expected expiration update to be recorded'
+    expirationUpdate = updateRecorder['update'][0]
+    assert expirationUpdate['status'] == 'expired'
+    assert 'expiredAt' in expirationUpdate
+
+
+def testListPendingPrinterCommandsIncludesNonExpiredCommands(monkeypatch):
+    monkeypatch.setattr(main, 'validPrinterApiKeys', set())
+
+    fakeRequest.headers = {}
+    fakeRequest.args = {
+        'recipientId': 'recipient-123',
+        'printerSerial': 'SN-001',
+        'printerIpAddress': '192.168.1.50',
+        'printerId': 'printer-ABC',
+    }
+    fakeRequest.clear_json()
+    fakeRequest.method = 'GET'
+
+    futureTimestamp = datetime.now(timezone.utc) + timedelta(minutes=5)
+    pendingCommandSnapshot = MockDocumentSnapshot(
+        'cmd-future',
+        {
+            'commandId': 'cmd-future',
+            'status': 'pending',
+            'recipientId': 'recipient-123',
+            'printerSerial': 'SN-001',
+            'expiresAt': futureTimestamp,
+        },
+    )
+    updateRecorder = {'set': None, 'update': []}
+    mockFirestoreClient = MockFirestoreClient(
+        documentSnapshots=[pendingCommandSnapshot],
+        updateRecorder=updateRecorder,
+    )
+    fakeClients = SimpleNamespace(firestoreClient=mockFirestoreClient)
+    monkeypatch.setattr(main, '_loadClientsOrError', lambda: (fakeClients, None))
+
+    responseBody, statusCode = main._listPendingPrinterControlCommands()
+
+    assert statusCode == 200
+    assert 'commands' in responseBody
+    assert len(responseBody['commands']) == 1
+    returnedCommand = responseBody['commands'][0]
+    assert returnedCommand['commandId'] == 'cmd-future'
+    assert all(update.get('status') != 'expired' for update in updateRecorder['update'])
+
+
 def testListPendingPrinterCommandsUsesActiveTransaction(monkeypatch):
     monkeypatch.setattr(main, 'validPrinterApiKeys', set())
 
