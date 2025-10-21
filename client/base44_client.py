@@ -84,6 +84,18 @@ def listPendingCommandsForRecipient(recipientId: str, limit: Optional[int] = Non
     if not response.content:
         return []
     payload = response.json()
+    try:
+        commandCount = 0
+        if isinstance(payload, list):
+            commandCount = len(payload)
+        elif isinstance(payload, dict):
+            items = payload.get("items") or payload.get("commands")
+            if isinstance(items, list):
+                commandCount = len(items)
+        if commandCount:
+            log.debug("Pending commands fetched for %s: %d", recipientId, commandCount)
+    except Exception:
+        pass
     if isinstance(payload, dict):
         items = payload.get("items") or payload.get("commands")
         if isinstance(items, list):
@@ -106,6 +118,7 @@ def acknowledgeCommand(commandId: str) -> None:
     payload = {"commandId": commandId}
     response = requests.post(url, json=payload, headers=_buildHeaders(), timeout=10)
     response.raise_for_status()
+    log.debug("ACK sent for %s", commandId)
 
 
 def postCommandResult(commandId: str, success: bool, message: Optional[str] = None) -> None:
@@ -116,3 +129,4 @@ def postCommandResult(commandId: str, success: bool, message: Optional[str] = No
         body["message"] = message
     response = requests.post(url, json=body, headers=_buildHeaders(), timeout=10)
     response.raise_for_status()
+    log.debug("RESULT sent for %s (success=%s)", commandId, success)
