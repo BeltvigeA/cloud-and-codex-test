@@ -1816,6 +1816,207 @@ def _listPendingPrinterControlCommands():
     return makeJsonResponse({'commands': commands}, 200)
 
 
+def _loadPrinterCommandDocument(commandId: str):
+    clients, clientError = _loadClientsOrError()
+    if clientError:
+        return None, None, clientError
+
+    firestoreClient = clients.firestoreClient
+    commandCollection = firestoreClient.collection(firestoreCollectionPrinterCommands)
+    commandDocument = commandCollection.document(commandId)
+
+    try:
+        commandSnapshot = commandDocument.get()
+    except Exception as error:  # pylint: disable=broad-except
+        logging.exception('Failed to fetch printer control command %s.', commandId)
+        return None, None, makeErrorResponse(
+            500,
+            'ServerError',
+            'Failed to load printer control command',
+            str(error),
+        )
+
+    if not getattr(commandSnapshot, 'exists', False):
+        logging.info('Printer control command %s not found.', commandId)
+        return None, None, makeErrorResponse(404, 'NotFound', 'Command not found')
+
+    commandData = commandSnapshot.to_dict() or {}
+    return commandDocument, commandData, None
+
+
+def _validateCommandRouting(
+    commandId: str,
+    commandData: dict,
+    recipientId: Optional[str],
+    printerSerial: Optional[str],
+):
+    expectedRecipientId = commandData.get('recipientId')
+    if recipientId and expectedRecipientId and expectedRecipientId != recipientId:
+        logging.warning(
+            'Recipient mismatch for command %s: expected %s received %s.',
+            commandId,
+            expectedRecipientId,
+            recipientId,
+        )
+        return makeErrorResponse(403, 'ForbiddenError', 'recipientId mismatch')
+
+    expectedPrinterSerial = commandData.get('printerSerial')
+    if printerSerial and expectedPrinterSerial and expectedPrinterSerial != printerSerial:
+        logging.warning(
+            'Printer serial mismatch for command %s: expected %s received %s.',
+            commandId,
+            expectedPrinterSerial,
+            printerSerial,
+        )
+        return makeErrorResponse(403, 'ForbiddenError', 'printerSerial mismatch')
+
+    return None
+
+
+@app.route('/control/ack', methods=['POST'])
+def acknowledgePrinterControlCommand():
+    logging.info('Received request to /control/ack')
+
+    apiKeyError = ensureValidApiKey()
+    if apiKeyError:
+        return apiKeyError
+
+    payload, payloadError = getJsonPayload()
+    if payloadError:
+        return payloadError
+
+    commandId, commandIdError = requireSanitizedStringField(payload, 'commandId')
+    if commandIdError:
+        return commandIdError
+
+    recipientId, recipientError = sanitizeOptionalStringField(payload, 'recipientId')
+    if recipientError:
+        return recipientError
+
+    printerSerial, printerSerialError = sanitizeOptionalStringField(payload, 'printerSerial')
+    if printerSerialError:
+        return printerSerialError
+
+    statusOverride, statusError = sanitizeOptionalStringField(payload, 'status')
+    if statusError:
+        return statusError
+
+    commandDocument, commandData, loadError = _loadPrinterCommandDocument(commandId)
+    if loadError:
+        return loadError
+
+    routingError = _validateCommandRouting(commandId, commandData, recipientId, printerSerial)
+    if routingError:
+        return routingError
+
+    ackStatus = statusOverride or 'processing'
+    updatePayload = {
+        'status': ackStatus,
+        'acknowledgedAt': firestore.SERVER_TIMESTAMP,
+        'startedAt': firestore.SERVER_TIMESTAMP,
+    }
+
+    try:
+        commandDocument.update(updatePayload)
+    except Exception as error:  # pylint: disable=broad-except
+        logging.exception('Failed to acknowledge printer control command %s.', commandId)
+        return makeErrorResponse(
+            500,
+            'ServerError',
+            'Failed to acknowledge printer control command',
+            str(error),
+        )
+
+    logEvent(
+        'command_acknowledged',
+        commandId=commandId,
+        status=ackStatus,
+        recipientId=recipientId,
+        printerSerial=printerSerial,
+    )
+
+    return makeJsonResponse({'ok': True}, 200)
+
+
+@app.route('/control/result', methods=['POST'])
+def submitPrinterControlResult():
+    logging.info('Received request to /control/result')
+
+    apiKeyError = ensureValidApiKey()
+    if apiKeyError:
+        return apiKeyError
+
+    payload, payloadError = getJsonPayload()
+    if payloadError:
+        return payloadError
+
+    commandId, commandIdError = requireSanitizedStringField(payload, 'commandId')
+    if commandIdError:
+        return commandIdError
+
+    recipientId, recipientError = sanitizeOptionalStringField(payload, 'recipientId')
+    if recipientError:
+        return recipientError
+
+    printerSerial, printerSerialError = sanitizeOptionalStringField(payload, 'printerSerial')
+    if printerSerialError:
+        return printerSerialError
+
+    finalStatus, statusError = requireSanitizedStringField(payload, 'status')
+    if statusError:
+        return statusError
+
+    message, messageError = sanitizeOptionalStringField(payload, 'message', allowEmpty=True)
+    if messageError:
+        return messageError
+
+    errorMessage, errorMessageError = sanitizeOptionalStringField(
+        payload, 'errorMessage', allowEmpty=True
+    )
+    if errorMessageError:
+        return errorMessageError
+
+    commandDocument, commandData, loadError = _loadPrinterCommandDocument(commandId)
+    if loadError:
+        return loadError
+
+    routingError = _validateCommandRouting(commandId, commandData, recipientId, printerSerial)
+    if routingError:
+        return routingError
+
+    updatePayload = {
+        'status': finalStatus,
+        'finishedAt': firestore.SERVER_TIMESTAMP,
+    }
+    if message is not None:
+        updatePayload['message'] = message
+    if errorMessage is not None:
+        updatePayload['errorMessage'] = errorMessage
+
+    try:
+        commandDocument.update(updatePayload)
+    except Exception as error:  # pylint: disable=broad-except
+        logging.exception('Failed to store result for printer control command %s.', commandId)
+        return makeErrorResponse(
+            500,
+            'ServerError',
+            'Failed to store printer control command result',
+            str(error),
+        )
+
+    logEvent(
+        'command_completed',
+        commandId=commandId,
+        status=finalStatus,
+        recipientId=recipientId,
+        printerSerial=printerSerial,
+        message=message,
+        errorMessage=errorMessage,
+    )
+
+    return makeJsonResponse({'ok': True}, 200)
+
+
 @app.route('/debug/listPendingCommands', methods=['POST'])
 def debugListPendingCommands():
     logging.info('Received request to /debug/listPendingCommands')
