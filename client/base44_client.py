@@ -96,13 +96,15 @@ def postReportError(payload: Dict[str, object]) -> Dict[str, object]:
 
 
 def listPendingCommandsForRecipient(recipientId: str, limit: Optional[int] = None) -> List[Dict[str, Any]]:
-    params: Dict[str, Any] = {}
+    params: Dict[str, Any] = {"recipientId": recipientId}
     if limit is not None:
         params["limit"] = int(limit)
     baseUrl = _resolveControlBaseUrl()
-    url = f"{baseUrl}/recipients/{recipientId}/pending"
+    from .client import getPrinterControlEndpointUrl
+
+    controlEndpointUrl = getPrinterControlEndpointUrl(baseUrl)
     response = requests.get(
-        url,
+        controlEndpointUrl,
         headers=_buildControlHeaders(),
         params=params or None,
         timeout=10,
@@ -111,36 +113,21 @@ def listPendingCommandsForRecipient(recipientId: str, limit: Optional[int] = Non
     if not response.content:
         return []
     payload = response.json()
-    commandCount: Optional[int] = 0
-    try:
-        if isinstance(payload, list):
-            commandCount = len(payload)
-        elif isinstance(payload, dict):
-            items = payload.get("items") or payload.get("commands")
-            if isinstance(items, list):
-                commandCount = len(items)
-            elif isinstance(payload.get("metadata"), list):
-                commandCount = len(payload.get("metadata", []))
-        else:
-            commandCount = 0
-    except Exception:
-        commandCount = None
+    commandsPayload: Optional[List[Any]] = None
+    if isinstance(payload, dict):
+        commandsCandidate = payload.get("commands")
+        if isinstance(commandsCandidate, list):
+            commandsPayload = commandsCandidate
+    elif isinstance(payload, list):
+        commandsPayload = payload
+    commandCount: Optional[int] = None
+    if commandsPayload is not None:
+        commandCount = len(commandsPayload)
     if commandCount is not None and _shouldLogPendingCount(recipientId):
         log.info("Pending commands fetched for %s: %d", recipientId, commandCount)
-    if isinstance(payload, dict):
-        items = payload.get("items") or payload.get("commands")
-        if isinstance(items, list):
-            normalized: List[Dict[str, Any]] = []
-            for entry in items:
-                if isinstance(entry, dict):
-                    normalized.append(entry)
-            return normalized
-        if isinstance(payload.get("metadata"), list):
-            return [entry for entry in payload.get("metadata", []) if isinstance(entry, dict)]
+    if not commandsPayload:
         return []
-    if isinstance(payload, list):
-        return [entry for entry in payload if isinstance(entry, dict)]
-    return []
+    return [entry for entry in commandsPayload if isinstance(entry, dict)]
 
 
 def acknowledgeCommand(commandId: str) -> None:

@@ -55,12 +55,12 @@ def test_control_requests_use_control_api_key(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setenv("PRINTER_BACKEND_API_KEY", "control-key")
     monkeypatch.setenv("BASE44_API_KEY", "legacy-key")
 
-    get_calls: List[Tuple[str, Dict[str, str]]] = []
+    get_calls: List[Tuple[str, Dict[str, str], Dict[str, Any] | None]] = []
     post_calls: List[Tuple[str, Dict[str, str]]] = []
 
     def fake_get(url: str, headers: Dict[str, str] | None = None, params: Dict[str, Any] | None = None, timeout: float = 0.0) -> _DummyResponse:
-        get_calls.append((url, dict(headers or {})))
-        return _DummyResponse([])
+        get_calls.append((url, dict(headers or {}), dict(params or {})))
+        return _DummyResponse({"commands": []})
 
     def fake_post(url: str, json: Dict[str, Any] | None = None, headers: Dict[str, str] | None = None, timeout: float = 0.0) -> _DummyResponse:
         post_calls.append((url, dict(headers or {})))
@@ -76,6 +76,8 @@ def test_control_requests_use_control_api_key(monkeypatch: pytest.MonkeyPatch) -
     base44_client.postCommandResult("cmd-1", success=True, message="ok")
 
     assert get_calls and get_calls[0][1].get("X-API-Key") == "control-key"
+    assert get_calls[0][0] == "https://printer-backend-934564650450.europe-west1.run.app/control"
+    assert get_calls[0][2] == {"recipientId": "recipient-123"}
     assert len(post_calls) == 2
     assert all(headers.get("X-API-Key") == "control-key" for _url, headers in post_calls)
 
