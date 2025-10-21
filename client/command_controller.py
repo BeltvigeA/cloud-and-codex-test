@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import queue
 import threading
 import time
 from datetime import datetime, timezone
@@ -17,6 +18,11 @@ except Exception:  # pragma: no cover - surfaced through logs and callbacks
     bambuApi = None
 
 from . import bambuPrinter
+from .base44_client import (
+    acknowledgeCommand,
+    listPendingCommandsForRecipient,
+    postCommandResult,
+)
 from .client import buildBaseUrl, defaultBaseUrl, getPrinterControlEndpointUrl
 
 log = logging.getLogger(__name__)
@@ -29,6 +35,169 @@ CACHE_FILE_PATH = CACHE_DIRECTORY / "command-cache.json"
 
 _cacheData: Optional[Dict[str, Any]] = None
 _cacheLock = threading.Lock()
+
+
+def _determinePollMode() -> str:
+    candidate = (os.getenv("CONTROL_POLL_MODE", "recipient") or "recipient").strip().lower()
+    return candidate if candidate in {"printer", "recipient"} else "recipient"
+
+
+_recipientRouters: Dict[str, "RecipientCommandRouter"] = {}
+_recipientRoutersLock = threading.Lock()
+
+
+def _registerRecipientRouter(recipientId: str, pollInterval: float) -> "RecipientCommandRouter":
+    with _recipientRoutersLock:
+        existing = _recipientRouters.get(recipientId)
+        if existing is not None and existing.isActive:
+            existing.updatePollInterval(pollInterval)
+            return existing
+        router = RecipientCommandRouter(recipientId, pollInterval)
+        _recipientRouters[recipientId] = router
+        return router
+
+
+def _unregisterRecipientRouter(recipientId: str, router: "RecipientCommandRouter") -> None:
+    with _recipientRoutersLock:
+        if _recipientRouters.get(recipientId) is router:
+            _recipientRouters.pop(recipientId, None)
+
+
+def _normalizeCommandMetadata(command: Dict[str, Any]) -> Dict[str, Any]:
+    metadata = command.get("metadata")
+    if isinstance(metadata, dict):
+        return metadata
+    if isinstance(metadata, str):
+        try:
+            parsed = json.loads(metadata)
+            if isinstance(parsed, dict):
+                command["metadata"] = parsed
+                return parsed
+        except Exception:
+            log.debug("Unable to parse command metadata for %s", command.get("commandId"), exc_info=True)
+    command["metadata"] = {}
+    return {}
+
+
+def _collectSerialCandidates(command: Dict[str, Any], metadata: Dict[str, Any]) -> List[str]:
+    candidates: List[str] = []
+    for container in (metadata, command):
+        if not isinstance(container, dict):
+            continue
+        for key in ("printerSerial", "serial", "printerId"):
+            value = container.get(key)
+            if isinstance(value, str):
+                normalized = value.strip()
+                if normalized and normalized not in candidates:
+                    candidates.append(normalized)
+    return candidates
+
+
+def _collectIpCandidates(command: Dict[str, Any], metadata: Dict[str, Any]) -> List[str]:
+    candidates: List[str] = []
+    for container in (metadata, command):
+        if not isinstance(container, dict):
+            continue
+        for key in ("printerIpAddress", "ip", "ipAddress"):
+            value = container.get(key)
+            if isinstance(value, str):
+                normalized = value.strip()
+                if normalized and normalized not in candidates:
+                    candidates.append(normalized)
+    return candidates
+
+
+class RecipientCommandRouter:
+    def __init__(self, recipientId: str, pollInterval: float) -> None:
+        self.recipientId = recipientId
+        self.pollIntervalSeconds = max(2.0, float(pollInterval))
+        self._lock = threading.Lock()
+        self._workers: Dict[str, "CommandWorker"] = {}
+        self._stopEvent = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run,
+            name=f"RecipientCommandRouter-{recipientId}",
+            daemon=True,
+        )
+        self._pollErrorCount = 0
+        self._thread.start()
+
+    @property
+    def isActive(self) -> bool:
+        return self._thread.is_alive() and not self._stopEvent.is_set()
+
+    def updatePollInterval(self, pollInterval: float) -> None:
+        try:
+            value = float(pollInterval)
+        except (TypeError, ValueError):
+            value = self.pollIntervalSeconds
+        self.pollIntervalSeconds = max(2.0, value)
+
+    def registerWorker(self, worker: "CommandWorker") -> None:
+        with self._lock:
+            self._workers[worker.serial] = worker
+
+    def unregisterWorker(self, serial: str) -> None:
+        shouldStop = False
+        with self._lock:
+            self._workers.pop(serial, None)
+            shouldStop = not self._workers
+        if shouldStop:
+            self._stopEvent.set()
+
+    def _snapshotWorkers(self) -> Dict[str, "CommandWorker"]:
+        with self._lock:
+            return dict(self._workers)
+
+    def _run(self) -> None:
+        log.info("Recipient command poller started for %s", self.recipientId)
+        try:
+            while not self._stopEvent.is_set():
+                workers = self._snapshotWorkers()
+                if not workers:
+                    if self._stopEvent.wait(1.0):
+                        break
+                    continue
+                try:
+                    commands = listPendingCommandsForRecipient(self.recipientId)
+                    self._pollErrorCount = 0
+                except Exception as error:  # noqa: BLE001 - log and continue
+                    self._pollErrorCount += 1
+                    if self._pollErrorCount == 1 or self._pollErrorCount % 50 == 0:
+                        log.warning("Recipient poll failed for %s: %s", self.recipientId, error)
+                    commands = []
+                for command in commands:
+                    metadata = _normalizeCommandMetadata(command)
+                    worker = self._selectWorker(workers, command, metadata)
+                    if worker is not None:
+                        worker.enqueueCommand(command)
+                    else:
+                        log.info(
+                            "No command worker found for command %s (meta=%s)",
+                            command.get("commandId"),
+                            metadata,
+                        )
+                self._stopEvent.wait(self.pollIntervalSeconds)
+        finally:
+            log.info("Recipient command poller stopped for %s", self.recipientId)
+            _unregisterRecipientRouter(self.recipientId, self)
+
+    def _selectWorker(
+        self,
+        workers: Dict[str, "CommandWorker"],
+        command: Dict[str, Any],
+        metadata: Dict[str, Any],
+    ) -> Optional["CommandWorker"]:
+        for serial in _collectSerialCandidates(command, metadata):
+            worker = workers.get(serial)
+            if worker is not None:
+                return worker
+        ipCandidates = _collectIpCandidates(command, metadata)
+        if ipCandidates:
+            for worker in workers.values():
+                if any(worker.matchesIp(ip) for ip in ipCandidates):
+                    return worker
+        return None
 
 
 def _ensureCacheLoaded() -> Dict[str, Any]:
@@ -122,6 +291,9 @@ class CommandWorker:
             2.0,
             float(pollInterval) if pollInterval is not None else CONTROL_POLL_SECONDS,
         )
+        self.pollMode = _determinePollMode()
+        self._commandQueue: Optional[queue.Queue] = None
+        self._router: Optional[RecipientCommandRouter] = None
         log.debug(
             "CommandWorker configured for %s using control endpoint %s", self.serial, self.controlEndpointUrl
         )
@@ -130,6 +302,13 @@ class CommandWorker:
         if self._thread and self._thread.is_alive():
             return
         self._stopEvent.clear()
+        if self.pollMode == "recipient":
+            if not self.recipientIdValue:
+                raise RuntimeError("Missing recipientId for recipient polling mode")
+            if self._commandQueue is None:
+                self._commandQueue = queue.Queue()
+            self._router = _registerRecipientRouter(self.recipientIdValue, self.pollIntervalSeconds)
+            self._router.registerWorker(self)
         self._thread = threading.Thread(target=self._run, name=f"CommandWorker-{self.serial}", daemon=True)
         self._thread.start()
 
@@ -138,10 +317,20 @@ class CommandWorker:
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=3)
         self._thread = None
+        if self.pollMode == "recipient" and self._router is not None:
+            self._router.unregisterWorker(self.serial)
+            self._router = None
+        self._drainQueue()
         self._disconnectPrinter()
 
     def _run(self) -> None:
-        log.info("CommandWorker started for %s (%s)", self.nickname, self.serial)
+        if self.pollMode == "recipient":
+            self._runRecipientMode()
+        else:
+            self._runPrinterMode()
+
+    def _runPrinterMode(self) -> None:
+        log.info("CommandWorker started for %s (%s) [printer-mode]", self.nickname, self.serial)
         try:
             while not self._stopEvent.is_set():
                 try:
@@ -156,7 +345,26 @@ class CommandWorker:
                     self._processCommand(command)
                 self._stopEvent.wait(self.pollIntervalSeconds)
         finally:
-            log.info("CommandWorker stopped for %s", self.serial)
+            log.info("CommandWorker stopped for %s [printer-mode]", self.serial)
+
+    def _runRecipientMode(self) -> None:
+        log.info("CommandWorker started for %s (%s) [recipient-mode]", self.nickname, self.serial)
+        queueRef = self._commandQueue
+        try:
+            if queueRef is None:
+                return
+            while not self._stopEvent.is_set():
+                try:
+                    command = queueRef.get(timeout=self.pollIntervalSeconds)
+                except queue.Empty:
+                    continue
+                self._processCommand(command)
+        finally:
+            log.info("CommandWorker stopped for %s [recipient-mode]", self.serial)
+            if self._router is not None:
+                self._router.unregisterWorker(self.serial)
+                self._router = None
+            self._drainQueue()
 
     def _processCommand(self, command: Dict[str, Any]) -> None:
         commandId = str(command.get("commandId") or "").strip()
@@ -164,6 +372,8 @@ class CommandWorker:
             return
         if not _reserveCommand(commandId):
             return
+
+        _normalizeCommandMetadata(command)
 
         try:
             self._sendCommandAck(commandId, "processing")
@@ -195,6 +405,30 @@ class CommandWorker:
             log.debug("Unable to submit result for %s", commandId, exc_info=True)
         _finalizeCommand(commandId, status)
         log.info("Command %s on %s: %s", commandId, self.serial, status)
+
+    def enqueueCommand(self, command: Dict[str, Any]) -> None:
+        if self.pollMode != "recipient":
+            return
+        if self._commandQueue is None:
+            self._commandQueue = queue.Queue()
+        try:
+            self._commandQueue.put_nowait(command)
+        except Exception:
+            log.debug("Unable to enqueue command %s", command.get("commandId"), exc_info=True)
+
+    def matchesIp(self, candidateIp: str) -> bool:
+        normalized = candidateIp.strip()
+        return bool(normalized) and normalized == (self.ipAddress or "").strip()
+
+    def _drainQueue(self) -> None:
+        if self._commandQueue is None:
+            return
+        try:
+            while True:
+                self._commandQueue.get_nowait()
+        except queue.Empty:
+            pass
+        self._commandQueue = None
 
     def _pollCommands(self) -> List[Dict[str, Any]]:
         if not self.apiKeyValue or not self.recipientIdValue:
@@ -235,6 +469,9 @@ class CommandWorker:
         return normalized
 
     def _sendCommandAck(self, commandId: str, status: str) -> bool:
+        if self.pollMode == "recipient":
+            acknowledgeCommand(commandId)
+            return True
         if not self.apiKeyValue or not self.recipientIdValue:
             raise RuntimeError("Missing API key or recipientId for CommandWorker")
         payload = {
@@ -256,6 +493,11 @@ class CommandWorker:
         message: Optional[str] = None,
         errorMessage: Optional[str] = None,
     ) -> None:
+        if self.pollMode == "recipient":
+            success = status.lower() == "completed"
+            detail = str(message or errorMessage or "") or None
+            postCommandResult(commandId, success, detail)
+            return
         if not self.apiKeyValue or not self.recipientIdValue:
             raise RuntimeError("Missing API key or recipientId for CommandWorker")
         payload: Dict[str, Any] = {
