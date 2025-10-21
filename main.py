@@ -1792,10 +1792,18 @@ def _listPendingPrinterControlCommands():
     commandCollection = firestoreClient.collection(firestoreCollectionPrinterCommands)
 
     query = commandCollection.where('status', '==', 'pending').where('recipientId', '==', sanitizedRecipientId)
+
+    identifierField = None
+    identifierValue = None
     if printerSerial:
-        query = query.where('printerSerial', '==', printerSerial)
-    if printerIpAddress:
-        query = query.where('printerIpAddress', '==', printerIpAddress)
+        identifierField = 'printerSerial'
+        identifierValue = printerSerial
+    elif printerIpAddress:
+        identifierField = 'printerIpAddress'
+        identifierValue = printerIpAddress
+
+    if identifierField and identifierValue:
+        query = query.where(identifierField, '==', identifierValue)
 
     try:
         documents = list(query.stream())
@@ -1808,9 +1816,24 @@ def _listPendingPrinterControlCommands():
             str(error),
         )
 
+    def commandMatchesIdentifiers(commandData: Dict[str, object]) -> bool:
+        if printerSerial and commandData.get('printerSerial') == printerSerial:
+            return True
+        if printerIpAddress and commandData.get('printerIpAddress') == printerIpAddress:
+            return True
+        if printerSerial and printerIpAddress:
+            return False
+        if printerSerial:
+            return commandData.get('printerSerial') == printerSerial
+        if printerIpAddress:
+            return commandData.get('printerIpAddress') == printerIpAddress
+        return True
+
     commands: List[Dict[str, object]] = []
     for document in documents:
         commandData = document.to_dict() or {}
+        if not commandMatchesIdentifiers(commandData):
+            continue
         if 'commandId' not in commandData:
             commandData['commandId'] = getattr(document, 'id', None)
         commands.append(commandData)
