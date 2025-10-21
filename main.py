@@ -1813,6 +1813,7 @@ def _listPendingPrinterControlCommands():
         )
 
     commands: List[Dict[str, object]] = []
+    currentTime = datetime.now(timezone.utc)
     for document in documents:
         commandData = document.to_dict() or {}
         commandId = commandData.get('commandId') or getattr(document, 'id', None)
@@ -1821,6 +1822,37 @@ def _listPendingPrinterControlCommands():
             continue
 
         commandDocument = commandCollection.document(commandId)
+        expiresAtValue = commandData.get('expiresAt')
+        expirationTime: Optional[datetime] = None
+        if isinstance(expiresAtValue, datetime):
+            expirationTime = expiresAtValue
+        elif isinstance(expiresAtValue, str):
+            expirationTime = parseIso8601Timestamp(expiresAtValue)
+
+        if expirationTime is not None:
+            if expirationTime.tzinfo is None:
+                expirationTime = expirationTime.replace(tzinfo=timezone.utc)
+            expirationTime = expirationTime.astimezone(timezone.utc)
+
+            if expirationTime <= currentTime:
+                expirationUpdate = {
+                    'status': 'expired',
+                    'expiredAt': firestore.SERVER_TIMESTAMP,
+                }
+                try:
+                    commandDocument.update(expirationUpdate)
+                except Exception:  # pylint: disable=broad-except
+                    logging.exception(
+                        'Failed to mark printer control command %s as expired.', commandId
+                    )
+                logEvent(
+                    'command_expired',
+                    commandId=commandId,
+                    recipientId=sanitizedRecipientId,
+                    printerSerial=commandData.get('printerSerial'),
+                    expiresAt=expirationTime.isoformat(),
+                )
+                continue
         claimMetadata: Dict[str, object] = {
             'status': 'reserved',
             'claimedAt': firestore.SERVER_TIMESTAMP,
@@ -1837,11 +1869,23 @@ def _listPendingPrinterControlCommands():
 
         try:
             with firestoreClient.transaction() as transaction:
-                snapshotCandidate = next(transaction.get(commandDocument), None)
-                if snapshotCandidate is None:
+                snapshotCandidateRaw = transaction.get(commandDocument)
+                snapshotCandidate = snapshotCandidateRaw
+                if snapshotCandidate is None or not hasattr(snapshotCandidate, 'to_dict'):
+                    try:
+                        snapshotIterator = iter(snapshotCandidateRaw)
+                    except TypeError:
+                        snapshotCandidate = None
+                    else:
+                        snapshotCandidate = next(snapshotIterator, None)
+
+                if snapshotCandidate is None or not hasattr(snapshotCandidate, 'to_dict'):
                     logging.warning(
-                        'Skipping printer control command %s because transaction returned no snapshot.',
+                        'Skipping printer control command %s because transaction returned %s.',
                         commandId,
+                        type(snapshotCandidateRaw).__name__
+                        if snapshotCandidateRaw is not None
+                        else 'None',
                     )
                     continue
 
