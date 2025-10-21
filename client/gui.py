@@ -133,6 +133,7 @@ class ListenerGuiApp:
 
         self.listenerRecipientId = ""
         self.listenerStatusApiKey = ""
+        self.listenerControlApiKey = ""
         self._managedEnvKeys: set[str] = set()
 
         self.activePrinterDialog: Optional[Dict[str, Any]] = None
@@ -194,32 +195,40 @@ class ListenerGuiApp:
         )
         self._updateListenerStatusApiKey()
 
-        ttk.Label(parent, text="Output Directory:").grid(row=3, column=0, sticky=tk.W, **paddingOptions)
+        ttk.Label(parent, text="Control API Key:").grid(row=3, column=0, sticky=tk.W, **paddingOptions)
+        self.controlApiKeyVar = tk.StringVar()
+        self.controlApiKeyVar.trace_add("write", lambda *_: self._updateListenerControlApiKey())
+        ttk.Entry(parent, textvariable=self.controlApiKeyVar, width=30, show="*").grid(
+            row=3, column=1, sticky=tk.EW, **paddingOptions
+        )
+        self._updateListenerControlApiKey()
+
+        ttk.Label(parent, text="Output Directory:").grid(row=4, column=0, sticky=tk.W, **paddingOptions)
         self.outputDirVar = tk.StringVar(value=str(defaultFilesDirectory))
         outputDirFrame = ttk.Frame(parent)
-        outputDirFrame.grid(row=3, column=1, sticky=tk.EW, **paddingOptions)
+        outputDirFrame.grid(row=4, column=1, sticky=tk.EW, **paddingOptions)
         outputDirEntry = ttk.Entry(outputDirFrame, textvariable=self.outputDirVar, width=40)
         outputDirEntry.pack(side=tk.LEFT, fill=tk.X, expand=True)
         ttk.Button(outputDirFrame, text="Browse", command=self._chooseOutputDir).pack(side=tk.LEFT, padx=4)
 
-        ttk.Label(parent, text="JSON Log File:").grid(row=4, column=0, sticky=tk.W, **paddingOptions)
+        ttk.Label(parent, text="JSON Log File:").grid(row=5, column=0, sticky=tk.W, **paddingOptions)
         self.logFileVar = tk.StringVar(
             value=str(Path.home() / ".printmaster" / "listener-log.json")
         )
         logFileFrame = ttk.Frame(parent)
-        logFileFrame.grid(row=4, column=1, sticky=tk.EW, **paddingOptions)
+        logFileFrame.grid(row=5, column=1, sticky=tk.EW, **paddingOptions)
         logFileEntry = ttk.Entry(logFileFrame, textvariable=self.logFileVar, width=40)
         logFileEntry.pack(side=tk.LEFT, fill=tk.X, expand=True)
         ttk.Button(logFileFrame, text="Browse", command=self._chooseLogFile).pack(side=tk.LEFT, padx=4)
 
-        ttk.Label(parent, text="Poll Interval (seconds):").grid(row=5, column=0, sticky=tk.W, **paddingOptions)
+        ttk.Label(parent, text="Poll Interval (seconds):").grid(row=6, column=0, sticky=tk.W, **paddingOptions)
         self.pollIntervalVar = tk.IntVar(value=30)
         ttk.Spinbox(parent, from_=5, to=3600, textvariable=self.pollIntervalVar).grid(
-            row=5, column=1, sticky=tk.W, **paddingOptions
+            row=6, column=1, sticky=tk.W, **paddingOptions
         )
 
         buttonFrame = ttk.Frame(parent)
-        buttonFrame.grid(row=6, column=0, columnspan=2, pady=12)
+        buttonFrame.grid(row=7, column=0, columnspan=2, pady=12)
         self.startButton = ttk.Button(buttonFrame, text="Start Listening", command=self.startListening)
         self.startButton.pack(side=tk.LEFT, padx=6)
         self.stopButton = ttk.Button(buttonFrame, text="Stop", command=self.stopListening, state=tk.DISABLED)
@@ -231,12 +240,12 @@ class ListenerGuiApp:
             command=self._handleLiveStatusToggle,
         ).pack(side=tk.LEFT, padx=6)
 
-        ttk.Label(parent, text="Event Log:").grid(row=7, column=0, sticky=tk.W, **paddingOptions)
+        ttk.Label(parent, text="Event Log:").grid(row=8, column=0, sticky=tk.W, **paddingOptions)
         self.logText = tk.Text(parent, height=10, state=tk.DISABLED)
-        self.logText.grid(row=7, column=1, sticky=tk.NSEW, **paddingOptions)
+        self.logText.grid(row=8, column=1, sticky=tk.NSEW, **paddingOptions)
 
         parent.columnconfigure(1, weight=1)
-        parent.rowconfigure(7, weight=1)
+        parent.rowconfigure(8, weight=1)
 
     def _buildPrintersTab(self, parent: ttk.Frame) -> None:
         self.printerSearchVar = tk.StringVar()
@@ -699,11 +708,25 @@ class ListenerGuiApp:
 
         apiKeyValue = self.listenerStatusApiKey.strip()
         if apiKeyValue:
+            os.environ["BASE44_FUNCTIONS_API_KEY"] = apiKeyValue
             os.environ["BASE44_API_KEY"] = apiKeyValue
+            self._managedEnvKeys.add("BASE44_FUNCTIONS_API_KEY")
             self._managedEnvKeys.add("BASE44_API_KEY")
-        elif "BASE44_API_KEY" in self._managedEnvKeys:
-            os.environ.pop("BASE44_API_KEY", None)
-            self._managedEnvKeys.discard("BASE44_API_KEY")
+        else:
+            if "BASE44_FUNCTIONS_API_KEY" in self._managedEnvKeys:
+                os.environ.pop("BASE44_FUNCTIONS_API_KEY", None)
+                self._managedEnvKeys.discard("BASE44_FUNCTIONS_API_KEY")
+            if "BASE44_API_KEY" in self._managedEnvKeys:
+                os.environ.pop("BASE44_API_KEY", None)
+                self._managedEnvKeys.discard("BASE44_API_KEY")
+
+        controlKeyValue = self.listenerControlApiKey.strip()
+        if controlKeyValue:
+            os.environ["PRINTER_BACKEND_API_KEY"] = controlKeyValue
+            self._managedEnvKeys.add("PRINTER_BACKEND_API_KEY")
+        elif "PRINTER_BACKEND_API_KEY" in self._managedEnvKeys:
+            os.environ.pop("PRINTER_BACKEND_API_KEY", None)
+            self._managedEnvKeys.discard("PRINTER_BACKEND_API_KEY")
 
     def _updateListenerRecipient(self, *_args: Any) -> None:
         self.listenerRecipientId = self.recipientVar.get().strip() if hasattr(self, "recipientVar") else ""
@@ -714,6 +737,59 @@ class ListenerGuiApp:
             self.statusApiKeyVar.get().strip() if hasattr(self, "statusApiKeyVar") else ""
         )
         self._applyBase44Environment()
+
+    def _updateListenerControlApiKey(self, *_args: Any) -> None:
+        self.listenerControlApiKey = (
+            self.controlApiKeyVar.get().strip() if hasattr(self, "controlApiKeyVar") else ""
+        )
+        self._applyBase44Environment()
+
+    def _updateStatusReporterState(self) -> None:
+        listenerActive = bool(getattr(self, "listenerActive", False))
+        listenerReady = bool(getattr(self, "listenerReady", False))
+        recipientId = str(getattr(self, "listenerRecipientId", "") or "").strip()
+        commandPoller = getattr(self, "commandPoller", None)
+        reporter = getattr(self, "base44Reporter", None)
+
+        def stopCommandPoller() -> None:
+            if commandPoller is not None and hasattr(commandPoller, "stop"):
+                commandPoller.stop()
+
+        def startCommandPoller() -> None:
+            if commandPoller is not None and hasattr(commandPoller, "start") and recipientId:
+                commandPoller.start(recipientId)
+
+        def stopReporter() -> None:
+            if reporter is not None and hasattr(reporter, "stop") and getattr(self, "base44ReporterActive", False):
+                reporter.stop()
+                self.base44ReporterActive = False
+
+        if not listenerActive or not listenerReady or not recipientId:
+            stopReporter()
+            stopCommandPoller()
+            return
+
+        snapshotCallable = getattr(self, "_snapshotPrintersForBase44", None)
+        try:
+            printerSnapshots = list(snapshotCallable()) if callable(snapshotCallable) else []
+        except Exception:
+            printerSnapshots = []
+
+        hasMqttReadyPrinters = any(
+            isinstance(entry, dict) and entry.get("mqttReady")
+            for entry in printerSnapshots
+        )
+
+        if hasMqttReadyPrinters:
+            if not getattr(self, "base44ReporterActive", False) and reporter is not None and hasattr(reporter, "start"):
+                apiKeyResolver = getattr(self, "_resolveStatusApiKey", None)
+                resolvedApiKey = apiKeyResolver() if callable(apiKeyResolver) else None
+                reporter.start(recipientId, resolvedApiKey)
+                self.base44ReporterActive = True
+            stopCommandPoller()
+        else:
+            stopReporter()
+            startCommandPoller()
 
     def _updateActivePrinterDialogIdentifiers(self) -> None:
         dialogInfo = getattr(self, "activePrinterDialog", None)
