@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import sys
 from typing import Any, List
@@ -47,11 +48,13 @@ def listenerApp() -> ListenerGuiApp:
     app.listenerReady = False
     app.listenerRecipientId = ""
     app.listenerStatusApiKey = "status-key"
+    app.listenerControlApiKey = ""
     app.base44ReporterActive = False
     app.base44Reporter = FakeBase44Reporter()
     app.commandPoller = FakeCommandPoller()
     app._snapshotPrintersForBase44 = lambda: []
     app._resolveStatusApiKey = lambda: "status-key"
+    app._managedEnvKeys = set()
     return app
 
 
@@ -115,3 +118,29 @@ def testCommandPollerInvokesListPendingOncePerInterval(monkeypatch: pytest.Monke
 
     assert callMarkers == [0, max(1, int(poller._intervalSeconds * 10))]
     assert all(duration == pytest.approx(0.1) for duration in sleepDurations)
+
+
+def testListenerApplyEnvironmentUpdatesApiKeys(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("BASE44_API_KEY", raising=False)
+    monkeypatch.delenv("BASE44_FUNCTIONS_API_KEY", raising=False)
+    monkeypatch.delenv("PRINTER_BACKEND_API_KEY", raising=False)
+
+    app = ListenerGuiApp.__new__(ListenerGuiApp)
+    app.listenerRecipientId = ""
+    app.listenerStatusApiKey = "status-key"
+    app.listenerControlApiKey = "control-key"
+    app._managedEnvKeys = set()
+
+    app._applyBase44Environment()
+
+    assert os.getenv("BASE44_FUNCTIONS_API_KEY") == "status-key"
+    assert os.getenv("BASE44_API_KEY") == "status-key"
+    assert os.getenv("PRINTER_BACKEND_API_KEY") == "control-key"
+
+    app.listenerStatusApiKey = ""
+    app.listenerControlApiKey = ""
+    app._applyBase44Environment()
+
+    assert os.getenv("BASE44_FUNCTIONS_API_KEY") is None
+    assert os.getenv("BASE44_API_KEY") is None
+    assert os.getenv("PRINTER_BACKEND_API_KEY") is None

@@ -173,6 +173,7 @@ class BambuStatusSubscriber:
                 while not stopEvent.is_set():
                     resolvedApiKey = self._resolveBase44ApiKey(printerConfig)
                     if resolvedApiKey:
+                        self._ensureEnvironmentValue("BASE44_FUNCTIONS_API_KEY", resolvedApiKey)
                         self._ensureEnvironmentValue("BASE44_API_KEY", resolvedApiKey)
 
                     statusPayload = self._collectSnapshot(printerInstance, printerConfig, printerMetadata)
@@ -619,8 +620,11 @@ class BambuStatusSubscriber:
         return updatePayload, updateComparable, errorPayload, errorComparable
 
     def _resolveBase44ApiKey(self, printerConfig: Dict[str, Any]) -> str:
-        envCandidate = os.getenv("BASE44_API_KEY", "").strip()
-        return envCandidate
+        for envKey in ("BASE44_FUNCTIONS_API_KEY", "BASE44_API_KEY"):
+            envCandidate = os.getenv(envKey, "").strip()
+            if envCandidate:
+                return envCandidate
+        return ""
 
     def _ensureEnvironmentValue(self, key: str, value: str) -> None:
         if not value:

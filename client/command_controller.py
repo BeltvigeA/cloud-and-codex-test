@@ -143,10 +143,11 @@ class RecipientCommandRouter:
             self._workers[worker.serial] = worker
             if not self._backlog:
                 return
-            pendingCommands = self._backlog
+            pendingCommands = list(self._backlog)
             self._backlog = []
             workersSnapshot = dict(self._workers)
-        self._routeCommands(pendingCommands, workersSnapshot, queued=True)
+        if pendingCommands:
+            self._routeCommands(pendingCommands, workersSnapshot, queued=True)
 
     def unregisterWorker(self, serial: str) -> None:
         shouldStop = False
@@ -166,8 +167,7 @@ class RecipientCommandRouter:
         *,
         suppressCheckLog: bool = False,
     ) -> None:
-        if not suppressCheckLog:
-            log.info("Checking for pending commands for recipient %s.", self.recipientId)
+        log.info("Checking for pending commands for recipient %s.", self.recipientId)
         try:
             commands = listPendingCommandsForRecipient(self.recipientId)
             self._pollErrorCount = 0
@@ -198,12 +198,11 @@ class RecipientCommandRouter:
                         self.recipientId,
                     )
                 return
-            commandsToRoute = backlogCommands
-            if commands:
-                commandsToRoute.extend(commands)
             self._backlog = []
-        if commandsToRoute:
-            self._routeCommands(commandsToRoute, workersSnapshot, queued=False)
+        if backlogCommands:
+            self._routeCommands(backlogCommands, workersSnapshot, queued=True)
+        if commands:
+            self._routeCommands(commands, workersSnapshot, queued=False)
 
     poll_once = pollOnce
 
@@ -333,7 +332,11 @@ class CommandWorker:
         self._thread: Optional[threading.Thread] = None
         self._printerInstance: Optional[Any] = None
         self._printerLock = threading.Lock()
-        self.apiKeyValue = (apiKey or os.getenv("BASE44_API_KEY", "")).strip()
+        self.apiKeyValue = (
+            apiKey
+            or os.getenv("PRINTER_BACKEND_API_KEY", "")
+            or os.getenv("BASE44_API_KEY", "")
+        ).strip()
         self.recipientIdValue = (recipientId or os.getenv("BASE44_RECIPIENT_ID", "")).strip()
         self.controlBaseUrl = (baseUrl or os.getenv("PRINTER_BACKEND_BASE_URL", "")).strip()
         baseCandidate = self.controlBaseUrl or defaultBaseUrl
