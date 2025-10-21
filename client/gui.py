@@ -2173,7 +2173,7 @@ class ListenerGuiApp:
                     ipAddress=ipAddress,
                     accessCode=accessCode,
                     nickname=printer.get("nickname"),
-                    apiKey=self.listenerStatusApiKey,
+                    apiKey=self.listenerControlApiKey or None,
                     recipientId=self.listenerRecipientId,
                     baseUrl=controlBaseUrl,
                     pollInterval=pollIntervalSeconds,

@@ -11,6 +11,7 @@ from requests import HTTPError
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from client.command_controller import CommandWorker, _normalizeCommandMetadata
+from client.gui import ListenerGuiApp
 
 
 class DummyResponse:
@@ -27,6 +28,67 @@ class DummyResponse:
     def raise_for_status(self) -> None:
         if self.status_code >= 400:
             raise HTTPError(response=self)
+
+
+def testCommandWorkerReceivesControlApiKey(monkeypatch: pytest.MonkeyPatch) -> None:
+    app = ListenerGuiApp.__new__(ListenerGuiApp)
+
+    class DummyVar:
+        def __init__(self, value: bool) -> None:
+            self._value = value
+
+        def get(self) -> bool:
+            return self._value
+
+    class DummyValue:
+        def __init__(self, value: str) -> None:
+            self._value = value
+
+        def get(self) -> str:
+            return self._value
+
+    class DummyThread:
+        def is_alive(self) -> bool:
+            return True
+
+    app.liveStatusEnabledVar = DummyVar(True)
+    app.listenerThread = DummyThread()
+    app.listenerStatusApiKey = "status-key"
+    app.listenerControlApiKey = "control-key"
+    app.listenerRecipientId = "recipient-123"
+    app.baseUrlVar = DummyValue("https://example.com")
+    app.pollIntervalVar = DummyValue("5")
+    app.commandWorkers = {}
+    app.log = lambda message: None
+    app._applyBase44Environment = lambda: None
+    app._collectActiveLanPrinters = lambda: [
+        {
+            "serialNumber": "SERIAL123",
+            "ipAddress": "192.168.1.10",
+            "accessCode": "abcd",
+            "nickname": "Printer",
+        }
+    ]
+
+    captured: Dict[str, Any] = {}
+
+    class FakeWorker:
+        def __init__(self, **kwargs: Any) -> None:
+            captured.update(kwargs)
+            self.serial = kwargs.get("serial", "")
+
+        def start(self) -> None:  # pragma: no cover - trivial behavior
+            captured["started"] = True
+
+        def stop(self) -> None:  # pragma: no cover - not used in test
+            pass
+
+    monkeypatch.setattr("client.gui.CommandWorker", FakeWorker)
+
+    app._startCommandWorkers()
+
+    assert captured["apiKey"] == "control-key"
+    assert captured["recipientId"] == "recipient-123"
 
 
 def testPollCommandsUsesGet(monkeypatch: pytest.MonkeyPatch) -> None:
