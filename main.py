@@ -4,7 +4,6 @@ import os
 import re
 import secrets
 import uuid
-from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Set, Tuple
@@ -1844,14 +1843,7 @@ def _listPendingPrinterControlCommands():
 
         if transaction is not None:
             try:
-                currentSnapshot = commandDocument.get(transaction=transaction)
-                if isinstance(currentSnapshot, Iterable) and not hasattr(
-                    currentSnapshot, 'to_dict'
-                ):
-                    currentSnapshot = next(iter(currentSnapshot), None)
-                if currentSnapshot is None or not hasattr(currentSnapshot, 'to_dict'):
-                    transaction.commit()
-                    continue
+                currentSnapshot = transaction.get(commandDocument)
                 currentData = currentSnapshot.to_dict() or {}
                 if currentData.get('status') != 'pending':
                     transaction.commit()
