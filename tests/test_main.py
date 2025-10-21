@@ -2148,7 +2148,7 @@ def testListPrinterControlCommandsReturnsPending(monkeypatch):
     assert responseBody['commands'][0]['commandId'] == 'cmd-1'
 
 
-def testListPrinterControlCommandsMatchesEitherIdentifier(monkeypatch):
+def testListPrinterControlCommandsIgnoresPrinterIpAddressForFiltering(monkeypatch):
     commandSnapshots = [
         MockDocumentSnapshot(
             'cmd-serial',
@@ -2156,6 +2156,16 @@ def testListPrinterControlCommandsMatchesEitherIdentifier(monkeypatch):
                 'commandId': 'cmd-serial',
                 'recipientId': 'recipient-123',
                 'printerSerial': 'SN-001',
+                'status': 'pending',
+            },
+        ),
+        MockDocumentSnapshot(
+            'cmd-other',
+            {
+                'commandId': 'cmd-other',
+                'recipientId': 'recipient-123',
+                'printerSerial': 'SN-002',
+                'printerIpAddress': '10.0.0.9',
                 'status': 'pending',
             },
         ),
@@ -2188,6 +2198,50 @@ def testListPrinterControlCommandsMatchesEitherIdentifier(monkeypatch):
     assert [item['commandId'] for item in responseBody['commands']] == ['cmd-serial']
 
 
+def testListPrinterControlCommandsFiltersBySerial(monkeypatch):
+    commandSnapshots = [
+        MockDocumentSnapshot(
+            'cmd-first',
+            {
+                'commandId': 'cmd-first',
+                'recipientId': 'recipient-123',
+                'printerSerial': 'SN-001',
+                'status': 'pending',
+            },
+        ),
+        MockDocumentSnapshot(
+            'cmd-second',
+            {
+                'commandId': 'cmd-second',
+                'recipientId': 'recipient-123',
+                'printerSerial': 'SN-002',
+                'status': 'pending',
+            },
+        ),
+    ]
+
+    mockClients = main.ClientBundle(
+        storageClient=MockStorageClient(),
+        firestoreClient=MockFirestoreClient(documentSnapshots=commandSnapshots),
+        kmsClient=MockEncryptClient({'sensitive': 'value'}),
+        kmsKeyPath='projects/test/locations/test/keyRings/test/cryptoKeys/test',
+        gcsBucketName='test-bucket',
+    )
+
+    monkeypatch.setattr(main, 'getClients', lambda: mockClients)
+    monkeypatch.setattr(main, 'validPrinterApiKeys', {'control-key'})
+
+    fakeRequest.headers = {'X-API-Key': 'control-key'}
+    fakeRequest.args = {'recipientId': 'recipient-123', 'printerSerial': 'SN-002'}
+    fakeRequest.clear_json()
+    fakeRequest.method = 'GET'
+
+    responseBody, statusCode = main.queuePrinterControlCommand()
+
+    assert statusCode == 200
+    assert [item['commandId'] for item in responseBody['commands']] == ['cmd-second']
+
+
 def testListPrinterControlCommandsRequiresParameters(monkeypatch):
     monkeypatch.setattr(main, 'validPrinterApiKeys', {'control-key'})
 
@@ -2210,7 +2264,7 @@ def testListPrinterControlCommandsRequiresParameters(monkeypatch):
     assert statusCode == 400
     assert responseBody['ok'] is False
     assert responseBody['error_type'] == 'ValidationError'
-    assert 'printerSerial or printerIpAddress' in responseBody['message']
+    assert 'printerSerial' in responseBody['message']
 
 
 def testUploadFileReportsMissingEnvironment(monkeypatch):

@@ -1761,28 +1761,18 @@ def _listPendingPrinterControlCommands():
     sanitizedRecipientId = recipientId.strip()
 
     printerSerialValue = queryArgs.get('printerSerial')
-    printerSerial = None
-    if printerSerialValue is not None:
-        if not isinstance(printerSerialValue, str) or not printerSerialValue.strip():
-            logging.warning('Invalid printerSerial parameter provided when listing commands.')
-            return makeErrorResponse(400, 'ValidationError', 'printerSerial must be a non-empty string')
-        printerSerial = printerSerialValue.strip()
+    if not isinstance(printerSerialValue, str) or not printerSerialValue.strip():
+        logging.warning('Missing or invalid printerSerial when listing printer commands.')
+        return makeErrorResponse(400, 'ValidationError', 'printerSerial query parameter is required')
+    sanitizedPrinterSerial = printerSerialValue.strip()
 
-    printerIpValue = queryArgs.get('printerIpAddress')
     printerIpAddress = None
-    if printerIpValue is not None:
+    if 'printerIpAddress' in queryArgs:
+        printerIpValue = queryArgs.get('printerIpAddress')
         if not isinstance(printerIpValue, str) or not printerIpValue.strip():
             logging.warning('Invalid printerIpAddress parameter provided when listing commands.')
             return makeErrorResponse(400, 'ValidationError', 'printerIpAddress must be a non-empty string')
         printerIpAddress = printerIpValue.strip()
-
-    if not printerSerial and not printerIpAddress:
-        logging.warning('Printer command poll missing printer identifiers.')
-        return makeErrorResponse(
-            400,
-            'ValidationError',
-            'printerSerial or printerIpAddress query parameter is required',
-        )
 
     clients, clientError = _loadClientsOrError()
     if clientError:
@@ -1791,19 +1781,11 @@ def _listPendingPrinterControlCommands():
     firestoreClient = clients.firestoreClient
     commandCollection = firestoreClient.collection(firestoreCollectionPrinterCommands)
 
-    query = commandCollection.where('status', '==', 'pending').where('recipientId', '==', sanitizedRecipientId)
-
-    identifierField = None
-    identifierValue = None
-    if printerSerial:
-        identifierField = 'printerSerial'
-        identifierValue = printerSerial
-    elif printerIpAddress:
-        identifierField = 'printerIpAddress'
-        identifierValue = printerIpAddress
-
-    if identifierField and identifierValue:
-        query = query.where(identifierField, '==', identifierValue)
+    query = (
+        commandCollection.where('status', '==', 'pending')
+        .where('recipientId', '==', sanitizedRecipientId)
+        .where('printerSerial', '==', sanitizedPrinterSerial)
+    )
 
     try:
         documents = list(query.stream())
@@ -1816,26 +1798,13 @@ def _listPendingPrinterControlCommands():
             str(error),
         )
 
-    def commandMatchesIdentifiers(commandData: Dict[str, object]) -> bool:
-        if printerSerial and commandData.get('printerSerial') == printerSerial:
-            return True
-        if printerIpAddress and commandData.get('printerIpAddress') == printerIpAddress:
-            return True
-        if printerSerial and printerIpAddress:
-            return False
-        if printerSerial:
-            return commandData.get('printerSerial') == printerSerial
-        if printerIpAddress:
-            return commandData.get('printerIpAddress') == printerIpAddress
-        return True
-
     commands: List[Dict[str, object]] = []
     for document in documents:
         commandData = document.to_dict() or {}
-        if not commandMatchesIdentifiers(commandData):
-            continue
         if 'commandId' not in commandData:
             commandData['commandId'] = getattr(document, 'id', None)
+        if printerIpAddress and 'printerIpAddress' not in commandData:
+            commandData['printerIpAddress'] = printerIpAddress
         commands.append(commandData)
 
     return makeJsonResponse({'commands': commands}, 200)
