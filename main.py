@@ -30,7 +30,7 @@ try:  # pragma: no cover - optional dependency handling
     from google.cloud import secretmanager
 except ImportError:  # pragma: no cover - fallback when secret manager is unavailable in tests
     secretmanager = None  # type: ignore[assignment]
-from google.cloud.firestore_v1 import DELETE_FIELD
+from google.cloud.firestore_v1 import DELETE_FIELD, DocumentSnapshot
 from werkzeug.utils import secure_filename
 
 
@@ -1843,8 +1843,16 @@ def _listPendingPrinterControlCommands():
 
         if transaction is not None:
             try:
-                currentSnapshot = transaction.get(commandDocument)
-                currentData = currentSnapshot.to_dict() or {}
+                snapshotCandidate = commandDocument.get(transaction=transaction)
+                if snapshotCandidate is None or not isinstance(snapshotCandidate, DocumentSnapshot):
+                    logging.warning(
+                        'Skipping printer control command %s because transaction returned %s.',
+                        commandId,
+                        type(snapshotCandidate).__name__ if snapshotCandidate is not None else 'None',
+                    )
+                    transaction.commit()
+                    continue
+                currentData = snapshotCandidate.to_dict() or {}
                 if currentData.get('status') != 'pending':
                     transaction.commit()
                     continue
