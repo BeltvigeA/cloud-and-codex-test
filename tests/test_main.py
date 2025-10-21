@@ -2240,9 +2240,74 @@ def testListPrinterControlCommandsFiltersBySerial(monkeypatch):
 
     assert statusCode == 200
     assert [item['commandId'] for item in responseBody['commands']] == ['cmd-second']
+    assert responseBody['commands'][0]['printerSerial'] == 'SN-002'
 
 
-def testListPrinterControlCommandsRequiresParameters(monkeypatch):
+def testListPrinterControlCommandsReturnsRecipientCommandsWhenSerialMissing(monkeypatch):
+    commandSnapshots = [
+        MockDocumentSnapshot(
+            'cmd-first',
+            {
+                'commandId': 'cmd-first',
+                'recipientId': 'recipient-123',
+                'printerSerial': 'SN-001',
+                'status': 'pending',
+            },
+        ),
+        MockDocumentSnapshot(
+            'cmd-second',
+            {
+                'commandId': 'cmd-second',
+                'recipientId': 'recipient-123',
+                'printerSerial': 'SN-002',
+                'status': 'pending',
+            },
+        ),
+        MockDocumentSnapshot(
+            'cmd-third',
+            {
+                'commandId': 'cmd-third',
+                'recipientId': 'recipient-456',
+                'printerSerial': 'SN-003',
+                'status': 'pending',
+            },
+        ),
+        MockDocumentSnapshot(
+            'cmd-ignored',
+            {
+                'commandId': 'cmd-ignored',
+                'recipientId': 'recipient-123',
+                'printerSerial': 'SN-001',
+                'status': 'completed',
+            },
+        ),
+    ]
+
+    mockClients = main.ClientBundle(
+        storageClient=MockStorageClient(),
+        firestoreClient=MockFirestoreClient(documentSnapshots=commandSnapshots),
+        kmsClient=MockEncryptClient({'sensitive': 'value'}),
+        kmsKeyPath='projects/test/locations/test/keyRings/test/cryptoKeys/test',
+        gcsBucketName='test-bucket',
+    )
+
+    monkeypatch.setattr(main, 'getClients', lambda: mockClients)
+    monkeypatch.setattr(main, 'validPrinterApiKeys', {'control-key'})
+
+    fakeRequest.headers = {'X-API-Key': 'control-key'}
+    fakeRequest.args = {'recipientId': 'recipient-123'}
+    fakeRequest.clear_json()
+    fakeRequest.method = 'GET'
+
+    responseBody, statusCode = main.queuePrinterControlCommand()
+
+    assert statusCode == 200
+    returnedCommands = responseBody['commands']
+    assert {item['commandId'] for item in returnedCommands} == {'cmd-first', 'cmd-second'}
+    assert all('printerSerial' in item for item in returnedCommands)
+
+
+def testListPrinterControlCommandsRequiresRecipientParameter(monkeypatch):
     monkeypatch.setattr(main, 'validPrinterApiKeys', {'control-key'})
 
     fakeRequest.headers = {'X-API-Key': 'control-key'}
@@ -2257,7 +2322,14 @@ def testListPrinterControlCommandsRequiresParameters(monkeypatch):
     assert responseBody['error_type'] == 'ValidationError'
     assert 'recipientId' in responseBody['message']
 
-    fakeRequest.args = {'recipientId': 'recipient-123'}
+
+def testListPrinterControlCommandsRejectsEmptyPrinterSerial(monkeypatch):
+    monkeypatch.setattr(main, 'validPrinterApiKeys', {'control-key'})
+
+    fakeRequest.headers = {'X-API-Key': 'control-key'}
+    fakeRequest.args = {'recipientId': 'recipient-123', 'printerSerial': '   '}
+    fakeRequest.clear_json()
+    fakeRequest.method = 'GET'
 
     responseBody, statusCode = main.queuePrinterControlCommand()
 
