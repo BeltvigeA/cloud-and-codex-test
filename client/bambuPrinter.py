@@ -693,6 +693,99 @@ def startPrintViaMqtt(
 
 
 
+def _buildRemoteDeleteCandidates(remotePath: str) -> List[str]:
+    normalized = remotePath.strip().replace("\\", "/")
+    if not normalized:
+        return []
+    stripped = normalized.lstrip("/")
+    candidates: List[str] = []
+    seen: set[str] = set()
+
+    def addCandidate(value: str) -> None:
+        if not value:
+            return
+        if value not in seen:
+            candidates.append(value)
+            seen.add(value)
+
+    addCandidate(normalized)
+    addCandidate(stripped)
+    addCandidate(f"/{stripped}")
+    if not stripped.startswith("sdcard/"):
+        addCandidate(f"sdcard/{stripped}")
+        addCandidate(f"/sdcard/{stripped}")
+    return candidates
+
+
+def deleteRemoteFile(printer: Any, remotePath: str) -> bool:
+    """Attempt to delete a remote file from the printer."""
+
+    if not remotePath:
+        return False
+
+    def tryDelete(target: Any, path: str) -> bool:
+        if target is None:
+            return False
+        deleteMethod = getattr(target, "delete_file", None)
+        if not callable(deleteMethod):
+            return False
+        try:
+            deleteMethod(path)
+            return True
+        except Exception as deleteError:
+            message = str(deleteError).lower()
+            if "not found" in message or "no such" in message:
+                return False
+            raise
+
+    candidates = _buildRemoteDeleteCandidates(str(remotePath))
+    if not candidates:
+        return False
+
+    for candidate in candidates:
+        try:
+            if tryDelete(printer, candidate):
+                return True
+        except Exception:
+            logger.debug("delete_file failed for %s on printer", candidate, exc_info=True)
+
+    mqttClient = getattr(printer, "mqtt_client", None)
+    for candidate in candidates:
+        try:
+            if tryDelete(mqttClient, candidate):
+                return True
+        except Exception:
+            logger.debug("mqtt_client.delete_file failed for %s", candidate, exc_info=True)
+
+    if isinstance(printer, dict):
+        ipAddress = printer.get("ipAddress") or printer.get("ip")
+        accessCode = printer.get("accessCode") or printer.get("password")
+        serialNumber = printer.get("serialNumber") or printer.get("serial") or ipAddress
+        if not ipAddress or not accessCode:
+            logger.info("Skip delete: missing credentials for printer %s", printer)
+            return False
+        if bambulabsApi is None:
+            logger.info("Skip delete: bambulabs_api unavailable; cannot delete %s", remotePath)
+            return False
+        printerInstance = bambulabsApi.Printer(str(ipAddress), str(accessCode), str(serialNumber or ""))
+        connectMethod = getattr(printerInstance, "mqtt_start", None) or getattr(printerInstance, "connect", None)
+        try:
+            if callable(connectMethod):
+                connectMethod()
+        except Exception:
+            logger.info("Skip delete: unable to connect to printer %s", serialNumber, exc_info=True)
+            safeDisconnectPrinter(printerInstance)
+            return False
+        try:
+            result = deleteRemoteFile(printerInstance, remotePath)
+            return result
+        finally:
+            safeDisconnectPrinter(printerInstance)
+
+    logger.info("Skip delete: delete_file not supported for remote path %s", remotePath)
+    return False
+
+
 def postStatus(status: Dict[str, Any], printerConfig: Dict[str, Any]) -> None:
     """Send the latest printer status to the configured remote endpoint."""
 
@@ -1566,6 +1659,7 @@ __all__ = [
     "applySkippedObjectsToArchive",
     "pickGcodeParamFrom3mf",
     "postStatus",
+    "deleteRemoteFile",
     "sendBambuPrintJob",
     "sendPrintJobViaCloud",
     "startPrintViaApi",

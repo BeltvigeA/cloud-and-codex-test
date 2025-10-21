@@ -4,7 +4,7 @@ import logging
 import sys
 import zipfile
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict, List
 
 import pytest
 
@@ -169,6 +169,73 @@ def test_dispatchBambuPrintIncludesPrinterDetailsInErrors(
     errorEvents = [event for event in result["events"] if event.get("event") == "error"]
     assert errorEvents and errorEvents[0]["error"] == errorMessage
     assert any("Studio Printer" in record.message and "192.168.0.8" in record.message for record in caplog.records)
+
+
+def test_dispatchDeletesRemoteFileOnCompletion(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    samplePath = tmp_path / "sample.3mf"
+    createSampleThreeMf(samplePath)
+
+    entryData = {
+        "savedFile": str(samplePath),
+        "unencryptedData": {
+            "printer": {
+                "printerSerial": "SERIALDEL",
+                "ipAddress": "192.168.0.50",
+                "accessCode": "ACCESS",
+                "brand": "Bambu Lab",
+            }
+        },
+        "decryptedData": {},
+    }
+
+    statusPayload = {
+        "fileName": "sample.3mf",
+        "lastRequestedAt": "2024-01-01T00:00:00Z",
+        "requestedMode": "full",
+        "success": True,
+    }
+
+    configuredPrinters = [
+        {
+            "serialNumber": "SERIALDEL",
+            "ipAddress": "192.168.0.50",
+            "accessCode": "ACCESS",
+            "brand": "Bambu Lab",
+        }
+    ]
+
+    deletionCalls: List[tuple[Dict[str, str], str]] = []
+
+    def fakeDelete(credentials: Dict[str, str], remotePath: str) -> bool:
+        deletionCalls.append((dict(credentials), remotePath))
+        return True
+
+    def fakeSendBambuPrintJob(**kwargs: Any) -> Dict[str, Any]:
+        statusCallback = kwargs["statusCallback"]
+        statusCallback({"status": "uploaded", "remoteFile": "sdcard/sample.3mf"})
+        statusCallback({"status": "progress", "mc_percent": 50, "gcode_state": "printing"})
+        statusCallback({"status": "completed", "remoteFile": "sdcard/sample.3mf"})
+        return {"remoteFile": "sdcard/sample.3mf"}
+
+    monkeypatch.setattr(client, "sendBambuPrintJob", fakeSendBambuPrintJob)
+    monkeypatch.setattr(client, "postStatus", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(client, "deleteRemoteFile", fakeDelete)
+    patchRequestsPost(monkeypatch)
+
+    result = client.dispatchBambuPrintIfPossible(
+        baseUrl="https://example.com",
+        productId="product-del",
+        recipientId="recipient-del",
+        entryData=entryData,
+        statusPayload=statusPayload,
+        configuredPrinters=configuredPrinters,
+    )
+
+    assert result and result["success"] is True
+    assert deletionCalls
+    credentials, remotePath = deletionCalls[0]
+    assert remotePath == "sdcard/sample.3mf"
+    assert credentials["serialNumber"] == "SERIALDEL"
 
 
 def test_dispatchBambuPrintUsesBambulabsApiWhenConfigured(

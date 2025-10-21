@@ -239,6 +239,80 @@ def testProcessUnsupportedCommandReportsFailure(monkeypatch: pytest.MonkeyPatch)
     assert "Unsupported" in (resultCalls[0]["errorMessage"] or "")
 
 
+def testCollectAndReportBambuError(monkeypatch: pytest.MonkeyPatch) -> None:
+    worker = CommandWorker(
+        serial="SERIAL-ERR",
+        ipAddress="10.0.0.30",
+        accessCode="code",
+        apiKey="api-key",
+        recipientId="recipient-err",
+        baseUrl="https://example.com",
+    )
+
+    class DummyClient:
+        def print_error_code(self) -> str:
+            return "HMS_0102-0001"
+
+    class DummyPrinter:
+        def __init__(self) -> None:
+            self.mqtt_client = DummyClient()
+
+        def print_error_code(self) -> str:
+            return "HMS_0102-0001"
+
+    captured: Dict[str, Any] = {}
+
+    def fakeReport(payload: Dict[str, Any]) -> Dict[str, Any]:
+        captured.update(payload)
+        return payload
+
+    monkeypatch.setattr("client.command_controller.postReportError", fakeReport)
+
+    worker._lastStatus = {"mc_percent": 42, "gcode_state": "printing"}
+    worker._lastRawStatus = {"gcode_state": "printing"}
+
+    worker._collectAndReportBambuError(DummyPrinter(), {"event": {"source": "test"}})
+
+    assert captured["printerSerial"] == "SERIAL-ERR"
+    assert captured["errorCode"] == "HMS_0102-0001"
+    assert captured["gcodeState"] == "printing"
+
+
+def testHandlePrinterStatusTracksProgressAndCompletion(monkeypatch: pytest.MonkeyPatch) -> None:
+    worker = CommandWorker(
+        serial="SERIAL-PROG",
+        ipAddress="10.0.0.31",
+        accessCode="code",
+        apiKey="api-key",
+        recipientId="recipient-prog",
+        baseUrl="https://example.com",
+    )
+
+    deleted: List[str] = []
+
+    def fakeDelete(_printer: Any, remotePath: str) -> bool:
+        deleted.append(remotePath)
+        return True
+
+    monkeypatch.setattr("client.command_controller.bambuPrinter.deleteRemoteFile", fakeDelete)
+
+    statuses = [
+        {"mc_percent": 0, "gcode_state": "prepare"},
+        {"mc_percent": 12, "gcode_state": "printing"},
+        {"mc_percent": 47, "gcode_state": "printing"},
+        {"mc_percent": 100, "gcode_state": "finish", "remoteFile": "sdcard/test.3mf"},
+    ]
+
+    worker._printerInstance = object()
+
+    for payload in statuses:
+        worker._handlePrinterStatus(payload)
+
+    assert worker._copyLastStatus().get("mc_percent") == 100
+    assert worker._jobActive is False
+    assert deleted == ["sdcard/test.3mf"]
+
+
 def testRecipientModeProcessesEnqueuedCommands(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("CONTROL_POLL_MODE", "recipient")
 
