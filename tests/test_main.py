@@ -270,11 +270,23 @@ class MockTransaction:
         self.documentStore = documentStore
         self.updateRecorder = updateRecorder
         self.writes = []
+        self._active = False
+
+    def __enter__(self):
+        self._active = True
+        return self
+
+    def __exit__(self, excType, excValue, excTraceback):  # pylint: disable=unused-argument
+        self._active = False
 
     def get(self, documentReference):
+        if not self._active:
+            raise ValueError('Transaction has not started')
         return documentReference.get(transaction=self)
 
     def update(self, documentReference, payload):
+        if not self._active:
+            raise ValueError('Transaction has not started')
         documentReference.update(payload)
         self.writes.append((documentReference.docId, payload))
 
@@ -2474,6 +2486,126 @@ def testListPrinterControlCommandsReservesPendingCommands(monkeypatch):
     documentReference = MockDocument.instances[-1]
     assert documentReference.lastTransaction is not None
     assert isinstance(documentReference.lastSnapshot, MockDocumentSnapshot)
+
+
+def testListPendingPrinterCommandsUsesActiveTransaction(monkeypatch):
+    monkeypatch.setattr(main, 'validPrinterApiKeys', set())
+
+    fakeRequest.headers = {}
+    fakeRequest.args = {
+        'recipientId': 'recipient-123',
+        'printerSerial': 'SN-001',
+        'printerIpAddress': '192.168.1.50',
+        'printerId': 'printer-ABC',
+    }
+    fakeRequest.clear_json()
+    fakeRequest.method = 'GET'
+
+    commandMetadata = {
+        'commandId': 'cmd-transaction',
+        'status': 'pending',
+        'recipientId': 'recipient-123',
+    }
+
+    class RaisingCommandDocument:
+        def __init__(self, docId, metadata):
+            self.docId = docId
+            self.data = dict(metadata)
+            self.directUpdateCalls = []
+
+        def update(self, payload):
+            self.directUpdateCalls.append(payload)
+            raise AssertionError('Direct document updates should not occur when transaction succeeds')
+
+        def get(self, transaction=None):  # pylint: disable=unused-argument
+            raise ValueError('Transaction has not started')
+
+    class FakeTransaction:
+        def __init__(self, documentReference):
+            self.documentReference = documentReference
+            self.entered = False
+            self.updatePayloads = []
+            self.getCalls = 0
+
+        def __enter__(self):
+            self.entered = True
+            return self
+
+        def __exit__(self, excType, excValue, excTraceback):  # pylint: disable=unused-argument
+            self.entered = False
+
+        def get(self, documentReference):
+            if not self.entered:
+                raise ValueError('Transaction has not started')
+            assert documentReference is self.documentReference
+            self.getCalls += 1
+            return MockDocumentSnapshot(
+                documentReference.docId, dict(documentReference.data)
+            )
+
+        def update(self, documentReference, payload):
+            if not self.entered:
+                raise ValueError('Transaction has not started')
+            assert documentReference is self.documentReference
+            self.updatePayloads.append(payload)
+            documentReference.data.update(payload)
+
+    class FakeCollection:
+        def __init__(self, documentReference):
+            self.documentReference = documentReference
+
+        def where(self, *_args, **_kwargs):
+            return self
+
+        def stream(self):
+            return [MockDocumentSnapshot(self.documentReference.docId, dict(commandMetadata))]
+
+        def document(self, docId):
+            assert docId == self.documentReference.docId
+            return self.documentReference
+
+    commandDocument = RaisingCommandDocument('cmd-transaction', commandMetadata)
+    fakeCollection = FakeCollection(commandDocument)
+
+    class FakeFirestoreClient:
+        def __init__(self):
+            self.transactions = []
+
+        def collection(self, name):
+            assert name == main.firestoreCollectionPrinterCommands
+            return fakeCollection
+
+        def transaction(self):
+            transaction = FakeTransaction(commandDocument)
+            self.transactions.append(transaction)
+            return transaction
+
+    fakeFirestoreClient = FakeFirestoreClient()
+    fakeClients = SimpleNamespace(firestoreClient=fakeFirestoreClient)
+    monkeypatch.setattr(main, '_loadClientsOrError', lambda: (fakeClients, None))
+
+    responseBody, statusCode = main._listPendingPrinterControlCommands()
+
+    assert statusCode == 200
+    assert 'commands' in responseBody
+    assert len(responseBody['commands']) == 1
+    claimedCommand = responseBody['commands'][0]
+    assert claimedCommand['commandId'] == 'cmd-transaction'
+    assert claimedCommand['status'] == 'reserved'
+    assert claimedCommand['claimedByRecipient'] == 'recipient-123'
+    assert claimedCommand['claimedByPrinterSerial'] == 'SN-001'
+    assert claimedCommand['claimedByPrinterIpAddress'] == '192.168.1.50'
+    assert claimedCommand['claimedByPrinterId'] == 'printer-ABC'
+
+    assert fakeFirestoreClient.transactions, 'Expected a transaction to be created'
+    transaction = fakeFirestoreClient.transactions[0]
+    assert transaction.getCalls == 1
+    assert transaction.updatePayloads, 'Expected transaction update to be applied'
+    updatePayload = transaction.updatePayloads[0]
+    assert updatePayload['status'] == 'reserved'
+    assert updatePayload['claimedByRecipient'] == 'recipient-123'
+    assert commandDocument.directUpdateCalls == []
+    assert commandDocument.data['status'] == 'reserved'
 
 
 def testAcknowledgePrinterControlCommandUpdatesStatus(monkeypatch):

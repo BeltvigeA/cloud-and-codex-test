@@ -1821,12 +1821,6 @@ def _listPendingPrinterControlCommands():
             continue
 
         commandDocument = commandCollection.document(commandId)
-        try:
-            transaction = firestoreClient.transaction()
-        except Exception as error:  # pylint: disable=broad-except
-            logging.exception('Failed to start transaction when reserving command %s.', commandId)
-            transaction = None
-
         claimMetadata: Dict[str, object] = {
             'status': 'reserved',
             'claimedAt': firestore.SERVER_TIMESTAMP,
@@ -1841,31 +1835,35 @@ def _listPendingPrinterControlCommands():
 
         claimedCommand: Optional[Dict[str, object]] = None
 
-        if transaction is not None:
-            try:
-                snapshotCandidate = commandDocument.get(transaction=transaction)
-                if snapshotCandidate is None or not isinstance(snapshotCandidate, DocumentSnapshot):
+        try:
+            with firestoreClient.transaction() as transaction:
+                snapshotCandidate = transaction.get(commandDocument)
+                if snapshotCandidate is None or not isinstance(
+                    snapshotCandidate, DocumentSnapshot
+                ):
                     logging.warning(
                         'Skipping printer control command %s because transaction returned %s.',
                         commandId,
                         type(snapshotCandidate).__name__ if snapshotCandidate is not None else 'None',
                     )
-                    transaction.commit()
                     continue
+
                 currentData = snapshotCandidate.to_dict() or {}
                 if currentData.get('status') != 'pending':
-                    transaction.commit()
                     continue
+
                 transaction.update(commandDocument, claimMetadata)
-                transaction.commit()
                 claimedCommand = {**currentData, **claimMetadata}
-            except Exception as error:  # pylint: disable=broad-except
-                logging.exception(
-                    'Failed to reserve printer control command %s within transaction.', commandId
-                )
-                continue
-        else:
+        except Exception as error:  # pylint: disable=broad-except
+            logging.exception(
+                'Failed to reserve printer control command %s within transaction.', commandId
+            )
+
+        if claimedCommand is None:
             try:
+                if commandData.get('status') != 'pending':
+                    continue
+
                 commandDocument.update(claimMetadata)
                 claimedCommand = {**commandData, **claimMetadata}
             except Exception as error:  # pylint: disable=broad-except
