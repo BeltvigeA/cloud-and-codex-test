@@ -116,6 +116,8 @@ class CommandWorker:
         self.controlEndpointUrl = getPrinterControlEndpointUrl(self.controlBaseUrl)
         self.controlAckUrl = f"{self.controlBaseUrl}/control/ack"
         self.controlResultUrl = f"{self.controlBaseUrl}/control/result"
+        self.pollErrorCount = 0
+        self.pollLogEvery = 50
         self.pollIntervalSeconds = max(
             2.0,
             float(pollInterval) if pollInterval is not None else CONTROL_POLL_SECONDS,
@@ -144,8 +146,11 @@ class CommandWorker:
             while not self._stopEvent.is_set():
                 try:
                     commands = self._pollCommands()
+                    self.pollErrorCount = 0
                 except Exception as error:
-                    log.warning("Control poll failed for %s: %s", self.serial, error)
+                    self.pollErrorCount += 1
+                    if self.pollErrorCount == 1 or self.pollErrorCount % self.pollLogEvery == 0:
+                        log.warning("Control poll failed for %s: %s", self.serial, error)
                     commands = []
                 for command in commands:
                     self._processCommand(command)

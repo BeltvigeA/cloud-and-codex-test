@@ -5,12 +5,18 @@ from __future__ import annotations
 import importlib
 import logging
 import os
+import platform
+import shutil
+import subprocess
 import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 import requests
+
+# Reduce noise from third-party SDK logger
+logging.getLogger("bambulabs_api").setLevel(logging.WARNING)
 
 from .bambuPrinter import extractStateText, looksLikeAmsFilamentConflict, safeDisconnectPrinter
 from .base44_client import postReportError, postUpdateStatus
@@ -56,6 +62,9 @@ class BambuStatusSubscriber:
         self._threads: Dict[str, threading.Thread] = {}
         self._stops: Dict[str, threading.Event] = {}
         self._lock = threading.Lock()
+        self.errorCountBySerial: Dict[str, int] = {}
+        self.errorCountLock = threading.Lock()
+        self.logEvery = 50
         self.defaultRecipientId = os.getenv("BASE44_RECIPIENT_ID", "").strip()
 
     def startAll(self, printers: Iterable[Dict[str, Any]]) -> None:
@@ -79,6 +88,12 @@ class BambuStatusSubscriber:
             return
 
         self.defaultRecipientId = os.getenv("BASE44_RECIPIENT_ID", "").strip()
+
+        if not self._pingHost(ipAddress, 1000):
+            if self._shouldLogConnectionFailure(serial):
+                sanitizedMessage = f"Printer unreachable at {ipAddress}"
+                self.onError(sanitizedMessage, dict(printerConfig))
+            return
 
         with self._lock:
             if serial in self._stops:
@@ -109,6 +124,7 @@ class BambuStatusSubscriber:
             stopEvent.set()
         if workerThread and workerThread.is_alive():
             workerThread.join(timeout=self.heartbeatInterval)
+        self._resetConnectionFailures(serial)
 
     def stop_printer(self, serialNumber: str) -> None:
         self.stopPrinter(serialNumber)
@@ -147,6 +163,7 @@ class BambuStatusSubscriber:
             try:
                 printerInstance = _printerClass(ipAddress, accessCode, serial)
                 self._connectPrinter(printerInstance)
+                self._resetConnectionFailures(serial)
                 printerMetadata = self._fetchPrinterMetadata(printerInstance)
                 lastBase44Comparable: Optional[Dict[str, Any]] = None
                 lastBase44Emit = 0.0
@@ -228,11 +245,62 @@ class BambuStatusSubscriber:
                 if stopEvent.is_set():
                     break
                 sanitizedMessage = self._sanitizeErrorMessage(str(error), accessCode)
-                self.onError(sanitizedMessage, dict(printerConfig))
-                stopEvent.wait(self.reconnectDelay)
+                if self._shouldLogConnectionFailure(serial):
+                    self.onError(sanitizedMessage, dict(printerConfig))
+                stopEvent.wait(self.reconnectDelay * 2)
             finally:
                 if printerInstance is not None:
                     safeDisconnectPrinter(printerInstance)
+
+    def _shouldLogConnectionFailure(self, serial: str) -> bool:
+        key = serial or "unknown"
+        with self.errorCountLock:
+            failureCount = self.errorCountBySerial.get(key, 0) + 1
+            self.errorCountBySerial[key] = failureCount
+        return failureCount == 1 or failureCount % self.logEvery == 0
+
+    def _resetConnectionFailures(self, serial: str) -> None:
+        key = serial or "unknown"
+        with self.errorCountLock:
+            if key in self.errorCountBySerial:
+                self.errorCountBySerial.pop(key, None)
+
+    def _pingHost(self, ipAddress: str, timeoutMillis: int) -> bool:
+        if not ipAddress:
+            return False
+        pingExecutable = shutil.which("ping")
+        if not pingExecutable:
+            return True
+        systemName = platform.system().lower()
+        timeoutSeconds = max(1, int(max(timeoutMillis, 100) / 1000))
+        if "windows" in systemName:
+            command = [
+                pingExecutable,
+                "-n",
+                "1",
+                "-w",
+                str(max(timeoutMillis, 100)),
+                ipAddress,
+            ]
+        else:
+            command = [
+                pingExecutable,
+                "-c",
+                "1",
+                "-W",
+                str(timeoutSeconds),
+                ipAddress,
+            ]
+        try:
+            result = subprocess.run(
+                command,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            return result.returncode == 0
+        except Exception:
+            return True
 
     def _connectPrinter(self, printer: Any) -> None:
         connectMethod = getattr(printer, "mqtt_start", None) or getattr(printer, "connect", None)
