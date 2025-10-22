@@ -1944,13 +1944,75 @@ def _listPendingPrinterControlCommands():
     if sanitizedPrinterId is not None:
         baseQuery = baseQuery.where('printerId', '==', sanitizedPrinterId)
 
+    def normalizeTimestamp(rawValue):
+        if isinstance(rawValue, datetime):
+            return rawValue if rawValue.tzinfo else rawValue.replace(tzinfo=timezone.utc)
+        if hasattr(rawValue, 'to_datetime'):
+            try:
+                normalizedValue = rawValue.to_datetime()
+                if normalizedValue.tzinfo is None:
+                    normalizedValue = normalizedValue.replace(tzinfo=timezone.utc)
+                return normalizedValue
+            except Exception:  # pylint: disable=broad-except
+                return None
+        if isinstance(rawValue, str):
+            try:
+                parsedValue = datetime.fromisoformat(rawValue)
+                if parsedValue.tzinfo is None:
+                    parsedValue = parsedValue.replace(tzinfo=timezone.utc)
+                return parsedValue
+            except ValueError:
+                return None
+        return None
+
+    def fetchPendingSnapshotsWithoutCompositeIndex():
+        snapshotCandidates: List[Tuple[datetime, firestore.DocumentSnapshot]] = []
+        seenDocumentIds: Set[str] = set()
+
+        def appendSnapshots(snapshots: List[firestore.DocumentSnapshot]):
+            for snapshot in snapshots:
+                documentId = getattr(snapshot, 'id', None)
+                if documentId is None or documentId in seenDocumentIds:
+                    continue
+
+                commandData = snapshot.to_dict() or {}
+                statusValue = commandData.get('status')
+                if statusValue not in (None, 'queued'):
+                    continue
+
+                createdAtValue = commandData.get('createdAt')
+                normalizedCreatedAt = normalizeTimestamp(createdAtValue)
+                if normalizedCreatedAt is None:
+                    createdAtFallback = getattr(snapshot, 'create_time', None)
+                    normalizedCreatedAt = normalizeTimestamp(createdAtFallback)
+                if normalizedCreatedAt is None:
+                    normalizedCreatedAt = datetime.min.replace(tzinfo=timezone.utc)
+
+                snapshotCandidates.append((normalizedCreatedAt, snapshot))
+                seenDocumentIds.add(documentId)
+
+        def streamOrderedSnapshots(query: firestore.Query) -> List[firestore.DocumentSnapshot]:
+            return list(query.order_by('createdAt').limit(limitSize).stream())
+
+        for statusFilter in ('queued', None):
+            try:
+                statusSnapshots = streamOrderedSnapshots(baseQuery.where('status', '==', statusFilter))
+            except FailedPrecondition as error:
+                raise error
+            appendSnapshots(statusSnapshots)
+
+        if len(snapshotCandidates) < limitSize:
+            try:
+                additionalSnapshots = streamOrderedSnapshots(baseQuery)
+            except FailedPrecondition as error:
+                raise error
+            appendSnapshots(additionalSnapshots)
+
+        snapshotCandidates.sort(key=lambda item: (item[0], getattr(item[1], 'id', '')))
+        return [item[1] for item in snapshotCandidates[:limitSize]]
+
     try:
-        pendingQuery = (
-            baseQuery.where('status', 'in', [None, 'queued'])
-            .order_by('createdAt')
-            .limit(limitSize)
-        )
-        documents = list(pendingQuery.stream())
+        documents = fetchPendingSnapshotsWithoutCompositeIndex()
     except FailedPrecondition as error:
         logging.warning(
             'Falling back to application-side filtering for pending printer control '
@@ -1971,27 +2033,6 @@ def _listPendingPrinterControlCommands():
                 str(fallbackError),
             )
 
-        def normalizeTimestamp(rawValue):
-            if isinstance(rawValue, datetime):
-                return rawValue if rawValue.tzinfo else rawValue.replace(tzinfo=timezone.utc)
-            if hasattr(rawValue, 'to_datetime'):
-                try:
-                    normalizedValue = rawValue.to_datetime()
-                    if normalizedValue.tzinfo is None:
-                        normalizedValue = normalizedValue.replace(tzinfo=timezone.utc)
-                    return normalizedValue
-                except Exception:  # pylint: disable=broad-except
-                    return None
-            if isinstance(rawValue, str):
-                try:
-                    parsedValue = datetime.fromisoformat(rawValue)
-                    if parsedValue.tzinfo is None:
-                        parsedValue = parsedValue.replace(tzinfo=timezone.utc)
-                    return parsedValue
-                except ValueError:
-                    return None
-            return None
-
         pendingDocuments = []
         for snapshot in fallbackDocuments:
             commandData = snapshot.to_dict() or {}
@@ -2009,7 +2050,7 @@ def _listPendingPrinterControlCommands():
 
             pendingDocuments.append((normalizedCreatedAt, snapshot))
 
-        pendingDocuments.sort(key=lambda item: item[0])
+        pendingDocuments.sort(key=lambda item: (item[0], getattr(item[1], 'id', '')))
         documents = [item[1] for item in pendingDocuments[:limitSize]]
     except Exception as error:  # pylint: disable=broad-except
         logging.exception('Failed to fetch pending printer control commands.')
