@@ -1965,6 +1965,8 @@ def _listPendingPrinterControlCommands():
                 return None
         return None
 
+    fallbackFetchLimit = max(limitSize * 3, limitSize + 10)
+
     def fetchPendingSnapshotsWithoutCompositeIndex():
         snapshotCandidates: List[Tuple[datetime, firestore.DocumentSnapshot]] = []
         seenDocumentIds: Set[str] = set()
@@ -1991,19 +1993,19 @@ def _listPendingPrinterControlCommands():
                 snapshotCandidates.append((normalizedCreatedAt, snapshot))
                 seenDocumentIds.add(documentId)
 
-        def streamOrderedSnapshots(query: firestore.Query) -> List[firestore.DocumentSnapshot]:
-            return list(query.order_by('createdAt').limit(limitSize).stream())
-
+        fetchLimit = fallbackFetchLimit
         for statusFilter in ('queued', None):
             try:
-                statusSnapshots = streamOrderedSnapshots(baseQuery.where('status', '==', statusFilter))
+                statusSnapshots = list(
+                    baseQuery.where('status', '==', statusFilter).limit(fetchLimit).stream()
+                )
             except FailedPrecondition as error:
                 raise error
             appendSnapshots(statusSnapshots)
 
         if len(snapshotCandidates) < limitSize:
             try:
-                additionalSnapshots = streamOrderedSnapshots(baseQuery)
+                additionalSnapshots = list(baseQuery.limit(fetchLimit).stream())
             except FailedPrecondition as error:
                 raise error
             appendSnapshots(additionalSnapshots)
@@ -2019,8 +2021,6 @@ def _listPendingPrinterControlCommands():
             'commands because the Firestore composite index is missing.',
             exc_info=error,
         )
-
-        fallbackFetchLimit = max(limitSize * 3, limitSize + 10)
 
         try:
             fallbackDocuments = list(baseQuery.limit(fallbackFetchLimit).stream())
