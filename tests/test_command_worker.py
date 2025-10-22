@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import sys
 import time
@@ -192,6 +193,80 @@ def testProcessHeatCommandAcknowledgesAndReports(monkeypatch: pytest.MonkeyPatch
     assert finalized == [("heat-1", "completed")]
     assert resultCalls[0]["status"] == "completed"
     assert "Heating" in (resultCalls[0]["message"] or "")
+
+
+def testCameraOnFallsBackToMqttClient(monkeypatch: pytest.MonkeyPatch) -> None:
+    worker = CommandWorker(
+        serial="SERIAL777",
+        ipAddress="10.0.0.77",
+        accessCode="code",
+        apiKey="api-key",
+        recipientId="recipient-3",
+        baseUrl="https://example.com",
+    )
+
+    monkeypatch.setattr("client.command_controller._reserveCommand", lambda commandId: True)
+    finalizeCalls: List[tuple[str, str]] = []
+    monkeypatch.setattr(
+        "client.command_controller._finalizeCommand",
+        lambda commandId, status: finalizeCalls.append((commandId, status)),
+    )
+
+    ackCalls: List[tuple[str, str]] = []
+    resultCalls: List[Dict[str, Any]] = []
+
+    def fakeAck(self: CommandWorker, commandId: str, status: str) -> bool:
+        ackCalls.append((commandId, status))
+        return True
+
+    def fakeResult(
+        self: CommandWorker,
+        commandId: str,
+        status: str,
+        *,
+        message: Optional[str] = None,
+        errorMessage: Optional[str] = None,
+    ) -> None:
+        resultCalls.append(
+            {
+                "commandId": commandId,
+                "status": status,
+                "message": message,
+                "errorMessage": errorMessage,
+            }
+        )
+
+    monkeypatch.setattr(CommandWorker, "_sendCommandAck", fakeAck)
+    monkeypatch.setattr(CommandWorker, "_sendCommandResult", fakeResult)
+
+    class FakeMqttClient:
+        def __init__(self) -> None:
+            self.publishCalls: List[tuple[str, bytes, int]] = []
+
+        def publish(self, topic: str, payload: bytes, qos: int = 0) -> None:
+            self.publishCalls.append((topic, payload, qos))
+
+    class FakePrinter:
+        def __init__(self) -> None:
+            self.mqtt_client = FakeMqttClient()
+
+    fakePrinter = FakePrinter()
+    monkeypatch.setattr(CommandWorker, "_connectPrinter", lambda self: fakePrinter)
+
+    worker._processCommand(
+        {
+            "commandId": "camera-1",
+            "commandType": "camera_on",
+        }
+    )
+
+    assert ackCalls == [("camera-1", "processing")]
+    assert finalizeCalls == [("camera-1", "completed")]
+    assert resultCalls[0]["status"] == "completed"
+    publishTopic, publishPayload, publishQos = fakePrinter.mqtt_client.publishCalls[0]
+    assert publishTopic == "device/SERIAL777/request"
+    assert publishQos == 1
+    assert json.loads(publishPayload.decode("utf-8")) == {"command": "camera", "param": {"on": True}}
 
 
 def testProcessUnsupportedCommandReportsFailure(monkeypatch: pytest.MonkeyPatch) -> None:
