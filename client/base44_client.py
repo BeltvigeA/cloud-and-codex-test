@@ -144,12 +144,23 @@ def acknowledgeCommand(commandId: str) -> None:
     log.debug("ACK sent for %s", commandId)
 
 
-def postCommandResult(commandId: str, success: bool, message: Optional[str] = None) -> None:
+def postCommandResult(
+    commandId: str,
+    status: str,
+    message: Optional[str] = None,
+    errorMessage: Optional[str] = None,
+) -> None:
     baseUrl = _resolveControlBaseUrl()
     url = f"{baseUrl}/control/result"
-    body: Dict[str, Any] = {"commandId": commandId, "success": bool(success)}
-    if message:
-        body["message"] = message
+    body: Dict[str, Any] = {"commandId": commandId, "status": str(status or "").strip() or "completed"}
+    if message is not None:
+        messageValue = str(message).strip()
+        if messageValue:
+            body["message"] = messageValue
+    if errorMessage is not None:
+        errorValue = str(errorMessage).strip()
+        if errorValue:
+            body["errorMessage"] = errorValue
     response = requests.post(
         url,
         json=body,
@@ -157,7 +168,7 @@ def postCommandResult(commandId: str, success: bool, message: Optional[str] = No
         timeout=10,
     )
     response.raise_for_status()
-    log.debug("RESULT sent for %s (success=%s)", commandId, success)
+    log.debug("RESULT sent for %s (status=%s)", commandId, body["status"])
 _pendingCommandLogLock = threading.Lock()
 _pendingCommandLogCounters: Dict[str, int] = {}
 

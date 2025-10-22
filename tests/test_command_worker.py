@@ -372,10 +372,15 @@ def testNormalizeCommandMetadataParsesJson() -> None:
 def testRecipientModeResultMapsSuccessStatuses(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("CONTROL_POLL_MODE", "recipient")
 
-    captured: List[tuple[str, bool, Optional[str]]] = []
+    captured: List[tuple[str, str, Optional[str], Optional[str]]] = []
 
-    def fakePostResult(commandId: str, success: bool, message: Optional[str] = None) -> None:
-        captured.append((commandId, success, message))
+    def fakePostResult(
+        commandId: str,
+        status: str,
+        message: Optional[str] = None,
+        errorMessage: Optional[str] = None,
+    ) -> None:
+        captured.append((commandId, status, message, errorMessage))
 
     monkeypatch.setattr("client.command_controller.postCommandResult", fakePostResult)
 
@@ -391,11 +396,14 @@ def testRecipientModeResultMapsSuccessStatuses(monkeypatch: pytest.MonkeyPatch) 
     for status in ["completed", "success", "ok", "done", "failed"]:
         worker._sendCommandResult(f"cmd-{status}", status, message="details")
 
+    worker._sendCommandResult("cmd-error", "error", errorMessage="boom")
+
     assert captured[:4] == [
-        ("cmd-completed", True, "details"),
-        ("cmd-success", True, "details"),
-        ("cmd-ok", True, "details"),
-        ("cmd-done", True, "details"),
+        ("cmd-completed", "completed", "details", None),
+        ("cmd-success", "completed", "details", None),
+        ("cmd-ok", "completed", "details", None),
+        ("cmd-done", "completed", "details", None),
     ]
-    assert captured[4] == ("cmd-failed", False, "details")
+    assert captured[4] == ("cmd-failed", "failed", "details", None)
+    assert captured[5] == ("cmd-error", "failed", None, "boom")
 

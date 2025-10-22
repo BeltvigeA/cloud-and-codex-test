@@ -591,11 +591,24 @@ class CommandWorker:
         errorMessage: Optional[str] = None,
     ) -> None:
         if self.pollMode == "recipient":
-            statusValue = str(status or "").lower()
+            normalizedStatus = str(status or "").strip()
+            normalizedLower = normalizedStatus.lower()
             successStatusSet = {"completed", "success", "ok", "done"}
-            success = statusValue in successStatusSet
-            detail = str(message or errorMessage or "") or None
-            postCommandResult(commandId, success, detail)
+            failureStatusSet = {"failed", "error", "errored", "ko"}
+            if not normalizedLower:
+                normalizedLower = "completed" if not errorMessage else "failed"
+            elif normalizedLower in successStatusSet:
+                normalizedLower = "completed"
+            elif normalizedLower in failureStatusSet:
+                normalizedLower = "failed"
+            messageValue = str(message) if message is not None else None
+            errorValue = str(errorMessage) if errorMessage is not None else None
+            postCommandResult(
+                commandId,
+                normalizedLower,
+                message=messageValue,
+                errorMessage=errorValue,
+            )
             return
         if not self.apiKeyValue or not self.recipientIdValue:
             raise RuntimeError("Missing API key or recipientId for CommandWorker")

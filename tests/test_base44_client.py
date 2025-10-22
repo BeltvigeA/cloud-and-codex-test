@@ -56,14 +56,14 @@ def test_control_requests_use_control_api_key(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setenv("BASE44_API_KEY", "legacy-key")
 
     get_calls: List[Tuple[str, Dict[str, str], Dict[str, Any] | None]] = []
-    post_calls: List[Tuple[str, Dict[str, str]]] = []
+    post_calls: List[Tuple[str, Dict[str, str], Dict[str, Any] | None]] = []
 
     def fake_get(url: str, headers: Dict[str, str] | None = None, params: Dict[str, Any] | None = None, timeout: float = 0.0) -> _DummyResponse:
         get_calls.append((url, dict(headers or {}), dict(params or {})))
         return _DummyResponse({"commands": []})
 
     def fake_post(url: str, json: Dict[str, Any] | None = None, headers: Dict[str, str] | None = None, timeout: float = 0.0) -> _DummyResponse:
-        post_calls.append((url, dict(headers or {})))
+        post_calls.append((url, dict(headers or {}), dict(json or {})))
         return _DummyResponse({})
 
     monkeypatch.setattr(base44_client.requests, "get", fake_get)
@@ -73,13 +73,14 @@ def test_control_requests_use_control_api_key(monkeypatch: pytest.MonkeyPatch) -
     assert commands == []
 
     base44_client.acknowledgeCommand("cmd-1")
-    base44_client.postCommandResult("cmd-1", success=True, message="ok")
+    base44_client.postCommandResult("cmd-1", status="completed", message="ok")
 
     assert get_calls and get_calls[0][1].get("X-API-Key") == "control-key"
     assert get_calls[0][0] == "https://printer-backend-934564650450.europe-west1.run.app/control"
     assert get_calls[0][2] == {"recipientId": "recipient-123"}
     assert len(post_calls) == 2
-    assert all(headers.get("X-API-Key") == "control-key" for _url, headers in post_calls)
+    assert all(headers.get("X-API-Key") == "control-key" for _url, headers, _payload in post_calls)
+    assert post_calls[1][2] == {"commandId": "cmd-1", "status": "completed", "message": "ok"}
 
 
 def test_control_headers_fallback_to_legacy_key(monkeypatch: pytest.MonkeyPatch) -> None:
