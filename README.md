@@ -100,7 +100,7 @@ For at Firestore skal støtte kombinasjonen `recipientId == ?` + `status == 'pen
 }
 ```
 
-Deploy indeksen med `firebase deploy --only firestore:indexes`, kjør `./scripts/deployFirestoreIndexes.sh` (krever at `GCP_PROJECT` er satt), eller last opp JSON-konfigurasjonen direkte via Firestore Console.
+Deploy indeksen med `firebase deploy --only firestore:indexes`, eller last opp JSON-konfigurasjonen direkte via Firestore Console.
 
 LAN-klientens oppførsel
 -----------------------
