@@ -1081,8 +1081,10 @@ class CommandWorker:
             log.debug("Error while reporting Bambu failure for %s", self.serial, exc_info=True)
 
     def _executeCommand(self, printer: Any, command: Dict[str, Any]) -> Tuple[str, str]:
-        commandType = str(command.get("commandType") or "").strip().lower()
-        metadata = command.get("metadata") or {}
+        rawCommandType = str(command.get("commandType") or "").strip()
+        commandType = rawCommandType.lower()
+        metadataValue = command.get("metadata")
+        metadata = metadataValue if isinstance(metadataValue, dict) else {}
         message = ""
 
         def callPrinterMethod(name: str, *args: Any, **kwargs: Any) -> None:
@@ -1131,7 +1133,8 @@ class CommandWorker:
                 return
             raise RuntimeError("No available transport to publish control payload")
 
-        normalizedType = commandType.replace("-", "_")
+        camelCaseConverted = re.sub(r"(?<!^)(?=[A-Z])", "_", rawCommandType)
+        normalizedType = camelCaseConverted.replace("-", "_").lower()
 
         if normalizedType in {"heat", "setheat"}:
             nozzleTemp = metadata.get("nozzleTemp")
@@ -1178,18 +1181,31 @@ class CommandWorker:
                 "cancel": "Cancelled",
             }
             message = statusMessages.get(normalizedType, normalizedType.replace("_", " ").title())
-        elif normalizedType == "camera_on":
+        elif normalizedType in {"camera", "camera_on", "camera_off"}:
+            desiredState: Optional[bool]
+            if normalizedType == "camera_on":
+                desiredState = True
+            elif normalizedType == "camera_off":
+                desiredState = False
+            else:
+                stateValue = metadata.get("cameraState")
+                desiredState = None
+                if isinstance(stateValue, bool):
+                    desiredState = stateValue
+                elif isinstance(stateValue, str):
+                    normalizedState = stateValue.strip().lower()
+                    if normalizedState == "on":
+                        desiredState = True
+                    elif normalizedState == "off":
+                        desiredState = False
+                if desiredState is None:
+                    raise ValueError("camera requires metadata.cameraState to be 'on'/'off' or boolean")
             try:
-                callPrinterMethod("camera_on")
+                methodName = "camera_on" if desiredState else "camera_off"
+                callPrinterMethod(methodName)
             except RuntimeError:
-                sendControlPayload({"command": "camera", "param": {"on": True}})
-            message = "Camera enabled"
-        elif normalizedType == "camera_off":
-            try:
-                callPrinterMethod("camera_off")
-            except RuntimeError:
-                sendControlPayload({"command": "camera", "param": {"on": False}})
-            message = "Camera disabled"
+                sendControlPayload({"command": "camera", "param": {"on": desiredState}})
+            message = "Camera enabled" if desiredState else "Camera disabled"
         elif normalizedType in {"set_speed", "speed", "setspeed"}:
             percentValue = metadata.get("percent") or metadata.get("speedPercent")
             if percentValue is None:
@@ -1282,7 +1298,7 @@ class CommandWorker:
                 sendControlPayload({"command": commandName, "param": {"slot": slotValue}})
                 message = ("Load" if commandName == "load_filament" else "Unload") + f" filament slot {slotValue}"
         else:
-            raise ValueError(f"Unsupported commandType: {commandType}")
+            raise ValueError(f"Unsupported commandType: {rawCommandType}")
 
         return "completed", message
 
