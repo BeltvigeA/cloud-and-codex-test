@@ -79,6 +79,18 @@ def logEvent(event: str, level: str = 'INFO', **fields) -> None:
     logMethod(serialized)
 
 
+def extractFirestoreIndexUrl(errorMessage: str) -> Optional[str]:
+    if not errorMessage:
+        return None
+
+    match = re.search(r'https://[^\s\"]+', errorMessage)
+    if not match:
+        return None
+
+    url = match.group(0).rstrip('.,)')
+    return url or None
+
+
 def makeJsonResponse(payload: dict, statusCode: int = 200):
     response = jsonify(payload)
     if hasattr(response, 'headers'):
