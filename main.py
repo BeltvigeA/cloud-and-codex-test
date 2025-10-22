@@ -9,12 +9,33 @@ from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Set, Tuple
 
 from flask import Flask, jsonify, request
-from google.api_core.exceptions import (
-    Forbidden,
-    GoogleAPICallError,
-    PermissionDenied,
-    Unauthorized,
-)
+try:  # pragma: no cover - optional dependency handling
+    from google.api_core.exceptions import (
+        FailedPrecondition,
+        Forbidden,
+        GoogleAPICallError,
+        PermissionDenied,
+        Unauthorized,
+    )
+except ImportError:  # pragma: no cover - fallback when google-api-core is unavailable in tests
+    class FailedPrecondition(Exception):
+        """Fallback placeholder when google.api_core.exceptions is unavailable."""
+
+
+    class Forbidden(Exception):  # type: ignore[no-redef]
+        """Fallback placeholder when google.api_core.exceptions is unavailable."""
+
+
+    class GoogleAPICallError(Exception):  # type: ignore[no-redef]
+        """Fallback placeholder when google.api_core.exceptions is unavailable."""
+
+
+    class PermissionDenied(Exception):  # type: ignore[no-redef]
+        """Fallback placeholder when google.api_core.exceptions is unavailable."""
+
+
+    class Unauthorized(Exception):  # type: ignore[no-redef]
+        """Fallback placeholder when google.api_core.exceptions is unavailable."""
 try:  # pragma: no cover - optional dependency handling
     from google.auth import default as googleAuthDefault
 except (ImportError, AttributeError):  # pragma: no cover - fallback when google-auth is unavailable in tests
@@ -56,6 +77,18 @@ def logEvent(event: str, level: str = 'INFO', **fields) -> None:
     serialized = json.dumps(record, ensure_ascii=False)
     logMethod = getattr(logging, level.lower(), logging.info)
     logMethod(serialized)
+
+
+def extractFirestoreIndexUrl(errorMessage: str) -> Optional[str]:
+    if not errorMessage:
+        return None
+
+    match = re.search(r'https://[^\s\"]+', errorMessage)
+    if not match:
+        return None
+
+    url = match.group(0).rstrip('.,)')
+    return url or None
 
 
 def makeJsonResponse(payload: dict, statusCode: int = 200):
@@ -1902,12 +1935,7 @@ def _listPendingPrinterControlCommands():
         limitSize,
     )
 
-    baseQuery = (
-        commandCollection.where('recipientId', '==', sanitizedRecipientId)
-        .where('status', 'in', [None, 'queued'])
-        .order_by('createdAt')
-        .limit(limitSize)
-    )
+    baseQuery = commandCollection.where('recipientId', '==', sanitizedRecipientId)
 
     if sanitizedPrinterSerial is not None:
         baseQuery = baseQuery.where('printerSerial', '==', sanitizedPrinterSerial)
@@ -1917,7 +1945,32 @@ def _listPendingPrinterControlCommands():
         baseQuery = baseQuery.where('printerId', '==', sanitizedPrinterId)
 
     try:
-        documents = list(baseQuery.stream())
+        pendingQuery = (
+            baseQuery.where('status', 'in', [None, 'queued'])
+            .order_by('createdAt')
+            .limit(limitSize)
+        )
+        documents = list(pendingQuery.stream())
+    except FailedPrecondition as error:
+        logging.error(
+            'Missing Firestore composite index for pending printer control command query.',
+            exc_info=error,
+        )
+
+        indexHintUrl = extractFirestoreIndexUrl(str(error))
+        detailMessage = (
+            'The Firestore composite index required for listing pending printer commands '
+            'is missing.'
+        )
+        if indexHintUrl:
+            detailMessage = f"{detailMessage} Create the index at {indexHintUrl}."
+
+        return makeErrorResponse(
+            503,
+            'FirestoreIndexMissing',
+            detailMessage,
+            str(error),
+        )
     except Exception as error:  # pylint: disable=broad-except
         logging.exception('Failed to fetch pending printer control commands.')
         return makeErrorResponse(
