@@ -2169,7 +2169,13 @@ def _listPendingPrinterControlCommands():
 
         responsePayload['commandId'] = commandId
 
-        claimedCommands.append(_to_jsonable(responsePayload))
+        jsonablePayload = _to_jsonable(responsePayload)
+        claimedCommands.append(jsonablePayload)
+        logging.info(
+            'Claimed printer control command %s with payload=%s',
+            commandId,
+            json.dumps(jsonablePayload, ensure_ascii=False),
+        )
         logging.debug('Claimed printer control command %s.', commandId)
 
     logging.info(
