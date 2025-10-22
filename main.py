@@ -135,7 +135,7 @@ allowedUploadMimeTypes = {
     'text/plain',
     'model/3mf',
 }
-readyToClaimStatuses: Set[str] = {'uploaded', 'queued'}
+readyToClaimStatuses: Set[str] = {'uploaded', 'queued', 'pending'}
 
 
 firestoreCollectionFiles = os.environ.get('FIRESTORE_COLLECTION_FILES', 'files')
@@ -1874,7 +1874,7 @@ def _claimPrinterCommand(transaction, documentReference, recipientId, claimUpdat
     if commandData.get('recipientId') != recipientId:
         return False, None
 
-    if commandData.get('status') not in (None, 'queued'):
+    if commandData.get('status') not in (None, 'queued', 'pending'):
         return False, None
 
     expirationTime = _parseExpirationTimestampValue(commandData.get('expiresAt'))
@@ -2005,7 +2005,7 @@ def _listPendingPrinterControlCommands():
 
                 commandData = snapshot.to_dict() or {}
                 statusValue = commandData.get('status')
-                if statusValue not in (None, 'queued'):
+                if statusValue not in (None, 'queued', 'pending'):
                     continue
 
                 createdAtValue = commandData.get('createdAt')
@@ -2020,7 +2020,7 @@ def _listPendingPrinterControlCommands():
                 seenDocumentIds.add(documentId)
 
         fetchLimit = fallbackFetchLimit
-        for statusFilter in ('queued', None):
+        for statusFilter in ('queued', 'pending', None):
             try:
                 statusSnapshots = list(
                     baseQuery.where(
@@ -2065,7 +2065,7 @@ def _listPendingPrinterControlCommands():
         for snapshot in fallbackDocuments:
             commandData = snapshot.to_dict() or {}
             statusValue = commandData.get('status')
-            if statusValue not in (None, 'queued'):
+            if statusValue not in (None, 'queued', 'pending'):
                 continue
 
             createdAtValue = commandData.get('createdAt')
