@@ -1118,11 +1118,16 @@ class CommandWorker:
             if callable(sendRequest):
                 sendRequest(payload)
                 return
-            mqttClient = getattr(printer, "_mqtt_client", None)
-            if mqttClient is not None:
+            for clientAttr in ("_mqtt_client", "mqtt_client"):
+                mqttClient = getattr(printer, clientAttr, None)
+                if mqttClient is None:
+                    continue
+                publishMethod = getattr(mqttClient, "publish", None)
+                if not callable(publishMethod):
+                    continue
                 topic = f"device/{self.serial}/request"
                 body = json.dumps(payload).encode("utf-8")
-                mqttClient.publish(topic, body, qos=1)
+                publishMethod(topic, body, qos=1)
                 return
             raise RuntimeError("No available transport to publish control payload")
 
