@@ -498,20 +498,11 @@ class CommandWorker:
         except Exception:
             log.debug("Unable to submit result for %s", commandId, exc_info=True)
         _finalizeCommand(commandId, status)
-        statusValue = str(status)
-        messageValue = str(message).strip() if message is not None else ""
-        statusLine = f"{statusValue} – {messageValue}" if messageValue else statusValue
         progressSuffix = self._buildProgressSuffix()
         if progressSuffix:
-            log.info(
-                "Command %s on %s: %s (%s)",
-                commandId,
-                self.serial,
-                statusLine,
-                progressSuffix,
-            )
+            log.info("Command %s on %s: %s (%s)", commandId, self.serial, status, progressSuffix)
         else:
-            log.info("Command %s on %s: %s", commandId, self.serial, statusLine)
+            log.info("Command %s on %s: %s", commandId, self.serial, status)
 
     def enqueueCommand(self, command: Dict[str, Any]) -> None:
         if self.pollMode != "recipient":
