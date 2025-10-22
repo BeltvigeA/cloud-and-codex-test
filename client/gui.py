@@ -22,6 +22,16 @@ from tkinter import filedialog, messagebox, ttk
 import requests
 
 
+hardcodedBaseUrl = "https://printer-backend-934564650450.europe-west1.run.app"
+hardcodedRecipientId = "91827364556473829182736455647382"
+hardcodedApiKey = (
+    "V9JDvmqG9SB40JpmNu1HwM8ZbvplTrf7ddjudAe6yvjg7hbENEgA429N6xuio4CWQ7nv30fk0c2V8WiOemNWuP2PCKa9dbp7Aoww5lfQPdQu1FGuNKgUZ4wmA23sFCQ7lpxRq9cgZdIWMmwY2EpeYCR13UMgUzDqE8Su6GDPXuXHuPcMKxZnrI9vKNFjtxtCymw1Q8Wr"
+)
+hardcodedOutputDirectory = str(Path.home() / ".printmaster" / "files")
+hardcodedJsonLogFile = str(Path.home() / ".printmaster" / "listener-log.json")
+hardcodedPollIntervalSeconds = 30
+
+
 def addPrinterIdentityToPayload(
     payload: Dict[str, Any], printerSerial: Optional[str], accessCode: Optional[str]
 ) -> Dict[str, Any]:
@@ -131,9 +141,9 @@ class ListenerGuiApp:
         self.statusRefreshIntervalMs = 60_000
         self.pendingImmediateStatusRefresh = False
 
-        self.listenerRecipientId = ""
-        self.listenerStatusApiKey = ""
-        self.listenerControlApiKey = ""
+        self.listenerRecipientId = hardcodedRecipientId
+        self.listenerStatusApiKey = hardcodedApiKey
+        self.listenerControlApiKey = hardcodedApiKey
         self._managedEnvKeys: set[str] = set()
 
         self.activePrinterDialog: Optional[Dict[str, Any]] = None
@@ -171,81 +181,101 @@ class ListenerGuiApp:
         self._buildPrintersTab(printersFrame)
 
     def _buildListenerTab(self, parent: ttk.Frame, paddingOptions: Dict[str, int]) -> None:
-        ttk.Label(parent, text="Base URL:").grid(row=0, column=0, sticky=tk.W, **paddingOptions)
-        self.baseUrlVar = tk.StringVar(value=defaultBaseUrl)
-        ttk.Entry(parent, textvariable=self.baseUrlVar, width=50).grid(
-            row=0, column=1, sticky=tk.EW, **paddingOptions
-        )
+        self.baseUrlVar = tk.StringVar(value=hardcodedBaseUrl)
+        self.recipientVar = tk.StringVar(value=hardcodedRecipientId)
+        self.statusApiKeyVar = tk.StringVar(value=hardcodedApiKey)
+        self.controlApiKeyVar = tk.StringVar(value=hardcodedApiKey)
+        self.outputDirVar = tk.StringVar(value=hardcodedOutputDirectory)
+        self.logFileVar = tk.StringVar(value=hardcodedJsonLogFile)
+        self.pollIntervalVar = tk.IntVar(value=hardcodedPollIntervalSeconds)
+        self.liveStatusEnabledVar.set(True)
 
-        ttk.Label(parent, text="Channel (Recipient ID):").grid(
-            row=1, column=0, sticky=tk.W, **paddingOptions
-        )
-        self.recipientVar = tk.StringVar()
         self.recipientVar.trace_add("write", lambda *_: self._updateListenerRecipient())
-        ttk.Entry(parent, textvariable=self.recipientVar, width=30).grid(
-            row=1, column=1, sticky=tk.EW, **paddingOptions
-        )
-        self._updateListenerRecipient()
-
-        ttk.Label(parent, text="Status API Key:").grid(row=2, column=0, sticky=tk.W, **paddingOptions)
-        self.statusApiKeyVar = tk.StringVar()
         self.statusApiKeyVar.trace_add("write", lambda *_: self._updateListenerStatusApiKey())
-        ttk.Entry(parent, textvariable=self.statusApiKeyVar, width=30, show="*").grid(
-            row=2, column=1, sticky=tk.EW, **paddingOptions
-        )
-        self._updateListenerStatusApiKey()
-
-        ttk.Label(parent, text="Control API Key:").grid(row=3, column=0, sticky=tk.W, **paddingOptions)
-        self.controlApiKeyVar = tk.StringVar()
         self.controlApiKeyVar.trace_add("write", lambda *_: self._updateListenerControlApiKey())
-        ttk.Entry(parent, textvariable=self.controlApiKeyVar, width=30, show="*").grid(
-            row=3, column=1, sticky=tk.EW, **paddingOptions
+
+        currentRow = 0
+        ttk.Label(parent, text="Channel (Recipient ID):").grid(
+            row=currentRow, column=0, sticky=tk.W, **paddingOptions
         )
-        self._updateListenerControlApiKey()
-
-        ttk.Label(parent, text="Output Directory:").grid(row=4, column=0, sticky=tk.W, **paddingOptions)
-        self.outputDirVar = tk.StringVar(value=str(defaultFilesDirectory))
-        outputDirFrame = ttk.Frame(parent)
-        outputDirFrame.grid(row=4, column=1, sticky=tk.EW, **paddingOptions)
-        outputDirEntry = ttk.Entry(outputDirFrame, textvariable=self.outputDirVar, width=40)
-        outputDirEntry.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        ttk.Button(outputDirFrame, text="Browse", command=self._chooseOutputDir).pack(side=tk.LEFT, padx=4)
-
-        ttk.Label(parent, text="JSON Log File:").grid(row=5, column=0, sticky=tk.W, **paddingOptions)
-        self.logFileVar = tk.StringVar(
-            value=str(Path.home() / ".printmaster" / "listener-log.json")
+        recipientFrame = ttk.Frame(parent)
+        recipientFrame.grid(row=currentRow, column=1, sticky=tk.EW, **paddingOptions)
+        self.recipientEntry = ttk.Entry(
+            recipientFrame,
+            textvariable=self.recipientVar,
+            width=40,
+            show="•",
+            state="readonly",
         )
-        logFileFrame = ttk.Frame(parent)
-        logFileFrame.grid(row=5, column=1, sticky=tk.EW, **paddingOptions)
-        logFileEntry = ttk.Entry(logFileFrame, textvariable=self.logFileVar, width=40)
-        logFileEntry.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        ttk.Button(logFileFrame, text="Browse", command=self._chooseLogFile).pack(side=tk.LEFT, padx=4)
+        self.recipientEntry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.recipientVisibleVar = tk.BooleanVar(value=False)
 
-        ttk.Label(parent, text="Poll Interval (seconds):").grid(row=6, column=0, sticky=tk.W, **paddingOptions)
-        self.pollIntervalVar = tk.IntVar(value=30)
-        ttk.Spinbox(parent, from_=5, to=3600, textvariable=self.pollIntervalVar).grid(
-            row=6, column=1, sticky=tk.W, **paddingOptions
+        def toggleRecipientVisibility() -> None:
+            self.recipientVisibleVar.set(not self.recipientVisibleVar.get())
+            self.refreshRecipientVisibility()
+
+        self.recipientToggleButton = ttk.Button(
+            recipientFrame, text="Show", command=toggleRecipientVisibility
+        )
+        self.recipientToggleButton.pack(side=tk.LEFT, padx=4)
+        ttk.Button(recipientFrame, text="Copy", command=self.copyRecipientIdToClipboard).pack(
+            side=tk.LEFT
         )
 
+        currentRow += 1
+        ttk.Label(
+            parent,
+            text="Connection settings are preconfigured for this installation.",
+        ).grid(row=currentRow, column=0, columnspan=2, sticky=tk.W, **paddingOptions)
+
+        currentRow += 1
         buttonFrame = ttk.Frame(parent)
-        buttonFrame.grid(row=7, column=0, columnspan=2, pady=12)
+        buttonFrame.grid(row=currentRow, column=0, columnspan=2, pady=12)
         self.startButton = ttk.Button(buttonFrame, text="Start Listening", command=self.startListening)
         self.startButton.pack(side=tk.LEFT, padx=6)
         self.stopButton = ttk.Button(buttonFrame, text="Stop", command=self.stopListening, state=tk.DISABLED)
         self.stopButton.pack(side=tk.LEFT, padx=6)
-        ttk.Checkbutton(
-            buttonFrame,
-            text="Subscribe live status",
-            variable=self.liveStatusEnabledVar,
-            command=self._handleLiveStatusToggle,
-        ).pack(side=tk.LEFT, padx=6)
 
-        ttk.Label(parent, text="Event Log:").grid(row=8, column=0, sticky=tk.W, **paddingOptions)
+        currentRow += 1
+        ttk.Label(parent, text="Event Log:").grid(row=currentRow, column=0, sticky=tk.W, **paddingOptions)
         self.logText = tk.Text(parent, height=10, state=tk.DISABLED)
-        self.logText.grid(row=8, column=1, sticky=tk.NSEW, **paddingOptions)
+        self.logText.grid(row=currentRow, column=1, sticky=tk.NSEW, **paddingOptions)
 
         parent.columnconfigure(1, weight=1)
-        parent.rowconfigure(8, weight=1)
+        parent.rowconfigure(currentRow, weight=1)
+
+        self._updateListenerRecipient()
+        self._updateListenerStatusApiKey()
+        self._updateListenerControlApiKey()
+        self.refreshRecipientVisibility()
+
+    def refreshRecipientVisibility(self) -> None:
+        entryWidget = getattr(self, "recipientEntry", None)
+        toggleButton = getattr(self, "recipientToggleButton", None)
+        visibleVar = getattr(self, "recipientVisibleVar", None)
+        if entryWidget is None or not isinstance(visibleVar, tk.BooleanVar):
+            return
+
+        if visibleVar.get():
+            entryWidget.configure(show="")
+            if toggleButton is not None:
+                toggleButton.configure(text="Hide")
+        else:
+            entryWidget.configure(show="•")
+            if toggleButton is not None:
+                toggleButton.configure(text="Show")
+
+    def copyRecipientIdToClipboard(self) -> None:
+        recipientValue = self.recipientVar.get().strip() if hasattr(self, "recipientVar") else ""
+        if not recipientValue:
+            return
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(recipientValue)
+            self.root.update_idletasks()
+            self.logQueue.put("Recipient ID copied to clipboard.")
+        except Exception:
+            logging.exception("Failed to copy recipient ID to clipboard")
 
     def _buildPrintersTab(self, parent: ttk.Frame) -> None:
         self.printerSearchVar = tk.StringVar()
@@ -1345,16 +1375,6 @@ class ListenerGuiApp:
         brandVar = tk.StringVar(value=(initialValues or {}).get("brand", ""))
         bambuModelVar = tk.StringVar(value=(initialValues or {}).get("bambuModel", ""))
         connectionMethodVar = tk.StringVar(value=(initialValues or {}).get("connectionMethod", ""))
-        statusBaseUrlDefault = getPrinterStatusEndpointUrl() or self.baseUrlVar.get().strip() or ""
-        statusApiKeyDefault = (
-            self.statusApiKeyVar.get().strip() if hasattr(self, "statusApiKeyVar") else ""
-        )
-        statusRecipientDefault = (
-            self.recipientVar.get().strip() if hasattr(self, "recipientVar") else ""
-        )
-        statusBaseUrlVar = tk.StringVar(value=statusBaseUrlDefault)
-        statusApiKeyVar = tk.StringVar(value=statusApiKeyDefault)
-        statusRecipientVar = tk.StringVar(value=statusRecipientDefault)
         initialStatus = (initialValues or {}).get("status", "Unknown") or "Unknown"
 
         ttk.Label(dialog, text="Nickname:").grid(row=0, column=0, sticky=tk.W, padx=12, pady=(12, 4))
@@ -1508,27 +1528,12 @@ class ListenerGuiApp:
         for trackedVar in (nicknameVar, ipAddressVar, serialNumberVar):
             trackedVar.trace_add("write", lambda *_: self._updateActivePrinterDialogIdentifiers())
 
-        ttk.Label(dialog, text="Status Base URL:").grid(row=7, column=0, sticky=tk.W, padx=12, pady=4)
-        ttk.Entry(dialog, textvariable=statusBaseUrlVar, state="readonly").grid(
-            row=7, column=1, sticky=tk.EW, padx=12, pady=4
-        )
-
-        ttk.Label(dialog, text="Status API Key:").grid(row=8, column=0, sticky=tk.W, padx=12, pady=4)
-        ttk.Entry(dialog, textvariable=statusApiKeyVar, show="*", state="readonly").grid(
-            row=8, column=1, sticky=tk.EW, padx=12, pady=4
-        )
-
-        ttk.Label(dialog, text="Status Recipient ID:").grid(row=9, column=0, sticky=tk.W, padx=12, pady=4)
-        ttk.Entry(dialog, textvariable=statusRecipientVar, state="readonly").grid(
-            row=9, column=1, sticky=tk.EW, padx=12, pady=4
-        )
-
         ttk.Label(
             dialog,
             text="Recipient, API key og URL styres fra Listener-panelet.",
-        ).grid(row=10, column=0, columnspan=2, sticky=tk.W, padx=12, pady=(0, 4))
-        statusLabelRow = 11
-        statusInfoLabelRow = 12
+        ).grid(row=7, column=0, columnspan=2, sticky=tk.W, padx=12, pady=(0, 4))
+        statusLabelRow = 8
+        statusInfoLabelRow = 9
 
         ttk.Label(dialog, text=f"Status: {initialStatus}").grid(
             row=statusLabelRow,
