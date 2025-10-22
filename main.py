@@ -60,6 +60,18 @@ try:  # pragma: no cover - optional dependency handling
 except ImportError:  # pragma: no cover - fallback when secret manager is unavailable in tests
     secretmanager = None  # type: ignore[assignment]
 from google.cloud.firestore_v1 import DELETE_FIELD
+
+try:  # pragma: no cover - optional dependency handling for FieldFilter import
+    from google.cloud.firestore_v1 import FieldFilter  # type: ignore[attr-defined]
+except (ImportError, AttributeError):  # pragma: no cover - fallback when FieldFilter is unavailable
+    try:
+        from google.cloud.firestore_v1.base_query import FieldFilter  # type: ignore
+    except (ImportError, AttributeError):  # pragma: no cover - define minimal fallback for tests
+        @dataclass(frozen=True)
+        class FieldFilter:  # type: ignore[no-redef]
+            field_path: str
+            op_string: str
+            value: object
 from werkzeug.utils import secure_filename
 
 
@@ -838,7 +850,7 @@ def productHandshake(productId: str):
             return jsonify({'error': 'Invalid status value'}), 400
 
         fileQuery = firestoreClient.collection(firestoreCollectionFiles).where(
-            'productId', '==', productId
+            filter=FieldFilter('productId', '==', productId)
         )
         documentSnapshots = list(fileQuery.stream())
 
@@ -1000,7 +1012,9 @@ def productStatusUpdate(productId: str):
 
         recipientId = payload.get('recipientId')
 
-        fileQuery = firestoreClient.collection(firestoreCollectionFiles).where('productId', '==', productId)
+        fileQuery = firestoreClient.collection(firestoreCollectionFiles).where(
+            filter=FieldFilter('productId', '==', productId)
+        )
         documentSnapshots = list(fileQuery.stream())
 
         if not documentSnapshots:
@@ -1150,7 +1164,7 @@ def fetchFile(fetchToken: str):
 
         fileQuery = (
             firestoreClient.collection(firestoreCollectionFiles)
-            .where('fetchToken', '==', fetchToken)
+            .where(filter=FieldFilter('fetchToken', '==', fetchToken))
             .limit(1)
         )
         fileDocuments = list(fileQuery.stream())
@@ -1401,12 +1415,16 @@ def buildPendingFileList(
     currentTime = datetime.now(timezone.utc)
 
     fileQuery = firestoreClient.collection(firestoreCollectionFiles).where(
-        'recipientId', '==', recipientId
+        filter=FieldFilter('recipientId', '==', recipientId)
     )
     if readyToClaimStatuses:
-        fileQuery = fileQuery.where('status', 'in', sorted(readyToClaimStatuses))
+        fileQuery = fileQuery.where(
+            filter=FieldFilter('status', 'in', sorted(readyToClaimStatuses))
+        )
 
-    fileQuery = fileQuery.where('fetchTokenConsumed', '==', False)
+    fileQuery = fileQuery.where(
+        filter=FieldFilter('fetchTokenConsumed', '==', False)
+    )
 
     for documentSnapshot in fileQuery.stream():
         metadata = documentSnapshot.to_dict() or {}
@@ -1935,14 +1953,22 @@ def _listPendingPrinterControlCommands():
         limitSize,
     )
 
-    baseQuery = commandCollection.where('recipientId', '==', sanitizedRecipientId)
+    baseQuery = commandCollection.where(
+        filter=FieldFilter('recipientId', '==', sanitizedRecipientId)
+    )
 
     if sanitizedPrinterSerial is not None:
-        baseQuery = baseQuery.where('printerSerial', '==', sanitizedPrinterSerial)
+        baseQuery = baseQuery.where(
+            filter=FieldFilter('printerSerial', '==', sanitizedPrinterSerial)
+        )
     if printerIpAddress is not None:
-        baseQuery = baseQuery.where('printerIpAddress', '==', printerIpAddress)
+        baseQuery = baseQuery.where(
+            filter=FieldFilter('printerIpAddress', '==', printerIpAddress)
+        )
     if sanitizedPrinterId is not None:
-        baseQuery = baseQuery.where('printerId', '==', sanitizedPrinterId)
+        baseQuery = baseQuery.where(
+            filter=FieldFilter('printerId', '==', sanitizedPrinterId)
+        )
 
     def normalizeTimestamp(rawValue):
         if isinstance(rawValue, datetime):
@@ -1997,7 +2023,9 @@ def _listPendingPrinterControlCommands():
         for statusFilter in ('queued', None):
             try:
                 statusSnapshots = list(
-                    baseQuery.where('status', '==', statusFilter).limit(fetchLimit).stream()
+                    baseQuery.where(
+                        filter=FieldFilter('status', '==', statusFilter)
+                    ).limit(fetchLimit).stream()
                 )
             except FailedPrecondition as error:
                 raise error
@@ -2384,8 +2412,8 @@ def debugListPendingCommands():
     firestoreClient = clients.firestoreClient
     query = (
         firestoreClient.collection(firestoreCollectionPrinterCommands)
-        .where('recipientId', '==', recipientId)
-        .where('status', '==', 'pending')
+        .where(filter=FieldFilter('recipientId', '==', recipientId))
+        .where(filter=FieldFilter('status', '==', 'pending'))
         .order_by('createdAt', direction=firestore.Query.DESCENDING)
         .limit(limitSize)
     )
