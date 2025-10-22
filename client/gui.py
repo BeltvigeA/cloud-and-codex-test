@@ -6,8 +6,10 @@ import contextlib
 import json
 import logging
 import os
+import secrets
 import socket
 import ssl
+import string
 import threading
 import uuid
 from datetime import datetime
@@ -23,13 +25,51 @@ import requests
 
 
 hardcodedBaseUrl = "https://printer-backend-934564650450.europe-west1.run.app"
-hardcodedRecipientId = "91827364556473829182736455647382"
 hardcodedApiKey = (
     "V9JDvmqG9SB40JpmNu1HwM8ZbvplTrf7ddjudAe6yvjg7hbENEgA429N6xuio4CWQ7nv30fk0c2V8WiOemNWuP2PCKa9dbp7Aoww5lfQPdQu1FGuNKgUZ4wmA23sFCQ7lpxRq9cgZdIWMmwY2EpeYCR13UMgUzDqE8Su6GDPXuXHuPcMKxZnrI9vKNFjtxtCymw1Q8Wr"
 )
 hardcodedOutputDirectory = str(Path.home() / ".printmaster" / "files")
 hardcodedJsonLogFile = str(Path.home() / ".printmaster" / "listener-log.json")
 hardcodedPollIntervalSeconds = 30
+
+
+def _generateRecipientId(length: int = 32) -> str:
+    alphabet = string.ascii_letters + string.digits
+    return "".join(secrets.choice(alphabet) for _ in range(length))
+
+
+def loadOrCreateRecipientId() -> str:
+    clientInfoPath = Path.home() / ".printmaster" / "client-info.json"
+    try:
+        clientInfoPath.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        logging.warning("Unable to prepare client info directory: %s", error)
+
+    clientInfoData: Dict[str, Any] = {}
+    recipientId: Optional[str] = None
+
+    if clientInfoPath.exists():
+        try:
+            with clientInfoPath.open("r", encoding="utf-8") as handle:
+                loadedData = json.load(handle)
+            if isinstance(loadedData, dict):
+                clientInfoData = loadedData
+                storedRecipientId = clientInfoData.get("recipientId")
+                if isinstance(storedRecipientId, str) and storedRecipientId.strip():
+                    recipientId = storedRecipientId.strip()
+        except (OSError, json.JSONDecodeError) as error:
+            logging.warning("Failed to read client info file: %s", error)
+
+    if not recipientId:
+        recipientId = _generateRecipientId()
+        clientInfoData["recipientId"] = recipientId
+        try:
+            with clientInfoPath.open("w", encoding="utf-8") as handle:
+                json.dump(clientInfoData, handle, indent=2, sort_keys=True)
+        except OSError as error:
+            logging.error("Failed to write client info file: %s", error)
+
+    return recipientId
 
 
 def addPrinterIdentityToPayload(
@@ -141,7 +181,7 @@ class ListenerGuiApp:
         self.statusRefreshIntervalMs = 60_000
         self.pendingImmediateStatusRefresh = False
 
-        self.listenerRecipientId = hardcodedRecipientId
+        self.listenerRecipientId = loadOrCreateRecipientId()
         self.listenerStatusApiKey = hardcodedApiKey
         self.listenerControlApiKey = hardcodedApiKey
         self._managedEnvKeys: set[str] = set()
@@ -182,7 +222,7 @@ class ListenerGuiApp:
 
     def _buildListenerTab(self, parent: ttk.Frame, paddingOptions: Dict[str, int]) -> None:
         self.baseUrlVar = tk.StringVar(value=hardcodedBaseUrl)
-        self.recipientVar = tk.StringVar(value=hardcodedRecipientId)
+        self.recipientVar = tk.StringVar(value=self.listenerRecipientId)
         self.statusApiKeyVar = tk.StringVar(value=hardcodedApiKey)
         self.controlApiKeyVar = tk.StringVar(value=hardcodedApiKey)
         self.outputDirVar = tk.StringVar(value=hardcodedOutputDirectory)
