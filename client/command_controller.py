@@ -7,6 +7,8 @@ import queue
 import re
 import threading
 import time
+import base64
+import binascii
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -65,11 +67,72 @@ def captureCameraSnapshot(printer: Any, serial: str) -> Path:
     if not callable(frameFetcher):
         raise RuntimeError("Camera capture is unavailable on this printer")
 
-    frameData = frameFetcher()
+    cameraAliveChecker = getattr(printer, "camera_client_alive", None)
+    cameraStarter = getattr(printer, "camera_start", None)
+    cameraStopper = getattr(printer, "camera_stop", None)
+    cameraStartedHere = False
+    try:
+        cameraIsAlive = False
+        if callable(cameraAliveChecker):
+            try:
+                cameraIsAlive = bool(cameraAliveChecker())
+            except Exception:  # pragma: no cover - diagnostic logging only
+                log.debug("camera_client_alive() check failed", exc_info=True)
+        if not cameraIsAlive and callable(cameraStarter):
+            try:
+                cameraStarter()
+                cameraStartedHere = True
+            except Exception:  # pragma: no cover - diagnostic logging only
+                log.debug("camera_start() invocation failed", exc_info=True)
+
+        frameData: Any = None
+        lastFetchError: Optional[Exception] = None
+        for attempt in range(5):
+            try:
+                fetched = frameFetcher()
+            except Exception as error:  # noqa: BLE001 - SDK raises generic Exception
+                lastFetchError = error
+                if "No frame available" in str(error) and attempt < 4:
+                    time.sleep(0.25)
+                    continue
+                raise RuntimeError("Camera capture failed") from error
+
+            if fetched is None:
+                if attempt < 4:
+                    time.sleep(0.1)
+                    continue
+                raise RuntimeError("Camera capture returned no data")
+
+            if isinstance(fetched, (list, tuple)) and not fetched:
+                if attempt < 4:
+                    time.sleep(0.1)
+                    continue
+                raise RuntimeError("Camera capture returned an empty payload")
+
+            frameData = fetched
+            break
+        else:  # pragma: no cover - defensive fallback
+            if lastFetchError is not None:
+                raise RuntimeError("Camera capture failed") from lastFetchError
+            raise RuntimeError("Camera capture returned no data")
+    finally:
+        if cameraStartedHere and callable(cameraStopper):
+            try:
+                cameraStopper()
+            except Exception:  # pragma: no cover - diagnostic logging only
+                log.debug("camera_stop() invocation failed", exc_info=True)
+
     if isinstance(frameData, (list, tuple)) and frameData:
         frameCandidate = frameData[0]
     else:
         frameCandidate = frameData
+    if isinstance(frameCandidate, str):
+        try:
+            frameCandidate = base64.b64decode(frameCandidate, validate=True)
+        except binascii.Error as error:
+            raise RuntimeError("Camera capture returned invalid base64 data") from error
+        except Exception as error:  # noqa: BLE001 - defensive fallback for unexpected decoder errors
+            raise RuntimeError("Camera capture returned non-decodable data") from error
     if not isinstance(frameCandidate, (bytes, bytearray)):
         raise RuntimeError("Camera capture did not return image bytes")
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 from pathlib import Path
 import sys
@@ -243,14 +244,29 @@ def testCameraCommandCapturesSnapshot(monkeypatch: pytest.MonkeyPatch, tmp_path:
         def __init__(self) -> None:
             self.connectCalls = 0
             self.getCameraFrameCalls = 0
+            self.cameraStartCalls = 0
+            self.cameraStopCalls = 0
+            self.cameraAlive = False
             self.mqtt_client = type("FakeMqttClient", (), {"publishCalls": []})()
 
         def connect(self) -> None:
             self.connectCalls += 1
 
+        def camera_client_alive(self) -> bool:
+            return self.cameraAlive
+
+        def camera_start(self) -> bool:
+            self.cameraStartCalls += 1
+            self.cameraAlive = True
+            return True
+
+        def camera_stop(self) -> None:
+            self.cameraStopCalls += 1
+            self.cameraAlive = False
+
         def get_camera_frame(self) -> bytes:
             self.getCameraFrameCalls += 1
-            return b"fake-bytes"
+            return base64.b64encode(b"fake-bytes").decode("ascii")
 
     fakePrinter = FakePrinter()
     monkeypatch.setattr(CommandWorker, "_connectPrinter", lambda self: fakePrinter)
@@ -276,6 +292,8 @@ def testCameraCommandCapturesSnapshot(monkeypatch: pytest.MonkeyPatch, tmp_path:
     assert fakePrinter.connectCalls >= 1
     assert fakePrinter.getCameraFrameCalls == 1
     assert not fakePrinter.mqtt_client.publishCalls
+    assert fakePrinter.cameraStartCalls == 1
+    assert fakePrinter.cameraStopCalls == 1
 
 
 def testCameraCommandOffInvokesCameraOff(monkeypatch: pytest.MonkeyPatch) -> None:
