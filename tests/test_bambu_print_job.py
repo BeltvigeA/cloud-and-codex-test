@@ -191,8 +191,10 @@ def test_sendBambuPrintJob_uses_api(monkeypatch: pytest.MonkeyPatch, tmp_path: P
         "fallbackTriggered": False,
     }
     monkeypatch.setattr(bambuPrinter, "startPrintViaApi", lambda **_kwargs: dict(apiResult))
-    mqttCalled = {}
-    monkeypatch.setattr(bambuPrinter, "startPrintViaMqtt", lambda **kwargs: mqttCalled.setdefault("called", kwargs))
+    def forbidMqtt(**_kwargs: Any) -> None:
+        raise AssertionError("startPrintViaMqtt should not be used under API-only policy")
+
+    monkeypatch.setattr(bambuPrinter, "startPrintViaMqtt", forbidMqtt)
 
     events: list[Dict[str, Any]] = []
 
@@ -216,24 +218,24 @@ def test_sendBambuPrintJob_uses_api(monkeypatch: pytest.MonkeyPatch, tmp_path: P
     assert result["method"] == "lan"
     assert result["startMethod"] == "api"
     assert result["api"] == apiResult
-    assert mqttCalled == {}
     startingEvents = [event for event in events if event.get("status") == "starting"]
     assert startingEvents and startingEvents[0]["method"] == "api"
 
 
-def test_sendBambuPrintJob_falls_back_to_mqtt(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_sendBambuPrintJob_raises_when_api_start_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     samplePath = tmp_path / "model.3mf"
     createSampleThreeMf(samplePath)
 
     monkeypatch.setattr(bambuPrinter, "uploadViaFtps", lambda **kwargs: kwargs["remoteName"])
     monkeypatch.setattr(bambuPrinter, "startPrintViaApi", lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("api failure")))
 
-    mqttCalls: Dict[str, Any] = {}
-
-    def fakeMqtt(**kwargs: Any) -> None:
-        mqttCalls.update(kwargs)
-
-    monkeypatch.setattr(bambuPrinter, "startPrintViaMqtt", fakeMqtt)
+    monkeypatch.setattr(
+        bambuPrinter,
+        "startPrintViaMqtt",
+        lambda **_kwargs: pytest.fail("startPrintViaMqtt should not be invoked"),
+    )
 
     options = bambuPrinter.BambuPrintOptions(
         ipAddress="1.2.3.4",
@@ -243,12 +245,12 @@ def test_sendBambuPrintJob_falls_back_to_mqtt(monkeypatch: pytest.MonkeyPatch, t
         startStrategy="api",
     )
 
-    result = bambuPrinter.sendBambuPrintJob(
-        filePath=samplePath,
-        options=options,
-        jobMetadata={"unencryptedData": {"ams_configuration": None}},
-    )
+    with pytest.raises(RuntimeError) as errorInfo:
+        bambuPrinter.sendBambuPrintJob(
+            filePath=samplePath,
+            options=options,
+            jobMetadata={"unencryptedData": {"ams_configuration": None}},
+        )
 
-    assert result["startMethod"] == "mqtt"
-    assert mqttCalls.get("useAms") is False
+    assert "API print start failed and MQTT fallback is disabled by policy" in str(errorInfo.value)
 

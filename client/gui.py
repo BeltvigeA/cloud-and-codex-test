@@ -11,6 +11,7 @@ import socket
 import ssl
 import string
 import threading
+import time
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -98,11 +99,6 @@ from .client import (
     extractPreferredTransport,
     registerPrintersConfigChangedListener,
 )
-
-try:  # pragma: no cover - optional dependency in some test environments
-    import paho.mqtt.client as mqtt  # type: ignore
-except ImportError:  # pragma: no cover - gracefully handled when MQTT is unavailable
-    mqtt = None  # type: ignore
 
 
 def loadPrinters() -> list[Dict[str, Any]]:
@@ -1784,7 +1780,7 @@ class ListenerGuiApp:
         brand = self._parseOptionalString(printer.get("brand"))
 
         looksLikeBambu = brand is None or "bambu" in brand.lower()
-        if serialNumber and accessCode and mqtt is not None and looksLikeBambu:
+        if serialNumber and accessCode and looksLikeBambu:
             try:
                 bambuTelemetry = self._fetchBambuTelemetry(ipAddress, serialNumber, accessCode)
                 if bambuTelemetry:
@@ -1936,119 +1932,104 @@ class ListenerGuiApp:
         accessCode: str,
         timeoutSeconds: float = 4.0,
     ) -> Dict[str, Any]:
-        if mqtt is None:  # pragma: no cover - guarded by caller
+        try:
+            import bambulabs_api as bl  # type: ignore[import]
+        except Exception:
             return {}
 
-        topicReport = f"device/{serialNumber}/report"
-        topicRequest = f"device/{serialNumber}/request"
-        receivedTelemetry: Dict[str, Any] = {}
-        telemetryEvent = threading.Event()
+        try:
+            printer = bl.Printer(ipAddress, accessCode, serialNumber)
+        except Exception:
+            return {}
 
-        callbackApiVersion = getattr(mqtt, "CallbackAPIVersion", None)
-        clientKwargs: Dict[str, Any] = {"protocol": mqtt.MQTTv311}  # type: ignore[attr-defined]
-        if callbackApiVersion is not None:
-            clientKwargs["callback_api_version"] = callbackApiVersion.VERSION2  # type: ignore[attr-defined]
+        try:
+            mqttStart = getattr(printer, "mqtt_start", None)
+            if callable(mqttStart):
+                mqttStart()
+        except Exception:
+            with contextlib.suppress(Exception):
+                printer.disconnect()
+            return {}
 
-        telemetryLock = threading.Lock()
-
-        def mergeTelemetry(update: Dict[str, Any]) -> bool:
-            significantKeys = {"progressPercent", "remainingTimeSeconds", "nozzleTemp", "bedTemp", "gcodeState"}
-            hasChange = False
-            hasDetails = False
-            with telemetryLock:
-                for key, value in update.items():
-                    if key not in ("status", *significantKeys):
-                        continue
-                    if key != "status" and value is not None:
-                        hasDetails = True
-                    if receivedTelemetry.get(key) != value:
-                        receivedTelemetry[key] = value
-                        hasChange = True
-            if hasChange and (hasDetails or receivedTelemetry.get("status")):
-                return True
-            return False
-
-        def onConnect(
-            client: mqtt.Client,  # type: ignore[name-defined]
-            _userdata: Any,
-            _flags: Dict[str, Any],
-            reasonCode: Any,
-            *extraArgs: Any,
-        ) -> None:
-            isFailure = False
-            if getattr(reasonCode, "is_failure", None):
-                isFailure = bool(reasonCode.is_failure)
-            elif isinstance(reasonCode, int):
-                isFailure = reasonCode != 0
-
-            if isFailure:
-                receivedTelemetry["status"] = "Offline"
-                telemetryEvent.set()
-                return
-            client.subscribe(topicReport, qos=1)
-            commandsToSend = [
-                {"pushed": {"command": "get_status"}},
-                {"pushed": {"command": "pushall"}},
-                {"print": {"command": "getstate"}},
-            ]
-            for command in commandsToSend:
-                try:
-                    client.publish(topicRequest, json.dumps(command), qos=1)
-                except Exception:  # noqa: BLE001 - telemetry is best-effort
-                    continue
-
-        def onMessage(
-            _client: mqtt.Client,  # type: ignore[name-defined]
-            _userdata: Any,
-            message: Any,
-        ) -> None:
+        connectMethod = getattr(printer, "connect", None)
+        if callable(connectMethod):
             try:
-                payload = json.loads(message.payload.decode("utf-8"))
-            except Exception:  # noqa: BLE001 - ignore malformed payloads
-                return
+                connectMethod()
+            except Exception:
+                pass
 
-            def findKey(obj: Any, key: str) -> Any:
-                if isinstance(obj, dict):
-                    if key in obj:
-                        return obj[key]
-                    for nested in obj.values():
-                        result = findKey(nested, key)
-                        if result is not None:
-                            return result
-                elif isinstance(obj, list):
-                    for nested in obj:
-                        result = findKey(nested, key)
-                        if result is not None:
-                            return result
+        try:
+            readinessDeadline = time.monotonic() + max(timeoutSeconds, 0.0)
+            statePayload: Any = None
+            while time.monotonic() < readinessDeadline:
+                try:
+                    statePayload = printer.get_state()
+                    break
+                except Exception:
+                    time.sleep(0.2)
+
+            try:
+                percentagePayload: Any = printer.get_percentage()
+            except Exception:
+                percentagePayload = None
+
+            gcodePayload: Any = None
+            gcodeGetter = getattr(printer, "get_gcode_state", None)
+            if callable(gcodeGetter):
+                try:
+                    gcodePayload = gcodeGetter()
+                except Exception:
+                    gcodePayload = None
+
+            def searchValue(payload: Any, keys: set[str]) -> Any:
+                if payload is None:
+                    return None
+                if isinstance(payload, dict):
+                    for key, value in payload.items():
+                        if key in keys:
+                            return value
+                        nested = searchValue(value, keys)
+                        if nested is not None:
+                            return nested
+                elif isinstance(payload, (list, tuple)):
+                    for item in payload:
+                        nested = searchValue(item, keys)
+                        if nested is not None:
+                            return nested
                 return None
 
+            def pickPercentage() -> Any:
+                if isinstance(percentagePayload, (int, float, str, bool)):
+                    return percentagePayload
+                return searchValue(statePayload, {"mc_percent", "print_percent", "percent"})
+
+            def pickRemaining() -> Any:
+                return searchValue(statePayload, {"mc_remaining_time", "remaining_time", "time_remaining"})
+
+            def pickState() -> Any:
+                candidate = searchValue(gcodePayload, {"gcode_state", "sub_state", "state"})
+                if candidate is None:
+                    candidate = searchValue(statePayload, {"gcode_state", "sub_state", "state", "printer_state"})
+                return candidate
+
+            def pickNozzle() -> Any:
+                return searchValue(statePayload, {"nozzle_temper", "nozzle_temp", "nozzle_target_temper"})
+
+            def pickBed() -> Any:
+                return searchValue(statePayload, {"bed_temper", "bed_temp", "bed_target_temper"})
+
             statusPayload = {
-                "mc_percent": findKey(payload, "mc_percent"),
-                "gcode_state": findKey(payload, "gcode_state"),
-                "mc_remaining_time": findKey(payload, "mc_remaining_time"),
-                "nozzle_temper": findKey(payload, "nozzle_temper"),
-                "bed_temper": findKey(payload, "bed_temper"),
+                "mc_percent": pickPercentage(),
+                "mc_remaining_time": pickRemaining(),
+                "gcode_state": pickState(),
+                "nozzle_temper": pickNozzle(),
+                "bed_temper": pickBed(),
             }
-            if mergeTelemetry(self._interpretBambuStatus(statusPayload)):
-                telemetryEvent.set()
 
-        client = mqtt.Client(**clientKwargs)  # type: ignore[name-defined]
-        client.username_pw_set("bblp", accessCode)
-        client.tls_set(cert_reqs=ssl.CERT_NONE)
-        client.tls_insecure_set(True)
-        client.on_connect = onConnect
-        client.on_message = onMessage
-
-        client.loop_start()
-        try:
-            client.connect(ipAddress, 8883, keepalive=30)
-            telemetryEvent.wait(timeoutSeconds)
+            return self._interpretBambuStatus(statusPayload)
         finally:
-            client.loop_stop()
             with contextlib.suppress(Exception):
-                client.disconnect()
-
-        return receivedTelemetry
+                printer.disconnect()
 
     def _interpretBambuStatus(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         percent = self._parseOptionalFloat(payload.get("mc_percent"))
