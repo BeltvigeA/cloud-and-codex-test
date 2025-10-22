@@ -1952,25 +1952,65 @@ def _listPendingPrinterControlCommands():
         )
         documents = list(pendingQuery.stream())
     except FailedPrecondition as error:
-        logging.error(
-            'Missing Firestore composite index for pending printer control command query.',
+        logging.warning(
+            'Falling back to application-side filtering for pending printer control '
+            'commands because the Firestore composite index is missing.',
             exc_info=error,
         )
 
-        indexHintUrl = extractFirestoreIndexUrl(str(error))
-        detailMessage = (
-            'The Firestore composite index required for listing pending printer commands '
-            'is missing.'
-        )
-        if indexHintUrl:
-            detailMessage = f"{detailMessage} Create the index at {indexHintUrl}."
+        fallbackFetchLimit = max(limitSize * 3, limitSize + 10)
 
-        return makeErrorResponse(
-            503,
-            'FirestoreIndexMissing',
-            detailMessage,
-            str(error),
-        )
+        try:
+            fallbackDocuments = list(baseQuery.limit(fallbackFetchLimit).stream())
+        except Exception as fallbackError:  # pylint: disable=broad-except
+            logging.exception('Failed to fetch pending printer control commands.')
+            return makeErrorResponse(
+                500,
+                'ServerError',
+                'Failed to fetch pending printer control commands',
+                str(fallbackError),
+            )
+
+        def normalizeTimestamp(rawValue):
+            if isinstance(rawValue, datetime):
+                return rawValue if rawValue.tzinfo else rawValue.replace(tzinfo=timezone.utc)
+            if hasattr(rawValue, 'to_datetime'):
+                try:
+                    normalizedValue = rawValue.to_datetime()
+                    if normalizedValue.tzinfo is None:
+                        normalizedValue = normalizedValue.replace(tzinfo=timezone.utc)
+                    return normalizedValue
+                except Exception:  # pylint: disable=broad-except
+                    return None
+            if isinstance(rawValue, str):
+                try:
+                    parsedValue = datetime.fromisoformat(rawValue)
+                    if parsedValue.tzinfo is None:
+                        parsedValue = parsedValue.replace(tzinfo=timezone.utc)
+                    return parsedValue
+                except ValueError:
+                    return None
+            return None
+
+        pendingDocuments = []
+        for snapshot in fallbackDocuments:
+            commandData = snapshot.to_dict() or {}
+            statusValue = commandData.get('status')
+            if statusValue not in (None, 'queued'):
+                continue
+
+            createdAtValue = commandData.get('createdAt')
+            normalizedCreatedAt = normalizeTimestamp(createdAtValue)
+            if normalizedCreatedAt is None:
+                createdAtFallback = getattr(snapshot, 'create_time', None)
+                normalizedCreatedAt = normalizeTimestamp(createdAtFallback)
+            if normalizedCreatedAt is None:
+                normalizedCreatedAt = datetime.min.replace(tzinfo=timezone.utc)
+
+            pendingDocuments.append((normalizedCreatedAt, snapshot))
+
+        pendingDocuments.sort(key=lambda item: item[0])
+        documents = [item[1] for item in pendingDocuments[:limitSize]]
     except Exception as error:  # pylint: disable=broad-except
         logging.exception('Failed to fetch pending printer control commands.')
         return makeErrorResponse(
