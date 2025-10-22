@@ -894,13 +894,6 @@ class CommandWorker:
         collectFromTarget(printer, ["get_percentage", "current_layer_num"])
         collectFromTarget(printer, ["get_time", "get_remaining_time"])
         collectFromTarget(printer, ["gcode", "get_gcode_state"])
-        mqttClient = getattr(printer, "mqtt_client", None)
-        if mqttClient is not None:
-            collectFromTarget(
-                mqttClient,
-                ["get_printer_state", "get_current_state", "get_last_print_percentage", "get_remaining_time"],
-            )
-            collectFromTarget(mqttClient, ["subtask_name"])
 
         snapshot: Dict[str, Any] = {"statusSources": sources}
         for candidate in sources:
@@ -1131,16 +1124,14 @@ class CommandWorker:
             self._lastRemoteFile = None
 
     def _readPrinterErrorCode(self, printer: Any) -> Optional[Any]:
-        for target in (printer, getattr(printer, "mqtt_client", None)):
-            if target is None:
-                continue
-            accessor = getattr(target, "print_error_code", None)
-            if accessor is None:
-                continue
+        if printer is None:
+            return None
+        accessor = getattr(printer, "print_error_code", None)
+        if accessor is not None:
             try:
                 return accessor() if callable(accessor) else accessor
             except Exception:
-                continue
+                log.debug("print_error_code accessor failed", exc_info=True)
         if not self._printErrorCodeUnsupportedLogged:
             log.info("Printer %s does not expose print_error_code", self.serial)
             self._printErrorCodeUnsupportedLogged = True
@@ -1233,26 +1224,11 @@ class CommandWorker:
             if callable(controlMethod):
                 controlMethod(payload)
                 return
-            publishMethod = getattr(printer, "publish", None)
-            if callable(publishMethod):
-                publishMethod(payload)
-                return
             sendRequest = getattr(printer, "send_request", None)
             if callable(sendRequest):
                 sendRequest(payload)
                 return
-            for clientAttr in ("_mqtt_client", "mqtt_client"):
-                mqttClient = getattr(printer, clientAttr, None)
-                if mqttClient is None:
-                    continue
-                publishMethod = getattr(mqttClient, "publish", None)
-                if not callable(publishMethod):
-                    continue
-                topic = f"device/{self.serial}/request"
-                body = json.dumps(payload).encode("utf-8")
-                publishMethod(topic, body, qos=1)
-                return
-            raise RuntimeError("No available transport to publish control payload")
+            raise RuntimeError("No API transport available for control payload (API-only policy)")
 
         camelCaseConverted = re.sub(r"(?<!^)(?=[A-Z])", "_", rawCommandType)
         normalizedType = camelCaseConverted.replace("-", "_").lower()

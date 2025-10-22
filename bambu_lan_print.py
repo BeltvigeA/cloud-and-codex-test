@@ -31,11 +31,6 @@ except ImportError as error:
     rprint("[bold red]Mangler 'bambulabs_api'. Kjør: pip install bambulabs_api[/bold red]")
     raise
 
-try:
-    import paho.mqtt.client as mqtt
-except ImportError:
-    mqtt = None
-
 CONFIG_PATH = Path.home() / ".printmaster" / "printers.json"
 
 
@@ -150,51 +145,7 @@ class BambuLanClient:
         return buffer
 
     def _publishProjectFileSpool(self, uploadName: str, param: str | int) -> None:
-        if not self.printer:
-            raise RuntimeError("Ikke tilkoblet")
-        if mqtt is None:
-            raise RuntimeError("paho-mqtt mangler. Kjør: pip install paho-mqtt")
-
-        topic = f"device/{self.serial}/request"
-        if isinstance(param, int):
-            paramValue = f"Metadata/plate_{param}.gcode"
-        else:
-            paramValue = param
-
-        payload = {
-            "print": {
-                "sequence_id": str(int(time.time() * 1000) % 10_000_000),
-                "command": "project_file",
-                "url": f"file:///sdcard/{uploadName}",
-                "param": paramValue,
-                "use_ams": False,
-                "bed_levelling": True,
-                "flow_cali": True,
-                "vibration_cali": False,
-                "layer_inspect": True,
-                "timelapse": True,
-                "bed_type": "auto",
-                "project_id": "0",
-                "profile_id": "0",
-                "task_id": "0",
-                "subtask_id": "0",
-                "subtask_name": uploadName,
-                "md5": "",
-            }
-        }
-
-        client = mqtt.Client()
-        client.tls_set(cert_reqs=ssl.CERT_NONE)
-        client.tls_insecure_set(True)
-        client.username_pw_set("bblp", self.accessCode)
-        client.connect(self.ip, 8883, keepalive=60)
-        client.loop_start()
-        time.sleep(0.3)
-        publishInfo = client.publish(topic, json.dumps(payload), qos=1)
-        publishInfo.wait_for_publish()
-        time.sleep(0.3)
-        client.loop_stop()
-        client.disconnect()
+        raise NotImplementedError("Spooling via raw MQTT is disabled by API-only policy")
 
     def _safeCall(self, function, *args, **kwargs):
         self.waitForMqttReady(timeout=15.0)
@@ -210,15 +161,9 @@ class BambuLanClient:
             if hasattr(self.printer, "send_request"):
                 return self.printer.send_request(payload)
         except Exception as error:
-            rprint(f"[yellow]Wrapper publish feilet, prøver raw: {error}[/yellow]")
+            rprint(f"[yellow]Wrapper publish feilet: {error}[/yellow]")
 
-        if hasattr(self.printer, "_mqtt_client") and self.printer._mqtt_client:
-            topic = f"device/{self.serial}/request"
-            data = json.dumps(payload).encode("utf-8")
-            self.printer._mqtt_client.publish(topic, data, qos=1)
-            return
-
-        raise RuntimeError("Ingen tilgjengelig måte å sende kontrollpayload i denne bambulabs_api-versjonen")
+        raise RuntimeError("Ingen tilgjengelig API-transport for kontrollpayload (API-only policy)")
 
     def pausePrint(self) -> None:
         if hasattr(self.printer, "pause_print"):
@@ -407,42 +352,7 @@ class BambuLanClient:
 
 
 def subscribeReportRaw(ip: str, serial: str, accessCode: str) -> None:
-    if mqtt is None:
-        rprint("[red]paho-mqtt er ikke installert. Kjør: pip install paho-mqtt[/red]")
-        sys.exit(2)
-
-    topic = f"device/{serial}/report"
-    client = mqtt.Client()
-    client.tls_set(cert_reqs=ssl.CERT_NONE)
-    client.tls_insecure_set(True)
-    client.username_pw_set("bblp", accessCode)
-
-    def onConnect(clientObj, userdata, flags, rc):
-        if rc == 0:
-            rprint(f"[green]Rå MQTT tilkoblet. Abonnerer på {topic}[/green]")
-            clientObj.subscribe(topic)
-        else:
-            rprint(f"[red]MQTT-tilkobling feilet rc={rc}[/red]")
-
-    def onMessage(clientObj, userdata, msg):
-        try:
-            payload = msg.payload.decode("utf-8", errors="ignore")
-            try:
-                data = json.loads(payload)
-                rprint(data)
-            except json.JSONDecodeError:
-                rprint(payload)
-        except Exception as error:
-            rprint(f"[red]Feil ved parsing av melding: {error}[/red]")
-
-    client.on_connect = onConnect
-    client.on_message = onMessage
-    rprint(f"[cyan]Kobler til MQTT {ip}:8883 som bblp[/cyan]")
-    client.connect(ip, 8883, keepalive=60)
-    try:
-        client.loop_forever()
-    except KeyboardInterrupt:
-        rprint("\n[yellow]Avslutter rå MQTT-abonnement[/yellow]")
+    raise NotImplementedError("Raw MQTT subscription is disabled by API-only policy")
 
 
 def openInBambuConnect(threeMfPath: Path, displayName: Optional[str] = None) -> None:

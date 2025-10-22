@@ -7,7 +7,6 @@ from typing import Any, Dict, List, Tuple
 
 import logging
 import socket
-import types
 
 import sys
 
@@ -315,53 +314,8 @@ def test_build_printer_transfer_file_name_preserves_regular_names() -> None:
     assert result == "Cool_Model.3mf"
 
 
-def test_startPrintViaMqtt_connection_failure_includes_context(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    class DummyClient:
-        def __init__(self, *args: Any, **kwargs: Any) -> None:
-            self.args = args
-            self.kwargs = kwargs
-            self.on_connect = None
-            self.on_message = None
-
-        def username_pw_set(self, *_args: Any, **_kwargs: Any) -> None:
-            return None
-
-        def tls_set(self, *args: Any, **kwargs: Any) -> None:
-            return None
-
-        def tls_insecure_set(self, _value: bool) -> None:
-            return None
-
-        def connect(self, host: str, port: int, keepalive: int = 60) -> None:
-            raise ConnectionRefusedError("refused")
-
-        def loop_start(self) -> None:
-            return None
-
-        def loop_stop(self) -> None:
-            return None
-
-        def disconnect(self) -> None:
-            return None
-
-        def publish(self, *_args: Any, **_kwargs: Any) -> None:
-            return None
-
-        def subscribe(self, *_args: Any, **_kwargs: Any) -> None:
-            return None
-
-    dummyMqtt = types.SimpleNamespace(
-        CallbackAPIVersion=types.SimpleNamespace(VERSION2="v2"),
-        MQTTv311="MQTTv311",
-        Client=DummyClient,
-    )
-
-    monkeypatch.setattr(bambuPrinter, "mqtt", dummyMqtt)
-
-    caplog.set_level(logging.ERROR)
-    with pytest.raises(RuntimeError) as errorInfo:
+def test_startPrintViaMqtt_disabled() -> None:
+    with pytest.raises(NotImplementedError):
         bambuPrinter.startPrintViaMqtt(
             ip="192.0.2.20",
             serial="PRINTER123",
@@ -369,10 +323,4 @@ def test_startPrintViaMqtt_connection_failure_includes_context(
             sdFileName="file.3mf",
             paramPath=None,
         )
-
-    message = str(errorInfo.value)
-    assert "192.0.2.20:8883" in message
-    assert "PRINTER123" in message
-    assert "refused" in message
-    assert any("192.0.2.20:8883" in record.message for record in caplog.records)
 

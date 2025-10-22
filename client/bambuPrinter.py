@@ -23,17 +23,11 @@ import xml.etree.ElementTree as ET
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from threading import Event
 from typing import Any, BinaryIO, Callable, Dict, Iterable, List, Optional, Sequence, Literal
 
 from urllib.parse import urljoin
 
 from ftplib import FTP_TLS, error_perm
-
-try:  # pragma: no cover - optional dependency in tests
-    import paho.mqtt.client as mqtt  # type: ignore
-except ImportError:  # pragma: no cover - handled gracefully by callers
-    mqtt = None  # type: ignore
 
 import requests
 
@@ -481,215 +475,11 @@ def pickGcodeParamFrom3mf(path: Path, plateIndex: Optional[int]) -> tuple[Option
         return None, []
 
 
-def startPrintViaMqtt(
-    *,
-    ip: str,
-    serial: str,
-    accessCode: str,
-    sdFileName: str,
-    paramPath: Optional[str],
-    useAms: bool = False,
-    bedLeveling: bool = True,
-    layerInspect: bool = True,
-    flowCalibration: bool = False,
-    vibrationCalibration: bool = False,
-    insecureTls: bool = True,
-    waitSeconds: int = 12,
-    statusWarmupSeconds: int = 5,
-    statusCallback: Optional[Callable[[Dict[str, Any]], None]] = None,
-) -> None:
-    """Start a print job via MQTT and stream status messages."""
+def startPrintViaMqtt(*_args, **_kwargs) -> None:
+    """Disabled legacy MQTT start helper."""
 
-    if mqtt is None:  # pragma: no cover - exercised when dependency missing
-        raise RuntimeError("paho-mqtt is required for MQTT print control")
+    raise NotImplementedError("Disabled by policy: raw MQTT is not allowed (API-only).")
 
-    port = 8883
-    topicReport = f"device/{serial}/report"
-    topicRequest = f"device/{serial}/request"
-
-    connectionReady = Event()
-    firstStatusReceived = Event()
-    connectionError: Optional[str] = None
-    lastStatus: Dict[str, Any] = {}
-    hmsWarningIssued = False
-
-    def emitStatus(payload: Dict[str, Any]) -> None:
-        if not statusCallback:
-            return
-        try:
-            statusCallback(dict(payload))
-        except Exception:  # pragma: no cover - callback exceptions should not stop MQTT loop
-            logger.exception("Status callback failed for MQTT payload")
-
-    def handleProgress(statusPayload: Dict[str, Any]) -> None:
-        nonlocal lastStatus
-        trackedKeys = ("mc_percent", "gcode_state", "mc_remaining_time", "nozzle_temper", "bed_temper")
-        snapshot = {key: statusPayload.get(key) for key in trackedKeys if statusPayload.get(key) is not None}
-        if not snapshot or snapshot == lastStatus:
-            return
-        lastStatus = snapshot
-        emitStatus({"status": "progress", **snapshot})
-
-    def onConnect(client: mqtt.Client, *args, **_kwargs):  # type: ignore[no-redef]
-        nonlocal connectionError
-        rc: Optional[int] = None
-        reasonCode: Any = None
-        if len(args) >= 3:
-            third = args[2]
-            if isinstance(third, int):
-                rc = third
-            else:
-                reasonCode = third
-        if rc is not None:
-            ok = rc == 0
-        elif reasonCode is not None:
-            ok = not getattr(reasonCode, "is_failure", False)
-        else:
-            ok = True
-        if ok:
-            client.subscribe(topicReport, qos=1)
-        else:
-            description = getattr(reasonCode, "value", reasonCode)
-            connectionError = f"MQTT connection failed: rc={rc or 'n/a'} reason={description}"
-        connectionReady.set()
-
-    def onMessage(_client: mqtt.Client, _userdata, message):  # type: ignore[no-redef]
-        nonlocal hmsWarningIssued
-        try:
-            payload = json.loads(message.payload.decode("utf-8"))
-        except Exception:
-            return
-
-        firstStatusReceived.set()
-
-        serialized = json.dumps(payload, ensure_ascii=False)
-        if not hmsWarningIssued and "HMS_07FF-2000-0002-0004" in serialized:
-            hmsWarningIssued = True
-            emitStatus(
-                {
-                    "status": "error",
-                    "error": (
-                        "Fullfør Unload/trekk ut filament fra verktøyhodet før AMS-jobben – "
-                        "deretter prøver vi igjen"
-                    ),
-                }
-            )
-
-        def findKey(obj: Any, key: str) -> Any:
-            if isinstance(obj, dict):
-                if key in obj:
-                    return obj[key]
-                for value in obj.values():
-                    result = findKey(value, key)
-                    if result is not None:
-                        return result
-            elif isinstance(obj, list):
-                for value in obj:
-                    result = findKey(value, key)
-                    if result is not None:
-                        return result
-            return None
-
-        statusMap = {
-            key: findKey(payload, key)
-            for key in ("mc_percent", "gcode_state", "mc_remaining_time", "nozzle_temper", "bed_temper")
-        }
-        handleProgress(statusMap)
-
-    client = mqtt.Client(protocol=mqtt.MQTTv311)
-    client.username_pw_set("bblp", accessCode)
-
-    if insecureTls:
-        client.tls_set(cert_reqs=ssl.CERT_NONE)
-        client.tls_insecure_set(True)
-    else:
-        client.tls_set()
-        client.tls_insecure_set(False)
-
-    def onDisconnect(clientObj: mqtt.Client, _userdata, rc):  # type: ignore[no-redef]
-        if rc != 0:
-            logger.warning(f"MQTT frakoblet uventet (rc={rc})")
-
-    client.on_connect = onConnect
-    client.on_message = onMessage
-    client.on_disconnect = onDisconnect
-
-    try:
-        client.connect(ip, port, keepalive=60)
-    except (OSError, socket.timeout, ssl.SSLError, EOFError) as connectionProblem:
-        errorMessage = (
-            f"Failed to connect to Bambu printer MQTT endpoint {ip}:{port} for serial {serial}: "
-            f"{connectionProblem}"
-        )
-        logger.error(errorMessage)
-        raise RuntimeError(errorMessage) from connectionProblem
-
-    client.loop_start()
-
-    try:
-        if not connectionReady.wait(timeout=10):
-            raise RuntimeError(f"Timed out waiting for MQTT connection to {serial}")
-
-        if connectionError:
-            raise RuntimeError(connectionError)
-
-        firstStatusReceived.wait(timeout=5)
-        if not firstStatusReceived.is_set():
-            logger.warning("Ingen status fra printer innen 5s etter MQTT-connect")
-
-        sequenceId = uuid.uuid4().hex
-        url = f"file:///sdcard/{sdFileName}"
-
-        payload = {
-            "print": {
-                "command": "project_file",
-                "sequence_id": sequenceId,
-                "url": url,
-                "use_ams": bool(useAms),
-                "bed_levelling": bool(bedLeveling),
-                "layer_inspect": bool(layerInspect),
-                "flow_cali": bool(flowCalibration),
-                "vibration_cali": bool(vibrationCalibration),
-            }
-        }
-        if paramPath:
-            payload["print"]["param"] = paramPath
-
-        printPayload = payload.get("print", {})
-        printPayload.pop("bed_leveling", None)
-        printPayload["bed_levelling"] = bool(bedLeveling)
-        printPayload.setdefault("project_id", "0")
-        printPayload.setdefault("profile_id", "0")
-        payload["print"] = printPayload
-
-        emitStatus(
-            {
-                "status": "starting",
-                "url": url,
-                "param": paramPath,
-                "useAms": bool(useAms),
-                "bedLeveling": bool(bedLeveling),
-                "layerInspect": bool(layerInspect),
-                "flowCalibration": bool(flowCalibration),
-                "vibrationCalibration": bool(vibrationCalibration),
-            }
-        )
-
-        payloadJson = json.dumps(payload)
-        publishInfo = client.publish(topicRequest, payloadJson, qos=1)
-        if publishInfo.rc != mqtt.MQTT_ERR_SUCCESS:
-            raise RuntimeError(f"MQTT publish feilet med rc={publishInfo.rc}")
-        publishInfo.wait_for_publish()
-        if not publishInfo.is_published():
-            raise RuntimeError("MQTT meldingen ble ikke bekreftet (QoS1 PUBACK mangler)")
-        logger.info("MQTT publish fullført (QoS1 ACK mottatt)")
-
-        timeoutDeadline = time.time() + max(waitSeconds, statusWarmupSeconds, 0)
-        while time.time() < timeoutDeadline:
-            time.sleep(0.5)
-    finally:
-        client.loop_stop()
-        client.disconnect()
 
 
 
@@ -748,14 +538,6 @@ def deleteRemoteFile(printer: Any, remotePath: str) -> bool:
                 return True
         except Exception:
             logger.debug("delete_file failed for %s on printer", candidate, exc_info=True)
-
-    mqttClient = getattr(printer, "mqtt_client", None)
-    for candidate in candidates:
-        try:
-            if tryDelete(mqttClient, candidate):
-                return True
-        except Exception:
-            logger.debug("mqtt_client.delete_file failed for %s", candidate, exc_info=True)
 
     if isinstance(printer, dict):
         ipAddress = printer.get("ipAddress") or printer.get("ip")
@@ -838,7 +620,7 @@ class BambuPrintOptions:
     lanStrategy: str = "legacy"
     transport: str = "lan"
     spoolMode: bool = False
-    startStrategy: Literal["api", "mqtt"] = "api"
+    startStrategy: Literal["api"] = "api"
 
 
 def _waitForMqttReady(apiPrinter: Any, timeout: float = 30.0, poll: float = 0.5) -> tuple[Any, Any]:
@@ -1473,11 +1255,13 @@ def sendBambuPrintJob(
             applySkippedObjectsToArchive(workingPath, skippedObjects)
 
         startStrategy = (options.startStrategy or "api").lower()
-        useApiStrategy = startStrategy == "api" and bambulabsApi is not None
+        if startStrategy != "api":
+            raise RuntimeError("API-only policy requires startStrategy='api'")
+        if bambulabsApi is None:
+            raise RuntimeError("bambulabs_api is required for API-only policy")
 
-        if useApiStrategy:
-            if lanStrategy != "bambuapi":
-                logger.info("Forcing bambulabs_api upload because startStrategy=api")
+        if lanStrategy != "bambuapi":
+            logger.info("Forcing bambulabs_api upload because startStrategy=api")
             lanStrategy = "bambuapi"
 
         if options.useCloud and options.cloudUrl:
@@ -1549,86 +1333,58 @@ def sendBambuPrintJob(
             )
 
         startStrategy = (options.startStrategy or "api").lower()
-        useApiStrategy = startStrategy == "api" and bambulabsApi is not None
+        if startStrategy != "api":
+            raise RuntimeError("API-only policy requires startStrategy='api'")
+        if bambulabsApi is None:
+            raise RuntimeError("bambulabs_api is required for API-only policy")
         startingEvent = {
             "status": "starting",
             "param": paramPath,
             "remoteFile": uploadedName,
             "useAms": resolvedUseAms,
-            "method": "api" if useApiStrategy else "mqtt",
+            "method": "api",
         }
         if statusCallback:
             statusCallback(startingEvent)
 
         apiResult: Optional[Dict[str, Any]] = None
-        if useApiStrategy:
-            try:
-                apiResult = startPrintViaApi(
-                    ip=options.ipAddress,
-                    serial=options.serialNumber,
-                    accessCode=options.accessCode,
-                    uploaded_name=uploadedName,
-                    plate_index=plateIndex,
-                    param_path=paramPath,
-                    options=options,
-                    job_metadata=jobMetadata,
-                    ack_timeout_sec=max(float(options.waitSeconds), 1.0),
-                )
-                if statusCallback:
-                    statusCallback(
-                        {
-                            "status": "started",
-                            "method": "api",
-                            "acknowledged": apiResult.get("acknowledged") if apiResult else False,
-                            "state": apiResult.get("state") if apiResult else None,
-                            "gcodeState": apiResult.get("gcodeState") if apiResult else None,
-                            "percentage": apiResult.get("percentage") if apiResult else None,
-                            "useAms": apiResult.get("useAms") if apiResult else resolvedUseAms,
-                            "fallback": apiResult.get("fallbackTriggered") if apiResult else False,
-                        }
-                    )
-            except Exception as error:
-                logger.warning("API start failed for %s: %s", options.serialNumber, error, exc_info=True)
-                if statusCallback:
-                    statusCallback({"status": "apiStartFailed", "error": str(error)})
-
-        if apiResult is None:
-            if startStrategy == "api" and bambulabsApi is None:
-                logger.warning("bambulabs_api not available – falling back to MQTT start for %s", options.serialNumber)
-            elif startStrategy == "api":
-                logger.info("Falling back to MQTT start for %s", options.serialNumber)
-
-            useAmsForMqtt = resolvedUseAms if isinstance(resolvedUseAms, bool) else False
-            if statusCallback and useApiStrategy:
-                statusCallback(
-                    {
-                        "status": "starting",
-                        "method": "mqtt",
-                        "param": paramPath,
-                        "remoteFile": uploadedName,
-                        "useAms": useAmsForMqtt,
-                    }
-                )
-
-            startPrintViaMqtt(
+        try:
+            apiResult = startPrintViaApi(
                 ip=options.ipAddress,
                 serial=options.serialNumber,
                 accessCode=options.accessCode,
-                sdFileName=uploadedName,
-                paramPath=paramPath,
-                useAms=useAmsForMqtt,
-                bedLeveling=options.bedLeveling,
-                layerInspect=options.layerInspect,
-                flowCalibration=options.flowCalibration,
-                vibrationCalibration=options.vibrationCalibration,
-                insecureTls=not options.secureConnection,
-                waitSeconds=options.waitSeconds,
-                statusCallback=statusCallback,
+                uploaded_name=uploadedName,
+                plate_index=plateIndex,
+                param_path=paramPath,
+                options=options,
+                job_metadata=jobMetadata,
+                ack_timeout_sec=max(float(options.waitSeconds), 1.0),
             )
+            if statusCallback:
+                statusCallback(
+                    {
+                        "status": "started",
+                        "method": "api",
+                        "acknowledged": apiResult.get("acknowledged") if apiResult else False,
+                        "state": apiResult.get("state") if apiResult else None,
+                        "gcodeState": apiResult.get("gcodeState") if apiResult else None,
+                        "percentage": apiResult.get("percentage") if apiResult else None,
+                        "useAms": apiResult.get("useAms") if apiResult else resolvedUseAms,
+                        "fallback": apiResult.get("fallbackTriggered") if apiResult else False,
+                    }
+                )
+        except Exception as error:
+            logger.warning("API start failed for %s: %s", options.serialNumber, error, exc_info=True)
+            if statusCallback:
+                statusCallback({"status": "apiStartFailed", "error": str(error)})
+            raise RuntimeError(
+                "API print start failed and MQTT fallback is disabled by policy"
+            ) from error
 
-            startMethodResult = "mqtt"
-        else:
-            startMethodResult = "api"
+        if apiResult is None:
+            raise RuntimeError("API print start failed and MQTT fallback is disabled by policy")
+
+        startMethodResult = "api"
 
         return {
             "method": "lan",

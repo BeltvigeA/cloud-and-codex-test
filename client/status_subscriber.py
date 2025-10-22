@@ -304,12 +304,28 @@ class BambuStatusSubscriber:
             return True
 
     def _connectPrinter(self, printer: Any) -> None:
-        connectMethod = getattr(printer, "mqtt_start", None) or getattr(printer, "connect", None)
+        mqttStart = getattr(printer, "mqtt_start", None)
+        if callable(mqttStart):
+            try:
+                mqttStart()
+            except Exception as error:  # pragma: no cover - surface via callbacks
+                raise RuntimeError(f"Unable to start printer MQTT: {error}") from error
+
+        connectMethod = getattr(printer, "connect", None)
         if callable(connectMethod):
             try:
                 connectMethod()
             except Exception as error:  # pragma: no cover - surface via callbacks
                 raise RuntimeError(f"Unable to connect printer: {error}") from error
+
+        try:
+            from . import bambuPrinter as _bp
+
+            wait = getattr(_bp, "_waitForMqttReady", None)
+            if callable(wait):
+                wait(printer, timeout=15.0)
+        except Exception:  # pragma: no cover - readiness wait is best effort
+            pass
 
     def _collectSnapshot(
         self,
