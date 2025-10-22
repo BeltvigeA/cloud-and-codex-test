@@ -99,6 +99,25 @@ def _normalizeCommandMetadata(command: Dict[str, Any]) -> Dict[str, Any]:
     return {}
 
 
+def _formatMetadataForLog(metadata: Dict[str, Any]) -> str:
+    if not metadata:
+        return "{}"
+    try:
+        return json.dumps(metadata, ensure_ascii=False, sort_keys=True)
+    except TypeError:
+        sanitizedMetadata: Dict[str, Any] = {}
+        for key, value in metadata.items():
+            try:
+                json.dumps(value, ensure_ascii=False)
+                sanitizedMetadata[key] = value
+            except TypeError:
+                sanitizedMetadata[key] = str(value)
+        try:
+            return json.dumps(sanitizedMetadata, ensure_ascii=False, sort_keys=True)
+        except Exception:  # noqa: BLE001 - best effort logging fallback
+            return str(sanitizedMetadata)
+
+
 def _collectSerialCandidates(command: Dict[str, Any], metadata: Dict[str, Any]) -> List[str]:
     candidates: List[str] = []
     for container in (metadata, command):
@@ -245,9 +264,22 @@ class RecipientCommandRouter:
             worker = self._selectWorker(workers, command, metadata)
             commandIdValue = str(command.get("commandId") or "")
             if worker is not None:
+                metadataSummary = _formatMetadataForLog(metadata)
                 if commandIdValue:
                     messagePrefix = "Routing queued command" if queued else "Routing command"
-                    log.debug("%s %s → %s", messagePrefix, commandIdValue, worker.serial)
+                    log.info(
+                        "%s %s → %s metadata=%s",
+                        messagePrefix,
+                        commandIdValue,
+                        worker.serial,
+                        metadataSummary,
+                    )
+                else:
+                    log.info(
+                        "Routing command to %s metadata=%s",
+                        worker.serial,
+                        metadataSummary,
+                    )
                 worker.enqueueCommand(command)
             else:
                 log.info(
@@ -455,7 +487,8 @@ class CommandWorker:
             return
 
         metadata = _normalizeCommandMetadata(command)
-        log.debug("Processing command %s (metadata=%s)", commandId, metadata)
+        metadataSummary = _formatMetadataForLog(metadata)
+        log.info("Processing command %s for %s metadata=%s", commandId, self.serial, metadataSummary)
 
         try:
             self._sendCommandAck(commandId, "processing")
