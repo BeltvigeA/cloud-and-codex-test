@@ -54,12 +54,29 @@ def captureCameraSnapshot(printer: Any, serial: str) -> Path:
     cameraDir = Path.home() / ".printmaster" / "camera"
     cameraDir.mkdir(parents=True, exist_ok=True)
 
+    mqttStart = getattr(printer, "mqtt_start", None)
+    if callable(mqttStart):
+        try:
+            mqttStart()
+        except Exception:
+            log.debug("Printer mqtt_start() failed during camera capture", exc_info=True)
+
     connectMethod = getattr(printer, "connect", None)
     if callable(connectMethod):
         try:
             connectMethod()
         except Exception:
             log.debug("Printer connect() failed during camera capture", exc_info=True)
+
+    getState = getattr(printer, "get_state", None)
+    if callable(getState):
+        readinessDeadline = time.monotonic() + 5.0
+        while time.monotonic() < readinessDeadline:
+            try:
+                getState()
+                break
+            except Exception:
+                time.sleep(0.2)
 
     frameFetcher = getattr(printer, "get_camera_frame", None)
     if not callable(frameFetcher):
@@ -782,22 +799,20 @@ class CommandWorker:
             if self._printerInstance is not None:
                 return self._printerInstance
             printer = bambuApi.Printer(self.ipAddress, self.accessCode, self.serial)
-            connectMethod = getattr(printer, "connect", None)
             mqttStart = getattr(printer, "mqtt_start", None)
-            if callable(connectMethod):
-                try:
-                    connectMethod()
-                except Exception:
-                    log.debug("Printer connect() failed", exc_info=True)
-            elif callable(mqttStart):
-                mqttStart()
-            else:
+            connectMethod = getattr(printer, "connect", None)
+            if not callable(mqttStart) and not callable(connectMethod):
                 raise RuntimeError("bambulabs_api.Printer is missing connect/mqtt_start")
             if callable(mqttStart):
                 try:
                     mqttStart()
                 except Exception:
                     log.debug("Printer mqtt_start() failed", exc_info=True)
+            if callable(connectMethod):
+                try:
+                    connectMethod()
+                except Exception:
+                    log.debug("Printer connect() failed", exc_info=True)
             waitForReady = getattr(bambuPrinter, "_waitForMqttReady", None)
             if callable(waitForReady):
                 try:
