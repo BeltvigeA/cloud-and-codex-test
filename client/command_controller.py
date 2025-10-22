@@ -48,6 +48,37 @@ _cacheData: Optional[Dict[str, Any]] = None
 _cacheLock = threading.Lock()
 
 
+def captureCameraSnapshot(printer: Any, serial: str) -> Path:
+    cameraDir = Path.home() / ".printmaster" / "camera"
+    cameraDir.mkdir(parents=True, exist_ok=True)
+
+    connectMethod = getattr(printer, "connect", None)
+    if callable(connectMethod):
+        try:
+            connectMethod()
+        except Exception:
+            log.debug("Printer connect() failed during camera capture", exc_info=True)
+
+    frameFetcher = getattr(printer, "get_camera_frame", None)
+    if not callable(frameFetcher):
+        frameFetcher = getattr(printer, "get_camera_snapshot", None)
+    if not callable(frameFetcher):
+        raise RuntimeError("Camera capture is unavailable on this printer")
+
+    frameData = frameFetcher()
+    if isinstance(frameData, (list, tuple)) and frameData:
+        frameCandidate = frameData[0]
+    else:
+        frameCandidate = frameData
+    if not isinstance(frameCandidate, (bytes, bytearray)):
+        raise RuntimeError("Camera capture did not return image bytes")
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    filePath = cameraDir / f"{serial}-{timestamp}.jpg"
+    filePath.write_bytes(frameCandidate)
+    return filePath
+
+
 def _determinePollMode() -> str:
     candidate = (os.getenv("CONTROL_POLL_MODE", "recipient") or "recipient").strip().lower()
     if candidate == "printer":
@@ -688,10 +719,22 @@ class CommandWorker:
             if self._printerInstance is not None:
                 return self._printerInstance
             printer = bambuApi.Printer(self.ipAddress, self.accessCode, self.serial)
-            connectMethod = getattr(printer, "mqtt_start", None) or getattr(printer, "connect", None)
-            if connectMethod is None:
+            connectMethod = getattr(printer, "connect", None)
+            mqttStart = getattr(printer, "mqtt_start", None)
+            if callable(connectMethod):
+                try:
+                    connectMethod()
+                except Exception:
+                    log.debug("Printer connect() failed", exc_info=True)
+            elif callable(mqttStart):
+                mqttStart()
+            else:
                 raise RuntimeError("bambulabs_api.Printer is missing connect/mqtt_start")
-            connectMethod()
+            if callable(mqttStart):
+                try:
+                    mqttStart()
+                except Exception:
+                    log.debug("Printer mqtt_start() failed", exc_info=True)
             waitForReady = getattr(bambuPrinter, "_waitForMqttReady", None)
             if callable(waitForReady):
                 try:
@@ -1200,12 +1243,15 @@ class CommandWorker:
                         desiredState = False
                 if desiredState is None:
                     raise ValueError("camera requires metadata.cameraState to be 'on'/'off' or boolean")
-            try:
-                methodName = "camera_on" if desiredState else "camera_off"
-                callPrinterMethod(methodName)
-            except RuntimeError:
-                sendControlPayload({"command": "camera", "param": {"on": desiredState}})
-            message = "Camera enabled" if desiredState else "Camera disabled"
+            if desiredState is False:
+                try:
+                    callPrinterMethod("camera_off")
+                except RuntimeError as error:
+                    raise RuntimeError("camera_off is unavailable") from error
+                message = "Camera disabled"
+            else:
+                snapshotPath = captureCameraSnapshot(printer, self.serial)
+                message = f"Camera snapshot saved to {snapshotPath}"
         elif normalizedType in {"set_speed", "speed", "setspeed"}:
             percentValue = metadata.get("percent") or metadata.get("speedPercent")
             if percentValue is None:

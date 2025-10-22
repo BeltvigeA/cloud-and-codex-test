@@ -195,7 +195,7 @@ def testProcessHeatCommandAcknowledgesAndReports(monkeypatch: pytest.MonkeyPatch
     assert "Heating" in (resultCalls[0]["message"] or "")
 
 
-def testCameraCommandOnFallsBackToMqttClient(monkeypatch: pytest.MonkeyPatch) -> None:
+def testCameraCommandCapturesSnapshot(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     worker = CommandWorker(
         serial="SERIAL777",
         ipAddress="10.0.0.77",
@@ -239,19 +239,22 @@ def testCameraCommandOnFallsBackToMqttClient(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setattr(CommandWorker, "_sendCommandAck", fakeAck)
     monkeypatch.setattr(CommandWorker, "_sendCommandResult", fakeResult)
 
-    class FakeMqttClient:
-        def __init__(self) -> None:
-            self.publishCalls: List[tuple[str, bytes, int]] = []
-
-        def publish(self, topic: str, payload: bytes, qos: int = 0) -> None:
-            self.publishCalls.append((topic, payload, qos))
-
     class FakePrinter:
         def __init__(self) -> None:
-            self.mqtt_client = FakeMqttClient()
+            self.connectCalls = 0
+            self.getCameraFrameCalls = 0
+            self.mqtt_client = type("FakeMqttClient", (), {"publishCalls": []})()
+
+        def connect(self) -> None:
+            self.connectCalls += 1
+
+        def get_camera_frame(self) -> bytes:
+            self.getCameraFrameCalls += 1
+            return b"fake-bytes"
 
     fakePrinter = FakePrinter()
     monkeypatch.setattr(CommandWorker, "_connectPrinter", lambda self: fakePrinter)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
 
     worker._processCommand(
         {
@@ -264,13 +267,18 @@ def testCameraCommandOnFallsBackToMqttClient(monkeypatch: pytest.MonkeyPatch) ->
     assert ackCalls == [("camera-1", "processing")]
     assert finalizeCalls == [("camera-1", "completed")]
     assert resultCalls[0]["status"] == "completed"
-    publishTopic, publishPayload, publishQos = fakePrinter.mqtt_client.publishCalls[0]
-    assert publishTopic == "device/SERIAL777/request"
-    assert publishQos == 1
-    assert json.loads(publishPayload.decode("utf-8")) == {"command": "camera", "param": {"on": True}}
+    message = resultCalls[0]["message"] or ""
+    assert "Camera snapshot saved to" in message
+    cameraDir = tmp_path / ".printmaster" / "camera"
+    savedFiles = list(cameraDir.glob("SERIAL777-*.jpg"))
+    assert len(savedFiles) == 1
+    assert str(savedFiles[0]) in message
+    assert fakePrinter.connectCalls >= 1
+    assert fakePrinter.getCameraFrameCalls == 1
+    assert not fakePrinter.mqtt_client.publishCalls
 
 
-def testCameraCommandOffFallsBackToMqttClient(monkeypatch: pytest.MonkeyPatch) -> None:
+def testCameraCommandOffInvokesCameraOff(monkeypatch: pytest.MonkeyPatch) -> None:
     worker = CommandWorker(
         serial="SERIAL778",
         ipAddress="10.0.0.78",
@@ -314,16 +322,12 @@ def testCameraCommandOffFallsBackToMqttClient(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setattr(CommandWorker, "_sendCommandAck", fakeAck)
     monkeypatch.setattr(CommandWorker, "_sendCommandResult", fakeResult)
 
-    class FakeMqttClient:
-        def __init__(self) -> None:
-            self.publishCalls: List[tuple[str, bytes, int]] = []
-
-        def publish(self, topic: str, payload: bytes, qos: int = 0) -> None:
-            self.publishCalls.append((topic, payload, qos))
-
     class FakePrinter:
         def __init__(self) -> None:
-            self.mqtt_client = FakeMqttClient()
+            self.cameraOffCalls = 0
+
+        def camera_off(self) -> None:
+            self.cameraOffCalls += 1
 
     fakePrinter = FakePrinter()
     monkeypatch.setattr(CommandWorker, "_connectPrinter", lambda self: fakePrinter)
@@ -339,10 +343,7 @@ def testCameraCommandOffFallsBackToMqttClient(monkeypatch: pytest.MonkeyPatch) -
     assert ackCalls == [("camera-2", "processing")]
     assert finalizeCalls == [("camera-2", "completed")]
     assert resultCalls[0]["status"] == "completed"
-    publishTopic, publishPayload, publishQos = fakePrinter.mqtt_client.publishCalls[0]
-    assert publishTopic == "device/SERIAL778/request"
-    assert publishQos == 1
-    assert json.loads(publishPayload.decode("utf-8")) == {"command": "camera", "param": {"on": False}}
+    assert fakePrinter.cameraOffCalls == 1
 
 
 def testProcessUnsupportedCommandReportsFailure(monkeypatch: pytest.MonkeyPatch) -> None:
