@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import base64
 import importlib
-import inspect
 import io
 import webbrowser
 import sys
@@ -939,8 +938,7 @@ def startPrintViaApi(
     except Exception as error:  # pragma: no cover - readiness is best effort
         logger.info("[start] readiness wait failed (continuing): %s", error, exc_info=START_DEBUG)
 
-    ftpPath = buildApiFilename(uploaded_name)
-    remoteUrl = f"file:///{ftpPath}"
+    remoteUrl = f"file:///sdcard/{uploaded_name}"
     if param_path:
         startParam = param_path
     elif isinstance(plate_index, int) and plate_index > 0:
@@ -955,55 +953,15 @@ def startPrintViaApi(
         localErrors: List[str] = []
         started = False
         startMethod = getattr(printer, "start_print", None)
-        startSignature = None
-        acceptsAnyKeyword = False
         if callable(startMethod):
             try:
-                startSignature = inspect.signature(startMethod)
-                if any(
-                    parameter.kind == inspect.Parameter.VAR_KEYWORD
-                    for parameter in startSignature.parameters.values()
-                ):
-                    acceptsAnyKeyword = True
-            except (TypeError, ValueError):
-                startSignature = None
-                acceptsAnyKeyword = True
-        if callable(startMethod):
-            try:
-                if startSignature and "url" in startSignature.parameters:
-                    startArgs: Dict[str, Any] = {"url": remoteUrl}
-                    if startParam:
-                        startArgs["param"] = startParam
-                    for key, value in flags.items():
-                        if value is not None:
-                            startArgs[key] = value
-                    startMethod(**startArgs)
-                else:
-                    startArgs: Dict[str, Any] = {}
-
-                    def supports(paramName: str) -> bool:
-                        if acceptsAnyKeyword:
-                            return True
-                        return (startSignature is None) or (paramName in startSignature.parameters)
-
-                    plateArgument: Any
-                    if isinstance(plate_index, int) and plate_index > 0:
-                        plateArgument = plate_index
-                    elif startParam:
-                        plateArgument = startParam
-                    else:
-                        plateArgument = 1
-
-                    if supports("filename"):
-                        startArgs["filename"] = ftpPath
-                    if supports("plate_number"):
-                        startArgs["plate_number"] = plateArgument
-                    if supports("use_ams") and flags.get("use_ams") is not None:
-                        startArgs["use_ams"] = flags["use_ams"]
-                    if supports("flow_calibration") and hasattr(options, "flowCalibration"):
-                        startArgs["flow_calibration"] = bool(options.flowCalibration)
-
-                    startMethod(**startArgs)
+                startArgs: Dict[str, Any] = {"url": remoteUrl}
+                if startParam:
+                    startArgs["param"] = startParam
+                for key, value in flags.items():
+                    if value is not None:
+                        startArgs[key] = value
+                startMethod(**startArgs)
                 started = True
                 if START_DEBUG:
                     logger.info("[start] start_print() invoked")
@@ -1015,13 +973,7 @@ def startPrintViaApi(
             controlMethod = getattr(printer, "send_control", None)
             if callable(controlMethod):
                 try:
-                    payload: Dict[str, Any] = {
-                        "print": {
-                            "command": "project_file",
-                            "url": remoteUrl,
-                            "file": ftpPath,
-                        }
-                    }
+                    payload: Dict[str, Any] = {"print": {"command": "project_file", "url": remoteUrl}}
                     if startParam:
                         payload["print"]["param"] = startParam
                     for key, value in flags.items():
@@ -1156,17 +1108,6 @@ def buildPrinterTransferFileName(localPath: Path) -> str:
     if match:
         trimmedName = match.group(1)
     return normalizeRemoteFileName(trimmedName)
-
-
-def buildApiFilename(uploadedName: str) -> str:
-    normalizedName = uploadedName.strip().replace("\\", "/")
-    normalizedName = re.sub(r"^file:/+", "", normalizedName)
-    normalizedName = normalizedName.lstrip("/")
-    if not normalizedName:
-        raise ValueError("Uploaded filename cannot be empty for API start")
-    if not normalizedName.lower().startswith("sdcard/"):
-        normalizedName = f"sdcard/{normalizedName}"
-    return normalizedName
 
 
 def _normalizeString(value: Any) -> Optional[str]:
