@@ -116,6 +116,9 @@ def captureCameraSnapshot(printer: Any, serial: str) -> Path:
     cameraStopMethod = getattr(printer, "camera_stop", None) or getattr(
         printer, "camera_off", None
     )
+    cameraRetryCount = 3
+    retryDelaySeconds = 0.75
+    cameraReadinessDeadline = time.monotonic() + 6.0
     cameraIsAlive = False
     if callable(cameraAliveMethod):
         try:
@@ -138,6 +141,22 @@ def captureCameraSnapshot(printer: Any, serial: str) -> Path:
                 error,
                 exc_info=cameraDebugEnabled,
             )
+    if callable(cameraAliveMethod):
+        while time.monotonic() < cameraReadinessDeadline:
+            try:
+                if cameraAliveMethod():
+                    cameraIsAlive = True
+                    if cameraDebugEnabled:
+                        log.info("[camera] camera_client_alive() confirmed ready")
+                    break
+            except Exception as error:  # noqa: BLE001 - third-party SDK raises generic Exception
+                cameraIsAlive = False
+                if cameraDebugEnabled:
+                    log.info("[camera] camera_client_alive() retry failed: %s", error)
+            time.sleep(0.25)
+        else:
+            if cameraDebugEnabled:
+                log.info("[camera] camera readiness deadline reached without confirmation")
 
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     filePath = cameraDirectory / f"{serial}-{timestamp}.jpg"
@@ -151,105 +170,126 @@ def captureCameraSnapshot(printer: Any, serial: str) -> Path:
 
     cameraImageMethod = getattr(printer, "get_camera_image", None)
     if callable(cameraImageMethod):
-        try:
-            methodStart = time.perf_counter()
-            pillowImage = cameraImageMethod()
-            byteStream = io.BytesIO()
-            pillowImage.save(byteStream, format="JPEG")
-            saveBytes(byteStream.getvalue())
-            if cameraDebugEnabled:
-                log.info(
-                    "[camera] get_camera_image() ok in %.3fs",
-                    time.perf_counter() - methodStart,
-                )
-            if startedHereFlag and callable(cameraStopMethod):
-                try:
-                    cameraStopMethod()
-                except Exception:  # pragma: no cover - diagnostic logging only
-                    log.debug(
-                        "[camera] camera_stop/off failed (ignored)",
-                        exc_info=cameraDebugEnabled,
+        lastImageError: Optional[Exception] = None
+        for attemptIndex in range(cameraRetryCount):
+            try:
+                methodStart = time.perf_counter()
+                pillowImage = cameraImageMethod()
+                byteStream = io.BytesIO()
+                pillowImage.save(byteStream, format="JPEG")
+                saveBytes(byteStream.getvalue())
+                if cameraDebugEnabled:
+                    log.info(
+                        "[camera] get_camera_image() ok in %.3fs",
+                        time.perf_counter() - methodStart,
                     )
-            return filePath
-        except Exception as error:  # noqa: BLE001 - third-party SDK raises generic Exception
-            errorMessages.append(f"get_camera_image: {error}")
-            if cameraDebugEnabled:
-                log.info(
-                    "[camera] get_camera_image() failed: %s",
-                    error,
-                    exc_info=True,
-                )
+                if startedHereFlag and callable(cameraStopMethod):
+                    try:
+                        cameraStopMethod()
+                    except Exception:  # pragma: no cover - diagnostic logging only
+                        log.debug(
+                            "[camera] camera_stop/off failed (ignored)",
+                            exc_info=cameraDebugEnabled,
+                        )
+                return filePath
+            except Exception as error:  # noqa: BLE001 - third-party SDK raises generic Exception
+                lastImageError = error
+                if cameraDebugEnabled:
+                    log.info(
+                        "[camera] get_camera_image() attempt %d failed: %s",
+                        attemptIndex + 1,
+                        error,
+                        exc_info=True,
+                    )
+                if attemptIndex + 1 < cameraRetryCount:
+                    time.sleep(retryDelaySeconds)
+        if lastImageError is not None:
+            errorMessages.append(f"get_camera_image: {lastImageError}")
 
     cameraFrameMethod = getattr(printer, "get_camera_frame", None)
     if callable(cameraFrameMethod):
-        try:
-            methodStart = time.perf_counter()
-            frameData = cameraFrameMethod()
-            if isinstance(frameData, str):
-                rawBytes = base64.b64decode(frameData, validate=False)
-                saveBytes(rawBytes)
-            else:
-                raise RuntimeError(
-                    f"unexpected type from get_camera_frame: {type(frameData)}"
-                )
-            if cameraDebugEnabled:
-                log.info(
-                    "[camera] get_camera_frame() ok in %.3fs",
-                    time.perf_counter() - methodStart,
-                )
-            if startedHereFlag and callable(cameraStopMethod):
-                try:
-                    cameraStopMethod()
-                except Exception:  # pragma: no cover - diagnostic logging only
-                    log.debug(
-                        "[camera] camera_stop/off failed (ignored)",
-                        exc_info=cameraDebugEnabled,
+        lastFrameError: Optional[Exception] = None
+        for attemptIndex in range(cameraRetryCount):
+            try:
+                methodStart = time.perf_counter()
+                frameData = cameraFrameMethod()
+                if isinstance(frameData, str):
+                    rawBytes = base64.b64decode(frameData, validate=False)
+                    saveBytes(rawBytes)
+                else:
+                    raise RuntimeError(
+                        f"unexpected type from get_camera_frame: {type(frameData)}"
                     )
-            return filePath
-        except Exception as error:  # noqa: BLE001 - third-party SDK raises generic Exception
-            errorMessages.append(f"get_camera_frame: {error}")
-            if cameraDebugEnabled:
-                log.info(
-                    "[camera] get_camera_frame() failed: %s",
-                    error,
-                    exc_info=True,
-                )
+                if cameraDebugEnabled:
+                    log.info(
+                        "[camera] get_camera_frame() ok in %.3fs",
+                        time.perf_counter() - methodStart,
+                    )
+                if startedHereFlag and callable(cameraStopMethod):
+                    try:
+                        cameraStopMethod()
+                    except Exception:  # pragma: no cover - diagnostic logging only
+                        log.debug(
+                            "[camera] camera_stop/off failed (ignored)",
+                            exc_info=cameraDebugEnabled,
+                        )
+                return filePath
+            except Exception as error:  # noqa: BLE001 - third-party SDK raises generic Exception
+                lastFrameError = error
+                if cameraDebugEnabled:
+                    log.info(
+                        "[camera] get_camera_frame() attempt %d failed: %s",
+                        attemptIndex + 1,
+                        error,
+                        exc_info=True,
+                    )
+                if attemptIndex + 1 < cameraRetryCount:
+                    time.sleep(retryDelaySeconds)
+        if lastFrameError is not None:
+            errorMessages.append(f"get_camera_frame: {lastFrameError}")
 
     cameraSnapshotMethod = getattr(printer, "get_camera_snapshot", None)
     if callable(cameraSnapshotMethod):
-        try:
-            methodStart = time.perf_counter()
-            snapshotData = cameraSnapshotMethod()
-            if isinstance(snapshotData, (bytes, bytearray)):
-                saveBytes(bytes(snapshotData))
-            elif isinstance(snapshotData, str):
-                saveBytes(base64.b64decode(snapshotData, validate=False))
-            else:
-                raise RuntimeError(
-                    f"unexpected type from get_camera_snapshot: {type(snapshotData)}"
-                )
-            if cameraDebugEnabled:
-                log.info(
-                    "[camera] get_camera_snapshot() ok in %.3fs",
-                    time.perf_counter() - methodStart,
-                )
-            if startedHereFlag and callable(cameraStopMethod):
-                try:
-                    cameraStopMethod()
-                except Exception:  # pragma: no cover - diagnostic logging only
-                    log.debug(
-                        "[camera] camera_stop/off failed (ignored)",
-                        exc_info=cameraDebugEnabled,
+        lastSnapshotError: Optional[Exception] = None
+        for attemptIndex in range(cameraRetryCount):
+            try:
+                methodStart = time.perf_counter()
+                snapshotData = cameraSnapshotMethod()
+                if isinstance(snapshotData, (bytes, bytearray)):
+                    saveBytes(bytes(snapshotData))
+                elif isinstance(snapshotData, str):
+                    saveBytes(base64.b64decode(snapshotData, validate=False))
+                else:
+                    raise RuntimeError(
+                        f"unexpected type from get_camera_snapshot: {type(snapshotData)}"
                     )
-            return filePath
-        except Exception as error:  # noqa: BLE001 - third-party SDK raises generic Exception
-            errorMessages.append(f"get_camera_snapshot: {error}")
-            if cameraDebugEnabled:
-                log.info(
-                    "[camera] get_camera_snapshot() failed: %s",
-                    error,
-                    exc_info=True,
-                )
+                if cameraDebugEnabled:
+                    log.info(
+                        "[camera] get_camera_snapshot() ok in %.3fs",
+                        time.perf_counter() - methodStart,
+                    )
+                if startedHereFlag and callable(cameraStopMethod):
+                    try:
+                        cameraStopMethod()
+                    except Exception:  # pragma: no cover - diagnostic logging only
+                        log.debug(
+                            "[camera] camera_stop/off failed (ignored)",
+                            exc_info=cameraDebugEnabled,
+                        )
+                return filePath
+            except Exception as error:  # noqa: BLE001 - third-party SDK raises generic Exception
+                lastSnapshotError = error
+                if cameraDebugEnabled:
+                    log.info(
+                        "[camera] get_camera_snapshot() attempt %d failed: %s",
+                        attemptIndex + 1,
+                        error,
+                        exc_info=True,
+                    )
+                if attemptIndex + 1 < cameraRetryCount:
+                    time.sleep(retryDelaySeconds)
+        if lastSnapshotError is not None:
+            errorMessages.append(f"get_camera_snapshot: {lastSnapshotError}")
 
     if startedHereFlag and callable(cameraStopMethod):
         try:
