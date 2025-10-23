@@ -26,6 +26,7 @@ from .base44_client import (
     listPendingCommandsForRecipient,
     postCommandResult,
     postReportError,
+    postReportPrinterImage,
 )
 from .client import buildBaseUrl, defaultBaseUrl, getPrinterControlEndpointUrl
 
@@ -1450,6 +1451,44 @@ class CommandWorker:
             else:
                 snapshotPath = captureCameraSnapshot(printer, self.serial)
                 message = f"Camera snapshot saved to {snapshotPath}"
+                try:
+                    imageBytes = snapshotPath.read_bytes()
+                except Exception as error:  # noqa: BLE001 - filesystem errors should not block command
+                    log.warning(
+                        "[camera] failed to read snapshot for upload: %s",
+                        error,
+                        exc_info=cameraDebugEnabled,
+                    )
+                else:
+                    encodedImage = base64.b64encode(imageBytes).decode("ascii")
+                    imageDataUri = f"data:image/jpeg;base64,{encodedImage}"
+                    payload = {
+                        "printerSerial": self.serial,
+                        "printerIpAddress": self.ipAddress,
+                        "imageType": "webcam",
+                        "imageData": imageDataUri,
+                    }
+                    log.info(
+                        "[camera] posting snapshot to Base44 for %s",
+                        self.serial,
+                    )
+                    try:
+                        postReportPrinterImage(payload)
+                    except Exception as error:  # noqa: BLE001 - HTTP client raises generic Exception
+                        log.warning(
+                            "[camera] failed to post snapshot for %s: %s",
+                            self.serial,
+                            error,
+                            exc_info=cameraDebugEnabled,
+                        )
+                    else:
+                        log.info(
+                            "[camera] snapshot posted for %s",
+                            self.serial,
+                        )
+                        message = (
+                            f"Camera snapshot saved to {snapshotPath} and sent to Base44"
+                        )
         elif normalizedType in {"set_speed", "speed", "setspeed"}:
             percentValue = metadata.get("percent") or metadata.get("speedPercent")
             if percentValue is None:
