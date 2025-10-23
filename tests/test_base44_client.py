@@ -36,19 +36,31 @@ def test_functions_requests_use_dedicated_api_key(monkeypatch: pytest.MonkeyPatc
     monkeypatch.setenv("BASE44_RECIPIENT_ID", "recipient-xyz")
 
     recorded_headers: List[Dict[str, str]] = []
+    recorded_requests: List[Tuple[str, Dict[str, Any]]] = []
 
     def fake_post(url: str, json: Dict[str, Any] | None = None, headers: Dict[str, str] | None = None, timeout: float = 0.0) -> _DummyResponse:
         if headers is not None:
             recorded_headers.append(dict(headers))
+        recorded_requests.append((url, dict(json or {})))
         return _DummyResponse({})
 
     monkeypatch.setattr(base44_client.requests, "post", fake_post)
 
     base44_client.postUpdateStatus({"status": "ready"})
     base44_client.postReportError({"errorMessage": "boom"})
+    base44_client.postReportPrinterImage(
+        {
+            "printerIpAddress": "192.168.1.100",
+            "imageType": "webcam",
+            "imageData": "data:image/jpeg;base64,xxx",
+        }
+    )
 
-    assert len(recorded_headers) == 2
+    assert len(recorded_headers) == 3
     assert all(headers.get("X-API-Key") == "functions-key" for headers in recorded_headers)
+    assert any(url.endswith("/reportPrinterImage") for url, _payload in recorded_requests)
+    image_payload = next(payload for url, payload in recorded_requests if url.endswith("/reportPrinterImage"))
+    assert image_payload["recipientId"] == "recipient-xyz"
 
 
 def test_control_requests_use_control_api_key(monkeypatch: pytest.MonkeyPatch) -> None:

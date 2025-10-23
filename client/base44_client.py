@@ -15,6 +15,7 @@ BASE44_FUNCTIONS_BASE = "https://print-flow-pro-eb683cc6.base44.app/api/apps/68b
 DEFAULT_CONTROL_BASE_URL = "https://printer-backend-934564650450.europe-west1.run.app"
 UPDATE_STATUS_URL = f"{BASE44_FUNCTIONS_BASE}/updatePrinterStatus"
 REPORT_ERROR_URL = f"{BASE44_FUNCTIONS_BASE}/reportPrinterError"
+REPORT_IMAGE_URL = f"{BASE44_FUNCTIONS_BASE}/reportPrinterImage"
 
 
 def _resolveApiKey(*envKeys: str) -> str:
@@ -87,6 +88,22 @@ def postReportError(payload: Dict[str, object]) -> Dict[str, object]:
         return {}
     response = requests.post(
         REPORT_ERROR_URL,
+        json=preparedPayload,
+        headers=_buildFunctionsHeaders(),
+        timeout=10,
+    )
+    response.raise_for_status()
+    return response.json() if response.content else {}
+
+
+def postReportPrinterImage(payload: Dict[str, object]) -> Dict[str, object]:
+    """POST to reportPrinterImage. payload MUST match the required schema."""
+
+    preparedPayload = dict(payload)
+    if not _ensureRecipient(preparedPayload):
+        return {}
+    response = requests.post(
+        REPORT_IMAGE_URL,
         json=preparedPayload,
         headers=_buildFunctionsHeaders(),
         timeout=10,
