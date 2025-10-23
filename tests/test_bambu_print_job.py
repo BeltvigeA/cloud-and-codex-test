@@ -31,6 +31,7 @@ class FakeApiPrinter:
         self.startCount = 0
         self._statePollsBeforeStart = 0
         self._statePollsAfterStart = 0
+        self.startPayloads: list[Dict[str, Any]] = []
 
     def mqtt_start(self) -> None:
         return None
@@ -54,11 +55,12 @@ class FakeApiPrinter:
     def get_gcode_state(self) -> str:
         return "PRINTING" if self.started else "IDLE"
 
-    def start_print(self, uploadName: str, startParam: Any | None = None, use_ams: Optional[bool] = None) -> None:
+    def start_print(self, **kwargs: Any) -> None:
         self.startCount += 1
         self.started = True
         self._statePollsAfterStart = 0
-        self.startRequests.append(use_ams)
+        self.startPayloads.append(dict(kwargs))
+        self.startRequests.append(kwargs.get("use_ams"))
         if self.startCount >= 2:
             self.conflictFirst = False
 
