@@ -31,7 +31,8 @@ class FakeApiPrinter:
         self.startCount = 0
         self._statePollsBeforeStart = 0
         self._statePollsAfterStart = 0
-        self.startPayloads: list[Dict[str, Any]] = []
+        self.startPositionalArgs: list[tuple[Any, ...]] = []
+        self.startKeywordArgs: list[Dict[str, Any]] = []
 
     def mqtt_start(self) -> None:
         return None
@@ -55,11 +56,12 @@ class FakeApiPrinter:
     def get_gcode_state(self) -> str:
         return "PRINTING" if self.started else "IDLE"
 
-    def start_print(self, **kwargs: Any) -> None:
+    def start_print(self, *args: Any, **kwargs: Any) -> None:
         self.startCount += 1
         self.started = True
         self._statePollsAfterStart = 0
-        self.startPayloads.append(dict(kwargs))
+        self.startPositionalArgs.append(tuple(args))
+        self.startKeywordArgs.append(dict(kwargs))
         self.startRequests.append(kwargs.get("use_ams"))
         if self.startCount >= 2:
             self.conflictFirst = False
@@ -141,6 +143,15 @@ def test_startPrintViaApi_acknowledges(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert result["acknowledged"] is True
     assert result["fallbackTriggered"] is False
+    assert fakePrinter.startPositionalArgs == [("job.3mf", "Metadata/plate_1.gcode")]
+    assert fakePrinter.startKeywordArgs == [
+        {
+            "bed_levelling": True,
+            "layer_inspect": True,
+            "flow_cali": False,
+            "vibration_cali": False,
+        }
+    ]
     assert fakePrinter.startRequests == [None]
     assert fakePrinter.disconnectCalls == 1
 
@@ -170,6 +181,25 @@ def test_startPrintViaApi_retries_on_conflict(monkeypatch: pytest.MonkeyPatch) -
 
     assert result["fallbackTriggered"] is True
     assert result["useAms"] is False
+    assert fakePrinter.startPositionalArgs == [
+        ("job.3mf", "Metadata/plate_1.gcode"),
+        ("job.3mf", "Metadata/plate_1.gcode"),
+    ]
+    assert fakePrinter.startKeywordArgs == [
+        {
+            "bed_levelling": True,
+            "layer_inspect": True,
+            "flow_cali": False,
+            "vibration_cali": False,
+        },
+        {
+            "bed_levelling": True,
+            "layer_inspect": True,
+            "flow_cali": False,
+            "vibration_cali": False,
+            "use_ams": False,
+        },
+    ]
     assert fakePrinter.startRequests == [None, False]
     assert fakePrinter.stopCalls == 1
 
