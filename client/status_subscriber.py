@@ -307,14 +307,24 @@ class BambuStatusSubscriber:
         mqttStart = getattr(printer, "mqtt_start", None)
         if callable(mqttStart):
             try:
+                startTime = time.perf_counter()
                 mqttStart()
+                self.log.info(
+                    "[status] mqtt_start() ok in %.3fs",
+                    time.perf_counter() - startTime,
+                )
             except Exception as error:  # pragma: no cover - surface via callbacks
                 raise RuntimeError(f"Unable to start printer MQTT: {error}") from error
 
         connectMethod = getattr(printer, "connect", None)
         if callable(connectMethod):
             try:
+                connectStartTime = time.perf_counter()
                 connectMethod()
+                self.log.info(
+                    "[status] connect() ok in %.3fs",
+                    time.perf_counter() - connectStartTime,
+                )
             except Exception as error:  # pragma: no cover - surface via callbacks
                 raise RuntimeError(f"Unable to connect printer: {error}") from error
 
@@ -323,7 +333,12 @@ class BambuStatusSubscriber:
 
             wait = getattr(_bp, "_waitForMqttReady", None)
             if callable(wait):
+                readinessStartTime = time.perf_counter()
                 wait(printer, timeout=15.0)
+                self.log.info(
+                    "[status] readiness ok in %.3fs",
+                    time.perf_counter() - readinessStartTime,
+                )
         except Exception:  # pragma: no cover - readiness wait is best effort
             pass
 
