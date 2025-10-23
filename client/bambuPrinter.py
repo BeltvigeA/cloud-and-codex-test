@@ -8,7 +8,6 @@ import io
 import webbrowser
 import sys
 import urllib.parse
-import json
 import os
 import re
 import shutil
@@ -40,15 +39,49 @@ else:
 
 
 logger = logging.getLogger(__name__)
+START_DEBUG = (
+    str(os.getenv("PRINTMASTER_START_DEBUG", "")).strip().lower()
+    not in ("", "0", "false", "off")
+)
+
+
+def _find_key(obj: Any, keys: set[str]) -> Any:
+    if obj is None:
+        return None
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            if key in keys:
+                return value
+            nested = _find_key(value, keys)
+            if nested is not None:
+                return nested
+    elif isinstance(obj, (list, tuple)):
+        for item in obj:
+            nested = _find_key(item, keys)
+            if nested is not None:
+                return nested
+    return None
+
+
+def _extract_gcode_state(state: Any) -> Optional[str]:
+    keys = {"gcode_state", "sub_state", "state", "printer_state", "job_state"}
+    value = _find_key(state, keys)
+    return str(value) if value is not None else None
+
+
+def _is_active_state(stateName: Optional[str]) -> bool:
+    if not stateName:
+        return False
+    normalized = str(stateName).upper()
+    return any(token in normalized for token in ("PRINT", "RUN", "HEAT", "PREP", "BUSY", "WORK"))
 
 
 
 # Persistent dir for handing 3MF to Bambu Connect
-from pathlib import Path as _PathAlias
-PERSISTENT_FILES_DIR = _PathAlias.home() / ".printmaster" / "files"
+PERSISTENT_FILES_DIR = Path.home() / ".printmaster" / "files"
 
 def _ensure_dir(path):
-    p = _PathAlias(path).expanduser().resolve()
+    p = Path(path).expanduser().resolve()
     p.mkdir(parents=True, exist_ok=True)
     return p
 def makeTlsContext(insecure: bool = True) -> ssl.SSLContext:
@@ -856,7 +889,7 @@ def startPrintViaApi(
     param_path: Optional[str],
     options: BambuPrintOptions,
     job_metadata: Optional[Dict[str, Any]] = None,
-    ack_timeout_sec: float = 60.0,
+    ack_timeout_sec: float = 15.0,
 ) -> Dict[str, Any]:
     """Start a print using bambulabs_api.Printer with acknowledgement handling."""
 
@@ -868,76 +901,152 @@ def startPrintViaApi(
         raise RuntimeError("bambulabs_api.Printer class is unavailable")
 
     printer = printerClass(ip, accessCode, serial)
-    # Prefer explicit gcode parameter when available; otherwise fall back to plate index
-    startParam = param_path if param_path is not None else plate_index
     resolvedUseAms = resolveUseAmsAuto(options, job_metadata, None)
 
-    paramDescription = startParam if startParam is not None else "<default>"
-    logger.info(
-        "Starting print via API for %s: file=%s param=%s use_ams=%s",
-        serial,
-        uploaded_name,
-        paramDescription,
-        resolvedUseAms,
-    )
+    flags: Dict[str, Any] = {"use_ams": resolvedUseAms}
 
-    connectMethod = getattr(printer, "mqtt_start", None) or getattr(printer, "connect", None)
-    if connectMethod:
-        connectMethod()
+    if START_DEBUG:
+        logger.info(
+            "[start] prepared printer=%s use_ams=%s ack_timeout=%.1fs",
+            serial,
+            resolvedUseAms,
+            ack_timeout_sec,
+        )
 
-    _waitForMqttReady(printer, timeout=30.0)
-
-    def _collectStatus() -> Dict[str, Any]:
-        snapshot: Dict[str, Any] = {"state": None, "gcodeState": None, "percentage": None}
+    if hasattr(printer, "mqtt_start"):
         try:
-            statePayload = printer.get_state()
-            snapshot["rawState"] = statePayload
-            snapshot["state"] = _extractStateText(statePayload)
-        except Exception as error:  # pragma: no cover - depends on SDK behaviour
-            snapshot["stateError"] = error
+            printer.mqtt_start()
+            if START_DEBUG:
+                logger.info("[start] mqtt_start() ok")
+        except Exception as error:  # pragma: no cover - best effort diagnostics
+            logger.warning("[start] mqtt_start() failed: %s", error, exc_info=START_DEBUG)
+    if hasattr(printer, "connect"):
         try:
-            gcodeStateGetter = getattr(printer, "get_gcode_state", None)
-            if callable(gcodeStateGetter):
-                snapshot["gcodeState"] = gcodeStateGetter()
-        except Exception as error:  # pragma: no cover - depends on SDK behaviour
-            snapshot["gcodeStateError"] = error
+            printer.connect()
+            if START_DEBUG:
+                logger.info("[start] connect() ok")
+        except Exception as error:  # pragma: no cover - best effort diagnostics
+            logger.warning("[start] connect() failed: %s", error, exc_info=START_DEBUG)
+    try:
+        _waitForMqttReady(printer, timeout=max(8.0, min(30.0, float(ack_timeout_sec))))
+    except Exception as error:  # pragma: no cover - readiness is best effort
+        logger.info("[start] readiness wait failed (continuing): %s", error, exc_info=START_DEBUG)
+
+    remoteUrl = f"file:///sdcard/{uploaded_name}"
+    if param_path:
+        startParam = param_path
+    elif isinstance(plate_index, int) and plate_index > 0:
+        startParam = f"Metadata/plate_{plate_index}.gcode"
+    else:
+        startParam = None
+
+    if START_DEBUG:
+        logger.info("[start] url=%s param=%s flags=%s", remoteUrl, startParam, flags)
+
+    def _invokeStart() -> None:
+        localErrors: List[str] = []
+        started = False
+        startMethod = getattr(printer, "start_print", None)
+        if callable(startMethod):
+            try:
+                startArgs: Dict[str, Any] = {"url": remoteUrl}
+                if startParam:
+                    startArgs["param"] = startParam
+                for key, value in flags.items():
+                    if value is not None:
+                        startArgs[key] = value
+                startMethod(**startArgs)
+                started = True
+                if START_DEBUG:
+                    logger.info("[start] start_print() invoked")
+            except Exception as error:
+                localErrors.append(f"start_print:{error}")
+                if START_DEBUG:
+                    logger.info("[start] start_print failed: %s", error, exc_info=True)
+        if not started:
+            controlMethod = getattr(printer, "send_control", None)
+            if callable(controlMethod):
+                try:
+                    payload: Dict[str, Any] = {"print": {"command": "project_file", "url": remoteUrl}}
+                    if startParam:
+                        payload["print"]["param"] = startParam
+                    for key, value in flags.items():
+                        if value is not None:
+                            payload["print"][key] = value
+                    if START_DEBUG:
+                        logger.info("[start] send_control payload=%s", payload)
+                    controlMethod(payload)
+                    started = True
+                    if START_DEBUG:
+                        logger.info("[start] send_control(project_file) invoked")
+                except Exception as error:
+                    localErrors.append(f"send_control(project_file):{error}")
+                    if START_DEBUG:
+                        logger.info("[start] send_control failed: %s", error, exc_info=True)
+        if not started:
+            summary = " | ".join(localErrors or ["no method"])
+            raise RuntimeError(f"Unable to start print via API: {summary}")
+
+    def _pollForAcknowledgement(timeoutSeconds: float) -> Dict[str, Any]:
+        deadline = time.monotonic() + max(5.0, float(timeoutSeconds))
+        lastStatePayload: Any = None
+        lastPercentage: Any = None
+        lastGcodeState: Optional[str] = None
+        while time.monotonic() < deadline:
+            try:
+                statePayload = printer.get_state()
+                if statePayload is not None:
+                    lastStatePayload = statePayload
+                    candidateState = _extract_gcode_state(statePayload)
+                    if candidateState is not None:
+                        lastGcodeState = candidateState
+            except Exception as error:
+                if START_DEBUG:
+                    logger.info("[start] poll get_state failed: %s", error)
+            try:
+                percentagePayload = printer.get_percentage()
+                if percentagePayload is not None:
+                    lastPercentage = percentagePayload
+            except Exception as error:
+                if START_DEBUG:
+                    logger.info("[start] poll get_percentage failed: %s", error)
+            stateIndicator = lastGcodeState or extractStateText(lastStatePayload)
+            percentageFloat: Optional[float]
+            try:
+                percentageFloat = float(lastPercentage) if lastPercentage is not None else None
+            except Exception:
+                percentageFloat = None
+            if START_DEBUG:
+                logger.info("[start] poll state=%s percent=%s", stateIndicator, lastPercentage)
+            if (percentageFloat is not None and percentageFloat > 0.0) or _is_active_state(stateIndicator):
+                return {
+                    "acknowledged": True,
+                    "statePayload": lastStatePayload,
+                    "state": extractStateText(lastStatePayload) or stateIndicator,
+                    "gcodeState": lastGcodeState or stateIndicator,
+                    "percentage": percentageFloat,
+                }
+            time.sleep(0.5)
         try:
-            snapshot["percentage"] = printer.get_percentage()
-        except Exception as error:  # pragma: no cover - depends on SDK behaviour
-            snapshot["percentageError"] = error
-        return snapshot
-
-    def _awaitAcknowledgement(timeoutSeconds: float) -> tuple[bool, Dict[str, Any]]:
-        acknowledgementDeadline = time.monotonic() + max(timeoutSeconds, 0.0)
-        lastSnapshot: Dict[str, Any] = {}
-        acknowledged = False
-        while time.monotonic() < acknowledgementDeadline:
-            snapshot = _collectStatus()
-            lastSnapshot = snapshot
-            percentage = snapshot.get("percentage")
-            stateText = snapshot.get("state")
-            gcodeState = snapshot.get("gcodeState")
-            if (isinstance(percentage, (int, float)) and percentage > 0) or _stateSuggestsPrinting(stateText) or _stateSuggestsPrinting(
-                gcodeState if isinstance(gcodeState, str) else None
-            ):
-                acknowledged = True
-                break
-            time.sleep(1.0)
-        return acknowledged, lastSnapshot
-
-    def _start(useAmsValue: Optional[bool]) -> tuple[bool, Dict[str, Any], float]:
-        startTime = time.monotonic()
-        printer.start_print(uploaded_name, startParam, use_ams=useAmsValue)
-        acknowledged, lastSnapshot = _awaitAcknowledgement(ack_timeout_sec)
-        elapsed = time.monotonic() - startTime
-        return acknowledged, lastSnapshot, elapsed
+            timeoutPercentage = float(lastPercentage) if lastPercentage is not None else None
+        except Exception:
+            timeoutPercentage = None
+        return {
+            "acknowledged": False,
+            "statePayload": lastStatePayload,
+            "state": extractStateText(lastStatePayload) or lastGcodeState,
+            "gcodeState": lastGcodeState,
+            "percentage": timeoutPercentage,
+        }
 
     fallbackTriggered = False
     finalUseAms = resolvedUseAms
 
     try:
-        acknowledged, snapshot, elapsed = _start(resolvedUseAms)
-        conflictDetected = _looksLikeAmsFilamentConflict(snapshot)
+        _invokeStart()
+        ackResult = _pollForAcknowledgement(ack_timeout_sec)
+        acknowledged = bool(ackResult.get("acknowledged"))
+        conflictDetected = _looksLikeAmsFilamentConflict(ackResult.get("statePayload"))
         if (resolvedUseAms is None) and (conflictDetected or not acknowledged):
             logger.warning(
                 "API start detected possible AMS filament conflict for %s – retrying with use_ams=False",
@@ -945,33 +1054,31 @@ def startPrintViaApi(
             )
             fallbackTriggered = True
             finalUseAms = False
+            flags["use_ams"] = False
             try:
-                printer.stop_print()
+                stopMethod = getattr(printer, "stop_print", None)
+                if callable(stopMethod):
+                    stopMethod()
             except Exception:  # pragma: no cover - best effort stop
                 logger.debug("stop_print failed during AMS retry", exc_info=True)
-            acknowledged, snapshot, elapsed = _start(False)
+            time.sleep(0.5)
+            _invokeStart()
+            ackResult = _pollForAcknowledgement(ack_timeout_sec)
+            acknowledged = bool(ackResult.get("acknowledged"))
         logger.info(
-            "API start acknowledgement for %s: acknowledged=%s state=%s gcodeState=%s pct=%s in %.1fs",
+            "API start acknowledgement for %s: acknowledged=%s state=%s gcodeState=%s pct=%s",
             serial,
             acknowledged,
-            snapshot.get("state"),
-            snapshot.get("gcodeState"),
-            snapshot.get("percentage"),
-            elapsed,
+            ackResult.get("state"),
+            ackResult.get("gcodeState"),
+            ackResult.get("percentage"),
         )
-        return {
-            "acknowledged": acknowledged,
-            "state": snapshot.get("state"),
-            "gcodeState": snapshot.get("gcodeState"),
-            "percentage": snapshot.get("percentage"),
-            "useAms": finalUseAms,
-            "fallbackTriggered": fallbackTriggered,
-        }
+        ackResult.pop("statePayload", None)
+        ackResult["useAms"] = finalUseAms
+        ackResult["fallbackTriggered"] = fallbackTriggered
+        return ackResult
     finally:
-        try:
-            printer.disconnect()
-        except Exception:  # pragma: no cover - best effort cleanup
-            pass
+        safeDisconnectPrinter(printer)
 
 
 def normalizeRemoteFileName(name: str) -> str:

@@ -15,11 +15,11 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 import requests
 
-# Reduce noise from third-party SDK logger
-logging.getLogger("bambulabs_api").setLevel(logging.WARNING)
-
 from .bambuPrinter import extractStateText, looksLikeAmsFilamentConflict, safeDisconnectPrinter
 from .base44_client import postReportError, postUpdateStatus
+
+# Reduce noise from third-party SDK logger
+logging.getLogger("bambulabs_api").setLevel(logging.WARNING)
 
 
 try:  # pragma: no cover - dependency handled dynamically in tests
@@ -56,6 +56,10 @@ class BambuStatusSubscriber:
         self.onUpdate = onUpdate
         self.onError = onError
         self.log = logger or logging.getLogger(__name__)
+        self.statusDebugEnabled = (
+            str(os.getenv("PRINTMASTER_STATUS_DEBUG", "")).strip().lower()
+            not in ("", "0", "false", "off")
+        )
         self.pollInterval = max(0.5, float(pollInterval))
         self.heartbeatInterval = max(1.0, float(heartbeatInterval))
         self.reconnectDelay = max(1.0, float(reconnectDelay))
@@ -357,6 +361,9 @@ class BambuStatusSubscriber:
         except Exception as error:  # pragma: no cover - depends on SDK behaviour
             self.log.debug("get_state failed", exc_info=error)
 
+        if self.statusDebugEnabled and isinstance(statePayload, dict):
+            self.log.info("[status] keys(state)=%s", sorted(list(statePayload.keys()))[:40])
+
         try:
             percentagePayload = printer.get_percentage()
         except Exception as error:  # pragma: no cover - depends on SDK behaviour
@@ -399,7 +406,15 @@ class BambuStatusSubscriber:
 
         progressCandidate = self._findValue(
             sources,
-            {"mc_percent", "progress", "percentage", "progressPercent"},
+            {
+                "mc_percent",
+                "progress",
+                "percentage",
+                "progressPercent",
+                "last_print_percentage",
+                "print_percent",
+                "percent",
+            },
         )
         if progressCandidate is None:
             progressCandidate = percentagePayload
@@ -415,9 +430,11 @@ class BambuStatusSubscriber:
             sources,
             {
                 "nozzle_temper",
+                "nozzle_temp",
                 "nozzleTemp",
                 "nozzle_temperature",
                 "nozzle_current_temper",
+                "nozzle_target_temper",
                 "nozzle",
             },
         )
@@ -427,9 +444,11 @@ class BambuStatusSubscriber:
             sources,
             {
                 "bed_temper",
+                "bed_temp",
                 "bedTemp",
                 "bed_temperature",
                 "bed_current_temper",
+                "bed_target_temper",
                 "bed",
             },
         )
@@ -471,6 +490,16 @@ class BambuStatusSubscriber:
             {"job_id", "task_id", "current_job_id", "print_id", "jobId"},
         )
         currentJobId = self._coerceString(jobCandidate)
+
+        if self.statusDebugEnabled:
+            self.log.info(
+                "[status] parsed progress=%s remaining=%s nozzle=%s bed=%s gcode=%s",
+                progressPercent,
+                remainingTimeSeconds,
+                nozzleTemp,
+                bedTemp,
+                gcodeState,
+            )
 
         firmwareVersion = self._extractFirmwareVersion(sources)
 

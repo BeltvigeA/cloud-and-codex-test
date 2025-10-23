@@ -1189,9 +1189,9 @@ class CommandWorker:
                 self._jobActive = True
             return
         if self._jobActive:
-            self._jobActive = False
             log.info("Print completed on %s — ready for next job", self.serial)
-            self._deleteRemoteFile()
+        self._jobActive = False
+        self._deleteRemoteFile()
 
     def _checkForPrinterError(self, status: Dict[str, Any]) -> None:
         printer = self._printerInstance
@@ -1299,7 +1299,6 @@ class CommandWorker:
 
     def _executeCommand(self, printer: Any, command: Dict[str, Any]) -> Tuple[str, str]:
         rawCommandType = str(command.get("commandType") or "").strip()
-        commandType = rawCommandType.lower()
         metadataValue = command.get("metadata")
         metadata = metadataValue if isinstance(metadataValue, dict) else {}
         message = ""
