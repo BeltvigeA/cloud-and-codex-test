@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import base64
-import json
 from pathlib import Path
 import sys
 import time
@@ -196,7 +195,9 @@ def testProcessHeatCommandAcknowledgesAndReports(monkeypatch: pytest.MonkeyPatch
     assert "Heating" in (resultCalls[0]["message"] or "")
 
 
-def testCameraCommandCapturesSnapshot(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def testCameraCommandCapturesSnapshot(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     worker = CommandWorker(
         serial="SERIAL777",
         ipAddress="10.0.0.77",
@@ -272,6 +273,18 @@ def testCameraCommandCapturesSnapshot(monkeypatch: pytest.MonkeyPatch, tmp_path:
     monkeypatch.setattr(CommandWorker, "_connectPrinter", lambda self: fakePrinter)
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
 
+    postedPayloads: List[Dict[str, Any]] = []
+
+    def fakePostReportPrinterImage(payload: Dict[str, object]) -> Dict[str, object]:
+        postedPayloads.append(dict(payload))
+        return {}
+
+    monkeypatch.setattr(
+        "client.command_controller.postReportPrinterImage", fakePostReportPrinterImage
+    )
+
+    caplog.set_level("INFO")
+
     worker._processCommand(
         {
             "commandId": "camera-1",
@@ -285,6 +298,7 @@ def testCameraCommandCapturesSnapshot(monkeypatch: pytest.MonkeyPatch, tmp_path:
     assert resultCalls[0]["status"] == "completed"
     message = resultCalls[0]["message"] or ""
     assert "Camera snapshot saved to" in message
+    assert "sent to Base44" in message
     cameraDir = tmp_path / ".printmaster" / "camera"
     savedFiles = list(cameraDir.glob("SERIAL777-*.jpg"))
     assert len(savedFiles) == 1
@@ -294,6 +308,16 @@ def testCameraCommandCapturesSnapshot(monkeypatch: pytest.MonkeyPatch, tmp_path:
     assert not fakePrinter.mqtt_client.publishCalls
     assert fakePrinter.cameraStartCalls == 1
     assert fakePrinter.cameraStopCalls == 1
+    assert postedPayloads
+    payload = postedPayloads[0]
+    assert payload["printerSerial"] == "SERIAL777"
+    assert payload["printerIpAddress"] == "10.0.0.77"
+    assert payload["imageType"] == "webcam"
+    assert payload["imageData"].startswith("data:image/jpeg;base64,")
+    base64Data = payload["imageData"].split(",", 1)[1]
+    assert base64Data == base64.b64encode(b"fake-bytes").decode("ascii")
+    assert "[camera] posting snapshot to Base44 for SERIAL777" in caplog.text
+    assert "[camera] snapshot posted for SERIAL777" in caplog.text
 
 
 def testCameraCommandOffInvokesCameraOff(monkeypatch: pytest.MonkeyPatch) -> None:
