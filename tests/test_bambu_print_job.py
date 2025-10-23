@@ -142,6 +142,9 @@ def test_startPrintViaApi_acknowledges(monkeypatch: pytest.MonkeyPatch) -> None:
     assert result["acknowledged"] is True
     assert result["fallbackTriggered"] is False
     assert fakePrinter.startRequests == [None]
+    assert fakePrinter.startPayloads[0]["filename"] == "sdcard/job.3mf"
+    assert fakePrinter.startPayloads[0]["plate_number"] == 1
+    assert fakePrinter.startPayloads[0]["flow_calibration"] is False
     assert fakePrinter.disconnectCalls == 1
 
 
@@ -171,6 +174,9 @@ def test_startPrintViaApi_retries_on_conflict(monkeypatch: pytest.MonkeyPatch) -
     assert result["fallbackTriggered"] is True
     assert result["useAms"] is False
     assert fakePrinter.startRequests == [None, False]
+    assert fakePrinter.startPayloads[0]["filename"] == "sdcard/job.3mf"
+    assert fakePrinter.startPayloads[0]["plate_number"] == "Metadata/plate_1.gcode"
+    assert fakePrinter.startPayloads[1]["use_ams"] is False
     assert fakePrinter.stopCalls == 1
 
 
@@ -183,6 +189,11 @@ def test_sendBambuPrintJob_uses_api(monkeypatch: pytest.MonkeyPatch, tmp_path: P
         bambuPrinter,
         "uploadViaFtps",
         lambda **kwargs: uploadCalls.setdefault("sdFileName", kwargs["remoteName"]),
+    )
+    monkeypatch.setattr(
+        bambuPrinter,
+        "uploadViaBambulabsApi",
+        lambda **kwargs: kwargs["remoteName"],
     )
     apiResult = {
         "acknowledged": True,
@@ -231,6 +242,7 @@ def test_sendBambuPrintJob_raises_when_api_start_fails(
     createSampleThreeMf(samplePath)
 
     monkeypatch.setattr(bambuPrinter, "uploadViaFtps", lambda **kwargs: kwargs["remoteName"])
+    monkeypatch.setattr(bambuPrinter, "uploadViaBambulabsApi", lambda **kwargs: kwargs["remoteName"])
     monkeypatch.setattr(bambuPrinter, "startPrintViaApi", lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("api failure")))
 
     monkeypatch.setattr(
