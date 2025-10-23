@@ -920,13 +920,35 @@ class BambuStatusSubscriber:
     def _normalizeKey(self, key: Any) -> str:
         return str(key).strip().replace("-", "_").replace(" ", "_").lower()
 
-    def _coerceFloat(self, value: Any) -> Optional[float]:
-        if isinstance(value, bool):
+    def _unwrapNumericValue(self, value: Any) -> Any:
+        if isinstance(value, dict):
+            preferredKeys = ("current", "value", "actual", "temperature", "temper", "target")
+            for key in preferredKeys:
+                if key in value:
+                    nested = self._unwrapNumericValue(value.get(key))
+                    if nested is not None:
+                        return nested
+            for nestedValue in value.values():
+                nested = self._unwrapNumericValue(nestedValue)
+                if nested is not None:
+                    return nested
             return None
-        if isinstance(value, (int, float)):
-            return float(value)
-        if isinstance(value, str):
-            candidate = value.strip().replace("°c", "").replace("°", "")
+        if isinstance(value, (list, tuple, set)):
+            for item in value:
+                nested = self._unwrapNumericValue(item)
+                if nested is not None:
+                    return nested
+            return None
+        return value
+
+    def _coerceFloat(self, value: Any) -> Optional[float]:
+        candidateValue = self._unwrapNumericValue(value)
+        if isinstance(candidateValue, bool):
+            return None
+        if isinstance(candidateValue, (int, float)):
+            return float(candidateValue)
+        if isinstance(candidateValue, str):
+            candidate = candidateValue.strip().replace("°c", "").replace("°", "")
             candidate = candidate.replace("%", "").replace("rpm", "")
             if candidate:
                 try:
@@ -936,14 +958,15 @@ class BambuStatusSubscriber:
         return None
 
     def _coerceInt(self, value: Any) -> Optional[int]:
-        if isinstance(value, bool):
+        candidateValue = self._unwrapNumericValue(value)
+        if isinstance(candidateValue, bool):
             return None
-        if isinstance(value, int):
-            return value
-        if isinstance(value, float):
-            return int(value)
-        if isinstance(value, str):
-            candidate = value.strip()
+        if isinstance(candidateValue, int):
+            return candidateValue
+        if isinstance(candidateValue, float):
+            return int(candidateValue)
+        if isinstance(candidateValue, str):
+            candidate = candidateValue.strip()
             if candidate.isdigit():
                 try:
                     return int(candidate)
