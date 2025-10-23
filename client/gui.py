@@ -469,11 +469,34 @@ class ListenerGuiApp:
                 logging.warning("Unable to load printers from %s: %s", self.printerStoragePath, error)
         return []
 
+    def _extractNumericCandidate(self, value: Any) -> Any:
+        if isinstance(value, dict):
+            preferredKeys = ("current", "value", "actual", "temperature", "temper", "target")
+            for key in preferredKeys:
+                if key in value:
+                    nested = self._extractNumericCandidate(value.get(key))
+                    if nested is not None:
+                        return nested
+            for nestedValue in value.values():
+                nested = self._extractNumericCandidate(nestedValue)
+                if nested is not None:
+                    return nested
+            return None
+        if isinstance(value, (list, tuple, set)):
+            for item in value:
+                nested = self._extractNumericCandidate(item)
+                if nested is not None:
+                    return nested
+            return None
+        return value
+
     def _parseOptionalFloat(self, value: Any) -> Optional[float]:
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
-            return float(value)
-        if isinstance(value, str):
-            candidate = value.strip().replace("°C", "")
+        candidateValue = self._extractNumericCandidate(value)
+        if isinstance(candidateValue, (int, float)) and not isinstance(candidateValue, bool):
+            return float(candidateValue)
+        if isinstance(candidateValue, str):
+            candidate = candidateValue.strip().replace("°C", "")
+            candidate = candidate.replace("°c", "").replace("°", "")
             if candidate:
                 try:
                     return float(candidate)
@@ -482,15 +505,16 @@ class ListenerGuiApp:
         return None
 
     def _parseOptionalInt(self, value: Any) -> Optional[int]:
-        if isinstance(value, bool):
+        candidateValue = self._extractNumericCandidate(value)
+        if isinstance(candidateValue, bool):
             return None
-        if isinstance(value, int):
-            return value
-        if isinstance(value, float):
-            return int(value)
-        if isinstance(value, str):
+        if isinstance(candidateValue, int):
+            return candidateValue
+        if isinstance(candidateValue, float):
+            return int(candidateValue)
+        if isinstance(candidateValue, str):
             candidate = (
-                value.strip()
+                candidateValue.strip()
                 .lower()
                 .replace("seconds", "")
                 .replace("second", "")
