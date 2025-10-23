@@ -903,7 +903,13 @@ def startPrintViaApi(
     printer = printerClass(ip, accessCode, serial)
     resolvedUseAms = resolveUseAmsAuto(options, job_metadata, None)
 
-    flags: Dict[str, Any] = {"use_ams": resolvedUseAms}
+    flags: Dict[str, Any] = {
+        "use_ams": resolvedUseAms,
+        "bed_levelling": bool(options.bedLeveling),
+        "layer_inspect": bool(options.layerInspect),
+        "flow_cali": bool(options.flowCalibration),
+        "vibration_cali": bool(options.vibrationCalibration),
+    }
 
     if START_DEBUG:
         logger.info(
