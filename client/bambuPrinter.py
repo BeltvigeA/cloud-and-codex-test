@@ -940,14 +940,14 @@ def startPrintViaApi(
 
     remoteUrl = f"file:///sdcard/{uploaded_name}"
     if param_path:
-        startArgument: Optional[Any] = param_path
-    elif isinstance(plate_index, int):
-        startArgument = plate_index
+        startParam = param_path
+    elif isinstance(plate_index, int) and plate_index > 0:
+        startParam = f"Metadata/plate_{plate_index}.gcode"
     else:
-        startArgument = None
+        startParam = None
 
     if START_DEBUG:
-        logger.info("[start] url=%s param=%s flags=%s", remoteUrl, startArgument, flags)
+        logger.info("[start] url=%s param=%s flags=%s", remoteUrl, startParam, flags)
 
     def _invokeStart() -> None:
         localErrors: List[str] = []
@@ -955,9 +955,13 @@ def startPrintViaApi(
         startMethod = getattr(printer, "start_print", None)
         if callable(startMethod):
             try:
-                positionalArgs: List[Any] = [uploaded_name, startArgument]
-                keywordFlags = {key: value for key, value in flags.items() if value is not None}
-                startMethod(*positionalArgs, **keywordFlags)
+                startArgs: Dict[str, Any] = {"url": remoteUrl}
+                if startParam:
+                    startArgs["param"] = startParam
+                for key, value in flags.items():
+                    if value is not None:
+                        startArgs[key] = value
+                startMethod(**startArgs)
                 started = True
                 if START_DEBUG:
                     logger.info("[start] start_print() invoked")
@@ -970,10 +974,8 @@ def startPrintViaApi(
             if callable(controlMethod):
                 try:
                     payload: Dict[str, Any] = {"print": {"command": "project_file", "url": remoteUrl}}
-                    if isinstance(startArgument, str):
-                        payload["print"]["param"] = startArgument
-                    elif isinstance(startArgument, int):
-                        payload["print"]["plate"] = startArgument
+                    if startParam:
+                        payload["print"]["param"] = startParam
                     for key, value in flags.items():
                         if value is not None:
                             payload["print"][key] = value
