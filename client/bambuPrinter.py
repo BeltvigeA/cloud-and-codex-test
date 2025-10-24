@@ -73,7 +73,9 @@ def _is_active_state(stateName: Optional[str]) -> bool:
     if not stateName:
         return False
     normalized = str(stateName).upper()
-    return any(token in normalized for token in ("PRINT", "RUN", "HEAT", "PREP", "BUSY", "WORK"))
+    return any(
+        token in normalized for token in ("PRINT", "RUN", "HEAT", "PREP", "BUSY", "WORK", "HOM", "HOME")
+    )
 
 
 
@@ -947,7 +949,12 @@ def startPrintViaApi(
         startParam = None
 
     if START_DEBUG:
-        logger.info("[start] url=%s param=%s flags=%s", remoteUrl, startParam, flags)
+        logger.info(
+            "[start] prepared file=%s param=%s flags=%s",
+            uploaded_name,
+            startParam,
+            {key: value for key, value in flags.items() if value is not None},
+        )
 
     def _invokeStart() -> None:
         localErrors: List[str] = []
@@ -955,16 +962,16 @@ def startPrintViaApi(
         startMethod = getattr(printer, "start_print", None)
         if callable(startMethod):
             try:
-                startArgs: Dict[str, Any] = {"url": remoteUrl}
-                if startParam:
-                    startArgs["param"] = startParam
-                for key, value in flags.items():
-                    if value is not None:
-                        startArgs[key] = value
-                startMethod(**startArgs)
+                positionalArgs = [uploaded_name, startParam if startParam is not None else None]
+                keywordArgs = {key: value for key, value in flags.items() if value is not None}
+                startMethod(*positionalArgs, **keywordArgs)
                 started = True
-                if START_DEBUG:
-                    logger.info("[start] start_print() invoked")
+                logger.info(
+                    "[start] start_print() invoked (file=%s, param=%s, flags=%s)",
+                    uploaded_name,
+                    startParam,
+                    keywordArgs,
+                )
             except Exception as error:
                 localErrors.append(f"start_print:{error}")
                 if START_DEBUG:
@@ -976,15 +983,12 @@ def startPrintViaApi(
                     payload: Dict[str, Any] = {"print": {"command": "project_file", "url": remoteUrl}}
                     if startParam:
                         payload["print"]["param"] = startParam
-                    for key, value in flags.items():
-                        if value is not None:
-                            payload["print"][key] = value
+                    payload["print"].update({key: value for key, value in flags.items() if value is not None})
                     if START_DEBUG:
                         logger.info("[start] send_control payload=%s", payload)
                     controlMethod(payload)
                     started = True
-                    if START_DEBUG:
-                        logger.info("[start] send_control(project_file) invoked")
+                    logger.info("[start] send_control(project_file) invoked")
                 except Exception as error:
                     localErrors.append(f"send_control(project_file):{error}")
                     if START_DEBUG:
