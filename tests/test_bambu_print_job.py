@@ -32,6 +32,10 @@ class FakeApiPrinter:
         self._statePollsBeforeStart = 0
         self._statePollsAfterStart = 0
         self.startPayloads: list[Dict[str, Any]] = []
+        self.startArgs: list[tuple[Any, ...]] = []
+        self.startKwargs: list[Dict[str, Any]] = []
+        self.autoStepRecovery: list[bool] = []
+        self.calibrationRequests: list[Dict[str, Any]] = []
 
     def mqtt_start(self) -> None:
         return None
@@ -55,11 +59,13 @@ class FakeApiPrinter:
     def get_gcode_state(self) -> str:
         return "PRINTING" if self.started else "IDLE"
 
-    def start_print(self, **kwargs: Any) -> None:
+    def start_print(self, *args: Any, **kwargs: Any) -> None:
         self.startCount += 1
         self.started = True
         self._statePollsAfterStart = 0
+        self.startArgs.append(tuple(args))
         self.startPayloads.append(dict(kwargs))
+        self.startKwargs.append(dict(kwargs))
         self.startRequests.append(kwargs.get("use_ams"))
         if self.startCount >= 2:
             self.conflictFirst = False
@@ -69,6 +75,25 @@ class FakeApiPrinter:
 
     def disconnect(self) -> None:
         self.disconnectCalls += 1
+
+    def set_auto_step_recovery(self, enabled: bool) -> None:
+        self.autoStepRecovery.append(bool(enabled))
+
+    def calibrate_printer(
+        self,
+        *,
+        bed_level: bool = True,
+        motor_noise_calibration: bool = True,
+        vibration_compensation: bool = True,
+    ) -> bool:
+        self.calibrationRequests.append(
+            {
+                "bed_level": bool(bed_level),
+                "motor_noise_calibration": bool(motor_noise_calibration),
+                "vibration_compensation": bool(vibration_compensation),
+            }
+        )
+        return True
 
 
 class ApiModuleStub:
@@ -143,6 +168,15 @@ def test_startPrintViaApi_acknowledges(monkeypatch: pytest.MonkeyPatch) -> None:
     assert result["fallbackTriggered"] is False
     assert fakePrinter.startRequests == [None]
     assert fakePrinter.disconnectCalls == 1
+    assert fakePrinter.startArgs == [("job.3mf", "Metadata/plate_1.gcode")]
+    assert fakePrinter.autoStepRecovery == [True]
+    assert fakePrinter.calibrationRequests == [
+        {
+            "bed_level": True,
+            "motor_noise_calibration": False,
+            "vibration_compensation": False,
+        }
+    ]
 
 
 def test_startPrintViaApi_retries_on_conflict(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -172,6 +206,23 @@ def test_startPrintViaApi_retries_on_conflict(monkeypatch: pytest.MonkeyPatch) -
     assert result["useAms"] is False
     assert fakePrinter.startRequests == [None, False]
     assert fakePrinter.stopCalls == 1
+    assert fakePrinter.startArgs == [
+        ("job.3mf", "Metadata/plate_1.gcode"),
+        ("job.3mf", "Metadata/plate_1.gcode"),
+    ]
+    assert fakePrinter.autoStepRecovery == [True, True]
+    assert fakePrinter.calibrationRequests == [
+        {
+            "bed_level": True,
+            "motor_noise_calibration": False,
+            "vibration_compensation": False,
+        },
+        {
+            "bed_level": True,
+            "motor_noise_calibration": False,
+            "vibration_compensation": False,
+        },
+    ]
 
 
 def test_sendBambuPrintJob_uses_api(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -183,6 +234,11 @@ def test_sendBambuPrintJob_uses_api(monkeypatch: pytest.MonkeyPatch, tmp_path: P
         bambuPrinter,
         "uploadViaFtps",
         lambda **kwargs: uploadCalls.setdefault("sdFileName", kwargs["remoteName"]),
+    )
+    monkeypatch.setattr(
+        bambuPrinter,
+        "uploadViaBambulabsApi",
+        lambda **kwargs: kwargs["remoteName"],
     )
     apiResult = {
         "acknowledged": True,
@@ -231,6 +287,11 @@ def test_sendBambuPrintJob_raises_when_api_start_fails(
     createSampleThreeMf(samplePath)
 
     monkeypatch.setattr(bambuPrinter, "uploadViaFtps", lambda **kwargs: kwargs["remoteName"])
+    monkeypatch.setattr(
+        bambuPrinter,
+        "uploadViaBambulabsApi",
+        lambda **kwargs: kwargs["remoteName"],
+    )
     monkeypatch.setattr(bambuPrinter, "startPrintViaApi", lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("api failure")))
 
     monkeypatch.setattr(

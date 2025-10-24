@@ -881,6 +881,42 @@ def safeDisconnectPrinter(printer: Any) -> None:
             logger.debug("bambulabs_api disconnect raised (ignored)", exc_info=True)
 
 
+def _applyPostStartControls(printer: Any, options: "BambuPrintOptions") -> None:
+    """Apply print-time toggles that are not supported directly by start_print."""
+
+    autoStepMethod = getattr(printer, "set_auto_step_recovery", None)
+    desiredLayerInspect = bool(getattr(options, "layerInspect", True))
+    if callable(autoStepMethod):
+        try:
+            autoStepMethod(desiredLayerInspect)
+            if START_DEBUG:
+                logger.info("[start] set_auto_step_recovery(%s) invoked", desiredLayerInspect)
+        except Exception:  # pragma: no cover - robustness
+            logger.debug("set_auto_step_recovery failed", exc_info=True)
+
+    bedEnabled = bool(getattr(options, "bedLeveling", True))
+    vibrationEnabled = bool(getattr(options, "vibrationCalibration", False))
+    if not bedEnabled and not vibrationEnabled:
+        return
+
+    calibrateMethod = getattr(printer, "calibrate_printer", None)
+    if callable(calibrateMethod):
+        try:
+            calibrateMethod(
+                bed_level=bedEnabled,
+                motor_noise_calibration=vibrationEnabled,
+                vibration_compensation=vibrationEnabled,
+            )
+            if START_DEBUG:
+                logger.info(
+                    "[start] calibrate_printer(bed_level=%s, vibration=%s) invoked",
+                    bedEnabled,
+                    vibrationEnabled,
+                )
+        except Exception:  # pragma: no cover - robustness
+            logger.debug("calibrate_printer failed", exc_info=True)
+
+
 def startPrintViaApi(
     *,
     ip: str,
@@ -905,7 +941,12 @@ def startPrintViaApi(
     printer = printerClass(ip, accessCode, serial)
     resolvedUseAms = resolveUseAmsAuto(options, job_metadata, None)
 
-    flags: Dict[str, Any] = {
+    startKeywordArgs: Dict[str, Any] = {}
+    if resolvedUseAms is not None:
+        startKeywordArgs["use_ams"] = resolvedUseAms
+    startKeywordArgs["flow_calibration"] = bool(options.flowCalibration)
+
+    sendControlFlags: Dict[str, Any] = {
         "use_ams": resolvedUseAms,
         "bed_levelling": bool(options.bedLeveling),
         "layer_inspect": bool(options.layerInspect),
@@ -943,17 +984,24 @@ def startPrintViaApi(
     remoteUrl = f"file:///sdcard/{uploaded_name}"
     if param_path:
         startParam = param_path
-    elif isinstance(plate_index, int) and plate_index > 0:
+    elif isinstance(plate_index, int) and plate_index >= 0:
         startParam = f"Metadata/plate_{plate_index}.gcode"
     else:
         startParam = None
+
+    if param_path:
+        plateArgument: Any = param_path
+    elif isinstance(plate_index, int):
+        plateArgument = plate_index
+    else:
+        plateArgument = 1
 
     if START_DEBUG:
         logger.info(
             "[start] prepared file=%s param=%s flags=%s",
             uploaded_name,
             startParam,
-            {key: value for key, value in flags.items() if value is not None},
+            {key: value for key, value in sendControlFlags.items() if value is not None},
         )
 
     def _invokeStart() -> None:
@@ -962,16 +1010,17 @@ def startPrintViaApi(
         startMethod = getattr(printer, "start_print", None)
         if callable(startMethod):
             try:
-                positionalArgs = [uploaded_name, startParam if startParam is not None else None]
-                keywordArgs = {key: value for key, value in flags.items() if value is not None}
+                positionalArgs = [uploaded_name, plateArgument]
+                keywordArgs = dict(startKeywordArgs)
                 startMethod(*positionalArgs, **keywordArgs)
                 started = True
                 logger.info(
-                    "[start] start_print() invoked (file=%s, param=%s, flags=%s)",
+                    "[start] start_print() invoked (file=%s, plate=%s, kwargs=%s)",
                     uploaded_name,
-                    startParam,
+                    plateArgument,
                     keywordArgs,
                 )
+                _applyPostStartControls(printer, options)
             except Exception as error:
                 localErrors.append(f"start_print:{error}")
                 if START_DEBUG:
@@ -983,12 +1032,13 @@ def startPrintViaApi(
                     payload: Dict[str, Any] = {"print": {"command": "project_file", "url": remoteUrl}}
                     if startParam:
                         payload["print"]["param"] = startParam
-                    payload["print"].update({key: value for key, value in flags.items() if value is not None})
+                    payload["print"].update({key: value for key, value in sendControlFlags.items() if value is not None})
                     if START_DEBUG:
                         logger.info("[start] send_control payload=%s", payload)
                     controlMethod(payload)
                     started = True
                     logger.info("[start] send_control(project_file) invoked")
+                    _applyPostStartControls(printer, options)
                 except Exception as error:
                     localErrors.append(f"send_control(project_file):{error}")
                     if START_DEBUG:
@@ -1064,7 +1114,8 @@ def startPrintViaApi(
             )
             fallbackTriggered = True
             finalUseAms = False
-            flags["use_ams"] = False
+            sendControlFlags["use_ams"] = False
+            startKeywordArgs["use_ams"] = False
             try:
                 stopMethod = getattr(printer, "stop_print", None)
                 if callable(stopMethod):
