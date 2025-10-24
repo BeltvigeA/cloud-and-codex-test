@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import base64
 import importlib
-import inspect
 import io
 import webbrowser
 import sys
@@ -40,9 +39,6 @@ else:
 
 
 logger = logging.getLogger(__name__)
-mqttEnabled = (
-    str(os.getenv("MQTT_ENABLED", "0")).strip().lower() not in ("0", "false", "off", "no")
-)
 START_DEBUG = (
     str(os.getenv("PRINTMASTER_START_DEBUG", "")).strip().lower()
     not in ("", "0", "false", "off")
@@ -455,21 +451,11 @@ def uploadViaBambulabsApi(
     try:
         # bambulabs_api 2.6.x expects a binary file handle rather than a path string
         with open(localPath, "rb") as fileHandle:
-            retryCount = 0
-            while True:
-                try:
-                    fileHandle.seek(0)
-                    try:
-                        uploadMethod(fileHandle, remoteName)
-                    except TypeError:
-                        fileHandle.seek(0)
-                        uploadMethod(fileHandle)
-                    break
-                except TimeoutError:
-                    retryCount += 1
-                    if retryCount > 1:
-                        raise
-                    logger.warning("Upload via API timed out once; retrying...")
+            try:
+                uploadMethod(fileHandle, remoteName)
+            except TypeError:
+                fileHandle.seek(0)
+                uploadMethod(fileHandle)
     finally:
         disconnectMethod = getattr(printer, "disconnect", None)
         if disconnectMethod:
@@ -670,43 +656,6 @@ class BambuPrintOptions:
     transport: str = "lan"
     spoolMode: bool = False
     startStrategy: Literal["api"] = "api"
-
-
-def _normalizeStartKwargs(printer: Any, raw: Optional[dict[str, Any]]) -> dict[str, Any]:
-    if raw is None:
-        raw = {}
-
-    aliasMap = {
-        "bed_levelling": "bed_leveling",
-        "useAms": "use_ams",
-        "timelapse_enabled": "timelapse",
-    }
-
-    normalized: dict[str, Any] = {}
-    for key, value in raw.items():
-        mappedKey = aliasMap.get(key, key)
-        normalized[mappedKey] = value
-
-    cleaned = {key: value for key, value in normalized.items() if value is not None}
-
-    startMethod = getattr(printer, "start_print", None)
-    if startMethod is None:
-        return cleaned
-
-    try:
-        signature = inspect.signature(startMethod)
-        allowedKeys = set(signature.parameters.keys())
-        filtered = {key: value for key, value in cleaned.items() if key in allowedKeys}
-        unknownKeys = sorted(set(cleaned.keys()) - allowedKeys)
-        if unknownKeys:
-            logger.info("Dropping unsupported start_print kwargs: %s", ", ".join(unknownKeys))
-        return filtered
-    except Exception:
-        logger.debug(
-            "Could not introspect start_print signature; sending normalized kwargs only",
-            exc_info=True,
-        )
-        return cleaned
 
 
 def _waitForMqttReady(apiPrinter: Any, timeout: float = 30.0, poll: float = 0.5) -> tuple[Any, Any]:
@@ -972,7 +921,7 @@ def startPrintViaApi(
             ack_timeout_sec,
         )
 
-    if mqttEnabled and hasattr(printer, "mqtt_start"):
+    if hasattr(printer, "mqtt_start"):
         try:
             printer.mqtt_start()
             if START_DEBUG:
@@ -1015,14 +964,13 @@ def startPrintViaApi(
             try:
                 positionalArgs = [uploaded_name, startParam if startParam is not None else None]
                 keywordArgs = {key: value for key, value in flags.items() if value is not None}
-                normalizedKwargs = _normalizeStartKwargs(printer, keywordArgs)
-                startMethod(*positionalArgs, **normalizedKwargs)
+                startMethod(*positionalArgs, **keywordArgs)
                 started = True
                 logger.info(
                     "[start] start_print() invoked (file=%s, param=%s, flags=%s)",
                     uploaded_name,
                     startParam,
-                    normalizedKwargs,
+                    keywordArgs,
                 )
             except Exception as error:
                 localErrors.append(f"start_print:{error}")
