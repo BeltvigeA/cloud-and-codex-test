@@ -413,6 +413,7 @@ class BambuStatusSubscriber:
                 "progressPercent",
                 "last_print_percentage",
                 "print_percent",
+                "print_percentage",
                 "percent",
             },
         )
@@ -436,6 +437,7 @@ class BambuStatusSubscriber:
                 "nozzle_current_temper",
                 "nozzle_target_temper",
                 "nozzle",
+                "nozzle_temp*",
             },
         )
         nozzleTemp = self._coerceFloat(nozzleCandidate)
@@ -450,6 +452,7 @@ class BambuStatusSubscriber:
                 "bed_current_temper",
                 "bed_target_temper",
                 "bed",
+                "bed_temp*",
             },
         )
         bedTemp = self._coerceFloat(bedCandidate)
@@ -893,13 +896,17 @@ class BambuStatusSubscriber:
 
     def _findValue(self, sources: Iterable[Any], keyNames: Set[str]) -> Any:
         normalizedTargets = {self._normalizeKey(name) for name in keyNames}
+        prefixTargets = {target[:-1] for target in normalizedTargets if target.endswith("*")}
+        exactTargets = {target for target in normalizedTargets if not target.endswith("*")}
         sentinel = object()
 
         def search(value: Any) -> Any:
             if isinstance(value, dict):
                 for key, nested in value.items():
                     normalizedKey = self._normalizeKey(key)
-                    if normalizedKey in normalizedTargets:
+                    if normalizedKey in exactTargets or any(
+                        normalizedKey.startswith(prefix) for prefix in prefixTargets
+                    ):
                         return nested
                     result = search(nested)
                     if result is not sentinel:
