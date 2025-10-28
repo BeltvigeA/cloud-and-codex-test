@@ -1573,6 +1573,7 @@ class CommandWorker:
                 paramCandidate = str(rawParamPath)
                 paramPath = paramCandidate or None
             useAms = metadata.get("useAms")
+            jobActivated = False
             try:
                 startArgs: List[Any] = [str(fileName)]
                 if paramPath:
@@ -1581,6 +1582,7 @@ class CommandWorker:
                     startArgs.append(plateIndex)
                 callPrinterMethod("start_print", *startArgs, use_ams=useAms)
                 message = "Print started"
+                jobActivated = True
             except RuntimeError:
                 options = bambuPrinter.BambuPrintOptions(
                     ipAddress=self.ipAddress,
@@ -1599,17 +1601,34 @@ class CommandWorker:
                     options=options,
                     job_metadata=metadata if isinstance(metadata, dict) else None,
                 )
-                acknowledged = result.get("acknowledged")
-                message = (
-                    f"Print started (acknowledged={acknowledged})"
+                resultData = result if isinstance(result, dict) else {}
+                acknowledged = resultData.get("acknowledged")
+                stateValue = resultData.get("gcodeState") or resultData.get("state")
+                normalizedState = str(stateValue or "").strip().upper()
+                if acknowledged is False or normalizedState in {"FINISH", "IDLE"}:
+                    self._jobActive = False
+                    declineDetails: List[str] = []
+                    if acknowledged is not None:
+                        declineDetails.append(f"acknowledged={acknowledged}")
+                    if normalizedState:
+                        declineDetails.append(f"state={normalizedState}")
+                    detailsText = ", ".join(declineDetails) or "no acknowledgement received"
+                    raise RuntimeError(
+                        f"Printer declined to start print ({detailsText})"
+                    )
+                suffix = (
+                    f" (acknowledged={acknowledged})"
                     if acknowledged is not None
-                    else "Print started"
+                    else ""
                 )
-            self._jobActive = True
-            try:
-                self._lastRemoteFile = str(fileName)
-            except Exception:
-                self._lastRemoteFile = None
+                message = f"Print started via API{suffix}".strip()
+                jobActivated = True
+            if jobActivated:
+                self._jobActive = True
+                try:
+                    self._lastRemoteFile = str(fileName)
+                except Exception:
+                    self._lastRemoteFile = None
         elif normalizedType in {"home", "light_on", "light_off", "lightoff", "lighton", "move", "jog", "load_filament", "unload_filament", "sendgcode"}:
             if normalizedType == "home":
                 sendGcode("G28")
