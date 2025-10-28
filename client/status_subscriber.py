@@ -173,6 +173,7 @@ class BambuStatusSubscriber:
                 lastBase44Emit = 0.0
                 lastErrorComparable: Optional[Dict[str, Any]] = None
                 lastErrorEmit = 0.0
+                printingStallStart: Optional[float] = None
 
                 while not stopEvent.is_set():
                     resolvedApiKey = self._resolveBase44ApiKey(printerConfig)
@@ -185,6 +186,16 @@ class BambuStatusSubscriber:
                     statusPayload["printerIp"] = ipAddress
                     statusPayload["nickname"] = nickname
                     statusPayload["status"] = statusPayload.get("status") or "update"
+
+                    derivedStatus, _, _ = self._deriveStatusAttributes(statusPayload)
+                    printingProgress = self._coerceFloat(statusPayload.get("progressPercent"))
+                    printingStallStart = self._maybeForceIdleForStall(
+                        printerInstance,
+                        statusPayload,
+                        derivedStatus,
+                        printingProgress,
+                        printingStallStart,
+                    )
 
                     base44Package = self._buildBase44Payloads(statusPayload, printerConfig, resolvedApiKey)
                     if base44Package is not None:
@@ -682,6 +693,59 @@ class BambuStatusSubscriber:
 
         return updatePayload, updateComparable, errorPayload, errorComparable
 
+    def _forcePrinterIdle(self, printer: Any, statusPayload: Dict[str, Any]) -> None:
+        stopIssued = False
+        stopPrint = getattr(printer, "stop_print", None)
+        if callable(stopPrint):
+            try:
+                stopPrint()
+            except Exception as error:  # pragma: no cover - dependent on SDK
+                self.log.warning("stop_print failed while clearing stalled job: %s", error)
+            else:
+                stopIssued = True
+                self.log.info("Issued stop_print to clear stalled job at 100%% progress")
+
+        if not stopIssued:
+            sendControl = getattr(printer, "send_control", None)
+            if callable(sendControl):
+                try:
+                    sendControl({"command": "stop"})
+                except Exception as error:  # pragma: no cover - dependent on SDK
+                    self.log.warning("send_control stop failed while clearing stalled job: %s", error)
+                else:
+                    stopIssued = True
+                    self.log.info("Issued send_control stop to clear stalled job at 100%% progress")
+
+        if not stopIssued:
+            self.log.warning("Unable to clear stalled job; printer stop commands unavailable")
+
+        statusPayload["status"] = "idle"
+        statusPayload["state"] = "idle"
+        statusPayload["gcodeState"] = statusPayload.get("gcodeState") or "idle"
+        statusPayload["progressPercent"] = 0.0
+
+    def _maybeForceIdleForStall(
+        self,
+        printer: Any,
+        statusPayload: Dict[str, Any],
+        derivedStatus: str,
+        printingProgress: Optional[float],
+        printingStallStart: Optional[float],
+    ) -> Optional[float]:
+        if (
+            derivedStatus == "printing"
+            and printingProgress is not None
+            and printingProgress >= 99.9
+            and not self._hasCompletionToken(statusPayload)
+        ):
+            if printingStallStart is None:
+                return time.monotonic()
+            if time.monotonic() - printingStallStart > 5.0:
+                self._forcePrinterIdle(printer, statusPayload)
+                return None
+            return printingStallStart
+        return None
+
     def _resolveBase44ApiKey(self, printerConfig: Dict[str, Any]) -> str:
         for envKey in ("BASE44_FUNCTIONS_API_KEY", "BASE44_API_KEY"):
             envCandidate = os.getenv(envKey, "").strip()
@@ -739,6 +803,16 @@ class BambuStatusSubscriber:
         combinedErrorMessage = self._composeErrorMessage(errorMessage, hmsCode, hasAmsConflict)
         isErrorState = status == "error" or hasAmsConflict
         return status, isErrorState, combinedErrorMessage
+
+    def _hasCompletionToken(self, snapshot: Dict[str, Any]) -> bool:
+        for key in ("state", "gcodeState"):
+            text = self._coerceString(snapshot.get(key))
+            if not text:
+                continue
+            lowered = text.lower()
+            if any(token in lowered for token in ("finish", "finished", "completed", "complete")):
+                return True
+        return False
 
     def _composeErrorMessage(
         self,
