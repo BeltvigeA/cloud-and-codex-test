@@ -1047,58 +1047,11 @@ def startPrintViaApi(
             summary = " | ".join(localErrors or ["no method"])
             raise RuntimeError(f"Unable to start print via API: {summary}")
 
-    def _captureBaselineIndicators() -> tuple[Optional[str], Optional[float]]:
-        baselineState: Optional[str] = None
-        baselinePercentage: Optional[float] = None
-        try:
-            statePayload = printer.get_state()
-            if statePayload is not None:
-                baselineCandidate = _extract_gcode_state(statePayload)
-                baselineState = baselineCandidate or extractStateText(statePayload)
-        except Exception as error:
-            if START_DEBUG:
-                logger.info("[start] baseline get_state failed: %s", error)
-        try:
-            percentagePayload = printer.get_percentage()
-            if percentagePayload is not None:
-                try:
-                    baselinePercentage = float(percentagePayload)
-                except Exception:
-                    baselinePercentage = None
-        except Exception as error:
-            if START_DEBUG:
-                logger.info("[start] baseline get_percentage failed: %s", error)
-        if START_DEBUG:
-            logger.info(
-                "[start] baseline state=%s percent=%s",
-                baselineState,
-                baselinePercentage,
-            )
-        return baselineState, baselinePercentage
-
-    def _pollForAcknowledgement(
-        timeoutSeconds: float,
-        baselineState: Optional[str],
-        baselinePercentage: Optional[float],
-    ) -> Dict[str, Any]:
+    def _pollForAcknowledgement(timeoutSeconds: float) -> Dict[str, Any]:
         deadline = time.monotonic() + max(5.0, float(timeoutSeconds))
         lastStatePayload: Any = None
         lastPercentage: Any = None
         lastGcodeState: Optional[str] = None
-
-        def percentageMoved(
-            referencePercentage: Optional[float], currentPercentage: Optional[float]
-        ) -> bool:
-            if currentPercentage is None:
-                return False
-            if currentPercentage >= 100.0 and (
-                referencePercentage is None or referencePercentage >= 100.0
-            ):
-                return False
-            if referencePercentage is None:
-                return currentPercentage > 0.0 and currentPercentage < 100.0
-            return abs(currentPercentage - referencePercentage) >= 0.1
-
         while time.monotonic() < deadline:
             try:
                 statePayload = printer.get_state()
@@ -1124,16 +1077,8 @@ def startPrintViaApi(
             except Exception:
                 percentageFloat = None
             if START_DEBUG:
-                logger.info(
-                    "[start] poll state=%s percent=%s baseline_state=%s baseline_percent=%s",
-                    stateIndicator,
-                    lastPercentage,
-                    baselineState,
-                    baselinePercentage,
-                )
-            hasActiveState = _is_active_state(stateIndicator)
-            hasProgress = percentageMoved(baselinePercentage, percentageFloat)
-            if hasActiveState or hasProgress:
+                logger.info("[start] poll state=%s percent=%s", stateIndicator, lastPercentage)
+            if (percentageFloat is not None and percentageFloat > 0.0) or _is_active_state(stateIndicator):
                 return {
                     "acknowledged": True,
                     "statePayload": lastStatePayload,
@@ -1158,9 +1103,8 @@ def startPrintViaApi(
     finalUseAms = resolvedUseAms
 
     try:
-        baselineState, baselinePercentage = _captureBaselineIndicators()
         _invokeStart()
-        ackResult = _pollForAcknowledgement(ack_timeout_sec, baselineState, baselinePercentage)
+        ackResult = _pollForAcknowledgement(ack_timeout_sec)
         acknowledged = bool(ackResult.get("acknowledged"))
         conflictDetected = _looksLikeAmsFilamentConflict(ackResult.get("statePayload"))
         if (resolvedUseAms is None) and (conflictDetected or not acknowledged):
@@ -1179,13 +1123,8 @@ def startPrintViaApi(
             except Exception:  # pragma: no cover - best effort stop
                 logger.debug("stop_print failed during AMS retry", exc_info=True)
             time.sleep(0.5)
-            baselineState, baselinePercentage = _captureBaselineIndicators()
             _invokeStart()
-            ackResult = _pollForAcknowledgement(
-                ack_timeout_sec,
-                baselineState,
-                baselinePercentage,
-            )
+            ackResult = _pollForAcknowledgement(ack_timeout_sec)
             acknowledged = bool(ackResult.get("acknowledged"))
         logger.info(
             "API start acknowledgement for %s: acknowledged=%s state=%s gcodeState=%s pct=%s",

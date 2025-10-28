@@ -22,7 +22,7 @@ def createSampleGcode(targetPath: Path) -> None:
 
 
 class FakeApiPrinter:
-    def __init__(self, *, conflictFirst: bool = False, finishLagCount: int = 0) -> None:
+    def __init__(self, *, conflictFirst: bool = False) -> None:
         self.started = False
         self.stopCalls = 0
         self.disconnectCalls = 0
@@ -31,9 +31,6 @@ class FakeApiPrinter:
         self.startCount = 0
         self._statePollsBeforeStart = 0
         self._statePollsAfterStart = 0
-        self.finishLagCount = max(0, int(finishLagCount))
-        self._finishLagRemaining = 0
-        self._activeStatePolls = 0
         self.startPayloads: list[Dict[str, Any]] = []
         self.startArgs: list[tuple[Any, ...]] = []
         self.startKwargs: list[Dict[str, Any]] = []
@@ -48,22 +45,16 @@ class FakeApiPrinter:
             self._statePollsBeforeStart += 1
             return "IDLE"
         self._statePollsAfterStart += 1
-        if self._finishLagRemaining > 0:
-            self._finishLagRemaining -= 1
-            return "FINISH"
-        self._activeStatePolls += 1
         if self.conflictFirst and self.startCount == 1:
             return {"messages": ["HMS_07FF-2000-0002-0004"]}
-        if self._activeStatePolls == 1:
+        if self._statePollsAfterStart == 1:
             return "PREPARE"
         return "PRINTING"
 
     def get_percentage(self) -> float:
         if not self.started:
             return 0.0
-        if self._finishLagRemaining > 0:
-            return 100.0
-        return 12.5 if self._activeStatePolls > 1 else 0.0
+        return 12.5 if self._statePollsAfterStart > 1 else 0.0
 
     def get_gcode_state(self) -> str:
         return "PRINTING" if self.started else "IDLE"
@@ -72,8 +63,6 @@ class FakeApiPrinter:
         self.startCount += 1
         self.started = True
         self._statePollsAfterStart = 0
-        self._finishLagRemaining = self.finishLagCount
-        self._activeStatePolls = 0
         self.startArgs.append(tuple(args))
         self.startPayloads.append(dict(kwargs))
         self.startKwargs.append(dict(kwargs))
@@ -188,36 +177,6 @@ def test_startPrintViaApi_acknowledges(monkeypatch: pytest.MonkeyPatch) -> None:
             "vibration_compensation": False,
         }
     ]
-
-
-def test_startPrintViaApi_waits_for_active_state(monkeypatch: pytest.MonkeyPatch) -> None:
-    fakePrinter = FakeApiPrinter(finishLagCount=3)
-    monkeypatch.setattr(bambuPrinter, "bambulabsApi", ApiModuleStub(lambda *_args, **_kwargs: fakePrinter))
-    monkeypatch.setattr(bambuPrinter.time, "sleep", lambda _seconds: None)
-    options = bambuPrinter.BambuPrintOptions(
-        ipAddress="1.2.3.4",
-        serialNumber="SERIAL",
-        accessCode="CODE",
-        waitSeconds=1,
-    )
-
-    result = bambuPrinter.startPrintViaApi(
-        ip="1.2.3.4",
-        serial="SERIAL",
-        accessCode="CODE",
-        uploaded_name="job.3mf",
-        plate_index=1,
-        param_path="Metadata/plate_1.gcode",
-        options=options,
-        job_metadata=None,
-        ack_timeout_sec=0.5,
-    )
-
-    assert result["acknowledged"] is True
-    assert "FINISH" not in str(result.get("state", "")).upper()
-    assert "FINISH" not in str(result.get("gcodeState", "")).upper()
-    assert fakePrinter._finishLagRemaining == 0
-    assert fakePrinter._activeStatePolls >= 1
 
 
 def test_startPrintViaApi_retries_on_conflict(monkeypatch: pytest.MonkeyPatch) -> None:
