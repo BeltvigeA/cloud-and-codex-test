@@ -1557,11 +1557,29 @@ class CommandWorker:
             fileName = metadata.get("fileName")
             if not fileName:
                 raise ValueError("start_print requires metadata.fileName")
-            plateIndex = metadata.get("plateIndex")
-            paramPath = metadata.get("paramPath")
+            rawPlateIndex = metadata.get("plateIndex")
+            plateIndex: Optional[int] = None
+            if rawPlateIndex not in (None, ""):
+                try:
+                    plateIndex = int(rawPlateIndex)
+                except (TypeError, ValueError) as error:
+                    raise ValueError("start_print requires metadata.plateIndex to be an integer") from error
+                if plateIndex < 0:
+                    raise ValueError("start_print requires metadata.plateIndex to be non-negative")
+
+            rawParamPath = metadata.get("paramPath")
+            paramPath: Optional[str] = None
+            if rawParamPath is not None:
+                paramCandidate = str(rawParamPath)
+                paramPath = paramCandidate or None
             useAms = metadata.get("useAms")
             try:
-                callPrinterMethod("start_print", str(fileName), plateIndex or paramPath, use_ams=useAms)
+                startArgs: List[Any] = [str(fileName)]
+                if paramPath:
+                    startArgs.append(paramPath)
+                elif plateIndex is not None:
+                    startArgs.append(plateIndex)
+                callPrinterMethod("start_print", *startArgs, use_ams=useAms)
                 message = "Print started"
             except RuntimeError:
                 options = bambuPrinter.BambuPrintOptions(
