@@ -495,14 +495,11 @@ class ListenerGuiApp:
         if isinstance(candidateValue, (int, float)) and not isinstance(candidateValue, bool):
             return float(candidateValue)
         if isinstance(candidateValue, str):
-            candidate = candidateValue.strip()
-            normalized = candidate.lower()
-            for token in ("°c", "°", "%", "rpm"):
-                normalized = normalized.replace(token, "")
-            normalized = normalized.replace(",", "").strip()
-            if normalized:
+            candidate = candidateValue.strip().replace("°C", "")
+            candidate = candidate.replace("°c", "").replace("°", "")
+            if candidate:
                 try:
-                    return float(normalized)
+                    return float(candidate)
                 except ValueError:
                     return None
         return None
@@ -527,13 +524,11 @@ class ListenerGuiApp:
                 .replace("hr", "")
                 .replace("hours", "")
                 .replace("hour", "")
-                .replace("rpm", "")
-                .replace("%", "")
                 .replace("s", "")
                 .replace("m", "")
                 .replace("h", "")
             )
-            candidate = candidate.replace(",", "").strip()
+            candidate = candidate.strip()
             if candidate:
                 try:
                     return int(float(candidate))

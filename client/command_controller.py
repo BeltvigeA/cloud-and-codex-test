@@ -169,42 +169,6 @@ def captureCameraSnapshot(printer: Any, serial: str) -> Path:
         if cameraDebugEnabled:
             log.info("[camera] saved %d bytes to %s", len(buffer), filePath)
 
-    turnLightOnMethod = getattr(printer, "turn_light_on", None)
-    turnLightOffMethod = getattr(printer, "turn_light_off", None)
-    lightTurnedOnHere = False
-
-    if callable(turnLightOnMethod):
-        try:
-            turnLightOnMethod()
-            lightTurnedOnHere = True
-        except Exception as error:  # noqa: BLE001 - third-party SDK raises generic Exception
-            log.warning(
-                "[camera] turn_light_on() failed: %s",
-                error,
-                exc_info=cameraDebugEnabled,
-            )
-    else:
-        log.info("[camera] turn_light_on() unavailable; proceeding without light")
-
-    def restoreLight() -> None:
-        nonlocal lightTurnedOnHere
-        if not lightTurnedOnHere:
-            return
-        if not callable(turnLightOffMethod):
-            log.warning("[camera] turn_light_off() unavailable after enabling light")
-            lightTurnedOnHere = False
-            return
-        try:
-            turnLightOffMethod()
-        except Exception as error:  # noqa: BLE001 - third-party SDK raises generic Exception
-            log.warning(
-                "[camera] turn_light_off() failed: %s",
-                error,
-                exc_info=cameraDebugEnabled,
-            )
-        else:
-            lightTurnedOnHere = False
-
     cameraImageMethod = getattr(printer, "get_camera_image", None)
     if callable(cameraImageMethod):
         lastImageError: Optional[Exception] = None
@@ -220,8 +184,6 @@ def captureCameraSnapshot(printer: Any, serial: str) -> Path:
                         "[camera] get_camera_image() ok in %.3fs",
                         time.perf_counter() - methodStart,
                     )
-                if lightTurnedOnHere:
-                    restoreLight()
                 if startedHereFlag and callable(cameraStopMethod):
                     try:
                         cameraStopMethod()
@@ -264,8 +226,6 @@ def captureCameraSnapshot(printer: Any, serial: str) -> Path:
                         "[camera] get_camera_frame() ok in %.3fs",
                         time.perf_counter() - methodStart,
                     )
-                if lightTurnedOnHere:
-                    restoreLight()
                 if startedHereFlag and callable(cameraStopMethod):
                     try:
                         cameraStopMethod()
@@ -309,8 +269,6 @@ def captureCameraSnapshot(printer: Any, serial: str) -> Path:
                         "[camera] get_camera_snapshot() ok in %.3fs",
                         time.perf_counter() - methodStart,
                     )
-                if lightTurnedOnHere:
-                    restoreLight()
                 if startedHereFlag and callable(cameraStopMethod):
                     try:
                         cameraStopMethod()
@@ -334,7 +292,6 @@ def captureCameraSnapshot(printer: Any, serial: str) -> Path:
         if lastSnapshotError is not None:
             errorMessages.append(f"get_camera_snapshot: {lastSnapshotError}")
 
-    restoreLight()
     if startedHereFlag and callable(cameraStopMethod):
         try:
             cameraStopMethod()
@@ -1557,32 +1514,12 @@ class CommandWorker:
             fileName = metadata.get("fileName")
             if not fileName:
                 raise ValueError("start_print requires metadata.fileName")
-            rawPlateIndex = metadata.get("plateIndex")
-            plateIndex: Optional[int] = None
-            if rawPlateIndex not in (None, ""):
-                try:
-                    plateIndex = int(rawPlateIndex)
-                except (TypeError, ValueError) as error:
-                    raise ValueError("start_print requires metadata.plateIndex to be an integer") from error
-                if plateIndex < 0:
-                    raise ValueError("start_print requires metadata.plateIndex to be non-negative")
-
-            rawParamPath = metadata.get("paramPath")
-            paramPath: Optional[str] = None
-            if rawParamPath is not None:
-                paramCandidate = str(rawParamPath)
-                paramPath = paramCandidate or None
+            plateIndex = metadata.get("plateIndex")
+            paramPath = metadata.get("paramPath")
             useAms = metadata.get("useAms")
-            jobActivated = False
             try:
-                startArgs: List[Any] = [str(fileName)]
-                if paramPath:
-                    startArgs.append(paramPath)
-                elif plateIndex is not None:
-                    startArgs.append(plateIndex)
-                callPrinterMethod("start_print", *startArgs, use_ams=useAms)
+                callPrinterMethod("start_print", str(fileName), plateIndex or paramPath, use_ams=useAms)
                 message = "Print started"
-                jobActivated = True
             except RuntimeError:
                 options = bambuPrinter.BambuPrintOptions(
                     ipAddress=self.ipAddress,
@@ -1601,34 +1538,17 @@ class CommandWorker:
                     options=options,
                     job_metadata=metadata if isinstance(metadata, dict) else None,
                 )
-                resultData = result if isinstance(result, dict) else {}
-                acknowledged = resultData.get("acknowledged")
-                stateValue = resultData.get("gcodeState") or resultData.get("state")
-                normalizedState = str(stateValue or "").strip().upper()
-                if acknowledged is False or normalizedState in {"FINISH", "IDLE"}:
-                    self._jobActive = False
-                    declineDetails: List[str] = []
-                    if acknowledged is not None:
-                        declineDetails.append(f"acknowledged={acknowledged}")
-                    if normalizedState:
-                        declineDetails.append(f"state={normalizedState}")
-                    detailsText = ", ".join(declineDetails) or "no acknowledgement received"
-                    raise RuntimeError(
-                        f"Printer declined to start print ({detailsText})"
-                    )
-                suffix = (
-                    f" (acknowledged={acknowledged})"
+                acknowledged = result.get("acknowledged")
+                message = (
+                    f"Print started (acknowledged={acknowledged})"
                     if acknowledged is not None
-                    else ""
+                    else "Print started"
                 )
-                message = f"Print started via API{suffix}".strip()
-                jobActivated = True
-            if jobActivated:
-                self._jobActive = True
-                try:
-                    self._lastRemoteFile = str(fileName)
-                except Exception:
-                    self._lastRemoteFile = None
+            self._jobActive = True
+            try:
+                self._lastRemoteFile = str(fileName)
+            except Exception:
+                self._lastRemoteFile = None
         elif normalizedType in {"home", "light_on", "light_off", "lightoff", "lighton", "move", "jog", "load_filament", "unload_filament", "sendgcode"}:
             if normalizedType == "home":
                 sendGcode("G28")
