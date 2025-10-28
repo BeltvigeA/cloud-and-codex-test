@@ -248,6 +248,8 @@ def testCameraCommandCapturesSnapshot(
             self.cameraStartCalls = 0
             self.cameraStopCalls = 0
             self.cameraAlive = False
+            self.turnLightOnCalls = 0
+            self.turnLightOffCalls = 0
             self.mqtt_client = type("FakeMqttClient", (), {"publishCalls": []})()
 
         def connect(self) -> None:
@@ -264,6 +266,12 @@ def testCameraCommandCapturesSnapshot(
         def camera_stop(self) -> None:
             self.cameraStopCalls += 1
             self.cameraAlive = False
+
+        def turn_light_on(self) -> None:
+            self.turnLightOnCalls += 1
+
+        def turn_light_off(self) -> None:
+            self.turnLightOffCalls += 1
 
         def get_camera_frame(self) -> bytes:
             self.getCameraFrameCalls += 1
@@ -308,6 +316,8 @@ def testCameraCommandCapturesSnapshot(
     assert not fakePrinter.mqtt_client.publishCalls
     assert fakePrinter.cameraStartCalls == 1
     assert fakePrinter.cameraStopCalls == 1
+    assert fakePrinter.turnLightOnCalls == 1
+    assert fakePrinter.turnLightOffCalls == 1
     assert postedPayloads
     payload = postedPayloads[0]
     assert payload["printerSerial"] == "SERIAL777"
