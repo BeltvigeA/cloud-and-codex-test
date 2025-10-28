@@ -169,6 +169,42 @@ def captureCameraSnapshot(printer: Any, serial: str) -> Path:
         if cameraDebugEnabled:
             log.info("[camera] saved %d bytes to %s", len(buffer), filePath)
 
+    turnLightOnMethod = getattr(printer, "turn_light_on", None)
+    turnLightOffMethod = getattr(printer, "turn_light_off", None)
+    lightTurnedOnHere = False
+
+    if callable(turnLightOnMethod):
+        try:
+            turnLightOnMethod()
+            lightTurnedOnHere = True
+        except Exception as error:  # noqa: BLE001 - third-party SDK raises generic Exception
+            log.warning(
+                "[camera] turn_light_on() failed: %s",
+                error,
+                exc_info=cameraDebugEnabled,
+            )
+    else:
+        log.info("[camera] turn_light_on() unavailable; proceeding without light")
+
+    def restoreLight() -> None:
+        nonlocal lightTurnedOnHere
+        if not lightTurnedOnHere:
+            return
+        if not callable(turnLightOffMethod):
+            log.warning("[camera] turn_light_off() unavailable after enabling light")
+            lightTurnedOnHere = False
+            return
+        try:
+            turnLightOffMethod()
+        except Exception as error:  # noqa: BLE001 - third-party SDK raises generic Exception
+            log.warning(
+                "[camera] turn_light_off() failed: %s",
+                error,
+                exc_info=cameraDebugEnabled,
+            )
+        else:
+            lightTurnedOnHere = False
+
     cameraImageMethod = getattr(printer, "get_camera_image", None)
     if callable(cameraImageMethod):
         lastImageError: Optional[Exception] = None
@@ -184,6 +220,8 @@ def captureCameraSnapshot(printer: Any, serial: str) -> Path:
                         "[camera] get_camera_image() ok in %.3fs",
                         time.perf_counter() - methodStart,
                     )
+                if lightTurnedOnHere:
+                    restoreLight()
                 if startedHereFlag and callable(cameraStopMethod):
                     try:
                         cameraStopMethod()
@@ -226,6 +264,8 @@ def captureCameraSnapshot(printer: Any, serial: str) -> Path:
                         "[camera] get_camera_frame() ok in %.3fs",
                         time.perf_counter() - methodStart,
                     )
+                if lightTurnedOnHere:
+                    restoreLight()
                 if startedHereFlag and callable(cameraStopMethod):
                     try:
                         cameraStopMethod()
@@ -269,6 +309,8 @@ def captureCameraSnapshot(printer: Any, serial: str) -> Path:
                         "[camera] get_camera_snapshot() ok in %.3fs",
                         time.perf_counter() - methodStart,
                     )
+                if lightTurnedOnHere:
+                    restoreLight()
                 if startedHereFlag and callable(cameraStopMethod):
                     try:
                         cameraStopMethod()
@@ -292,6 +334,7 @@ def captureCameraSnapshot(printer: Any, serial: str) -> Path:
         if lastSnapshotError is not None:
             errorMessages.append(f"get_camera_snapshot: {lastSnapshotError}")
 
+    restoreLight()
     if startedHereFlag and callable(cameraStopMethod):
         try:
             cameraStopMethod()
