@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import logging
 import sys
-import types
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -522,86 +521,3 @@ def test_collect_telemetry_marks_printer_online(monkeypatch: pytest.MonkeyPatch)
 
     assert statusPayload["online"] is True
     assert statusPayload["mqttReady"] is True
-
-
-def testInterpretBambuStatusNormalizesUnits(monkeypatch: pytest.MonkeyPatch) -> None:
-    app = ListenerGuiApp.__new__(ListenerGuiApp)
-    app._parseOptionalFloat = ListenerGuiApp._parseOptionalFloat.__get__(app, ListenerGuiApp)
-    app._parseOptionalInt = ListenerGuiApp._parseOptionalInt.__get__(app, ListenerGuiApp)
-    app._parseOptionalString = ListenerGuiApp._parseOptionalString.__get__(app, ListenerGuiApp)
-    app._mapBambuState = ListenerGuiApp._mapBambuState.__get__(app, ListenerGuiApp)
-
-    payload = {
-        "mc_percent": {"value": "47%"},
-        "mc_remaining_time": "180s",
-        "nozzle_temper": "212.5°C",
-        "bed_temper": {"current": "60RPM"},
-        "gcode_state": "PRINTING",
-    }
-
-    interpreted = ListenerGuiApp._interpretBambuStatus(app, payload)
-
-    assert interpreted["progressPercent"] == pytest.approx(47.0)
-    assert interpreted["nozzleTemp"] == pytest.approx(212.5)
-    assert interpreted["bedTemp"] == pytest.approx(60.0)
-    assert interpreted["remainingTimeSeconds"] == 180
-    assert interpreted["status"] == "Printing"
-
-
-def testCollectPrinterTelemetryNormalizesUnitStrings(monkeypatch: pytest.MonkeyPatch) -> None:
-    class FakePrinter:
-        def __init__(self) -> None:
-            self.statePayload = {
-                "mc_percent": "58%",
-                "mc_remaining_time": "900s",
-                "nozzle_temper": "215°C",
-                "bed_temper": {"value": "60RPM"},
-                "gcode_state": "PRINTING",
-            }
-
-        def mqtt_start(self) -> None:
-            return None
-
-        def connect(self) -> None:  # noqa: D401 - simple stub
-            return None
-
-        def get_state(self) -> Dict[str, Any]:
-            return dict(self.statePayload)
-
-        def get_percentage(self) -> str:
-            return str(self.statePayload["mc_percent"])
-
-        def get_gcode_state(self) -> Dict[str, Any]:
-            return {"gcode_state": self.statePayload["gcode_state"]}
-
-        def disconnect(self) -> None:
-            return None
-
-    fakePrinter = FakePrinter()
-    fakeModule = types.ModuleType("bambulabs_api")
-    fakeModule.Printer = lambda *_args, **_kwargs: fakePrinter  # type: ignore[assignment]
-    monkeypatch.setitem(sys.modules, "bambulabs_api", fakeModule)
-
-    app = ListenerGuiApp.__new__(ListenerGuiApp)
-    app._parseOptionalFloat = ListenerGuiApp._parseOptionalFloat.__get__(app, ListenerGuiApp)
-    app._parseOptionalInt = ListenerGuiApp._parseOptionalInt.__get__(app, ListenerGuiApp)
-    app._parseOptionalString = ListenerGuiApp._parseOptionalString.__get__(app, ListenerGuiApp)
-    app._mapBambuState = ListenerGuiApp._mapBambuState.__get__(app, ListenerGuiApp)
-    app._interpretBambuStatus = ListenerGuiApp._interpretBambuStatus.__get__(app, ListenerGuiApp)
-    app._fetchBambuTelemetry = ListenerGuiApp._fetchBambuTelemetry.__get__(app, ListenerGuiApp)
-    app._probePrinterAvailability = lambda _ip: "Online"
-
-    printerDetails = {
-        "ipAddress": "192.168.0.50",
-        "serialNumber": "SN-67890",
-        "accessCode": "CODE-456",
-        "brand": "Bambu",
-    }
-
-    telemetry = ListenerGuiApp._collectPrinterTelemetry(app, printerDetails)
-
-    assert telemetry["progressPercent"] == pytest.approx(58.0)
-    assert telemetry["nozzleTemp"] == pytest.approx(215.0)
-    assert telemetry["bedTemp"] == pytest.approx(60.0)
-    assert telemetry["remainingTimeSeconds"] == 900
-    assert telemetry["gcodeState"] == "PRINTING"

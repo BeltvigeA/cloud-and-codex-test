@@ -1004,29 +1004,28 @@ def startPrintViaApi(
             {key: value for key, value in sendControlFlags.items() if value is not None},
         )
 
-    def _invokeStart(*, forceControl: bool = False) -> str:
+    def _invokeStart() -> None:
         localErrors: List[str] = []
-        startMode: Optional[str] = None
-        if not forceControl:
-            startMethod = getattr(printer, "start_print", None)
-            if callable(startMethod):
-                try:
-                    positionalArgs = [uploaded_name, plateArgument]
-                    keywordArgs = dict(startKeywordArgs)
-                    startMethod(*positionalArgs, **keywordArgs)
-                    startMode = "start_print"
-                    logger.info(
-                        "[start] start_print() invoked (file=%s, plate=%s, kwargs=%s)",
-                        uploaded_name,
-                        plateArgument,
-                        keywordArgs,
-                    )
-                    _applyPostStartControls(printer, options)
-                except Exception as error:
-                    localErrors.append(f"start_print:{error}")
-                    if START_DEBUG:
-                        logger.info("[start] start_print failed: %s", error, exc_info=True)
-        if startMode is None:
+        started = False
+        startMethod = getattr(printer, "start_print", None)
+        if callable(startMethod):
+            try:
+                positionalArgs = [uploaded_name, plateArgument]
+                keywordArgs = dict(startKeywordArgs)
+                startMethod(*positionalArgs, **keywordArgs)
+                started = True
+                logger.info(
+                    "[start] start_print() invoked (file=%s, plate=%s, kwargs=%s)",
+                    uploaded_name,
+                    plateArgument,
+                    keywordArgs,
+                )
+                _applyPostStartControls(printer, options)
+            except Exception as error:
+                localErrors.append(f"start_print:{error}")
+                if START_DEBUG:
+                    logger.info("[start] start_print failed: %s", error, exc_info=True)
+        if not started:
             controlMethod = getattr(printer, "send_control", None)
             if callable(controlMethod):
                 try:
@@ -1037,17 +1036,16 @@ def startPrintViaApi(
                     if START_DEBUG:
                         logger.info("[start] send_control payload=%s", payload)
                     controlMethod(payload)
-                    startMode = "send_control"
+                    started = True
                     logger.info("[start] send_control(project_file) invoked")
                     _applyPostStartControls(printer, options)
                 except Exception as error:
                     localErrors.append(f"send_control(project_file):{error}")
                     if START_DEBUG:
                         logger.info("[start] send_control failed: %s", error, exc_info=True)
-        if startMode is None:
+        if not started:
             summary = " | ".join(localErrors or ["no method"])
             raise RuntimeError(f"Unable to start print via API: {summary}")
-        return startMode
 
     def _pollForAcknowledgement(timeoutSeconds: float) -> Dict[str, Any]:
         deadline = time.monotonic() + max(5.0, float(timeoutSeconds))
@@ -1080,23 +1078,7 @@ def startPrintViaApi(
                 percentageFloat = None
             if START_DEBUG:
                 logger.info("[start] poll state=%s percent=%s", stateIndicator, lastPercentage)
-            normalizedState = (stateIndicator or "").strip().upper() if stateIndicator else None
-            realisticPercentage = (
-                percentageFloat is not None and 0.0 < percentageFloat < 100.0
-            )
-            if (
-                normalizedState in {"FINISH", "IDLE"}
-                and percentageFloat is not None
-                and percentageFloat >= 100.0
-            ):
-                return {
-                    "acknowledged": False,
-                    "statePayload": lastStatePayload,
-                    "state": extractStateText(lastStatePayload) or stateIndicator,
-                    "gcodeState": lastGcodeState or stateIndicator,
-                    "percentage": percentageFloat,
-                }
-            if realisticPercentage or _is_active_state(stateIndicator):
+            if (percentageFloat is not None and percentageFloat > 0.0) or _is_active_state(stateIndicator):
                 return {
                     "acknowledged": True,
                     "statePayload": lastStatePayload,
@@ -1121,30 +1103,10 @@ def startPrintViaApi(
     finalUseAms = resolvedUseAms
 
     try:
-        startMode = _invokeStart()
+        _invokeStart()
         ackResult = _pollForAcknowledgement(ack_timeout_sec)
         acknowledged = bool(ackResult.get("acknowledged"))
         conflictDetected = _looksLikeAmsFilamentConflict(ackResult.get("statePayload"))
-        ackStateIndicator = ackResult.get("gcodeState") or ackResult.get("state")
-        ackStateText = str(ackStateIndicator) if ackStateIndicator is not None else ""
-        controlRetryPerformed = False
-        if (
-            not acknowledged
-            and startMode == "start_print"
-            and ackStateText
-            and not _is_active_state(ackStateText)
-        ):
-            logger.warning(
-                "API start reported non-active state '%s' after start_print for %s – retrying via send_control",
-                ackStateText,
-                serial,
-            )
-            controlRetryPerformed = True
-            startMode = _invokeStart(forceControl=True)
-            ackResult = _pollForAcknowledgement(ack_timeout_sec)
-            acknowledged = bool(ackResult.get("acknowledged"))
-            ackStateIndicator = ackResult.get("gcodeState") or ackResult.get("state")
-            ackStateText = str(ackStateIndicator) if ackStateIndicator is not None else ""
         if (resolvedUseAms is None) and (conflictDetected or not acknowledged):
             logger.warning(
                 "API start detected possible AMS filament conflict for %s – retrying with use_ams=False",
@@ -1164,8 +1126,6 @@ def startPrintViaApi(
             _invokeStart()
             ackResult = _pollForAcknowledgement(ack_timeout_sec)
             acknowledged = bool(ackResult.get("acknowledged"))
-        if controlRetryPerformed:
-            fallbackTriggered = True
         logger.info(
             "API start acknowledgement for %s: acknowledged=%s state=%s gcodeState=%s pct=%s",
             serial,
