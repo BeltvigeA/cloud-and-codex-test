@@ -1078,7 +1078,23 @@ def startPrintViaApi(
                 percentageFloat = None
             if START_DEBUG:
                 logger.info("[start] poll state=%s percent=%s", stateIndicator, lastPercentage)
-            if (percentageFloat is not None and percentageFloat > 0.0) or _is_active_state(stateIndicator):
+            normalizedState = (stateIndicator or "").strip().upper() if stateIndicator else None
+            realisticPercentage = (
+                percentageFloat is not None and 0.0 < percentageFloat < 100.0
+            )
+            if (
+                normalizedState in {"FINISH", "IDLE"}
+                and percentageFloat is not None
+                and percentageFloat >= 100.0
+            ):
+                return {
+                    "acknowledged": False,
+                    "statePayload": lastStatePayload,
+                    "state": extractStateText(lastStatePayload) or stateIndicator,
+                    "gcodeState": lastGcodeState or stateIndicator,
+                    "percentage": percentageFloat,
+                }
+            if realisticPercentage or _is_active_state(stateIndicator):
                 return {
                     "acknowledged": True,
                     "statePayload": lastStatePayload,
