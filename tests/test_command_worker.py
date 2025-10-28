@@ -283,6 +283,80 @@ def testStartPrintPrefersParamPath(monkeypatch: pytest.MonkeyPatch) -> None:
     assert not apiStartCalls
 
 
+def testStartPrintApiDecline(monkeypatch: pytest.MonkeyPatch) -> None:
+    worker = CommandWorker(
+        serial="SERIAL999",
+        ipAddress="10.0.0.99",
+        accessCode="code",
+        apiKey="api-key",
+        recipientId="recipient-9",
+        baseUrl="https://example.com",
+    )
+
+    monkeypatch.setattr("client.command_controller._reserveCommand", lambda commandId: True)
+    finalizeCalls: List[tuple[str, str]] = []
+    monkeypatch.setattr(
+        "client.command_controller._finalizeCommand",
+        lambda commandId, status: finalizeCalls.append((commandId, status)),
+    )
+
+    ackCalls: List[tuple[str, str]] = []
+    resultCalls: List[Dict[str, Any]] = []
+
+    def fakeAck(self: CommandWorker, commandId: str, status: str) -> bool:
+        ackCalls.append((commandId, status))
+        return True
+
+    def fakeResult(
+        self: CommandWorker,
+        commandId: str,
+        status: str,
+        *,
+        message: Optional[str] = None,
+        errorMessage: Optional[str] = None,
+    ) -> None:
+        resultCalls.append(
+            {
+                "commandId": commandId,
+                "status": status,
+                "message": message,
+                "errorMessage": errorMessage,
+            }
+        )
+
+    monkeypatch.setattr(CommandWorker, "_sendCommandAck", fakeAck)
+    monkeypatch.setattr(CommandWorker, "_sendCommandResult", fakeResult)
+
+    class FakePrinter:
+        def start_print(self, *args: Any, **kwargs: Any) -> None:
+            raise RuntimeError("fallback to api")
+
+    monkeypatch.setattr(CommandWorker, "_connectPrinter", lambda self: FakePrinter())
+
+    apiStartCalls: List[Dict[str, Any]] = []
+
+    def fakeStartPrintViaApi(**kwargs: Any) -> Dict[str, Any]:
+        apiStartCalls.append(dict(kwargs))
+        return {"acknowledged": False, "state": "IDLE"}
+
+    monkeypatch.setattr("client.command_controller.bambuPrinter.startPrintViaApi", fakeStartPrintViaApi)
+
+    worker._processCommand(
+        {
+            "commandId": "start-decline",
+            "commandType": "start_print",
+            "metadata": {"fileName": "example.3mf"},
+        }
+    )
+
+    assert ackCalls == [("start-decline", "processing")]
+    assert finalizeCalls == [("start-decline", "failed")]
+    assert resultCalls[0]["status"] == "failed"
+    assert "Printer declined" in (resultCalls[0]["errorMessage"] or "")
+    assert apiStartCalls and apiStartCalls[0]["uploaded_name"] == "example.3mf"
+    assert worker._jobActive is False
+
+
 def testCameraCommandCapturesSnapshot(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
