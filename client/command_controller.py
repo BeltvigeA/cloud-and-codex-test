@@ -675,6 +675,7 @@ class CommandWorker:
         self.cameraSnapshotIntervalSeconds = cameraSnapshotIntervalSeconds
         self._cameraLoopThread: Optional[threading.Thread] = None
         self._cameraLoopStopEvent = threading.Event()
+        self._idleConnectErrorCount = 0
         log.debug(
             "CommandWorker configured for %s using control endpoint %s", self.serial, self.controlEndpointUrl
         )
@@ -716,6 +717,7 @@ class CommandWorker:
         log.info("CommandWorker started for %s (%s) [printer-mode]", self.nickname, self.serial)
         try:
             while not self._stopEvent.is_set():
+                self._attemptIdlePrinterConnection()
                 try:
                     commands = self._pollCommands()
                     self.pollErrorCount = 0
@@ -737,6 +739,7 @@ class CommandWorker:
             if queueRef is None:
                 return
             while not self._stopEvent.is_set():
+                self._attemptIdlePrinterConnection()
                 try:
                     command = queueRef.get(timeout=self.pollIntervalSeconds)
                 except queue.Empty:
@@ -997,6 +1000,27 @@ class CommandWorker:
                 log.debug("Error while disconnecting printer %s", self.serial, exc_info=True)
             finally:
                 self._printerInstance = None
+
+    def _attemptIdlePrinterConnection(self) -> None:
+        if self._stopEvent.is_set():
+            return
+        with self._printerLock:
+            printerReady = self._printerInstance is not None
+        if printerReady:
+            self._idleConnectErrorCount = 0
+            return
+        try:
+            self._connectPrinter()
+        except Exception as error:  # noqa: BLE001 - propagate through logging
+            self._idleConnectErrorCount += 1
+            if self._idleConnectErrorCount == 1 or self._idleConnectErrorCount % self.pollLogEvery == 0:
+                log.warning(
+                    "Idle printer connect failed for %s: %s",
+                    self.serial,
+                    error,
+                )
+        else:
+            self._idleConnectErrorCount = 0
 
     def _ensureStatusMonitor(self, printer: Any) -> None:
         if self._statusThread and self._statusThread.is_alive():
