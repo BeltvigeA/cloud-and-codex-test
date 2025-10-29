@@ -78,6 +78,77 @@ def _is_active_state(stateName: Optional[str]) -> bool:
     )
 
 
+def _safe_get_state(printer: Any) -> Optional[Dict[str, Any]]:
+    getStateMethod = getattr(printer, "get_state", None)
+    if not callable(getStateMethod):
+        return None
+    try:
+        statePayload = getStateMethod()
+    except Exception as error:  # pragma: no cover - dependent on printer state
+        if START_DEBUG:
+            logger.info("[start] preflight get_state() failed: %s", error, exc_info=True)
+        return None
+    if isinstance(statePayload, dict):
+        return statePayload
+    if START_DEBUG and statePayload is not None:
+        logger.info(
+            "[start] preflight get_state() returned %s", type(statePayload).__name__
+        )
+    return None
+
+
+def _extract_mc_percent(payload: Any) -> Optional[int]:
+    percentValue = _find_key(payload, {"mc_percent", "percentage", "percent"})
+    if percentValue is None:
+        return None
+    try:
+        percentFloat = float(percentValue)
+    except (TypeError, ValueError):
+        return None
+    try:
+        return int(percentFloat)
+    except (TypeError, ValueError):  # pragma: no cover - float coercion safeguard
+        return None
+
+
+def _state_is_completed_like(payload: Any) -> bool:
+    if payload is None:
+        return False
+    percentValue = _extract_mc_percent(payload)
+    if percentValue == 100:
+        return True
+    stateText = _extract_gcode_state(payload)
+    if not stateText:
+        return False
+    normalized = stateText.strip().lower()
+    completedStates = {"finish", "finished", "completed", "idle", "complete"}
+    return normalized in completedStates
+
+
+def _preselect_project_file(
+    printer: Any,
+    remoteUrl: str,
+    startParam: Optional[str],
+    sendControlFlags: Dict[str, Any],
+) -> bool:
+    controlMethod = getattr(printer, "send_control", None)
+    if not callable(controlMethod):
+        return False
+    payload: Dict[str, Any] = {"print": {"command": "project_file", "url": remoteUrl}}
+    if startParam:
+        payload["print"]["param"] = startParam
+    payload["print"].update({key: value for key, value in sendControlFlags.items() if value is not None})
+    if START_DEBUG:
+        logger.info("[start] preselect send_control payload=%s", payload)
+    try:
+        controlMethod(payload)
+        logger.info("[start] preselected project_file before start_print")
+        return True
+    except Exception as error:  # pragma: no cover - dependent on printer state
+        if START_DEBUG:
+            logger.info("[start] preselect send_control failed: %s", error, exc_info=True)
+        return False
+
 
 # Persistent dir for handing 3MF to Bambu Connect
 PERSISTENT_FILES_DIR = Path.home() / ".printmaster" / "files"
@@ -1003,6 +1074,16 @@ def startPrintViaApi(
             startParam,
             {key: value for key, value in sendControlFlags.items() if value is not None},
         )
+
+    preflightState = _safe_get_state(printer)
+    if START_DEBUG and preflightState is not None:
+        logger.info(
+            "[start] preflight state percent=%s state=%s",
+            _extract_mc_percent(preflightState),
+            _extract_gcode_state(preflightState),
+        )
+    if _state_is_completed_like(preflightState):
+        _preselect_project_file(printer, remoteUrl, startParam, sendControlFlags)
 
     def _invokeStart() -> None:
         localErrors: List[str] = []
