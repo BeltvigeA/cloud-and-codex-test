@@ -5,6 +5,7 @@ from pathlib import Path
 import sys
 import time
 from typing import Any, Dict, List, Optional
+import threading
 
 import pytest
 from requests import HTTPError
@@ -387,6 +388,65 @@ def testCameraCommandOffInvokesCameraOff(monkeypatch: pytest.MonkeyPatch) -> Non
     assert resultCalls[0]["status"] == "completed"
     assert fakePrinter.cameraOffCalls == 1
 
+
+def testCameraSnapshotLoopUploads(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    worker = CommandWorker(
+        serial="SERIAL888",
+        ipAddress="10.0.0.88",
+        accessCode="code",
+        apiKey="api-key",
+        recipientId="recipient-4",
+        baseUrl="https://example.com",
+    )
+
+    worker.cameraSnapshotIntervalSeconds = 0.05
+
+    snapshotPath = tmp_path / ".printmaster" / "camera" / "SERIAL888-test.jpg"
+    snapshotPath.parent.mkdir(parents=True, exist_ok=True)
+    snapshotPath.write_bytes(b"fake-camera-bytes")
+
+    captureCalls: List[tuple[Any, str]] = []
+    uploadCalls: List[Dict[str, Any]] = []
+    firstUploadEvent = threading.Event()
+
+    def fakeCapture(printer: Any, serial: str) -> Path:
+        captureCalls.append((printer, serial))
+        return snapshotPath
+
+    def fakePost(payload: Dict[str, object]) -> Dict[str, object]:
+        uploadCalls.append(dict(payload))
+        firstUploadEvent.set()
+        return {}
+
+    class FakePrinter:
+        def disconnect(self) -> None:
+            pass
+
+    fakePrinter = FakePrinter()
+
+    monkeypatch.setattr("client.command_controller.captureCameraSnapshot", fakeCapture)
+    monkeypatch.setattr("client.command_controller.postReportPrinterImage", fakePost)
+    monkeypatch.setattr(CommandWorker, "_statusMonitorLoop", lambda self, printer: None)
+
+    with worker._printerLock:
+        worker._printerInstance = fakePrinter
+
+    worker._ensureStatusMonitor(fakePrinter)
+
+    assert firstUploadEvent.wait(1.0)
+    deadline = time.time() + 1.0
+    while time.time() < deadline:
+        if len(captureCalls) >= 2:
+            break
+        time.sleep(0.01)
+
+    worker.stop()
+
+    assert len(captureCalls) >= 2
+    assert uploadCalls
+    payload = uploadCalls[0]
+    assert payload["printerSerial"] == "SERIAL888"
+    assert payload["imageType"] == "webcam"
 
 def testProcessUnsupportedCommandReportsFailure(monkeypatch: pytest.MonkeyPatch) -> None:
     worker = CommandWorker(
