@@ -448,6 +448,66 @@ def testCameraSnapshotLoopUploads(monkeypatch: pytest.MonkeyPatch, tmp_path: Pat
     assert payload["printerSerial"] == "SERIAL888"
     assert payload["imageType"] == "webcam"
 
+
+def testCommandWorkerIdleCapturesSnapshots(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("CONTROL_POLL_MODE", "printer")
+
+    worker = CommandWorker(
+        serial="SERIALIDLE",
+        ipAddress="10.0.0.88",
+        accessCode="code",
+        apiKey="api-key",
+        recipientId="recipient-idle",
+        baseUrl="https://example.com",
+    )
+
+    worker.cameraSnapshotIntervalSeconds = 0.05
+    worker.pollIntervalSeconds = 0.05
+
+    captureCalls: List[tuple[Any, str]] = []
+    uploadCalls: List[Dict[str, Any]] = []
+    firstCaptureEvent = threading.Event()
+
+    snapshotPath = tmp_path / "idle-snapshot.jpg"
+
+    def fakeCapture(printer: Any, serial: str) -> Path:
+        snapshotPath.write_bytes(b"idle-bytes")
+        captureCalls.append((printer, serial))
+        firstCaptureEvent.set()
+        return snapshotPath
+
+    def fakePost(payload: Dict[str, object]) -> Dict[str, object]:
+        uploadCalls.append(dict(payload))
+        return {}
+
+    class FakePrinter:
+        def disconnect(self) -> None:
+            pass
+
+    fakePrinter = FakePrinter()
+
+    def fakeConnect() -> Any:
+        with worker._printerLock:
+            if worker._printerInstance is None:
+                worker._printerInstance = fakePrinter
+        worker._ensureStatusMonitor(fakePrinter)
+        return fakePrinter
+
+    monkeypatch.setattr(CommandWorker, "_statusMonitorLoop", lambda self, printer: None)
+    monkeypatch.setattr("client.command_controller.captureCameraSnapshot", fakeCapture)
+    monkeypatch.setattr("client.command_controller.postReportPrinterImage", fakePost)
+    worker._connectPrinter = fakeConnect
+    worker._pollCommands = lambda: []
+
+    worker.start()
+    try:
+        assert firstCaptureEvent.wait(2.0)
+    finally:
+        worker.stop()
+
+    assert captureCalls
+    assert uploadCalls
+    assert all(payload["printerSerial"] == "SERIALIDLE" for payload in uploadCalls)
 def testProcessUnsupportedCommandReportsFailure(monkeypatch: pytest.MonkeyPatch) -> None:
     worker = CommandWorker(
         serial="SERIAL999",
