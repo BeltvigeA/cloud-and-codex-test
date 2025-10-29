@@ -59,6 +59,17 @@ cameraDebugEnabled = (
 )
 
 
+def _resolveCameraSnapshotIntervalSeconds() -> float:
+    try:
+        value = float(os.getenv("CAMERA_SNAPSHOT_INTERVAL_SECONDS", "30"))
+    except ValueError:
+        value = 30.0
+    return max(1.0, value)
+
+
+cameraSnapshotIntervalSeconds = _resolveCameraSnapshotIntervalSeconds()
+
+
 def captureCameraSnapshot(printer: Any, serial: str) -> Path:
     cameraDirectory = Path.home() / ".printmaster" / "camera"
     cameraDirectory.mkdir(parents=True, exist_ok=True)
@@ -661,6 +672,9 @@ class CommandWorker:
         self._sawActivityDuringJob = False
         self._lastErrorCodeReported: Optional[str] = None
         self._printErrorCodeUnsupportedLogged = False
+        self.cameraSnapshotIntervalSeconds = cameraSnapshotIntervalSeconds
+        self._cameraLoopThread: Optional[threading.Thread] = None
+        self._cameraLoopStopEvent = threading.Event()
         log.debug(
             "CommandWorker configured for %s using control endpoint %s", self.serial, self.controlEndpointUrl
         )
@@ -689,6 +703,7 @@ class CommandWorker:
             self._router = None
         self._drainQueue()
         self._stopStatusMonitor()
+        self._stopCameraSnapshotLoop()
         self._disconnectPrinter()
 
     def _run(self) -> None:
@@ -996,12 +1011,92 @@ class CommandWorker:
             daemon=True,
         )
         self._statusThread.start()
+        self._ensureCameraSnapshotLoop(printer)
 
     def _stopStatusMonitor(self) -> None:
         self._statusStopEvent.set()
         if self._statusThread and self._statusThread.is_alive():
             self._statusThread.join(timeout=2.0)
         self._statusThread = None
+        self._stopCameraSnapshotLoop()
+
+    def _ensureCameraSnapshotLoop(self, printer: Any) -> None:
+        if self.cameraSnapshotIntervalSeconds <= 0:
+            return
+        if self._cameraLoopThread and self._cameraLoopThread.is_alive():
+            return
+        self._cameraLoopStopEvent.clear()
+        self._cameraLoopThread = threading.Thread(
+            target=self._cameraSnapshotLoop,
+            name=f"CommandWorkerCamera-{self.serial}",
+            args=(printer,),
+            daemon=True,
+        )
+        self._cameraLoopThread.start()
+
+    def _stopCameraSnapshotLoop(self) -> None:
+        self._cameraLoopStopEvent.set()
+        if self._cameraLoopThread and self._cameraLoopThread.is_alive():
+            self._cameraLoopThread.join(timeout=2.0)
+        self._cameraLoopThread = None
+
+    def _cameraSnapshotLoop(self, printer: Any) -> None:
+        intervalSeconds = max(1.0, float(self.cameraSnapshotIntervalSeconds))
+        while not self._cameraLoopStopEvent.is_set() and not self._stopEvent.is_set():
+            if not self._isPrinterConnected(printer):
+                if self._cameraLoopStopEvent.wait(1.0):
+                    break
+                continue
+            try:
+                snapshotPath = captureCameraSnapshot(printer, self.serial)
+            except Exception:  # noqa: BLE001 - propagates through logging in captureCameraSnapshot
+                log.debug("[camera] periodic snapshot failed for %s", self.serial, exc_info=cameraDebugEnabled)
+            else:
+                self._postCameraSnapshot(snapshotPath)
+            if self._cameraLoopStopEvent.wait(intervalSeconds):
+                break
+
+    def _isPrinterConnected(self, printer: Any) -> bool:
+        with self._printerLock:
+            return self._printerInstance is printer and self._printerInstance is not None
+
+    def _postCameraSnapshot(self, snapshotPath: Path) -> bool:
+        try:
+            imageBytes = snapshotPath.read_bytes()
+        except Exception as error:  # noqa: BLE001 - filesystem errors should not block command
+            log.warning(
+                "[camera] failed to read snapshot for upload: %s",
+                error,
+                exc_info=cameraDebugEnabled,
+            )
+            return False
+        encodedImage = base64.b64encode(imageBytes).decode("ascii")
+        imageDataUri = f"data:image/jpeg;base64,{encodedImage}"
+        payload = {
+            "printerSerial": self.serial,
+            "printerIpAddress": self.ipAddress,
+            "imageType": "webcam",
+            "imageData": imageDataUri,
+        }
+        log.info(
+            "[camera] posting snapshot to Base44 for %s",
+            self.serial,
+        )
+        try:
+            postReportPrinterImage(payload)
+        except Exception as error:  # noqa: BLE001 - HTTP client raises generic Exception
+            log.warning(
+                "[camera] failed to post snapshot for %s: %s",
+                self.serial,
+                error,
+                exc_info=cameraDebugEnabled,
+            )
+            return False
+        log.info(
+            "[camera] snapshot posted for %s",
+            self.serial,
+        )
+        return True
 
     def _statusMonitorLoop(self, printer: Any) -> None:
         startTime = time.monotonic()
@@ -1206,7 +1301,7 @@ class CommandWorker:
                 remoteFileText = str(remoteFile)
             except Exception:
                 remoteFileText = remoteFile
-            if remoteFileText != self._lastRemoteFile:
+            if remoteFileText != self._lastRemoteFile and not self._jobActive:
                 self._sawActivityDuringJob = False
             self._lastRemoteFile = remoteFileText
         self._logProgressIfNeeded(normalized)
@@ -1476,44 +1571,10 @@ class CommandWorker:
             else:
                 snapshotPath = captureCameraSnapshot(printer, self.serial)
                 message = f"Camera snapshot saved to {snapshotPath}"
-                try:
-                    imageBytes = snapshotPath.read_bytes()
-                except Exception as error:  # noqa: BLE001 - filesystem errors should not block command
-                    log.warning(
-                        "[camera] failed to read snapshot for upload: %s",
-                        error,
-                        exc_info=cameraDebugEnabled,
+                if self._postCameraSnapshot(snapshotPath):
+                    message = (
+                        f"Camera snapshot saved to {snapshotPath} and sent to Base44"
                     )
-                else:
-                    encodedImage = base64.b64encode(imageBytes).decode("ascii")
-                    imageDataUri = f"data:image/jpeg;base64,{encodedImage}"
-                    payload = {
-                        "printerSerial": self.serial,
-                        "printerIpAddress": self.ipAddress,
-                        "imageType": "webcam",
-                        "imageData": imageDataUri,
-                    }
-                    log.info(
-                        "[camera] posting snapshot to Base44 for %s",
-                        self.serial,
-                    )
-                    try:
-                        postReportPrinterImage(payload)
-                    except Exception as error:  # noqa: BLE001 - HTTP client raises generic Exception
-                        log.warning(
-                            "[camera] failed to post snapshot for %s: %s",
-                            self.serial,
-                            error,
-                            exc_info=cameraDebugEnabled,
-                        )
-                    else:
-                        log.info(
-                            "[camera] snapshot posted for %s",
-                            self.serial,
-                        )
-                        message = (
-                            f"Camera snapshot saved to {snapshotPath} and sent to Base44"
-                        )
         elif normalizedType in {"set_speed", "speed", "setspeed"}:
             percentValue = metadata.get("percent") or metadata.get("speedPercent")
             if percentValue is None:
