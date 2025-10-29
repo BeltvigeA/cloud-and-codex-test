@@ -658,6 +658,7 @@ class CommandWorker:
         self._lastStatusTimestamp: float = 0.0
         self._statusWarningLogged = False
         self._jobActive = False
+        self.jobSawActivity = False
         self._lastErrorCodeReported: Optional[str] = None
         self._printErrorCodeUnsupportedLogged = False
         log.debug(
@@ -1224,14 +1225,23 @@ class CommandWorker:
         percent = status.get("mc_percent")
         state = (status.get("gcode_state") or status.get("job_state") or "").lower()
         completedStates = {"finish", "finished", "completed", "idle", "complete"}
+        if percent is not None and percent < 100:
+            self.jobSawActivity = True
+        if state and state not in completedStates:
+            self.jobSawActivity = True
         isComplete = bool(percent == 100 or state in completedStates)
         if not isComplete:
-            if percent not in {None, 0}:
+            if percent is not None:
                 self._jobActive = True
+            elif self.jobSawActivity:
+                self._jobActive = True
+            return
+        if not self.jobSawActivity:
             return
         if self._jobActive:
             log.info("Print completed on %s — ready for next job", self.serial)
         self._jobActive = False
+        self.jobSawActivity = False
         self._deleteRemoteFile()
 
     def _checkForPrinterError(self, status: Dict[str, Any]) -> None:
@@ -1549,6 +1559,7 @@ class CommandWorker:
                 self._lastRemoteFile = str(fileName)
             except Exception:
                 self._lastRemoteFile = None
+            self.jobSawActivity = False
         elif normalizedType in {"home", "light_on", "light_off", "lightoff", "lighton", "move", "jog", "load_filament", "unload_filament", "sendgcode"}:
             if normalizedType == "home":
                 sendGcode("G28")

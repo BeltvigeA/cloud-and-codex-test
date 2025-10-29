@@ -507,6 +507,93 @@ def testHandlePrinterStatusTracksProgressAndCompletion(monkeypatch: pytest.Monke
     assert deleted == ["sdcard/test.3mf"]
 
 
+def testStartPrintCompletionDefersUntilProgress(monkeypatch: pytest.MonkeyPatch) -> None:
+    worker = CommandWorker(
+        serial="SERIAL-START",
+        ipAddress="10.0.0.88",
+        accessCode="code",
+        apiKey="api-key",
+        recipientId="recipient-start",
+        baseUrl="https://example.com",
+    )
+
+    monkeypatch.setattr("client.command_controller._reserveCommand", lambda commandId: True)
+    monkeypatch.setattr("client.command_controller._finalizeCommand", lambda commandId, status: None)
+
+    def fakeAck(self: CommandWorker, commandId: str, status: str) -> bool:
+        return True
+
+    def fakeResult(
+        self: CommandWorker,
+        commandId: str,
+        status: str,
+        *,
+        message: Optional[str] = None,
+        errorMessage: Optional[str] = None,
+    ) -> None:
+        return None
+
+    monkeypatch.setattr(CommandWorker, "_sendCommandAck", fakeAck)
+    monkeypatch.setattr(CommandWorker, "_sendCommandResult", fakeResult)
+
+    class FakePrinter:
+        def __init__(self) -> None:
+            self.startCalls: List[Dict[str, Any]] = []
+
+        def start_print(self, fileName: str, *_args: Any, **_kwargs: Any) -> None:
+            self.startCalls.append({"fileName": fileName})
+
+    fakePrinter = FakePrinter()
+
+    def fakeConnect(self: CommandWorker) -> FakePrinter:
+        self._printerInstance = fakePrinter
+        return fakePrinter
+
+    monkeypatch.setattr(CommandWorker, "_connectPrinter", fakeConnect)
+
+    deleteCalls: List[str] = []
+
+    def fakeDelete(_printer: Any, remotePath: str) -> bool:
+        deleteCalls.append(remotePath)
+        return True
+
+    monkeypatch.setattr("client.command_controller.bambuPrinter.deleteRemoteFile", fakeDelete)
+
+    worker._processCommand(
+        {
+            "commandId": "start-1",
+            "commandType": "start_print",
+            "metadata": {"fileName": "sdcard/test.3mf"},
+        }
+    )
+
+    assert worker._jobActive is True
+    assert worker.jobSawActivity is False
+    assert worker._lastRemoteFile == "sdcard/test.3mf"
+
+    worker._handlePrinterStatus(
+        {"mc_percent": 100, "job_state": "completed", "remoteFile": "sdcard/test.3mf"}
+    )
+
+    assert deleteCalls == []
+    assert worker._lastRemoteFile == "sdcard/test.3mf"
+    assert worker.jobSawActivity is False
+
+    worker._handlePrinterStatus({"mc_percent": 42, "job_state": "printing"})
+
+    assert worker.jobSawActivity is True
+    assert deleteCalls == []
+
+    worker._handlePrinterStatus(
+        {"mc_percent": 100, "job_state": "completed", "remoteFile": "sdcard/test.3mf"}
+    )
+
+    assert deleteCalls == ["sdcard/test.3mf"]
+    assert worker._lastRemoteFile is None
+    assert worker.jobSawActivity is False
+    assert worker._jobActive is False
+
+
 def testRecipientModeProcessesEnqueuedCommands(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("CONTROL_POLL_MODE", "recipient")
 
