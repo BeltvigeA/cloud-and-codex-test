@@ -71,11 +71,15 @@ cameraSnapshotIntervalSeconds = _resolveCameraSnapshotIntervalSeconds()
 
 
 def captureCameraSnapshot(printer: Any, serial: str) -> Path:
-    cameraDirectory = Path.home() / ".printmaster" / "camera"
+    cameraBaseDirectory = Path.home() / ".printmaster" / "camera"
+    currentTimestamp = datetime.now(timezone.utc)
+    cameraDirectory = cameraBaseDirectory / currentTimestamp.strftime("%Y-%m-%d")
+    timestampString = currentTimestamp.strftime("%Y%m%dT%H%M%SZ")
+    filePath = cameraDirectory / f"{serial}-{timestampString}.jpg"
     cameraDirectory.mkdir(parents=True, exist_ok=True)
 
     startTime = time.perf_counter()
-    log.info("[camera] starting capture for %s → %s", serial, cameraDirectory)
+    log.info("[camera] starting capture for %s → %s", serial, filePath)
 
     mqttStarter = getattr(printer, "mqtt_start", None)
     if callable(mqttStarter):
@@ -170,8 +174,6 @@ def captureCameraSnapshot(printer: Any, serial: str) -> Path:
             if cameraDebugEnabled:
                 log.info("[camera] camera readiness deadline reached without confirmation")
 
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    filePath = cameraDirectory / f"{serial}-{timestamp}.jpg"
     errorMessages: List[str] = []
 
     def saveBytes(buffer: bytes) -> None:

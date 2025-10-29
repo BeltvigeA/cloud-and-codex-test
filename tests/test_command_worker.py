@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+from datetime import datetime, timezone
 from pathlib import Path
 import sys
 import time
@@ -274,6 +275,17 @@ def testCameraCommandCapturesSnapshot(
     monkeypatch.setattr(CommandWorker, "_connectPrinter", lambda self: fakePrinter)
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
 
+    fixedNow = datetime(2024, 5, 7, 12, 0, 0, tzinfo=timezone.utc)
+
+    class FixedDatetime:
+        @classmethod
+        def now(cls, tz: Optional[timezone] = None) -> datetime:
+            if tz is None:
+                return fixedNow
+            return fixedNow.astimezone(tz)
+
+    monkeypatch.setattr("client.command_controller.datetime", FixedDatetime)
+
     postedPayloads: List[Dict[str, Any]] = []
 
     def fakePostReportPrinterImage(payload: Dict[str, object]) -> Dict[str, object]:
@@ -301,9 +313,12 @@ def testCameraCommandCapturesSnapshot(
     assert "Camera snapshot saved to" in message
     assert "sent to Base44" in message
     cameraDir = tmp_path / ".printmaster" / "camera"
-    savedFiles = list(cameraDir.glob("SERIAL777-*.jpg"))
+    dateDir = cameraDir / "2024-05-07"
+    savedFiles = list(dateDir.glob("SERIAL777-*.jpg"))
     assert len(savedFiles) == 1
-    assert str(savedFiles[0]) in message
+    expectedPath = dateDir / "SERIAL777-20240507T120000Z.jpg"
+    assert savedFiles[0] == expectedPath
+    assert str(expectedPath) in message
     assert fakePrinter.connectCalls >= 1
     assert fakePrinter.getCameraFrameCalls == 1
     assert not fakePrinter.mqtt_client.publishCalls
@@ -401,7 +416,7 @@ def testCameraSnapshotLoopUploads(monkeypatch: pytest.MonkeyPatch, tmp_path: Pat
 
     worker.cameraSnapshotIntervalSeconds = 0.05
 
-    snapshotPath = tmp_path / ".printmaster" / "camera" / "SERIAL888-test.jpg"
+    snapshotPath = tmp_path / ".printmaster" / "camera" / "2024-05-07" / "SERIAL888-test.jpg"
     snapshotPath.parent.mkdir(parents=True, exist_ok=True)
     snapshotPath.write_bytes(b"fake-camera-bytes")
 
