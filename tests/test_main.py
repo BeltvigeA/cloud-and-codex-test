@@ -3,7 +3,6 @@ import logging
 import os
 import sys
 from datetime import datetime, timedelta, timezone
-from io import BytesIO
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
@@ -51,7 +50,9 @@ class FakeRequest(SimpleNamespace):
         self._jsonPayload = None
         self.is_json = False
 
-    def get_json(self):
+    def get_json(self, silent=False):
+        if self._jsonPayload is None and silent:
+            return None
         return self._jsonPayload
 
 
@@ -190,16 +191,6 @@ class MockBlob:
 
     def generate_signed_url(self, **_kwargs):
         return 'https://example.com/signed-url'
-
-
-class MockUploadFile:
-    def __init__(self, data, filename, mimetype='application/octet-stream'):
-        self.stream = BytesIO(data)
-        self.filename = filename
-        self.mimetype = mimetype
-
-    def read(self, *_args, **_kwargs):
-        return self.stream.read(*_args, **_kwargs)
 
 
 class MockBucket:
@@ -440,13 +431,31 @@ def testUploadFileStoresExpiryMetadata(monkeypatch):
     monkeypatch.setattr(main, 'getClients', lambda: mockClients)
     monkeypatch.setattr(main, 'generateFetchToken', lambda: 'testFetchToken')
 
-    fakeRequest.files = {'file': MockUploadFile(b'file-contents', 'test.gcode')}
-    fakeRequest.form = {
-        'unencrypted_data': json.dumps({'visible': 'info'}),
-        'encrypted_data_payload': json.dumps({'secure': 'payload'}),
-        'recipient_id': 'recipient123',
-        'product_id': '123e4567-e89b-12d3-a456-426614174000',
-    }
+    class DummyDownloadResponse:
+        def __init__(self):
+            self.content = b'file-contents'
+
+        def raise_for_status(self):
+            return None
+
+    monkeypatch.setattr(
+        main.requests,
+        'get',
+        lambda *_, **__: DummyDownloadResponse(),
+    )
+    monkeypatch.setenv('PRINTER_API_TOKEN', 'printer-token')
+
+    fakeRequest.set_json(
+        {
+            'recipientId': 'recipient123',
+            'productId': '123e4567-e89b-12d3-a456-426614174000',
+            'gcodeUrl': 'https://example.com/print_jobs/test.gcode',
+            'originalFilename': 'test.gcode',
+            'lastRequestFilename': 'test.gcode',
+            'unencrypted_data': json.dumps({'visible': 'info'}),
+            'encrypted_data_payload': json.dumps({'secure': 'payload'}),
+        }
+    )
 
     responseBody, statusCode = main.uploadFile()
 

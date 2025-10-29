@@ -3,8 +3,6 @@ import sys
 import types
 from pathlib import Path
 import importlib.util
-import io
-
 import pytest
 
 
@@ -102,27 +100,26 @@ class DummyGoogleApiCallError(Exception):
         self.message = message
 
 
-class DummyFileStorage:
-    def __init__(self, data, filename, mimetype='application/octet-stream'):
-        if isinstance(data, io.BytesIO):
-            self.stream = data
-        else:
-            self.stream = io.BytesIO(data)
-        self.filename = filename
-        self.mimetype = mimetype
-
-    def read(self, size=-1):
-        return self.stream.read(size)
-
-    def seek(self, position, whence=0):
-        return self.stream.seek(position, whence)
-
-
 def installGoogleStubs(monkeypatch):
     class DummyRequest:
         def __init__(self):
-            self.files = {}
-            self.form = {}
+            self._jsonPayload = None
+            self.is_json = False
+
+        def set_json(self, payload):
+            self._jsonPayload = payload
+            self.is_json = True
+
+        def clear_json(self):
+            self._jsonPayload = None
+            self.is_json = False
+
+        def get_json(self, silent=False):
+            if not self.is_json:
+                if silent:
+                    return None
+                raise ValueError('No JSON payload')
+            return self._jsonPayload
 
     class DummyResponse(dict):
         def get_json(self):
@@ -142,7 +139,9 @@ def installGoogleStubs(monkeypatch):
             return decorator
 
     def secureFilename(value):
-        sanitized = ''.join(character for character in value if character.isalnum() or character in {'.', '_', '-'})
+        sanitized = ''.join(
+            character for character in value if character.isalnum() or character in {'.', '_', '-'}
+        )
         return sanitized.strip(' .')
 
     googleModule = types.ModuleType('google')
@@ -175,6 +174,33 @@ def installGoogleStubs(monkeypatch):
     werkzeugModule.utils = werkzeugUtilsModule
     werkzeugUtilsModule.secure_filename = secureFilename
 
+    class DummyRequestException(Exception):
+        pass
+
+    class DummyResponseObject:
+        def __init__(self, payload=b'gcode data', statusCode=200):
+            self.content = payload
+            self.status_code = statusCode
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                raise DummyRequestException(f'HTTP {self.status_code}')
+
+    class DummyRequestsModule(types.SimpleNamespace):
+        def __init__(self):
+            super().__init__()
+            self.calls = []
+            self.responsePayload = b'gcode data'
+            self.statusCode = 200
+            self.raiseError = False
+            self.exceptions = types.SimpleNamespace(RequestException=DummyRequestException)
+
+        def get(self, url, headers=None, timeout=None):  # pylint: disable=unused-argument
+            self.calls.append({'url': url, 'headers': headers or {}, 'timeout': timeout})
+            if self.raiseError:
+                raise self.exceptions.RequestException('download failed')
+            return DummyResponseObject(self.responsePayload, self.statusCode)
+
     googleModule.cloud = cloudModule
     googleModule.api_core = apiCoreModule
     cloudModule.storage = storageModule
@@ -192,12 +218,15 @@ def installGoogleStubs(monkeypatch):
     sys.modules['flask'] = flaskModule
     sys.modules['werkzeug'] = werkzeugModule
     sys.modules['werkzeug.utils'] = werkzeugUtilsModule
+    requestsModule = DummyRequestsModule()
+    sys.modules['requests'] = requestsModule
 
     monkeypatch.setenv('GCP_PROJECT_ID', 'test-project')
     monkeypatch.setenv('GCS_BUCKET_NAME', 'test-bucket')
     monkeypatch.setenv('KMS_KEY_RING', 'test-ring')
     monkeypatch.setenv('KMS_KEY_NAME', 'test-key')
     monkeypatch.setenv('KMS_LOCATION', 'test-location')
+    monkeypatch.setenv('PRINTER_API_TOKEN', 'printer-token')
 
 
 @pytest.fixture()
@@ -215,12 +244,14 @@ def appModule(monkeypatch):
     yield module
 
 
-def buildRequest(module, fileStorage, formValues):
+def buildRequest(module, payload):
     cachedClients = getattr(module, 'cachedClients', None)
     if cachedClients and hasattr(cachedClients.storageClient, 'bucketInstances'):
         cachedClients.storageClient.bucketInstances.clear()
-    module.request.files = {'file': fileStorage}
-    module.request.form = formValues
+    if hasattr(module.request, 'clear_json'):
+        module.request.clear_json()
+    module.request.set_json(payload)
+    module.requests.calls.clear()
 
 
 def extractResponse(result):
@@ -231,12 +262,13 @@ def extractResponse(result):
 def test_uploadAcceptsAllowedExtension(appModule):
     buildRequest(
         appModule,
-        DummyFileStorage(b'gcode data', 'print_job.gcode'),
         {
+            'recipientId': 'recipient123',
+            'productId': '123e4567-e89b-12d3-a456-426614174000',
+            'gcodeUrl': 'https://example.com/files/print_job.gcode',
+            'originalFilename': 'print_job.gcode',
             'unencrypted_data': json.dumps({'info': 'value'}),
             'encrypted_data_payload': json.dumps({'secret': 'value'}),
-            'recipient_id': 'recipient123',
-            'product_id': '123e4567-e89b-12d3-a456-426614174000',
         },
     )
 
@@ -249,12 +281,13 @@ def test_uploadAcceptsAllowedExtension(appModule):
 def test_uploadRejectsDisallowedExtension(appModule):
     buildRequest(
         appModule,
-        DummyFileStorage(b'invalid data', 'notes.txt'),
         {
+            'recipientId': 'recipient123',
+            'productId': '123e4567-e89b-12d3-a456-426614174000',
+            'gcodeUrl': 'https://example.com/files/notes.txt',
+            'originalFilename': 'notes.txt',
             'unencrypted_data': '{}',
             'encrypted_data_payload': '{}',
-            'recipient_id': 'recipient123',
-            'product_id': '123e4567-e89b-12d3-a456-426614174000',
         },
     )
 
@@ -267,12 +300,14 @@ def test_uploadRejectsDisallowedExtension(appModule):
 def test_uploadRejectsDisallowedMimeType(appModule):
     buildRequest(
         appModule,
-        DummyFileStorage(b'gcode data', 'build.gcode', mimetype='image/png'),
         {
+            'recipientId': 'recipient123',
+            'productId': '123e4567-e89b-12d3-a456-426614174000',
+            'gcodeUrl': 'https://example.com/files/build.gcode',
+            'originalFilename': 'build.gcode',
+            'mimeType': 'image/png',
             'unencrypted_data': '{}',
             'encrypted_data_payload': '{}',
-            'recipient_id': 'recipient123',
-            'product_id': '123e4567-e89b-12d3-a456-426614174000',
         },
     )
 
@@ -285,12 +320,13 @@ def test_uploadRejectsDisallowedMimeType(appModule):
 def test_uploadAcceptsUppercaseExtension(appModule):
     buildRequest(
         appModule,
-        DummyFileStorage(b'gcode data', 'MODEL.GCO'),
         {
+            'recipientId': 'recipient123',
+            'productId': '123e4567-e89b-12d3-a456-426614174000',
+            'gcodeUrl': 'https://example.com/files/MODEL.GCO',
+            'originalFilename': 'MODEL.GCO',
             'unencrypted_data': json.dumps({'info': 'value'}),
             'encrypted_data_payload': json.dumps({'secret': 'value'}),
-            'recipient_id': 'recipient123',
-            'product_id': '123e4567-e89b-12d3-a456-426614174000',
         },
     )
 
@@ -311,12 +347,13 @@ def test_uploadAcceptsDoubleEncodedJson(appModule):
     doubleEncodedValue = json.dumps(json.dumps({'info': 'value'}))
     buildRequest(
         appModule,
-        DummyFileStorage(b'gcode data', 'print_job.gcode'),
         {
+            'recipientId': 'recipient123',
+            'productId': '123e4567-e89b-12d3-a456-426614174000',
+            'gcodeUrl': 'https://example.com/files/print_job.gcode',
+            'originalFilename': 'print_job.gcode',
             'unencrypted_data': doubleEncodedValue,
             'encrypted_data_payload': doubleEncodedValue,
-            'recipient_id': 'recipient123',
-            'product_id': '123e4567-e89b-12d3-a456-426614174000',
         },
     )
 
@@ -329,12 +366,13 @@ def test_uploadAcceptsDoubleEncodedJson(appModule):
 def test_uploadRejectsNonObjectJsonMetadata(appModule):
     buildRequest(
         appModule,
-        DummyFileStorage(b'gcode data', 'print_job.gcode'),
         {
+            'recipientId': 'recipient123',
+            'productId': '123e4567-e89b-12d3-a456-426614174000',
+            'gcodeUrl': 'https://example.com/files/print_job.gcode',
+            'originalFilename': 'print_job.gcode',
             'unencrypted_data': '[]',
             'encrypted_data_payload': '{}',
-            'recipient_id': 'recipient123',
-            'product_id': '123e4567-e89b-12d3-a456-426614174000',
         },
     )
 
@@ -347,12 +385,13 @@ def test_uploadRejectsNonObjectJsonMetadata(appModule):
 def test_uploadRejectsExtensionBeforeUpload(appModule):
     buildRequest(
         appModule,
-        DummyFileStorage(b'invalid data', '../../escape.exe'),
         {
+            'recipientId': 'recipient123',
+            'productId': '123e4567-e89b-12d3-a456-426614174000',
+            'gcodeUrl': 'https://example.com/files/../../escape.exe',
+            'originalFilename': '../../escape.exe',
             'unencrypted_data': '{}',
             'encrypted_data_payload': '{}',
-            'recipient_id': 'recipient123',
-            'product_id': '123e4567-e89b-12d3-a456-426614174000',
         },
     )
 
@@ -363,3 +402,23 @@ def test_uploadRejectsExtensionBeforeUpload(appModule):
     cachedClients = appModule.cachedClients
     assert cachedClients is not None
     assert cachedClients.storageClient.bucketInstances == []
+
+
+def test_uploadSendsPrinterApiTokenHeader(appModule):
+    buildRequest(
+        appModule,
+        {
+            'recipientId': 'recipient123',
+            'productId': '123e4567-e89b-12d3-a456-426614174000',
+            'gcodeUrl': 'https://example.com/files/print_job.gcode',
+            'originalFilename': 'print_job.gcode',
+            'unencrypted_data': json.dumps({'info': 'value'}),
+            'encrypted_data_payload': json.dumps({'secret': 'value'}),
+        },
+    )
+
+    appModule.uploadFile()
+
+    assert appModule.requests.calls, 'Expected download request to be issued'
+    headers = appModule.requests.calls[-1]['headers']
+    assert headers.get('X-API-Key') == 'printer-token'

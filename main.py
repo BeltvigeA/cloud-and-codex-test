@@ -1,3 +1,4 @@
+import io
 import json
 import logging
 import os
@@ -7,6 +8,9 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Set, Tuple
+from urllib.parse import urlparse
+
+import requests
 
 from flask import Flask, jsonify, request
 try:  # pragma: no cover - optional dependency handling
@@ -480,6 +484,29 @@ def parseJsonObjectField(rawValue: str, fieldName: str) -> Tuple[Optional[dict],
     return None, ({'error': 'Invalid JSON format for associated data'}, 400)
 
 
+def parseJsonObjectPayload(
+    rawValue: object, fieldName: str
+) -> Tuple[Optional[dict], Optional[Tuple[dict, int]]]:
+    """Normalize JSON payloads that may already be dictionaries."""
+
+    if isinstance(rawValue, dict):
+        return rawValue, None
+
+    if rawValue is None:
+        logging.warning('Missing JSON payload for field %s.', fieldName)
+        return None, ({'error': 'Invalid JSON format for associated data'}, 400)
+
+    if isinstance(rawValue, str):
+        return parseJsonObjectField(rawValue, fieldName)
+
+    logging.warning(
+        'Unsupported JSON payload type for field %s: %s',
+        fieldName,
+        type(rawValue).__name__,
+    )
+    return None, ({'error': 'Invalid JSON format for associated data'}, 400)
+
+
 def parseCommandMetadata(
     rawMetadata: object,
 ) -> Tuple[Optional[dict], Optional[Tuple[dict, int]]]:
@@ -649,24 +676,17 @@ def uploadFile():
         kmsKeyPath = clients.kmsKeyPath
         gcsBucketName = clients.gcsBucketName
 
-        if 'file' not in request.files:
-            logging.warning('No file part in the request.')
-            return jsonify({'error': 'No file part'}), 400
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            logging.warning('Upload payload is not a JSON object.')
+            return jsonify({'error': 'Expected JSON body'}), 400
 
-        upload = request.files['file']
-        if not upload.filename:
-            logging.warning('No selected file.')
-            return jsonify({'error': 'No selected file'}), 400
-
-        unencryptedDataRaw = request.form.get('unencrypted_data', '{}')
-        encryptedDataPayloadRaw = request.form.get('encrypted_data_payload', '{}')
-        recipientId = request.form.get('recipient_id')
-        productIdRaw = request.form.get('product_id')
-
+        recipientId = payload.get('recipientId') or payload.get('recipient_id')
         if not recipientId:
             logging.warning('Recipient ID is missing.')
             return jsonify({'error': 'Recipient ID is required'}), 400
 
+        productIdRaw = payload.get('productId') or payload.get('product_id')
         if not productIdRaw:
             logging.warning('Product ID is missing.')
             return jsonify({'error': 'Product ID is required'}), 400
@@ -679,18 +699,36 @@ def uploadFile():
 
         productId = str(productUuid)
 
-        unencryptedData, errorResponse = parseJsonObjectField(unencryptedDataRaw, 'unencrypted_data')
+        gcodeUrl = payload.get('gcodeUrl')
+        if not gcodeUrl:
+            logging.warning('Missing gcodeUrl in upload payload.')
+            return jsonify({'error': 'gcodeUrl is required'}), 400
+
+        unencryptedData, errorResponse = parseJsonObjectPayload(
+            payload.get('unencrypted_data', {}), 'unencrypted_data'
+        )
         if errorResponse:
             return jsonify(errorResponse[0]), errorResponse[1]
 
-        encryptedDataPayload, errorResponse = parseJsonObjectField(
-            encryptedDataPayloadRaw, 'encrypted_data_payload'
+        encryptedDataPayload, errorResponse = parseJsonObjectPayload(
+            payload.get('encrypted_data_payload', {}), 'encrypted_data_payload'
         )
         if errorResponse:
             return jsonify(errorResponse[0]), errorResponse[1]
 
         fileId = str(uuid.uuid4())
-        normalizedFilename = secure_filename(upload.filename)
+        originalFilename = (
+            payload.get('originalFilename')
+            or payload.get('lastRequestFilename')
+            or payload.get('original_filename')
+            or payload.get('last_request_filename')
+        )
+
+        if not originalFilename:
+            parsedUrl = urlparse(gcodeUrl)
+            originalFilename = os.path.basename(parsedUrl.path)
+
+        normalizedFilename = secure_filename(originalFilename or '')
         if not normalizedFilename:
             logging.warning('Invalid or empty filename provided.')
             return jsonify({'error': 'Invalid filename'}), 400
@@ -711,9 +749,10 @@ def uploadFile():
                 400,
             )
 
-        if upload.mimetype and upload.mimetype not in allowedUploadMimeTypes:
+        mimeType = payload.get('mimeType') or payload.get('mime_type')
+        if mimeType and mimeType not in allowedUploadMimeTypes:
             logging.warning(
-                'Rejected file due to unsupported MIME type: %s', upload.mimetype
+                'Rejected file due to unsupported MIME type: %s', mimeType
             )
             return (
                 jsonify(
@@ -727,11 +766,32 @@ def uploadFile():
                 400,
             )
 
+        printerApiToken = os.environ.get('PRINTER_API_TOKEN')
+        downloadHeaders: Dict[str, str] = {}
+        if printerApiToken:
+            downloadHeaders['X-API-Key'] = printerApiToken
+
+        try:
+            downloadResponse = requests.get(
+                gcodeUrl,
+                headers=downloadHeaders,
+                timeout=60,
+            )
+            downloadResponse.raise_for_status()
+        except requests.RequestException as error:
+            logging.error('Failed to download G-code from %s: %s', gcodeUrl, error)
+            return (
+                jsonify({'error': 'Failed to download G-code from provided URL'}),
+                502,
+            )
+
+        downloadBuffer = io.BytesIO(downloadResponse.content)
+
         gcsObjectName = f"{recipientId}/{productId}_{normalizedFilename}"
         bucket = storageClient.bucket(gcsBucketName)
         blob = bucket.blob(gcsObjectName)
 
-        blob.upload_from_file(upload)
+        blob.upload_from_file(downloadBuffer)
         logging.info(
             'File %s uploaded to gs://%s/%s', normalizedFilename, gcsBucketName, gcsObjectName
         )
@@ -764,8 +824,16 @@ def uploadFile():
             'status': 'uploaded',
             'timestamp': firestore.SERVER_TIMESTAMP,
             'lastRequestTimestamp': None,
-            'lastRequestFileName': normalizedFilename,
+            'lastRequestFileName': secure_filename(
+                payload.get('lastRequestFilename')
+                or payload.get('last_request_filename')
+                or normalizedFilename
+            ),
         }
+
+        upstreamFileId = payload.get('fileId')
+        if upstreamFileId:
+            metadata['sourceFileId'] = str(upstreamFileId)
 
         firestoreClient.collection(firestoreCollectionFiles).document(fileId).set(metadata)
         logging.info('Metadata for file %s stored in Firestore.', fileId)
