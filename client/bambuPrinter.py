@@ -1157,9 +1157,23 @@ def startPrintViaApi(
                 percentageFloat = float(lastPercentage) if lastPercentage is not None else None
             except Exception:
                 percentageFloat = None
+            if percentageFloat is None and lastStatePayload is not None:
+                embeddedPercent = _extract_mc_percent(lastStatePayload)
+                if embeddedPercent is not None:
+                    percentageFloat = float(embeddedPercent)
+            completedLike = _state_is_completed_like(lastStatePayload)
+            if not completedLike and percentageFloat is not None and percentageFloat >= 100.0:
+                completedLike = True
+            pctOk = percentageFloat is not None and 0.0 < percentageFloat < 100.0
+            activeOk = _is_active_state(stateIndicator) and not completedLike
             if START_DEBUG:
-                logger.info("[start] poll state=%s percent=%s", stateIndicator, lastPercentage)
-            if (percentageFloat is not None and percentageFloat > 0.0) or _is_active_state(stateIndicator):
+                logger.info(
+                    "[start] poll state=%s percent=%s completedLike=%s",
+                    stateIndicator,
+                    lastPercentage,
+                    completedLike,
+                )
+            if pctOk or activeOk:
                 return {
                     "acknowledged": True,
                     "statePayload": lastStatePayload,
@@ -1172,6 +1186,10 @@ def startPrintViaApi(
             timeoutPercentage = float(lastPercentage) if lastPercentage is not None else None
         except Exception:
             timeoutPercentage = None
+        if timeoutPercentage is None and lastStatePayload is not None:
+            fallbackPercent = _extract_mc_percent(lastStatePayload)
+            if fallbackPercent is not None:
+                timeoutPercentage = float(fallbackPercent)
         return {
             "acknowledged": False,
             "statePayload": lastStatePayload,

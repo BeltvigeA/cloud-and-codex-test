@@ -658,7 +658,7 @@ class CommandWorker:
         self._lastStatusTimestamp: float = 0.0
         self._statusWarningLogged = False
         self._jobActive = False
-        self.jobSawActivity = False
+        self._sawActivityDuringJob = False
         self._lastErrorCodeReported: Optional[str] = None
         self._printErrorCodeUnsupportedLogged = False
         log.debug(
@@ -1207,7 +1207,7 @@ class CommandWorker:
             except Exception:
                 remoteFileText = remoteFile
             if remoteFileText != self._lastRemoteFile:
-                self.jobSawActivity = False
+                self._sawActivityDuringJob = False
             self._lastRemoteFile = remoteFileText
         self._logProgressIfNeeded(normalized)
         self._checkForCompletion(normalized)
@@ -1233,24 +1233,30 @@ class CommandWorker:
             percentFloat = float(rawPercent)
         except (TypeError, ValueError):
             percentFloat = None
-        percent = int(percentFloat) if percentFloat is not None else None
-        state = (status.get("gcode_state") or status.get("job_state") or "").lower()
+        stateText = status.get("gcode_state") or status.get("job_state") or ""
+        stateNormalized = str(stateText).strip().lower() if stateText is not None else ""
         completedStates = {"finish", "finished", "completed", "idle", "complete"}
+
+        inProgress = False
         if percentFloat is not None and 0.0 < percentFloat < 100.0:
-            self.jobSawActivity = True
-        elif state and state not in completedStates:
-            self.jobSawActivity = True
-        isComplete = bool((percent == 100) or (state in completedStates and state))
-        if not isComplete:
-            if (percentFloat is not None and percentFloat > 0.0) or (state and state not in completedStates):
-                self._jobActive = True
+            inProgress = True
+        elif stateNormalized and stateNormalized not in completedStates:
+            inProgress = True
+
+        if inProgress:
+            self._sawActivityDuringJob = True
+            self._jobActive = True
+
+        isCompletePercent = percentFloat is not None and percentFloat >= 100.0
+        isCompleteState = bool(stateNormalized) and stateNormalized in completedStates
+        if not (isCompletePercent or isCompleteState):
             return
-        if not self.jobSawActivity:
+        if not self._sawActivityDuringJob:
             return
         if self._jobActive:
             log.info("Print completed on %s — ready for next job", self.serial)
         self._jobActive = False
-        self.jobSawActivity = False
+        self._sawActivityDuringJob = False
         self._deleteRemoteFile()
 
     def _checkForPrinterError(self, status: Dict[str, Any]) -> None:
@@ -1568,7 +1574,7 @@ class CommandWorker:
                 self._lastRemoteFile = str(fileName)
             except Exception:
                 self._lastRemoteFile = None
-            self.jobSawActivity = False
+            self._sawActivityDuringJob = False
         elif normalizedType in {"home", "light_on", "light_off", "lightoff", "lighton", "move", "jog", "load_filament", "unload_filament", "sendgcode"}:
             if normalizedType == "home":
                 sendGcode("G28")
