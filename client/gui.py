@@ -20,7 +20,7 @@ from datetime import datetime
 from pathlib import Path
 from ipaddress import ip_address
 from queue import Empty, Queue
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Tuple
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -90,12 +90,26 @@ def addPrinterIdentityToPayload(
     return payload
 
 from . import bambuPrinter as bambuPrinterModule
-from .bambuPrinter import (
-    BambuPrintOptions,
-    postStatus,
-    safeDisconnectPrinter,
-    sendBambuPrintJob,
-)
+try:
+    from .bambuPrinter import (
+        BambuPrintOptions,
+        postStatus,
+        safeDisconnectPrinter,
+        sendBambuPrintJob,
+    )
+except Exception:
+    from .bambuPrinter import (  # type: ignore
+        BambuPrintOptions,
+        postStatus,
+        sendBambuPrintJob,
+    )
+
+    def safeDisconnectPrinter(printer: Any) -> None:
+        for name in ("camera_off", "camera_stop", "disconnect", "mqtt_stop"):
+            method = getattr(printer, name, None)
+            if callable(method):
+                with contextlib.suppress(Exception):
+                    method()
 from .status_subscriber import BambuStatusSubscriber
 from .command_controller import CommandWorker
 from .client import (
@@ -202,6 +216,7 @@ class ListenerGuiApp:
         self.activePrinterDialog: Optional[Dict[str, Any]] = None
 
         self.liveStatusEnabledVar = tk.BooleanVar(value=True)
+        self.plateStatusVar = tk.StringVar(value="Plate status: (ingen test ennå)")
         self.statusSubscriber = BambuStatusSubscriber(
             onUpdate=self._onPrinterStatusUpdate,
             onError=self._onPrinterStatusError,
@@ -363,6 +378,20 @@ class ListenerGuiApp:
             sticky=tk.W,
             padx=4,
             pady=(8, 4),
+        )
+        ttk.Label(plateFrame, text="Status:").grid(
+            row=5,
+            column=0,
+            sticky=tk.W,
+            padx=4,
+            pady=(4, 6),
+        )
+        ttk.Label(plateFrame, textvariable=self.plateStatusVar).grid(
+            row=5,
+            column=1,
+            sticky=tk.W,
+            padx=4,
+            pady=(4, 6),
         )
 
         self._updateListenerRecipient()
@@ -755,14 +784,18 @@ class ListenerGuiApp:
             self.logQueue.put("Plate check settings saved.")
 
     def _handleTestSnapshotClick(self) -> None:
+        self._setPlateStatus("Plate status: tester snapshot...")
         worker = threading.Thread(target=self._runTestSnapshotWorker, name="PlateSnapshotTest", daemon=True)
         worker.start()
 
     def _runTestSnapshotWorker(self) -> None:
+        printerInstance: Optional[Any] = None
         try:
             printerConfig = self._selectSnapshotPrinter()
             if not printerConfig:
-                self.logQueue.put("Plate snapshot test: no printers are configured.")
+                message = "Plate snapshot test: no printers are configured."
+                self.logQueue.put(message)
+                self._setPlateStatus(message)
                 return
             printerInstance = self._connectSnapshotPrinter(printerConfig)
             if printerInstance is None:
@@ -771,17 +804,221 @@ class ListenerGuiApp:
                 snapshotBytes = self._captureSnapshotBytes(printerInstance)
                 savedPath = self._saveSnapshotBytes(snapshotBytes)
                 self.logQueue.put(f"Plate snapshot saved to {savedPath}")
+                analysisSummary: Optional[str]
+                try:
+                    analysisSummary = self._analyzeSnapshotBytes(snapshotBytes)
+                except Exception:
+                    logging.exception("Plate snapshot analysis failed", exc_info=True)
+                    analysisSummary = None
+                if analysisSummary:
+                    statusMessage = f"{analysisSummary} · lagret: {savedPath}"
+                else:
+                    statusMessage = f"Snapshot lagret: {savedPath}"
+                self._setPlateStatus(statusMessage)
             except Exception as error:
                 logging.exception("Test snapshot failed", exc_info=True)
-                self.logQueue.put(f"Plate snapshot failed: {error}")
-            finally:
+                errorMessage = f"Plate snapshot failed: {error}"
+                self.logQueue.put(errorMessage)
+                self._setPlateStatus(errorMessage)
+        except Exception as error:
+            logging.exception("Unexpected snapshot test failure", exc_info=True)
+            message = f"Plate snapshot test error: {error}"
+            self.logQueue.put(message)
+            self._setPlateStatus(message)
+        finally:
+            if printerInstance is not None:
                 try:
                     safeDisconnectPrinter(printerInstance)
                 except Exception:
                     logging.debug("Printer disconnect after snapshot failed", exc_info=True)
-        except Exception as error:
-            logging.exception("Unexpected snapshot test failure", exc_info=True)
-            self.logQueue.put(f"Plate snapshot test error: {error}")
+
+    def _setPlateStatus(self, text: str) -> None:
+        plateVar = getattr(self, "plateStatusVar", None)
+        rootWidget = getattr(self, "root", None)
+
+        if not isinstance(rootWidget, tk.Misc) or not isinstance(plateVar, tk.StringVar):
+            return
+
+        def update() -> None:
+            plateVar.set(text)
+
+        rootWidget.after(0, update)
+
+    def _parseRoiStr(self, roiText: str) -> Optional[Tuple[float, float, float, float]]:
+        """
+        Parser ROI-tekst "x1,x2,y1,y2" → klamper til [0..1] og sørger for riktig rekkefølge.
+        Returnerer (x1, x2, y1, y2) eller None ved ugyldig input.
+        """
+        raw = (roiText or "").strip()
+        if not raw:
+            return None
+        # Standardiser separator og fjern mellomrom
+        cleaned = raw.replace(" ", "")
+        parts = cleaned.split(",")
+        if len(parts) != 4:
+            return None
+        try:
+            x1, x2, y1, y2 = (float(p) for p in parts)
+        except (TypeError, ValueError):
+            return None
+        # Klampe til [0..1]
+        x1 = max(0.0, min(1.0, x1))
+        x2 = max(0.0, min(1.0, x2))
+        y1 = max(0.0, min(1.0, y1))
+        y2 = max(0.0, min(1.0, y2))
+        # Sikre økende rekkefølge
+        if x2 <= x1:
+            x1, x2 = min(x1, x2), max(x1, x2)
+        if y2 <= y1:
+            y1, y2 = min(y1, y2), max(y1, y2)
+        # Gyldig ROI må fortsatt ha areal
+        if x2 - x1 <= 0.0 or y2 - y1 <= 0.0:
+            return None
+        return (x1, x2, y1, y2)
+
+    def _formatMetric(self, value: Optional[float]) -> str:
+        if value is None:
+            return "-"
+        try:
+            numericValue = float(value)
+        except (TypeError, ValueError):
+            return "-"
+        formatted = f"{numericValue:.2f}".rstrip("0").rstrip(".")
+        return formatted or "0"
+
+    def _analyzeSnapshotBytes(self, snapshotBytes: bytes) -> Optional[str]:
+        analysisFunc = getattr(bambuPrinterModule, "_plate_empty_v1", None)
+        if not callable(analysisFunc):
+            return None
+
+        roiText = plateCheckDefaultRoi
+        try:
+            roiCandidate = self.plateRoiVar.get().strip()
+            if roiCandidate:
+                roiText = roiCandidate
+        except Exception:
+            logging.debug("Failed to read ROI value", exc_info=True)
+        roi = self._parseRoiStr(roiText)
+
+        def _coerce_float(valueText: str, defaultText: str) -> float:
+            try:
+                return float(valueText)
+            except (TypeError, ValueError):
+                try:
+                    return float(defaultText)
+                except (TypeError, ValueError):
+                    return 0.0
+
+        darkFractionText = plateCheckDefaultDarkFraction
+        try:
+            candidate = self.plateDarkFractionMaxVar.get().strip()
+            if candidate:
+                darkFractionText = candidate
+        except Exception:
+            logging.debug("Failed to read dark fraction value", exc_info=True)
+        darkFractionMax = _coerce_float(darkFractionText, plateCheckDefaultDarkFraction)
+
+        stddevText = plateCheckDefaultStddev
+        try:
+            candidate = self.plateStddevMaxVar.get().strip()
+            if candidate:
+                stddevText = candidate
+        except Exception:
+            logging.debug("Failed to read stddev value", exc_info=True)
+        stddevMax = _coerce_float(stddevText, plateCheckDefaultStddev)
+
+        kwargs: Dict[str, Any] = {}
+        if roi is not None:
+            kwargs["roi"] = roi
+        kwargs["dark_fraction_max"] = darkFractionMax
+        kwargs["stddev_max"] = stddevMax
+
+        try:
+            resultPayload = analysisFunc(snapshotBytes, **kwargs)
+        except TypeError as error:
+            logging.debug("Plate analysis retry without keyword arguments: %s", error, exc_info=True)
+            try:
+                resultPayload = analysisFunc(snapshotBytes)
+            except Exception:
+                logging.debug("Plate analysis failed after retry", exc_info=True)
+                return None
+        except Exception:
+            logging.debug("Plate analysis invocation failed", exc_info=True)
+            return None
+
+        emptyState: Optional[bool] = None
+        darkFractionValue: Optional[float] = None
+        stddevValue: Optional[float] = None
+
+        def interpret_bool(value: Any) -> Optional[bool]:
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                return bool(value)
+            if isinstance(value, str):
+                normalized = value.strip().lower()
+                if normalized in {"true", "1", "yes", "y", "empty", "tom"}:
+                    return True
+                if normalized in {"false", "0", "no", "n", "occupied", "ikke tom"}:
+                    return False
+            return None
+
+        def process_payload(payload: Any) -> None:
+            nonlocal emptyState, darkFractionValue, stddevValue
+            if payload is None:
+                return
+            if isinstance(payload, dict):
+                for key, value in payload.items():
+                    lowered = key.lower()
+                    if emptyState is None and any(token in lowered for token in ("empty", "result")):
+                        interpreted = interpret_bool(value)
+                        if interpreted is not None:
+                            emptyState = interpreted
+                    if darkFractionValue is None and "dark" in lowered:
+                        candidateValue = self._parseOptionalFloat(value)
+                        if candidateValue is not None:
+                            darkFractionValue = candidateValue
+                    if stddevValue is None and any(token in lowered for token in ("std", "stdev", "sigma")):
+                        candidateValue = self._parseOptionalFloat(value)
+                        if candidateValue is not None:
+                            stddevValue = candidateValue
+                    if isinstance(value, (dict, list, tuple, set)):
+                        process_payload(value)
+                return
+            if isinstance(payload, (list, tuple, set)):
+                for item in payload:
+                    process_payload(item)
+                return
+            if emptyState is None:
+                interpreted = interpret_bool(payload)
+                if interpreted is not None:
+                    emptyState = interpreted
+
+        process_payload(resultPayload)
+
+        if emptyState is None and darkFractionValue is None and stddevValue is None:
+            return None
+
+        if emptyState is True:
+            prefix = "Plate: Tom"
+        elif emptyState is False:
+            prefix = "Plate: Ikke tom"
+        else:
+            prefix = None
+
+        metricParts: list[str] = []
+        if darkFractionValue is not None:
+            metricParts.append(f"dark={self._formatMetric(darkFractionValue)}")
+        if stddevValue is not None:
+            metricParts.append(f"std={self._formatMetric(stddevValue)}")
+
+        if prefix is None and metricParts:
+            return f"Plate-metrikker: {', '.join(metricParts)}"
+        if prefix is None:
+            return None
+        if metricParts:
+            return f"{prefix} ({', '.join(metricParts)})"
+        return prefix
 
     def _selectSnapshotPrinter(self) -> Optional[Dict[str, Any]]:
         printers = list(getattr(self, "printers", []) or [])
@@ -809,21 +1046,27 @@ class ListenerGuiApp:
             bambuApi = importlib.import_module("bambulabs_api")
         except Exception as error:
             logging.warning("bambulabs_api unavailable for snapshot: %s", error)
-            self.logQueue.put("Plate snapshot failed: bambulabs_api is unavailable.")
+            message = "Plate snapshot failed: bambulabs_api is unavailable."
+            self.logQueue.put(message)
+            self._setPlateStatus(message)
             return None
 
         ipAddress = str(printerConfig.get("ipAddress") or "").strip()
         accessCode = str(printerConfig.get("accessCode") or "").strip()
         serialNumber = str(printerConfig.get("serialNumber") or "").strip()
         if not ipAddress or not accessCode or not serialNumber:
-            self.logQueue.put("Plate snapshot failed: printer credentials are incomplete.")
+            message = "Plate snapshot failed: printer credentials are incomplete."
+            self.logQueue.put(message)
+            self._setPlateStatus(message)
             return None
 
         try:
             printerInstance = bambuApi.Printer(ipAddress, accessCode, serialNumber)
         except Exception as error:
             logging.warning("Failed to initialize bambulabs_api.Printer: %s", error)
-            self.logQueue.put(f"Plate snapshot failed: {error}")
+            message = f"Plate snapshot failed: {error}"
+            self.logQueue.put(message)
+            self._setPlateStatus(message)
             return None
 
         try:
@@ -833,17 +1076,26 @@ class ListenerGuiApp:
             connectMethod = getattr(printerInstance, "connect", None)
             if callable(connectMethod):
                 connectMethod()
-            waitReady = getattr(bambuPrinterModule, "_waitForMqttReady", None)
-            if callable(waitReady):
-                waitReady(printerInstance, timeout=10.0)
         except Exception as error:
             try:
                 safeDisconnectPrinter(printerInstance)
             except Exception:
                 logging.debug("Printer cleanup after connection failure failed", exc_info=True)
             logging.warning("Failed to connect to printer for snapshot: %s", error)
-            self.logQueue.put(f"Plate snapshot failed: {error}")
+            message = f"Plate snapshot failed: {error}"
+            self.logQueue.put(message)
+            self._setPlateStatus(message)
             return None
+
+        waitReady = getattr(bambuPrinterModule, "_waitForMqttReady", None)
+        if callable(waitReady):
+            try:
+                waitReady(printerInstance, timeout=10.0)
+            except Exception:
+                logging.debug("_waitForMqttReady failed, using fallback delay", exc_info=True)
+                time.sleep(0.4)
+        else:
+            time.sleep(0.4)
 
         return printerInstance
 
