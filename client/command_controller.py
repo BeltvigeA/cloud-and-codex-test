@@ -21,6 +21,7 @@ except Exception:  # pragma: no cover - surfaced through logs and callbacks
     bambuApi = None
 
 from . import bambuPrinter
+from pathlib import Path
 from .base44_client import (
     acknowledgeCommand,
     listPendingCommandsForRecipient,
@@ -1685,33 +1686,70 @@ class CommandWorker:
             plateIndex = metadata.get("plateIndex")
             paramPath = metadata.get("paramPath")
             useAms = metadata.get("useAms")
-            try:
-                callPrinterMethod("start_print", str(fileName), plateIndex or paramPath, use_ams=useAms)
-                message = "Print started"
-            except RuntimeError:
-                options = bambuPrinter.BambuPrintOptions(
-                    ipAddress=self.ipAddress,
-                    serialNumber=self.serial,
-                    accessCode=self.accessCode,
-                    useAms=useAms,
-                    plateIndex=plateIndex,
-                )
-                result = bambuPrinter.startPrintViaApi(
-                    ip=self.ipAddress,
-                    serial=self.serial,
-                    accessCode=self.accessCode,
-                    uploaded_name=str(fileName),
-                    plate_index=plateIndex,
-                    param_path=paramPath,
-                    options=options,
-                    job_metadata=metadata if isinstance(metadata, dict) else None,
-                )
-                acknowledged = result.get("acknowledged")
-                message = (
-                    f"Print started (acknowledged={acknowledged})"
-                    if acknowledged is not None
-                    else "Print started"
-                )
+            # --- NEW: alltid bruk API-stien (sikrer timelapse-aktivering) ---
+            def _norm_key(s: str) -> str:
+                return "".join(ch for ch in str(s).lower() if ch.isalnum())
+
+            def _search_bool(obj) -> bool:
+                if isinstance(obj, dict):
+                    for k, v in obj.items():
+                        nk = _norm_key(k)
+                        if nk in ("enabletimelapse", "timelapseenabled"):
+                            return bool(v) if isinstance(v, bool) else str(v).strip().lower() in ("1","true","yes","on")
+                        if _search_bool(v):
+                            return True
+                elif isinstance(obj, list):
+                    return any(_search_bool(x) for x in obj)
+                return False
+
+            def _search_str(obj, keys=("timelapsedirectory","timelapsepath")):
+                if isinstance(obj, dict):
+                    for k, v in obj.items():
+                        nk = _norm_key(k)
+                        if nk in keys:
+                            try:
+                                return str(v)
+                            except Exception:
+                                return None
+                        sv = _search_str(v, keys)
+                        if sv:
+                            return sv
+                elif isinstance(obj, list):
+                    for x in obj:
+                        sv = _search_str(x, keys)
+                        if sv:
+                            return sv
+                return None
+
+            enable_timelapse = _search_bool(metadata or {})
+            tl_dir_raw = _search_str(metadata or {})
+            tl_dir = Path(tl_dir_raw).expanduser() if tl_dir_raw else None
+
+            options = bambuPrinter.BambuPrintOptions(
+                ipAddress=self.ipAddress,
+                serialNumber=self.serial,
+                accessCode=self.accessCode,
+                useAms=useAms,
+                plateIndex=plateIndex,
+                enableTimeLapse=enable_timelapse,
+                timeLapseDirectory=tl_dir,
+            )
+            result = bambuPrinter.startPrintViaApi(
+                ip=self.ipAddress,
+                serial=self.serial,
+                accessCode=self.accessCode,
+                uploaded_name=str(fileName),
+                plate_index=plateIndex,
+                param_path=paramPath,
+                options=options,
+                job_metadata=metadata if isinstance(metadata, dict) else None,
+            )
+            acknowledged = result.get("acknowledged")
+            message = (
+                f"Print started (acknowledged={acknowledged})"
+                if acknowledged is not None
+                else "Print started"
+            )
             self._jobActive = True
             try:
                 self._lastRemoteFile = str(fileName)

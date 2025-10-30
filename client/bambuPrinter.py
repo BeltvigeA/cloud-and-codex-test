@@ -20,7 +20,7 @@ import uuid
 import zipfile
 import xml.etree.ElementTree as ET
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, BinaryIO, Callable, Dict, Iterable, List, Optional, Sequence, Literal
 
@@ -1120,7 +1120,36 @@ def startPrintViaApi(
     printer = printerClass(ip, accessCode, serial)
     resolvedUseAms = resolveUseAmsAuto(options, job_metadata, None)
 
+    # Resolve requested timelapse directory from options first
     timelapsePath = timelapse_directory or _resolveTimeLapseDirectory(options, ensure=True)
+
+    # --- NEW: metadata fallback (covers MQTT→API fallback where options.enableTimeLapse wasn't set) ---
+    if timelapsePath is None and job_metadata:
+        def _norm_key(s):
+            try:
+                return "".join(ch for ch in str(s).lower() if ch.isalnum())
+            except Exception:
+                return ""
+        def _any_enable(obj) -> bool:
+            if isinstance(obj, dict):
+                for k, v in obj.items():
+                    nk = _norm_key(k)
+                    if nk in ("enabletimelapse", "timelapseenabled"):
+                        try:
+                            return bool(v) if isinstance(v, bool) else str(v).strip().lower() in ("1","true","yes","on")
+                        except Exception:
+                            return False
+                    if _any_enable(v):
+                        return True
+            elif isinstance(obj, list):
+                return any(_any_enable(x) for x in obj)
+            return False
+        if _any_enable(job_metadata):
+            # default: ~/.printmaster/timelapse
+            timelapsePath = Path.home() / ".printmaster" / "timelapse"
+            timelapsePath.mkdir(parents=True, exist_ok=True)
+            if START_DEBUG:
+                logger.info("[start] timelapse enabled by metadata -> %s", timelapsePath)
 
     startKeywordArgs: Dict[str, Any] = {}
     if resolvedUseAms is not None:
@@ -1554,6 +1583,23 @@ def sendBambuPrintJob(
 
     plateIndex = options.plateIndex
     lanStrategy = (options.lanStrategy or "legacy").lower()
+
+    # --- NEW: løft timelapse fra jobMetadata → options før vi lager/mappe ---
+    try:
+        if jobMetadata:
+            tl_hint = _findMetadataValue(jobMetadata, {"enable_timelapse", "enabletimelapse", "timelapseenabled"})
+            tl_bool = _interpretFlexibleBoolean(tl_hint) if tl_hint is not None else None
+            tl_dir  = _findMetadataValue(jobMetadata, {"timelapse_directory", "timelapsedirectory", "timelapsepath"})
+            if tl_bool and not getattr(options, "enableTimeLapse", False):
+                options = replace(options, enableTimeLapse=True)
+            if tl_dir and not getattr(options, "timeLapseDirectory", None):
+                try:
+                    options = replace(options, timeLapseDirectory=Path(str(tl_dir)).expanduser())
+                except Exception:
+                    pass
+    except Exception:
+        logger.debug("timelapse metadata merge failed (ignored)", exc_info=START_DEBUG)
+
     timelapsePath = _resolveTimeLapseDirectory(options, ensure=True)
 
     def _with_plate_options(payload: Dict[str, Any]) -> Dict[str, Any]:
