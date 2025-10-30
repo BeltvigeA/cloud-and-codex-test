@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import base64
 import contextlib
+import importlib
+import io
 import json
 import logging
 import os
@@ -32,6 +35,10 @@ hardcodedApiKey = (
 hardcodedOutputDirectory = str(Path.home() / ".printmaster" / "files")
 hardcodedJsonLogFile = str(Path.home() / ".printmaster" / "listener-log.json")
 hardcodedPollIntervalSeconds = 30
+
+plateCheckDefaultRoi = "0.2,0.8,0.25,0.85"
+plateCheckDefaultDarkFraction = "0.06"
+plateCheckDefaultStddev = "22.0"
 
 
 def _generateRecipientId(length: int = 32) -> str:
@@ -82,7 +89,13 @@ def addPrinterIdentityToPayload(
         payload["accessCode"] = accessCode
     return payload
 
-from .bambuPrinter import BambuPrintOptions, postStatus, sendBambuPrintJob
+from . import bambuPrinter as bambuPrinterModule
+from .bambuPrinter import (
+    BambuPrintOptions,
+    postStatus,
+    safeDisconnectPrinter,
+    sendBambuPrintJob,
+)
 from .status_subscriber import BambuStatusSubscriber
 from .command_controller import CommandWorker
 from .client import (
@@ -165,6 +178,10 @@ class ListenerGuiApp:
             self.bambuConnectMethod,
         ]
 
+        self.settingsConfigPath = Path.home() / ".printmaster" / "config.json"
+        self.appConfigData = self._loadAppConfig()
+        self.plateSettings = self._resolvePlateSettings(self.appConfigData)
+
         self.logQueue: "Queue[str]" = Queue()
         self.listenerThread: Optional[threading.Thread] = None
         self.stopEvent: Optional[threading.Event] = None
@@ -226,6 +243,18 @@ class ListenerGuiApp:
         self.pollIntervalVar = tk.IntVar(value=hardcodedPollIntervalSeconds)
         self.liveStatusEnabledVar.set(True)
 
+        plateSettings = getattr(self, "plateSettings", {})
+        self.plateCheckVar = tk.BooleanVar(value=bool(plateSettings.get("plateCheck", False)))
+        self.plateLightVar = tk.BooleanVar(value=bool(plateSettings.get("plateLight", False)))
+        self.plateSaveVar = tk.BooleanVar(value=bool(plateSettings.get("plateSave", False)))
+        self.plateRoiVar = tk.StringVar(value=str(plateSettings.get("plateRoi", plateCheckDefaultRoi)))
+        self.plateDarkFractionMaxVar = tk.StringVar(
+            value=str(plateSettings.get("plateDarkFractionMax", plateCheckDefaultDarkFraction))
+        )
+        self.plateStddevMaxVar = tk.StringVar(
+            value=str(plateSettings.get("plateStddevMax", plateCheckDefaultStddev))
+        )
+
         self.recipientVar.trace_add("write", lambda *_: self._updateListenerRecipient())
         self.statusApiKeyVar.trace_add("write", lambda *_: self._updateListenerStatusApiKey())
         self.controlApiKeyVar.trace_add("write", lambda *_: self._updateListenerControlApiKey())
@@ -271,6 +300,9 @@ class ListenerGuiApp:
         self.startButton.pack(side=tk.LEFT, padx=6)
         self.stopButton = ttk.Button(buttonFrame, text="Stop", command=self.stopListening, state=tk.DISABLED)
         self.stopButton.pack(side=tk.LEFT, padx=6)
+        ttk.Button(buttonFrame, text="Save Settings", command=self._handleSaveListenerSettings).pack(
+            side=tk.LEFT, padx=6
+        )
 
         currentRow += 1
         ttk.Label(parent, text="Event Log:").grid(row=currentRow, column=0, sticky=tk.W, **paddingOptions)
@@ -279,6 +311,59 @@ class ListenerGuiApp:
 
         parent.columnconfigure(1, weight=1)
         parent.rowconfigure(currentRow, weight=1)
+
+        currentRow += 1
+        plateFrame = ttk.LabelFrame(parent, text="Plate Check (pre-start)")
+        plateFrame.grid(row=currentRow, column=0, columnspan=2, sticky=tk.EW, padx=8, pady=(8, 12))
+        plateFrame.columnconfigure(1, weight=1)
+
+        toggleFrame = ttk.Frame(plateFrame)
+        toggleFrame.grid(row=0, column=0, columnspan=2, sticky=tk.W, padx=4, pady=(4, 8))
+        ttk.Checkbutton(toggleFrame, text="Enable", variable=self.plateCheckVar).pack(
+            side=tk.LEFT, padx=(0, 12)
+        )
+        ttk.Checkbutton(toggleFrame, text="Light assist", variable=self.plateLightVar).pack(
+            side=tk.LEFT, padx=(0, 12)
+        )
+        ttk.Checkbutton(toggleFrame, text="Save snapshot", variable=self.plateSaveVar).pack(
+            side=tk.LEFT
+        )
+
+        ttk.Label(plateFrame, text="ROI:").grid(row=1, column=0, sticky=tk.W, padx=4, pady=4)
+        ttk.Entry(plateFrame, textvariable=self.plateRoiVar).grid(
+            row=1,
+            column=1,
+            sticky=tk.EW,
+            padx=4,
+            pady=4,
+        )
+
+        ttk.Label(plateFrame, text="Max dark fraction:").grid(row=2, column=0, sticky=tk.W, padx=4, pady=4)
+        ttk.Entry(plateFrame, textvariable=self.plateDarkFractionMaxVar).grid(
+            row=2,
+            column=1,
+            sticky=tk.EW,
+            padx=4,
+            pady=4,
+        )
+
+        ttk.Label(plateFrame, text="Max stddev:").grid(row=3, column=0, sticky=tk.W, padx=4, pady=4)
+        ttk.Entry(plateFrame, textvariable=self.plateStddevMaxVar).grid(
+            row=3,
+            column=1,
+            sticky=tk.EW,
+            padx=4,
+            pady=4,
+        )
+
+        ttk.Button(plateFrame, text="Test Snapshot", command=self._handleTestSnapshotClick).grid(
+            row=4,
+            column=0,
+            columnspan=2,
+            sticky=tk.W,
+            padx=4,
+            pady=(8, 4),
+        )
 
         self._updateListenerRecipient()
         self._updateListenerStatusApiKey()
@@ -468,6 +553,386 @@ class ListenerGuiApp:
             except (OSError, json.JSONDecodeError) as error:
                 logging.warning("Unable to load printers from %s: %s", self.printerStoragePath, error)
         return []
+
+    def _loadAppConfig(self) -> Dict[str, Any]:
+        configPath = getattr(self, "settingsConfigPath", Path.home() / ".printmaster" / "config.json")
+        try:
+            configPath.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as error:
+            logging.warning("Unable to prepare config directory: %s", error)
+        if not configPath.exists():
+            return {}
+        try:
+            with configPath.open("r", encoding="utf-8") as handle:
+                loaded = json.load(handle)
+            if isinstance(loaded, dict):
+                return loaded
+            logging.warning("Configuration file %s is not a JSON object", configPath)
+        except (OSError, json.JSONDecodeError) as error:
+            logging.warning("Failed to load configuration from %s: %s", configPath, error)
+        return {}
+
+    def _writeAppConfig(self, configData: Dict[str, Any]) -> None:
+        configPath = getattr(self, "settingsConfigPath", Path.home() / ".printmaster" / "config.json")
+        configPath.parent.mkdir(parents=True, exist_ok=True)
+        with configPath.open("w", encoding="utf-8") as handle:
+            json.dump(configData, handle, indent=2, sort_keys=True)
+
+    def _resolvePlateSettings(self, configData: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        configValues = dict(configData or {})
+
+        def resolveBoolean(key: str, envKey: str, default: bool) -> bool:
+            if key in configValues:
+                return interpretBoolean(configValues.get(key))
+            envValue = os.getenv(envKey)
+            if envValue is not None:
+                return interpretBoolean(envValue)
+            return default
+
+        def resolveString(key: str, envKey: str, default: str) -> str:
+            if key in configValues:
+                return self._sanitizePlateRoiValue(configValues[key]) if key == "plateRoi" else self._sanitizePlateNumericValue(configValues[key], default)
+            envValue = os.getenv(envKey)
+            if envValue:
+                if key == "plateRoi":
+                    return self._sanitizePlateRoiValue(envValue)
+                return self._sanitizePlateNumericValue(envValue, default)
+            return default
+
+        settings = {
+            "plateCheck": resolveBoolean("plateCheck", "PRINTMASTER_PLATE_CHECK", False),
+            "plateLight": resolveBoolean("plateLight", "PRINTMASTER_PLATE_LIGHT", False),
+            "plateSave": resolveBoolean("plateSave", "PRINTMASTER_PLATE_SAVE", False),
+            "plateRoi": resolveString("plateRoi", "PRINTMASTER_PLATE_ROI", plateCheckDefaultRoi),
+            "plateDarkFractionMax": resolveString(
+                "plateDarkFractionMax",
+                "PRINTMASTER_PLATE_EMPTY_DARK_FRACTION_MAX",
+                plateCheckDefaultDarkFraction,
+            ),
+            "plateStddevMax": resolveString(
+                "plateStddevMax",
+                "PRINTMASTER_PLATE_EMPTY_STDDEV_MAX",
+                plateCheckDefaultStddev,
+            ),
+        }
+        return settings
+
+    def _formatPlateFloat(self, value: float) -> str:
+        formatted = f"{value:.6f}".rstrip("0").rstrip(".")
+        return formatted or "0"
+
+    def _sanitizePlateRoiValue(self, value: Any) -> str:
+        if isinstance(value, (list, tuple)):
+            parts = [str(item).strip() for item in value if str(item).strip()]
+        else:
+            raw = str(value or "")
+            parts = [segment.strip() for segment in raw.split(",") if segment.strip()]
+        if len(parts) != 4:
+            return plateCheckDefaultRoi
+        sanitizedParts: list[str] = []
+        for part in parts:
+            try:
+                sanitizedParts.append(self._formatPlateFloat(float(part)))
+            except (TypeError, ValueError):
+                return plateCheckDefaultRoi
+        return ",".join(sanitizedParts)
+
+    def _sanitizePlateNumericValue(self, value: Any, fallback: str) -> str:
+        if value is None:
+            return fallback
+        candidate = str(value).strip()
+        if not candidate:
+            return fallback
+        normalized = candidate.replace(" ", "")
+        normalized = normalized.replace(",", ".")
+        try:
+            numericValue = float(normalized)
+        except ValueError:
+            return fallback
+        if "." in candidate or "," in candidate:
+            return normalized
+        return self._formatPlateFloat(numericValue)
+
+    def _collectPlateSettingsFromVars(self) -> Dict[str, Any]:
+        currentSettings = dict(getattr(self, "plateSettings", {}))
+        plateCheckValue = bool(self.plateCheckVar.get()) if hasattr(self, "plateCheckVar") else bool(
+            currentSettings.get("plateCheck", False)
+        )
+        plateLightValue = bool(self.plateLightVar.get()) if hasattr(self, "plateLightVar") else bool(
+            currentSettings.get("plateLight", False)
+        )
+        plateSaveValue = bool(self.plateSaveVar.get()) if hasattr(self, "plateSaveVar") else bool(
+            currentSettings.get("plateSave", False)
+        )
+        roiText = (
+            self.plateRoiVar.get().strip()
+            if hasattr(self, "plateRoiVar")
+            else str(currentSettings.get("plateRoi", plateCheckDefaultRoi))
+        )
+        darkFractionText = (
+            self.plateDarkFractionMaxVar.get().strip()
+            if hasattr(self, "plateDarkFractionMaxVar")
+            else str(currentSettings.get("plateDarkFractionMax", plateCheckDefaultDarkFraction))
+        )
+        stddevText = (
+            self.plateStddevMaxVar.get().strip()
+            if hasattr(self, "plateStddevMaxVar")
+            else str(currentSettings.get("plateStddevMax", plateCheckDefaultStddev))
+        )
+
+        sanitizedSettings = {
+            "plateCheck": plateCheckValue,
+            "plateLight": plateLightValue,
+            "plateSave": plateSaveValue,
+            "plateRoi": self._sanitizePlateRoiValue(roiText or plateCheckDefaultRoi),
+            "plateDarkFractionMax": self._sanitizePlateNumericValue(
+                darkFractionText or plateCheckDefaultDarkFraction,
+                plateCheckDefaultDarkFraction,
+            ),
+            "plateStddevMax": self._sanitizePlateNumericValue(
+                stddevText or plateCheckDefaultStddev,
+                plateCheckDefaultStddev,
+            ),
+        }
+        return sanitizedSettings
+
+    def _applyPlateCheckEnvironment(self, settings: Optional[Dict[str, Any]] = None) -> None:
+        appliedSettings = dict(settings or getattr(self, "plateSettings", {}))
+        boolToEnv = lambda value: "1" if bool(value) else "0"
+        envMap = {
+            "PRINTMASTER_PLATE_CHECK": boolToEnv(appliedSettings.get("plateCheck", False)),
+            "PRINTMASTER_PLATE_LIGHT": boolToEnv(appliedSettings.get("plateLight", False)),
+            "PRINTMASTER_PLATE_SAVE": boolToEnv(appliedSettings.get("plateSave", False)),
+            "PRINTMASTER_PLATE_ROI": str(appliedSettings.get("plateRoi", plateCheckDefaultRoi)),
+            "PRINTMASTER_PLATE_EMPTY_DARK_FRACTION_MAX": str(
+                appliedSettings.get("plateDarkFractionMax", plateCheckDefaultDarkFraction)
+            ),
+            "PRINTMASTER_PLATE_EMPTY_STDDEV_MAX": str(
+                appliedSettings.get("plateStddevMax", plateCheckDefaultStddev)
+            ),
+        }
+        for key, value in envMap.items():
+            if value:
+                os.environ[key] = value
+                self._managedEnvKeys.add(key)
+            else:
+                if key in self._managedEnvKeys:
+                    os.environ.pop(key, None)
+                    self._managedEnvKeys.discard(key)
+
+    def _handleSaveListenerSettings(self) -> None:
+        try:
+            settings = self._collectPlateSettingsFromVars()
+        except Exception as error:
+            logging.exception("Failed to collect plate settings", exc_info=True)
+            self.logQueue.put(f"Plate check settings error: {error}")
+            return
+
+        self.plateCheckVar.set(settings["plateCheck"])
+        self.plateLightVar.set(settings["plateLight"])
+        self.plateSaveVar.set(settings["plateSave"])
+        self.plateRoiVar.set(settings["plateRoi"])
+        self.plateDarkFractionMaxVar.set(settings["plateDarkFractionMax"])
+        self.plateStddevMaxVar.set(settings["plateStddevMax"])
+
+        configData = dict(self.appConfigData)
+        configData.update(settings)
+
+        writeError: Optional[Exception] = None
+        try:
+            self._writeAppConfig(configData)
+            self.appConfigData = configData
+        except Exception as error:
+            writeError = error
+            logging.warning("Failed to persist plate settings: %s", error)
+        finally:
+            self.plateSettings = dict(settings)
+            self._applyPlateCheckEnvironment(settings)
+
+        if writeError is not None:
+            self.logQueue.put(f"Failed to save plate check settings: {writeError}")
+        else:
+            self.logQueue.put("Plate check settings saved.")
+
+    def _handleTestSnapshotClick(self) -> None:
+        worker = threading.Thread(target=self._runTestSnapshotWorker, name="PlateSnapshotTest", daemon=True)
+        worker.start()
+
+    def _runTestSnapshotWorker(self) -> None:
+        try:
+            printerConfig = self._selectSnapshotPrinter()
+            if not printerConfig:
+                self.logQueue.put("Plate snapshot test: no printers are configured.")
+                return
+            printerInstance = self._connectSnapshotPrinter(printerConfig)
+            if printerInstance is None:
+                return
+            try:
+                snapshotBytes = self._captureSnapshotBytes(printerInstance)
+                savedPath = self._saveSnapshotBytes(snapshotBytes)
+                self.logQueue.put(f"Plate snapshot saved to {savedPath}")
+            except Exception as error:
+                logging.exception("Test snapshot failed", exc_info=True)
+                self.logQueue.put(f"Plate snapshot failed: {error}")
+            finally:
+                try:
+                    safeDisconnectPrinter(printerInstance)
+                except Exception:
+                    logging.debug("Printer disconnect after snapshot failed", exc_info=True)
+        except Exception as error:
+            logging.exception("Unexpected snapshot test failure", exc_info=True)
+            self.logQueue.put(f"Plate snapshot test error: {error}")
+
+    def _selectSnapshotPrinter(self) -> Optional[Dict[str, Any]]:
+        printers = list(getattr(self, "printers", []) or [])
+        if not printers:
+            return None
+        subscriber = getattr(self, "statusSubscriber", None)
+        pingMethod = getattr(subscriber, "_pingHost", None)
+        if callable(pingMethod):
+            for printer in printers:
+                ipValue = str(printer.get("ipAddress") or "").strip()
+                if not ipValue:
+                    continue
+                try:
+                    if pingMethod(ipValue, 1000):
+                        return printer
+                except Exception:
+                    logging.debug("Printer ping failed for %s", ipValue, exc_info=True)
+        for printer in printers:
+            if str(printer.get("ipAddress") or "").strip():
+                return printer
+        return printers[0]
+
+    def _connectSnapshotPrinter(self, printerConfig: Dict[str, Any]) -> Optional[Any]:
+        try:
+            bambuApi = importlib.import_module("bambulabs_api")
+        except Exception as error:
+            logging.warning("bambulabs_api unavailable for snapshot: %s", error)
+            self.logQueue.put("Plate snapshot failed: bambulabs_api is unavailable.")
+            return None
+
+        ipAddress = str(printerConfig.get("ipAddress") or "").strip()
+        accessCode = str(printerConfig.get("accessCode") or "").strip()
+        serialNumber = str(printerConfig.get("serialNumber") or "").strip()
+        if not ipAddress or not accessCode or not serialNumber:
+            self.logQueue.put("Plate snapshot failed: printer credentials are incomplete.")
+            return None
+
+        try:
+            printerInstance = bambuApi.Printer(ipAddress, accessCode, serialNumber)
+        except Exception as error:
+            logging.warning("Failed to initialize bambulabs_api.Printer: %s", error)
+            self.logQueue.put(f"Plate snapshot failed: {error}")
+            return None
+
+        try:
+            mqttStart = getattr(printerInstance, "mqtt_start", None)
+            if callable(mqttStart):
+                mqttStart()
+            connectMethod = getattr(printerInstance, "connect", None)
+            if callable(connectMethod):
+                connectMethod()
+            waitReady = getattr(bambuPrinterModule, "_waitForMqttReady", None)
+            if callable(waitReady):
+                waitReady(printerInstance, timeout=10.0)
+        except Exception as error:
+            try:
+                safeDisconnectPrinter(printerInstance)
+            except Exception:
+                logging.debug("Printer cleanup after connection failure failed", exc_info=True)
+            logging.warning("Failed to connect to printer for snapshot: %s", error)
+            self.logQueue.put(f"Plate snapshot failed: {error}")
+            return None
+
+        return printerInstance
+
+    def _captureSnapshotBytes(self, printerInstance: Any) -> bytes:
+        cameraStart = getattr(printerInstance, "camera_start", None) or getattr(
+            printerInstance, "camera_on", None
+        )
+        cameraStop = getattr(printerInstance, "camera_stop", None) or getattr(
+            printerInstance, "camera_off", None
+        )
+        cameraStarted = False
+        if callable(cameraStart):
+            try:
+                cameraStart()
+                cameraStarted = True
+            except Exception:
+                logging.debug("camera_start failed (ignored)", exc_info=True)
+
+        errors: list[str] = []
+        methodNames = [
+            "get_camera_snapshot",
+            "get_camera_image",
+            "snapshot",
+            "get_snapshot",
+            "camera_snapshot",
+            "get_preview_image",
+            "fetch_camera_frame",
+        ]
+
+        try:
+            for methodName in methodNames:
+                method = getattr(printerInstance, methodName, None)
+                if not callable(method):
+                    continue
+                try:
+                    result = method()
+                except Exception as error:
+                    errors.append(f"{methodName}: {error}")
+                    continue
+                normalized = self._normalizeSnapshotPayload(result)
+                if normalized:
+                    return normalized
+                errors.append(f"{methodName}: unsupported result type {type(result).__name__}")
+        finally:
+            if cameraStarted and callable(cameraStop):
+                try:
+                    cameraStop()
+                except Exception:
+                    logging.debug("camera_stop failed (ignored)", exc_info=True)
+
+        attempted = " | ".join(errors) if errors else "no snapshot methods available"
+        raise RuntimeError(f"Snapshot capture failed – {attempted}")
+
+    def _normalizeSnapshotPayload(self, payload: Any) -> Optional[bytes]:
+        if payload is None:
+            return None
+        if isinstance(payload, (bytes, bytearray)):
+            return bytes(payload)
+        if isinstance(payload, str):
+            candidate = payload.strip()
+            if not candidate:
+                return None
+            try:
+                return base64.b64decode(candidate, validate=False)
+            except Exception:
+                logging.debug("Failed to decode snapshot string payload", exc_info=True)
+                return None
+        saveMethod = getattr(payload, "save", None)
+        if callable(saveMethod):
+            buffer = io.BytesIO()
+            try:
+                saveMethod(buffer, format="JPEG")
+            except TypeError:
+                buffer.seek(0)
+                payload.save(buffer, format="JPEG")  # type: ignore[attr-defined]
+            except Exception:
+                logging.debug("Snapshot object save failed", exc_info=True)
+                return None
+            return buffer.getvalue()
+        return None
+
+    def _saveSnapshotBytes(self, buffer: bytes) -> Path:
+        snapshotDirectory = Path.home() / ".printmaster" / "snapshots"
+        snapshotDirectory.mkdir(parents=True, exist_ok=True)
+        timestamp = int(time.time() * 1000)
+        filePath = snapshotDirectory / f"{timestamp}_test.jpg"
+        with filePath.open("wb") as handle:
+            handle.write(buffer)
+        return filePath
 
     def _extractNumericCandidate(self, value: Any) -> Any:
         if isinstance(value, dict):
