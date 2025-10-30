@@ -1,3 +1,4 @@
+import threading
 import zipfile
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -485,4 +486,103 @@ def test_sendBambuPrintJob_raises_when_api_start_fails(
         )
 
     assert "API print start failed and MQTT fallback is disabled by policy" in str(errorInfo.value)
+
+
+def test_timelapse_watcher_detects_new_file(tmp_path: Path) -> None:
+    existingPath = tmp_path / "existing.mp4"
+    existingPath.write_bytes(b"initial")
+
+    events: list[Dict[str, Any]] = []
+    savedEvent = threading.Event()
+
+    def capture(event: Dict[str, Any]) -> None:
+        events.append(dict(event))
+        if event.get("status") == "timelapseSaved":
+            savedEvent.set()
+
+    watcher = bambuPrinter._TimelapseWatcher(
+        directory=tmp_path,
+        callback=capture,
+        pollSeconds=0.05,
+        timeoutSeconds=1.0,
+    )
+    assert watcher.start() is True
+    try:
+        newPath = tmp_path / "new_capture.mp4"
+        newPath.write_bytes(b"video data")
+
+        assert savedEvent.wait(timeout=2.0) is True
+
+        savedEvents = [event for event in events if event.get("status") == "timelapseSaved"]
+        assert savedEvents and savedEvents[0]["path"] == str(newPath)
+        errorEvents = [event for event in events if event.get("status") == "timelapseError"]
+        assert not errorEvents
+    finally:
+        watcher.stop()
+
+
+def test_timelapse_watcher_reports_timeout(tmp_path: Path) -> None:
+    events: list[Dict[str, Any]] = []
+    errorEvent = threading.Event()
+
+    def capture(event: Dict[str, Any]) -> None:
+        events.append(dict(event))
+        if event.get("status") == "timelapseError":
+            errorEvent.set()
+
+    watcher = bambuPrinter._TimelapseWatcher(
+        directory=tmp_path,
+        callback=capture,
+        pollSeconds=0.05,
+        timeoutSeconds=0.2,
+    )
+    assert watcher.start() is True
+    try:
+        assert errorEvent.wait(timeout=2.0) is True
+
+        errorEvents = [event for event in events if event.get("status") == "timelapseError"]
+        assert errorEvents
+        assert "timeout" in errorEvents[0]["error"].lower()
+        assert errorEvents[0]["directory"] == str(tmp_path)
+    finally:
+        watcher.stop()
+
+
+def test_timelapse_watcher_reports_io_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    events: list[Dict[str, Any]] = []
+    errorEvent = threading.Event()
+
+    def capture(event: Dict[str, Any]) -> None:
+        events.append(dict(event))
+        if event.get("status") == "timelapseError":
+            errorEvent.set()
+
+    callState = {"count": 0}
+
+    def fakeList(directory: Path) -> set[Path]:
+        callState["count"] += 1
+        if callState["count"] == 1:
+            return set()
+        raise OSError("simulated failure")
+
+    monkeypatch.setattr(bambuPrinter, "_listTimelapseFiles", fakeList)
+
+    watcher = bambuPrinter._TimelapseWatcher(
+        directory=tmp_path,
+        callback=capture,
+        pollSeconds=0.05,
+        timeoutSeconds=1.0,
+    )
+    assert watcher.start() is True
+    try:
+        assert errorEvent.wait(timeout=2.0) is True
+
+        errorEvents = [event for event in events if event.get("status") == "timelapseError"]
+        assert errorEvents
+        assert errorEvents[0]["error"] == "simulated failure"
+        assert errorEvents[0]["directory"] == str(tmp_path)
+    finally:
+        watcher.stop()
 
