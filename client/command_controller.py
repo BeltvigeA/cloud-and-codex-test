@@ -1524,6 +1524,39 @@ class CommandWorker:
         camelCaseConverted = re.sub(r"(?<!^)(?=[A-Z])", "_", rawCommandType)
         normalizedType = camelCaseConverted.replace("-", "_").lower()
 
+        def _read_last_state_flags() -> tuple[bool, bool, str]:
+            """
+            Returns: (paused, busy, state_text)
+              paused: printer er i pause-aktig tilstand
+              busy:   printer har/har hatt aktivitet (kjører el. ikke ferdig)
+            """
+            st = self._copyLastStatus()
+            state_text = str(st.get("gcode_state") or st.get("job_state") or "").strip().lower()
+            paused = state_text in {"pause", "paused", "pausing"}
+            # Busy hvis prosent >0 og <100, eller state antyder pågående aktivitet
+            pct = st.get("mc_percent")
+            try:
+                pctf = float(pct)
+            except (TypeError, ValueError):
+                pctf = None
+            active_states = {
+                "start",
+                "starting",
+                "prepare",
+                "preparing",
+                "heat",
+                "heating",
+                "print",
+                "printing",
+                "run",
+                "running",
+                "work",
+                "busy",
+                "homing",
+            }
+            busy = (pctf is not None and 0.0 < pctf < 100.0) or (state_text in active_states)
+            return paused, busy, state_text
+
         if normalizedType in {"heat", "setheat"}:
             nozzleTemp = metadata.get("nozzleTemp")
             bedTemp = metadata.get("bedTemp")
@@ -1549,26 +1582,49 @@ class CommandWorker:
                 sendGcode("M140 S0")
             message = "Cooling started"
         elif normalizedType in {"pause", "resume", "stop", "stop_print", "cancel"}:
-            methodMap = {
-                "pause": "pause_print",
-                "resume": "resume_print",
-                "stop": "stop_print",
-                "stop_print": "stop_print",
-                "cancel": "cancel_print",
+            # aktivitet/tilstand-guard
+            paused, busy, state_txt = _read_last_state_flags()
+            if normalizedType == "pause" and paused:
+                return "completed", "Already paused"
+            if normalizedType == "resume":
+                if not paused and busy:
+                    return "completed", "Already running"
+                if not paused and not busy:
+                    return "completed", "Nothing to resume"
+            if normalizedType in {"stop", "stop_print", "cancel"} and not busy and not paused:
+                return "completed", "Nothing to stop"
+
+            controlConfig = {
+                "pause": (["pause_print"], "pause", "Paused"),
+                "resume": (["resume_print"], "resume", "Resumed"),
+                "stop": (["stop_print", "cancel_print"], "stop", "Stopped"),
+                "stop_print": (["stop_print", "cancel_print"], "stop", "Stopped"),
+                "cancel": (["cancel_print", "stop_print"], "stop", "Cancelled"),
             }
-            methodName = methodMap.get(normalizedType, normalizedType)
-            try:
-                callPrinterMethod(methodName)
-            except RuntimeError:
-                sendControlPayload({"command": normalizedType})
-            statusMessages = {
-                "pause": "Paused",
-                "resume": "Resumed",
-                "stop": "Stopped",
-                "stop_print": "Stopped",
-                "cancel": "Cancelled",
-            }
-            message = statusMessages.get(normalizedType, normalizedType.replace("_", " ").title())
+            methods, transportCmd, okMessage = controlConfig[normalizedType]
+
+            used = None
+            for meth in methods:
+                method = getattr(printer, meth, None)
+                if callable(method):
+                    log.info("Control %s → printer.%s()", normalizedType, meth)
+                    method()
+                    used = meth
+                    break
+            if not used:
+                payload = {"command": transportCmd}
+                controlSender = getattr(printer, "send_control", None)
+                if callable(controlSender):
+                    log.info("Control %s → send_control(%s)", normalizedType, payload)
+                    controlSender(payload)
+                else:
+                    requestSender = getattr(printer, "send_request", None)
+                    if callable(requestSender):
+                        log.info("Control %s → send_request(%s)", normalizedType, payload)
+                        requestSender(payload)
+                    else:
+                        raise RuntimeError("No API transport available for control payload")
+            message = okMessage
         elif normalizedType in {"camera", "camera_on", "camera_off"}:
             desiredState: Optional[bool]
             if normalizedType == "camera_on":
