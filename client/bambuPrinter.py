@@ -721,10 +721,11 @@ def _resolveTimeLapseDirectory(
     return directory
 
 
-def _activateTimelapseCapture(printer: Any, directory: Path) -> None:
+def _activateTimelapseCapture(printer: Any, directory: Path) -> Dict[str, Any]:
     directoryString = str(directory)
     cameraClient = getattr(printer, "camera_client", None)
     cameraConfigured = False
+    errorMessages: List[str] = []
 
     if cameraClient is not None:
         for methodName in (
@@ -739,7 +740,8 @@ def _activateTimelapseCapture(printer: Any, directory: Path) -> None:
                     configureMethod(directoryString)
                     cameraConfigured = True
                     break
-                except Exception:  # pragma: no cover - diagnostic logging only
+                except Exception as error:  # pragma: no cover - diagnostic logging only
+                    errorMessages.append(f"{methodName}:{error}")
                     logger.debug("timelapse configure %s failed", methodName, exc_info=START_DEBUG)
         if not cameraConfigured:
             for attributeName in (
@@ -753,7 +755,8 @@ def _activateTimelapseCapture(printer: Any, directory: Path) -> None:
                         setattr(cameraClient, attributeName, directoryString)
                         cameraConfigured = True
                         break
-                    except Exception:  # pragma: no cover - diagnostic logging only
+                    except Exception as error:  # pragma: no cover - diagnostic logging only
+                        errorMessages.append(f"setattr({attributeName}):{error}")
                         logger.debug(
                             "timelapse attribute %s assignment failed",
                             attributeName,
@@ -784,13 +787,15 @@ def _activateTimelapseCapture(printer: Any, directory: Path) -> None:
                     activationMethod()
                     activated = True
                     break
-                except Exception:  # pragma: no cover - diagnostic logging only
+                except Exception as error:  # pragma: no cover - diagnostic logging only
+                    errorMessages.append(f"{methodName}():{error}")
                     logger.debug(
                         "timelapse activation %s without args failed",
                         methodName,
                         exc_info=START_DEBUG,
                     )
-            except Exception:  # pragma: no cover - diagnostic logging only
+            except Exception as error:  # pragma: no cover - diagnostic logging only
+                errorMessages.append(f"{methodName}({directoryString}):{error}")
                 logger.debug("timelapse activation %s failed", methodName, exc_info=START_DEBUG)
         if activated:
             break
@@ -806,6 +811,15 @@ def _activateTimelapseCapture(printer: Any, directory: Path) -> None:
             logger.info("[timelapse] capture activated for %s", directoryString)
         else:
             logger.info("[timelapse] capture requested for %s but no activation hooks succeeded", directoryString)
+
+    result = {
+        "activated": activated,
+        "configured": cameraConfigured,
+        "errors": errorMessages,
+        "directory": directoryString,
+    }
+
+    return result
 
 
 @dataclass(frozen=True)
@@ -1195,8 +1209,15 @@ def startPrintViaApi(
     if _state_is_completed_like(preflightState):
         _preselect_project_file(printer, remoteUrl, startParam, sendControlFlags)
 
+    timelapseInfo: Optional[Dict[str, Any]] = None
     if timelapsePath is not None:
-        _activateTimelapseCapture(printer, timelapsePath)
+        timelapseInfo = _activateTimelapseCapture(printer, timelapsePath)
+        if timelapseInfo.get("activated") is not True:
+            logger.warning(
+                "[timelapse] activation failed for %s: %s",
+                timelapseInfo.get("directory"),
+                ", ".join(timelapseInfo.get("errors", [])) or "no hooks succeeded",
+            )
 
     def _invokeStart() -> None:
         localErrors: List[str] = []
@@ -1349,6 +1370,9 @@ def startPrintViaApi(
         ackResult.pop("statePayload", None)
         ackResult["useAms"] = finalUseAms
         ackResult["fallbackTriggered"] = fallbackTriggered
+        if timelapseInfo is not None:
+            ackResult["timelapse"] = dict(timelapseInfo)
+            ackResult["timelapseError"] = not bool(timelapseInfo.get("activated"))
         return ackResult
     finally:
         safeDisconnectPrinter(printer)
@@ -1760,6 +1784,19 @@ def sendBambuPrintJob(
                 ack_timeout_sec=max(float(options.waitSeconds), 1.0),
                 timelapse_directory=timelapsePath,
             )
+            timelapsePayload = apiResult.get("timelapse") if apiResult else None
+            if statusCallback and timelapsePayload is not None:
+                timelapseEvent = {
+                    "status": "timelapseConfigured"
+                    if bool(timelapsePayload.get("activated"))
+                    else "timelapseError",
+                    "timelapse": dict(timelapsePayload),
+                }
+                if timelapsePayload.get("directory"):
+                    timelapseEvent.setdefault("directory", timelapsePayload.get("directory"))
+                if timelapsePayload.get("errors"):
+                    timelapseEvent.setdefault("errors", list(timelapsePayload.get("errors")))
+                statusCallback(_with_plate_options(timelapseEvent))
             if statusCallback:
                 statusCallback(
                     _with_plate_options(
