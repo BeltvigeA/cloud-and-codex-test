@@ -317,6 +317,65 @@ def extractPreferredTransport(*sources: Any) -> Optional[str]:
     return None
 
 
+def extractEnableTimeLapse(*sources: Any) -> Optional[bool]:
+    targetKeys = {"enabletimelapse", "timelapseenabled"}
+
+    def search(value: Any) -> Optional[bool]:
+        if isinstance(value, dict):
+            for rawKey, rawValue in value.items():
+                normalizedKey = rawKey.replace("-", "").replace("_", "").lower()
+                if normalizedKey in targetKeys:
+                    interpreted = interpretBoolean(rawValue)
+                    if interpreted is not None:
+                        return interpreted
+                    if rawValue is None:
+                        return None
+                    return bool(rawValue)
+                result = search(rawValue)
+                if result is not None:
+                    return result
+        elif isinstance(value, list):
+            for item in value:
+                result = search(item)
+                if result is not None:
+                    return result
+        return None
+
+    for source in sources:
+        result = search(source)
+        if result is not None:
+            return result
+    return None
+
+
+def extractTimeLapseDirectory(*sources: Any) -> Optional[str]:
+    targetKeys = {"timelapsedirectory", "timelapsepath"}
+
+    def search(value: Any) -> Optional[str]:
+        if isinstance(value, dict):
+            for rawKey, rawValue in value.items():
+                normalizedKey = rawKey.replace("-", "").replace("_", "").lower()
+                if normalizedKey in targetKeys:
+                    textValue = normalizeTextValue(rawValue)
+                    if textValue:
+                        return textValue
+                result = search(rawValue)
+                if result is not None:
+                    return result
+        elif isinstance(value, list):
+            for item in value:
+                result = search(item)
+                if result is not None:
+                    return result
+        return None
+
+    for source in sources:
+        result = search(source)
+        if result is not None:
+            return result
+    return None
+
+
 def normalizePrinterDetails(details: Dict[str, Any]) -> Dict[str, Any]:
     normalized: Dict[str, Any] = {}
     for rawKey, rawValue in details.items():
@@ -404,6 +463,14 @@ def normalizePrinterDetails(details: Dict[str, Any]) -> Dict[str, Any]:
             if connectionValue is not None:
                 normalized["connectionMethod"] = connectionValue
                 normalized.setdefault("transport", connectionValue)
+        elif key in {"enabletimelapse", "timelapseenabled"}:
+            interpreted = interpretBoolean(rawValue)
+            if interpreted is not None:
+                normalized["enableTimeLapse"] = interpreted
+        elif key in {"timelapsedirectory", "timelapsepath"}:
+            directoryValue = normalizeTextValue(rawValue)
+            if directoryValue is not None:
+                normalized["timeLapseDirectory"] = directoryValue
     return normalized
 
 
@@ -1045,6 +1112,30 @@ def dispatchBambuPrintIfPossible(
 
     resolvedAccessCode = "" if accessCode in {None, ""} else str(accessCode)
 
+    enableTimeLapseOverride = extractEnableTimeLapse(entryData, statusPayload)
+    configEnableTimeLapse = resolvedDetails.get("enableTimeLapse")
+    if enableTimeLapseOverride is not None:
+        enableTimeLapse = enableTimeLapseOverride
+    elif isinstance(configEnableTimeLapse, bool):
+        enableTimeLapse = configEnableTimeLapse
+    elif configEnableTimeLapse is not None:
+        interpretedConfig = interpretBoolean(configEnableTimeLapse)
+        enableTimeLapse = bool(interpretedConfig) if interpretedConfig is not None else False
+    else:
+        enableTimeLapse = False
+
+    rawTimeLapseDirectory = extractTimeLapseDirectory(entryData, statusPayload)
+    if not rawTimeLapseDirectory:
+        rawTimeLapseDirectory = resolvedDetails.get("timeLapseDirectory")
+
+    resolvedTimeLapseDirectory: Optional[Path] = None
+    if rawTimeLapseDirectory:
+        try:
+            resolvedTimeLapseDirectory = Path(str(rawTimeLapseDirectory)).expanduser()
+        except Exception:
+            logging.warning("Invalid timelapse directory configured: %s", rawTimeLapseDirectory)
+            resolvedTimeLapseDirectory = None
+
     options = BambuPrintOptions(
         ipAddress=str(ipAddress),
         serialNumber=str(serialNumber),
@@ -1064,6 +1155,8 @@ def dispatchBambuPrintIfPossible(
         waitSeconds=resolveInt("waitSeconds", 8) or 8,
         lanStrategy=str(resolvedDetails.get("lanStrategy") or "legacy"),
         transport=selectedTransport,
+        enableTimeLapse=enableTimeLapse,
+        timeLapseDirectory=resolvedTimeLapseDirectory,
     )
 
     printerDetails = {
