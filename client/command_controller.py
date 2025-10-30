@@ -1549,26 +1549,70 @@ class CommandWorker:
                 sendGcode("M140 S0")
             message = "Cooling started"
         elif normalizedType in {"pause", "resume", "stop", "stop_print", "cancel"}:
-            methodMap = {
-                "pause": "pause_print",
-                "resume": "resume_print",
-                "stop": "stop_print",
-                "stop_print": "stop_print",
-                "cancel": "cancel_print",
+            controlConfig = {
+                "pause": {
+                    "methods": ["pause_print"],
+                    "transportCommand": "pause",
+                    "message": "Paused",
+                },
+                "resume": {
+                    "methods": ["resume_print"],
+                    "transportCommand": "resume",
+                    "message": "Resumed",
+                },
+                "stop": {
+                    "methods": ["stop_print", "cancel_print"],
+                    "transportCommand": "stop",
+                    "message": "Stopped",
+                },
+                "stop_print": {
+                    "methods": ["stop_print", "cancel_print"],
+                    "transportCommand": "stop",
+                    "message": "Stopped",
+                },
+                "cancel": {
+                    "methods": ["cancel_print", "stop_print"],
+                    "transportCommand": "stop",
+                    "message": "Cancelled",
+                },
             }
-            methodName = methodMap.get(normalizedType, normalizedType)
-            try:
-                callPrinterMethod(methodName)
-            except RuntimeError:
-                sendControlPayload({"command": normalizedType})
-            statusMessages = {
-                "pause": "Paused",
-                "resume": "Resumed",
-                "stop": "Stopped",
-                "stop_print": "Stopped",
-                "cancel": "Cancelled",
-            }
-            message = statusMessages.get(normalizedType, normalizedType.replace("_", " ").title())
+            controlInfo = controlConfig[normalizedType]
+            methodUsed: Optional[str] = None
+            for methodName in controlInfo["methods"]:
+                printerMethod = getattr(printer, methodName, None)
+                if callable(printerMethod):
+                    log.info(
+                        "Control command %s invoking printer.%s()",
+                        normalizedType,
+                        methodName,
+                    )
+                    printerMethod()
+                    methodUsed = methodName
+                    break
+            if methodUsed is None:
+                controlPayload = {"command": controlInfo["transportCommand"]}
+                controlMethod = getattr(printer, "send_control", None)
+                if callable(controlMethod):
+                    log.info(
+                        "Control command %s falling back to send_control with payload=%s",
+                        normalizedType,
+                        controlPayload,
+                    )
+                    controlMethod(controlPayload)
+                else:
+                    sendRequest = getattr(printer, "send_request", None)
+                    if callable(sendRequest):
+                        log.info(
+                            "Control command %s falling back to send_request with payload=%s",
+                            normalizedType,
+                            controlPayload,
+                        )
+                        sendRequest(controlPayload)
+                    else:
+                        raise RuntimeError(
+                            "No API transport available for control payload (API-only policy)"
+                        )
+            message = controlInfo["message"]
         elif normalizedType in {"camera", "camera_on", "camera_off"}:
             desiredState: Optional[bool]
             if normalizedType == "camera_on":
