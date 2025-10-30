@@ -213,6 +213,9 @@ class ListenerGuiApp:
         self.listenerControlApiKey = hardcodedApiKey
         self._managedEnvKeys: set[str] = set()
 
+        # Printer selection for ROI/snapshot
+        self.snapshotPrinterVar = tk.StringVar(value="")
+        self._snapshotPrinterOptions: Dict[str, Dict[str, Any]] = {}
         self.activePrinterDialog: Optional[Dict[str, Any]] = None
 
         self.liveStatusEnabledVar = tk.BooleanVar(value=True)
@@ -230,6 +233,8 @@ class ListenerGuiApp:
         self.root.after(200, self._processPrinterStatusUpdates)
         self._scheduleStatusRefresh(0)
         self._registerPrintersConfigListener()
+
+        self._refreshSnapshotPrinterOptions()
 
     def log(self, message: str) -> None:
         self.logQueue.put(str(message))
@@ -393,6 +398,25 @@ class ListenerGuiApp:
             padx=4,
             pady=(4, 6),
         )
+
+        # Snapshot/ROI printer selector
+        ttk.Label(plateFrame, text="Snapshot-printer:").grid(
+            row=6,
+            column=0,
+            sticky=tk.W,
+            padx=4,
+            pady=(4, 6),
+        )
+        self.snapshotPrinterCombo = ttk.Combobox(
+            plateFrame,
+            textvariable=self.snapshotPrinterVar,
+            state="readonly",
+            width=42,
+            values=tuple(self._snapshotPrinterOptions.keys()),
+        )
+        self.snapshotPrinterCombo.grid(row=6, column=1, sticky=tk.EW, padx=4, pady=(4, 6))
+        # Rebuild options now that widget exists
+        self._refreshSnapshotPrinterOptions()
 
         self._updateListenerRecipient()
         self._updateListenerStatusApiKey()
@@ -783,6 +807,45 @@ class ListenerGuiApp:
         else:
             self.logQueue.put("Plate check settings saved.")
 
+    # ----- snapshot/ROI printer selection helpers -----
+    def _printerDisplayName(self, entry: Dict[str, Any]) -> str:
+        try:
+            nickname = (entry.get("nickname") or "").strip()
+            serial = (entry.get("serialNumber") or "").strip()
+            ip = (entry.get("ipAddress") or "").strip()
+            label = nickname or serial or ip or "Unknown"
+            metaParts = []
+            if serial:
+                metaParts.append(serial)
+            if ip:
+                metaParts.append(ip)
+            suffix = f" [{' @ '.join(metaParts)}]" if metaParts else ""
+            return f"{label}{suffix}"
+        except Exception:
+            return "Unknown"
+
+    def _refreshSnapshotPrinterOptions(self) -> None:
+        # Build mapping display -> printer
+        self._snapshotPrinterOptions = {}
+        for entry in (self.printers or []):
+            try:
+                display = self._printerDisplayName(entry)
+                # Skip duplicates of same display string (keep first)
+                if display not in self._snapshotPrinterOptions:
+                    self._snapshotPrinterOptions[display] = entry
+            except Exception:
+                continue
+        # Push into combobox if it exists
+        combo = getattr(self, "snapshotPrinterCombo", None)
+        values = tuple(self._snapshotPrinterOptions.keys())
+        if combo is not None:
+            combo["values"] = values
+        # Ensure a valid current selection
+        current = self.snapshotPrinterVar.get().strip()
+        if not current or current not in self._snapshotPrinterOptions:
+            if values:
+                self.snapshotPrinterVar.set(values[0])
+
     def _handleTestSnapshotClick(self) -> None:
         self._setPlateStatus("Plate status: tester snapshot...")
         worker = threading.Thread(target=self._runTestSnapshotWorker, name="PlateSnapshotTest", daemon=True)
@@ -1021,6 +1084,18 @@ class ListenerGuiApp:
         return prefix
 
     def _selectSnapshotPrinter(self) -> Optional[Dict[str, Any]]:
+        # Prefer explicit GUI selection
+        selected = None
+        try:
+            selectedKey = self.snapshotPrinterVar.get().strip()
+            if selectedKey and selectedKey in self._snapshotPrinterOptions:
+                selected = self._snapshotPrinterOptions[selectedKey]
+        except Exception:
+            selected = None
+        if selected:
+            return selected
+
+        # Fallback: try to pick a reachable printer
         printers = list(getattr(self, "printers", []) or [])
         if not printers:
             return None
@@ -1096,6 +1171,12 @@ class ListenerGuiApp:
                 time.sleep(0.4)
         else:
             time.sleep(0.4)
+
+        # In case printers.json changed, keep options fresh
+        try:
+            self._refreshSnapshotPrinterOptions()
+        except Exception:
+            pass
 
         return printerInstance
 
