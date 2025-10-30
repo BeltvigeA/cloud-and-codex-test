@@ -106,6 +106,65 @@ def test_dispatchBambuPrintExtractsSkippedObjects(tmp_path: Path, monkeypatch: p
     assert capturedSkipped["skippedObjects"] == expectedSkipped
 
 
+def test_dispatchBambuPrintPropagatesTimelapseFlag(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    samplePath = tmp_path / "sample.3mf"
+    samplePath.write_bytes(b"dummy")
+
+    entryData = {
+        "savedFile": str(samplePath),
+        "unencryptedData": {
+            "printer": {
+                "printerSerial": "SERIALTL",
+                "ipAddress": "192.168.1.10",
+                "accessCode": "ACCESS",
+                "brand": "Bambu Lab",
+            }
+        },
+        "decryptedData": {},
+    }
+
+    statusPayload = {
+        "fileName": "sample.3mf",
+        "lastRequestedAt": "2024-01-01T00:00:00Z",
+        "requestedMode": "full",
+        "success": True,
+        "enable_time_lapse": True,
+    }
+
+    configuredPrinters = [
+        {
+            "serialNumber": "SERIALTL",
+            "ipAddress": "192.168.1.10",
+            "accessCode": "ACCESS",
+            "brand": "Bambu Lab",
+        }
+    ]
+
+    capturedOptions: dict[str, bambuPrinter.BambuPrintOptions] = {}
+
+    def fakeSendBambuPrintJob(**kwargs: Any) -> dict[str, Any]:
+        capturedOptions["options"] = kwargs.get("options")
+        return {"remoteFile": "uploaded.3mf", "method": "lan"}
+
+    monkeypatch.setattr(client, "sendBambuPrintJob", fakeSendBambuPrintJob)
+    patchRequestsPost(monkeypatch)
+
+    result = client.dispatchBambuPrintIfPossible(
+        baseUrl="https://example.com",
+        productId="product-1",
+        recipientId="recipient-1",
+        entryData=entryData,
+        statusPayload=statusPayload,
+        configuredPrinters=configuredPrinters,
+    )
+
+    assert result is not None
+    selectedOptions = capturedOptions.get("options")
+    assert isinstance(selectedOptions, bambuPrinter.BambuPrintOptions)
+    assert selectedOptions.enableTimeLapse is True
+    assert selectedOptions.timeLapseDirectory is None
+
+
 def test_dispatchBambuPrintIncludesPrinterDetailsInErrors(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:

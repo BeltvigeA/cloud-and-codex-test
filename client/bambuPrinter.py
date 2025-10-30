@@ -705,6 +705,109 @@ def postStatus(status: Dict[str, Any], printerConfig: Dict[str, Any]) -> None:
         logger.debug("Failed to post status update", exc_info=True)
 
 
+def _resolveTimeLapseDirectory(
+    options: "BambuPrintOptions", *, ensure: bool = False
+) -> Optional[Path]:
+    if not getattr(options, "enableTimeLapse", False):
+        return None
+
+    rawDirectory = options.timeLapseDirectory
+    if rawDirectory is None:
+        rawDirectory = Path.home() / ".printmaster" / "timelapse"
+
+    directory = Path(rawDirectory).expanduser()
+    if ensure:
+        directory.mkdir(parents=True, exist_ok=True)
+    return directory
+
+
+def _activateTimelapseCapture(printer: Any, directory: Path) -> None:
+    directoryString = str(directory)
+    cameraClient = getattr(printer, "camera_client", None)
+    cameraConfigured = False
+
+    if cameraClient is not None:
+        for methodName in (
+            "set_timelapse_directory",
+            "set_output_directory",
+            "set_save_directory",
+            "set_directory",
+        ):
+            configureMethod = getattr(cameraClient, methodName, None)
+            if callable(configureMethod):
+                try:
+                    configureMethod(directoryString)
+                    cameraConfigured = True
+                    break
+                except Exception:  # pragma: no cover - diagnostic logging only
+                    logger.debug("timelapse configure %s failed", methodName, exc_info=START_DEBUG)
+        if not cameraConfigured:
+            for attributeName in (
+                "timelapseDirectory",
+                "timelapse_directory",
+                "outputDirectory",
+                "output_directory",
+            ):
+                if hasattr(cameraClient, attributeName):
+                    try:
+                        setattr(cameraClient, attributeName, directoryString)
+                        cameraConfigured = True
+                        break
+                    except Exception:  # pragma: no cover - diagnostic logging only
+                        logger.debug(
+                            "timelapse attribute %s assignment failed",
+                            attributeName,
+                            exc_info=START_DEBUG,
+                        )
+        if not bool(getattr(cameraClient, "alive", False)):
+            startMethod = getattr(printer, "camera_start", None)
+            if callable(startMethod):
+                try:
+                    startMethod()
+                except Exception:  # pragma: no cover - best effort
+                    logger.debug("camera_start() failed during timelapse activation", exc_info=START_DEBUG)
+
+    activated = False
+    for candidate in (cameraClient, printer):
+        if candidate is None:
+            continue
+        for methodName in ("start_timelapse_capture", "start_timelapse", "enable_timelapse"):
+            activationMethod = getattr(candidate, methodName, None)
+            if not callable(activationMethod):
+                continue
+            try:
+                activationMethod(directoryString)
+                activated = True
+                break
+            except TypeError:
+                try:
+                    activationMethod()
+                    activated = True
+                    break
+                except Exception:  # pragma: no cover - diagnostic logging only
+                    logger.debug(
+                        "timelapse activation %s without args failed",
+                        methodName,
+                        exc_info=START_DEBUG,
+                    )
+            except Exception:  # pragma: no cover - diagnostic logging only
+                logger.debug("timelapse activation %s failed", methodName, exc_info=START_DEBUG)
+        if activated:
+            break
+
+    if hasattr(printer, "timelapse_directory"):
+        try:
+            setattr(printer, "timelapse_directory", directoryString)
+        except Exception:  # pragma: no cover - diagnostic logging only
+            logger.debug("setting printer.timelapse_directory failed", exc_info=START_DEBUG)
+
+    if START_DEBUG:
+        if activated:
+            logger.info("[timelapse] capture activated for %s", directoryString)
+        else:
+            logger.info("[timelapse] capture requested for %s but no activation hooks succeeded", directoryString)
+
+
 @dataclass(frozen=True)
 class BambuPrintOptions:
     ipAddress: str
@@ -727,6 +830,8 @@ class BambuPrintOptions:
     transport: str = "lan"
     spoolMode: bool = False
     startStrategy: Literal["api"] = "api"
+    enableTimeLapse: bool = False
+    timeLapseDirectory: Optional[Path] = None
 
 
 def _waitForMqttReady(apiPrinter: Any, timeout: float = 30.0, poll: float = 0.5) -> tuple[Any, Any]:
@@ -999,6 +1104,7 @@ def startPrintViaApi(
     options: BambuPrintOptions,
     job_metadata: Optional[Dict[str, Any]] = None,
     ack_timeout_sec: float = 15.0,
+    timelapse_directory: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """Start a print using bambulabs_api.Printer with acknowledgement handling."""
 
@@ -1011,6 +1117,8 @@ def startPrintViaApi(
 
     printer = printerClass(ip, accessCode, serial)
     resolvedUseAms = resolveUseAmsAuto(options, job_metadata, None)
+
+    timelapsePath = timelapse_directory or _resolveTimeLapseDirectory(options, ensure=True)
 
     startKeywordArgs: Dict[str, Any] = {}
     if resolvedUseAms is not None:
@@ -1084,6 +1192,9 @@ def startPrintViaApi(
         )
     if _state_is_completed_like(preflightState):
         _preselect_project_file(printer, remoteUrl, startParam, sendControlFlags)
+
+    if timelapsePath is not None:
+        _activateTimelapseCapture(printer, timelapsePath)
 
     def _invokeStart() -> None:
         localErrors: List[str] = []
@@ -1441,6 +1552,7 @@ def sendBambuPrintJob(
 
     plateIndex = options.plateIndex
     lanStrategy = (options.lanStrategy or "legacy").lower()
+    timelapsePath = _resolveTimeLapseDirectory(options, ensure=True)
 
     with tempfile.TemporaryDirectory() as temporaryDirectory:
         paramPath: Optional[str] = None
@@ -1626,6 +1738,7 @@ def sendBambuPrintJob(
                 options=options,
                 job_metadata=jobMetadata,
                 ack_timeout_sec=max(float(options.waitSeconds), 1.0),
+                timelapse_directory=timelapsePath,
             )
             if statusCallback:
                 statusCallback(

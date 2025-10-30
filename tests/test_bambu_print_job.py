@@ -21,6 +21,30 @@ def createSampleGcode(targetPath: Path) -> None:
     targetPath.write_text("G1 X0 Y0\n", encoding="utf-8")
 
 
+class FakeCameraClient:
+    def __init__(self) -> None:
+        self.alive = False
+        self.startCalls = 0
+        self.timelapseActivations: list[str] = []
+        self.configuredDirectories: list[str] = []
+
+    def start(self) -> bool:
+        self.alive = True
+        self.startCalls += 1
+        return True
+
+    def start_timelapse_capture(self, directory: str) -> bool:
+        self.alive = True
+        self.timelapseActivations.append(directory)
+        return True
+
+    def enable_timelapse(self, directory: str) -> bool:
+        return self.start_timelapse_capture(directory)
+
+    def set_timelapse_directory(self, directory: str) -> None:
+        self.configuredDirectories.append(directory)
+
+
 class FakeApiPrinter:
     def __init__(self, *, conflictFirst: bool = False) -> None:
         self.started = False
@@ -36,9 +60,16 @@ class FakeApiPrinter:
         self.startKwargs: list[Dict[str, Any]] = []
         self.autoStepRecovery: list[bool] = []
         self.calibrationRequests: list[Dict[str, Any]] = []
+        self.camera_client = FakeCameraClient()
+        self.cameraStartCalls = 0
+        self.timelapseRequests: list[str] = []
 
     def mqtt_start(self) -> None:
         return None
+
+    def camera_start(self) -> bool:
+        self.cameraStartCalls += 1
+        return self.camera_client.start()
 
     def get_state(self) -> Any:
         if not self.started:
@@ -72,6 +103,10 @@ class FakeApiPrinter:
 
     def stop_print(self) -> None:
         self.stopCalls += 1
+
+    def start_timelapse_capture(self, directory: str) -> bool:
+        self.timelapseRequests.append(directory)
+        return True
 
     def disconnect(self) -> None:
         self.disconnectCalls += 1
@@ -223,6 +258,39 @@ def test_startPrintViaApi_retries_on_conflict(monkeypatch: pytest.MonkeyPatch) -
             "vibration_compensation": False,
         },
     ]
+
+
+def test_startPrintViaApi_enables_timelapse(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    fakePrinter = FakeApiPrinter()
+    monkeypatch.setattr(bambuPrinter, "bambulabsApi", ApiModuleStub(lambda *_args, **_kwargs: fakePrinter))
+    monkeypatch.setattr(bambuPrinter.time, "sleep", lambda _seconds: None)
+
+    timelapseDir = tmp_path / "timelapse"
+    options = bambuPrinter.BambuPrintOptions(
+        ipAddress="1.2.3.4",
+        serialNumber="SERIAL",
+        accessCode="CODE",
+        waitSeconds=1,
+        enableTimeLapse=True,
+        timeLapseDirectory=timelapseDir,
+    )
+
+    bambuPrinter.startPrintViaApi(
+        ip="1.2.3.4",
+        serial="SERIAL",
+        accessCode="CODE",
+        uploaded_name="job.3mf",
+        plate_index=1,
+        param_path="Metadata/plate_1.gcode",
+        options=options,
+        job_metadata=None,
+        ack_timeout_sec=0.2,
+    )
+
+    expectedDirectory = str(timelapseDir.expanduser())
+    assert timelapseDir.exists()
+    assert fakePrinter.camera_client.configuredDirectories == [expectedDirectory]
+    assert fakePrinter.camera_client.timelapseActivations == [expectedDirectory]
 
 
 def test_sendBambuPrintJob_uses_api(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
