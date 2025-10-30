@@ -14,7 +14,6 @@ import shutil
 import socket
 import ssl
 import tempfile
-import threading
 import time
 import unicodedata
 import uuid
@@ -44,22 +43,6 @@ START_DEBUG = (
     str(os.getenv("PRINTMASTER_START_DEBUG", "")).strip().lower()
     not in ("", "0", "false", "off")
 )
-
-_TIMELAPSE_WATCH_POLL_SECONDS = max(
-    0.25,
-    float(os.getenv("PRINTMASTER_TIMELAPSE_POLL_SECONDS", "2.0") or 2.0),
-)
-
-_TIMELAPSE_WATCH_TIMEOUT_ENV = os.getenv("PRINTMASTER_TIMELAPSE_TIMEOUT_SECONDS", "").strip()
-try:
-    _TIMELAPSE_WATCH_TIMEOUT_SECONDS: Optional[float]
-    if _TIMELAPSE_WATCH_TIMEOUT_ENV:
-        parsedTimeout = float(_TIMELAPSE_WATCH_TIMEOUT_ENV)
-        _TIMELAPSE_WATCH_TIMEOUT_SECONDS = parsedTimeout if parsedTimeout > 0 else None
-    else:
-        _TIMELAPSE_WATCH_TIMEOUT_SECONDS = None
-except ValueError:
-    _TIMELAPSE_WATCH_TIMEOUT_SECONDS = None
 
 
 def _find_key(obj: Any, keys: set[str]) -> Any:
@@ -736,106 +719,6 @@ def _resolveTimeLapseDirectory(
     if ensure:
         directory.mkdir(parents=True, exist_ok=True)
     return directory
-
-
-def _listTimelapseFiles(directory: Path) -> set[Path]:
-    files: set[Path] = set()
-    for filePath in directory.glob("*.mp4"):
-        if filePath.is_file():
-            files.add(filePath)
-    return files
-
-
-class _TimelapseWatcher:
-    def __init__(
-        self,
-        *,
-        directory: Path,
-        callback: Optional[Callable[[Dict[str, Any]], None]],
-        pollSeconds: float,
-        timeoutSeconds: Optional[float],
-    ) -> None:
-        self.directory = Path(directory)
-        self.callback = callback
-        self.pollSeconds = max(float(pollSeconds), 0.05)
-        self.timeoutSeconds = timeoutSeconds if timeoutSeconds and timeoutSeconds > 0 else None
-        self.stopEvent = threading.Event()
-        self.thread = threading.Thread(
-            target=self._run, name="BambuTimelapseWatcher", daemon=True
-        )
-        self.threadStarted = False
-        self.knownFiles: set[Path] = set()
-        self.errorReported = False
-
-    def start(self) -> bool:
-        try:
-            initialFiles = _listTimelapseFiles(self.directory)
-        except Exception as error:
-            self._emitError(error)
-            return False
-        self.knownFiles = {path.resolve() for path in initialFiles}
-        self.thread.start()
-        self.threadStarted = True
-        return True
-
-    def stop(self) -> None:
-        self.stopEvent.set()
-        if self.threadStarted:
-            self.thread.join(timeout=5.0)
-
-    def _safeInvoke(self, payload: Dict[str, Any]) -> None:
-        if self.callback is None:
-            return
-        try:
-            self.callback(payload)
-        except Exception:  # pragma: no cover - callback robustness
-            logger.debug("timelapse watcher callback failed", exc_info=True)
-
-    def _emitSaved(self, filePath: Path) -> None:
-        payload = {"status": "timelapseSaved", "path": str(filePath)}
-        self._safeInvoke(payload)
-
-    def _emitError(self, error: BaseException) -> None:
-        if self.errorReported:
-            return
-        self.errorReported = True
-        payload = {
-            "status": "timelapseError",
-            "error": str(error),
-            "directory": str(self.directory),
-        }
-        self._safeInvoke(payload)
-        self.stopEvent.set()
-
-    def _run(self) -> None:
-        startTime = time.monotonic()
-        while not self.stopEvent.is_set():
-            if self.timeoutSeconds is not None:
-                elapsed = time.monotonic() - startTime
-                if elapsed >= self.timeoutSeconds:
-                    timeoutError = TimeoutError(
-                        f"timelapse watcher timeout after {self.timeoutSeconds:.1f}s"
-                    )
-                    self._emitError(timeoutError)
-                    return
-            try:
-                currentFiles = {path.resolve() for path in _listTimelapseFiles(self.directory)}
-            except Exception as error:
-                self._emitError(error)
-                return
-
-            newFiles = sorted(currentFiles - self.knownFiles, key=lambda item: str(item))
-            if newFiles:
-                for filePath in newFiles:
-                    self.knownFiles.add(filePath)
-                    self._emitSaved(filePath)
-                startTime = time.monotonic()
-
-            self.knownFiles.update(currentFiles)
-
-            if self.stopEvent.wait(self.pollSeconds):
-                break
-
 
 
 def _activateTimelapseCapture(printer: Any, directory: Path) -> Dict[str, Any]:
@@ -1704,50 +1587,35 @@ def sendBambuPrintJob(
             payload.setdefault("plateTemplate", options.plateTemplate)
         return payload
 
-    timelapseWatcher: Optional[_TimelapseWatcher] = None
-    if timelapsePath is not None and statusCallback is not None:
-        def watcherCallback(payload: Dict[str, Any]) -> None:
-            statusCallback(_with_plate_options(payload))
+    with tempfile.TemporaryDirectory() as temporaryDirectory:
+        paramPath: Optional[str] = None
+        tempDir = Path(temporaryDirectory)
 
-        watcherCandidate = _TimelapseWatcher(
-            directory=timelapsePath,
-            callback=watcherCallback,
-            pollSeconds=_TIMELAPSE_WATCH_POLL_SECONDS,
-            timeoutSeconds=_TIMELAPSE_WATCH_TIMEOUT_SECONDS,
-        )
-        if watcherCandidate.start():
-            timelapseWatcher = watcherCandidate
+        if resolvedPath.suffix.lower() == ".gcode":
+            targetPlate = max(1, plateIndex or 1)
+            platePath = f"Metadata/plate_{targetPlate}.gcode"
+            gcodeText = resolvedPath.read_text(encoding="utf-8", errors="ignore")
+            buffer = packageGcodeToThreeMfBytes(gcodeText, platePath=platePath)
+            workingPath = tempDir / f"{resolvedPath.stem}.3mf"
+            workingPath.write_bytes(buffer.getvalue())
+            paramPath = platePath
+        else:
+            workingPath = tempDir / resolvedPath.name
+            shutil.copy2(resolvedPath, workingPath)
+            try:
+                with zipfile.ZipFile(workingPath, "r"):
+                    pass
+            except zipfile.BadZipFile as zipError:
+                raise ValueError(f"{resolvedPath} is not a valid 3MF archive") from zipError
 
-    try:
-        with tempfile.TemporaryDirectory() as temporaryDirectory:
-            paramPath: Optional[str] = None
-            tempDir = Path(temporaryDirectory)
-
-            if resolvedPath.suffix.lower() == ".gcode":
-                targetPlate = max(1, plateIndex or 1)
-                platePath = f"Metadata/plate_{targetPlate}.gcode"
-                gcodeText = resolvedPath.read_text(encoding="utf-8", errors="ignore")
-                buffer = packageGcodeToThreeMfBytes(gcodeText, platePath=platePath)
-                workingPath = tempDir / f"{resolvedPath.stem}.3mf"
-                workingPath.write_bytes(buffer.getvalue())
-                paramPath = platePath
-            else:
-                workingPath = tempDir / resolvedPath.name
-                shutil.copy2(resolvedPath, workingPath)
-                try:
-                    with zipfile.ZipFile(workingPath, "r"):
-                        pass
-                except zipfile.BadZipFile as zipError:
-                    raise ValueError(f"{resolvedPath} is not a valid 3MF archive") from zipError
-
-                paramPath, candidates = pickGcodeParamFrom3mf(workingPath, plateIndex)
-                if paramPath is None:
-                    if not candidates:
-                        raise ValueError(
-                            "3MF-arkivet mangler G-code i Metadata/. Eksporter med innebygd G-code "
-                            "eller send .gcode slik at klienten kan pakke det automatisk."
-                        )
-                    paramPath = candidates[0]
+            paramPath, candidates = pickGcodeParamFrom3mf(workingPath, plateIndex)
+            if paramPath is None:
+                if not candidates:
+                    raise ValueError(
+                        "3MF-arkivet mangler G-code i Metadata/. Eksporter med innebygd G-code "
+                        "eller send .gcode slik at klienten kan pakke det automatisk."
+                    )
+                paramPath = candidates[0]
 
         remoteName = buildRemoteFileName(workingPath)
         resolvedUseAms = resolveUseAmsAuto(options, jobMetadata, resolvedPath)
@@ -1967,9 +1835,6 @@ def sendBambuPrintJob(
             "startMethod": startMethodResult,
         }
         return _with_plate_options(resultPayload)
-    finally:
-        if timelapseWatcher is not None:
-            timelapseWatcher.stop()
 
 
 
