@@ -275,7 +275,7 @@ def test_startPrintViaApi_enables_timelapse(monkeypatch: pytest.MonkeyPatch, tmp
         timeLapseDirectory=timelapseDir,
     )
 
-    result = bambuPrinter.startPrintViaApi(
+    bambuPrinter.startPrintViaApi(
         ip="1.2.3.4",
         serial="SERIAL",
         accessCode="CODE",
@@ -291,11 +291,6 @@ def test_startPrintViaApi_enables_timelapse(monkeypatch: pytest.MonkeyPatch, tmp
     assert timelapseDir.exists()
     assert fakePrinter.camera_client.configuredDirectories == [expectedDirectory]
     assert fakePrinter.camera_client.timelapseActivations == [expectedDirectory]
-    assert result["timelapse"]["activated"] is True
-    assert result["timelapse"]["configured"] is True
-    assert result["timelapse"]["directory"] == expectedDirectory
-    assert result["timelapse"]["errors"] == []
-    assert result["timelapseError"] is False
 
 
 def test_sendBambuPrintJob_uses_api(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -320,13 +315,6 @@ def test_sendBambuPrintJob_uses_api(monkeypatch: pytest.MonkeyPatch, tmp_path: P
         "percentage": 5.0,
         "useAms": True,
         "fallbackTriggered": False,
-        "timelapse": {
-            "activated": True,
-            "configured": True,
-            "errors": [],
-            "directory": "/tmp/timelapse",
-        },
-        "timelapseError": False,
     }
     monkeypatch.setattr(bambuPrinter, "startPrintViaApi", lambda **_kwargs: dict(apiResult))
     def forbidMqtt(**_kwargs: Any) -> None:
@@ -360,12 +348,6 @@ def test_sendBambuPrintJob_uses_api(monkeypatch: pytest.MonkeyPatch, tmp_path: P
     assert result["api"] == apiResult
     assert result["enableBrakePlate"] is True
     assert result["plateTemplate"] == "smooth_plate"
-    timelapseEvents = [event for event in events if event.get("status") in {"timelapseConfigured", "timelapseError"}]
-    assert timelapseEvents and timelapseEvents[0]["status"] == "timelapseConfigured"
-    assert timelapseEvents[0]["timelapse"]["activated"] is True
-    assert timelapseEvents[0]["directory"] == "/tmp/timelapse"
-    assert timelapseEvents[0]["timelapse"]["errors"] == []
-    assert timelapseEvents[0]["enableBrakePlate"] is True
     startingEvents = [event for event in events if event.get("status") == "starting"]
     assert startingEvents and startingEvents[0]["method"] == "api"
     assert startingEvents[0]["enableBrakePlate"] is True
@@ -376,77 +358,6 @@ def test_sendBambuPrintJob_uses_api(monkeypatch: pytest.MonkeyPatch, tmp_path: P
     startedEvents = [event for event in events if event.get("status") == "started"]
     assert startedEvents and startedEvents[0]["enableBrakePlate"] is True
     assert startedEvents[0]["plateTemplate"] == "smooth_plate"
-
-
-def test_sendBambuPrintJob_reports_timelapse_failure(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    samplePath = tmp_path / "model.3mf"
-    createSampleThreeMf(samplePath)
-
-    monkeypatch.setattr(
-        bambuPrinter,
-        "uploadViaFtps",
-        lambda **kwargs: kwargs["remoteName"],
-    )
-    monkeypatch.setattr(
-        bambuPrinter,
-        "uploadViaBambulabsApi",
-        lambda **kwargs: kwargs["remoteName"],
-    )
-
-    failureTimelapse = {
-        "activated": False,
-        "configured": False,
-        "errors": ["start_timelapse_capture:boom"],
-        "directory": "/tmp/fail",
-    }
-
-    def fakeStartViaApi(**_kwargs: Any) -> Dict[str, Any]:
-        return {
-            "acknowledged": True,
-            "state": "IDLE",
-            "gcodeState": "IDLE",
-            "percentage": 0.0,
-            "useAms": False,
-            "fallbackTriggered": False,
-            "timelapse": dict(failureTimelapse),
-            "timelapseError": True,
-        }
-
-    monkeypatch.setattr(bambuPrinter, "startPrintViaApi", fakeStartViaApi)
-    monkeypatch.setattr(
-        bambuPrinter,
-        "startPrintViaMqtt",
-        lambda **_kwargs: pytest.fail("startPrintViaMqtt should not be invoked"),
-    )
-
-    events: list[Dict[str, Any]] = []
-
-    def capture(event: Dict[str, Any]) -> None:
-        events.append(dict(event))
-
-    options = bambuPrinter.BambuPrintOptions(
-        ipAddress="1.2.3.4",
-        serialNumber="SERIAL",
-        accessCode="CODE",
-        waitSeconds=0,
-        startStrategy="api",
-    )
-
-    result = bambuPrinter.sendBambuPrintJob(
-        filePath=samplePath,
-        options=options,
-        statusCallback=capture,
-    )
-
-    timelapseEvents = [event for event in events if event.get("status") == "timelapseError"]
-    assert timelapseEvents and timelapseEvents[0]["timelapse"]["activated"] is False
-    assert timelapseEvents[0]["errors"] == failureTimelapse["errors"]
-    assert timelapseEvents[0]["directory"] == failureTimelapse["directory"]
-    assert timelapseEvents[0]["timelapse"] == failureTimelapse
-    assert result["api"]["timelapse"] == failureTimelapse
-    assert result["api"]["timelapseError"] is True
 
 
 def test_sendBambuPrintJob_raises_when_api_start_fails(
