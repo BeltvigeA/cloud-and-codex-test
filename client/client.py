@@ -376,6 +376,56 @@ def extractTimeLapseDirectory(*sources: Any) -> Optional[str]:
     return None
 
 
+def _coerceMetadataBoolean(value: Any) -> Optional[bool]:
+    interpreted = interpretBoolean(value)
+    if interpreted is not None:
+        return interpreted
+    if value is None:
+        return None
+    if isinstance(value, (int, float, bool)):
+        return bool(value)
+    return None
+
+
+def extractBrakePlatePreferences(*sources: Any) -> tuple[Optional[bool], Optional[str]]:
+    enableKeys = {"enablebrakeplate", "brakeplateenabled"}
+    templateKeys = {"template", "platetemplate"}
+    enableValue: Optional[bool] = None
+    templateValue: Optional[str] = None
+
+    def search(candidate: Any) -> None:
+        nonlocal enableValue, templateValue
+        if candidate is None:
+            return
+        if enableValue is not None and templateValue is not None:
+            return
+        if isinstance(candidate, dict):
+            for rawKey, rawValue in candidate.items():
+                normalizedKey = _normalizeMetadataKey(str(rawKey))
+                if enableValue is None and normalizedKey in enableKeys:
+                    enableValue = _coerceMetadataBoolean(rawValue)
+                if templateValue is None and normalizedKey in templateKeys:
+                    templateCandidate = normalizeTextValue(rawValue)
+                    if templateCandidate is not None:
+                        templateValue = templateCandidate
+                if isinstance(rawValue, (dict, list, tuple, set)):
+                    search(rawValue)
+                elif enableValue is not None and templateValue is not None:
+                    return
+        elif isinstance(candidate, (list, tuple, set)):
+            for item in candidate:
+                if enableValue is not None and templateValue is not None:
+                    break
+                search(item)
+
+    for source in sources:
+        if enableValue is not None and templateValue is not None:
+            break
+        search(source)
+
+    return enableValue, templateValue
+
+
 def normalizePrinterDetails(details: Dict[str, Any]) -> Dict[str, Any]:
     normalized: Dict[str, Any] = {}
     for rawKey, rawValue in details.items():
@@ -1136,6 +1186,13 @@ def dispatchBambuPrintIfPossible(
             logging.warning("Invalid timelapse directory configured: %s", rawTimeLapseDirectory)
             resolvedTimeLapseDirectory = None
 
+    enableBrakePlate, plateTemplate = extractBrakePlatePreferences(
+        entryData,
+        entryData.get("unencryptedData"),
+        entryData.get("decryptedData"),
+        statusPayload,
+    )
+
     options = BambuPrintOptions(
         ipAddress=str(ipAddress),
         serialNumber=str(serialNumber),
@@ -1157,6 +1214,8 @@ def dispatchBambuPrintIfPossible(
         transport=selectedTransport,
         enableTimeLapse=enableTimeLapse,
         timeLapseDirectory=resolvedTimeLapseDirectory,
+        enableBrakePlate=enableBrakePlate,
+        plateTemplate=plateTemplate,
     )
 
     printerDetails = {

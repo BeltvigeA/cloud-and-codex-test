@@ -333,6 +333,8 @@ def test_sendBambuPrintJob_uses_api(monkeypatch: pytest.MonkeyPatch, tmp_path: P
         accessCode="CODE",
         waitSeconds=0,
         startStrategy="api",
+        enableBrakePlate=True,
+        plateTemplate="smooth_plate",
     )
 
     result = bambuPrinter.sendBambuPrintJob(
@@ -344,8 +346,18 @@ def test_sendBambuPrintJob_uses_api(monkeypatch: pytest.MonkeyPatch, tmp_path: P
     assert result["method"] == "lan"
     assert result["startMethod"] == "api"
     assert result["api"] == apiResult
+    assert result["enableBrakePlate"] is True
+    assert result["plateTemplate"] == "smooth_plate"
     startingEvents = [event for event in events if event.get("status") == "starting"]
     assert startingEvents and startingEvents[0]["method"] == "api"
+    assert startingEvents[0]["enableBrakePlate"] is True
+    assert startingEvents[0]["plateTemplate"] == "smooth_plate"
+    uploadedEvents = [event for event in events if event.get("status") == "uploaded"]
+    assert uploadedEvents and uploadedEvents[0]["enableBrakePlate"] is True
+    assert uploadedEvents[0]["plateTemplate"] == "smooth_plate"
+    startedEvents = [event for event in events if event.get("status") == "started"]
+    assert startedEvents and startedEvents[0]["enableBrakePlate"] is True
+    assert startedEvents[0]["plateTemplate"] == "smooth_plate"
 
 
 def test_sendBambuPrintJob_raises_when_api_start_fails(

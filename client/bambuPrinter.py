@@ -832,6 +832,8 @@ class BambuPrintOptions:
     startStrategy: Literal["api"] = "api"
     enableTimeLapse: bool = False
     timeLapseDirectory: Optional[Path] = None
+    enableBrakePlate: Optional[bool] = None
+    plateTemplate: Optional[str] = None
 
 
 def _waitForMqttReady(apiPrinter: Any, timeout: float = 30.0, poll: float = 0.5) -> tuple[Any, Any]:
@@ -1554,6 +1556,13 @@ def sendBambuPrintJob(
     lanStrategy = (options.lanStrategy or "legacy").lower()
     timelapsePath = _resolveTimeLapseDirectory(options, ensure=True)
 
+    def _with_plate_options(payload: Dict[str, Any]) -> Dict[str, Any]:
+        if options.enableBrakePlate is not None:
+            payload.setdefault("enableBrakePlate", options.enableBrakePlate)
+        if options.plateTemplate is not None:
+            payload.setdefault("plateTemplate", options.plateTemplate)
+        return payload
+
     with tempfile.TemporaryDirectory() as temporaryDirectory:
         paramPath: Optional[str] = None
         tempDir = Path(temporaryDirectory)
@@ -1609,23 +1618,26 @@ def sendBambuPrintJob(
                     webbrowser.open(uri)
                 if statusCallback:
                     statusCallback(
-                        {
-                            "status": "bambuConnectOpened",
-                            "uri": uri,
-                            "persistentPath": str(persistentPath),
-                            "name": connectName,
-                        }
+                        _with_plate_options(
+                            {
+                                "status": "bambuConnectOpened",
+                                "uri": uri,
+                                "persistentPath": str(persistentPath),
+                                "name": connectName,
+                            }
+                        )
                     )
-                return {
+                connectPayload = {
                     "method": "bambu_connect",
                     "uri": uri,
                     "remoteFile": remoteName,
                     "localFile": str(persistentPath),
                     "paramPath": paramPath,
                 }
+                return _with_plate_options(connectPayload)
             except Exception as error:
                 if statusCallback:
-                    statusCallback({"status": "error", "error": str(error)})
+                    statusCallback(_with_plate_options({"status": "error", "error": str(error)}))
                 raise
 
         printerFileName = buildPrinterTransferFileName(workingPath)
@@ -1662,8 +1674,14 @@ def sendBambuPrintJob(
             )
             response = sendPrintJobViaCloud(options.cloudUrl, payload, timeoutSeconds=options.cloudTimeout)
             if statusCallback:
-                statusCallback({"status": "cloudAccepted", "response": response})
-            return {"method": "cloud", "remoteFile": remoteName, "paramPath": paramPath, "response": response}
+                statusCallback(_with_plate_options({"status": "cloudAccepted", "response": response}))
+            resultPayload = {
+                "method": "cloud",
+                "remoteFile": remoteName,
+                "paramPath": paramPath,
+                "response": response,
+            }
+            return _with_plate_options(resultPayload)
 
         uploadedName: Optional[str] = None
 
@@ -1703,12 +1721,14 @@ def sendBambuPrintJob(
 
         if statusCallback:
             statusCallback(
-                {
-                    "status": "uploaded",
-                    "remoteFile": uploadedName,
-                    "originalRemoteFile": remoteName,
-                    "param": paramPath,
-                }
+                _with_plate_options(
+                    {
+                        "status": "uploaded",
+                        "remoteFile": uploadedName,
+                        "originalRemoteFile": remoteName,
+                        "param": paramPath,
+                    }
+                )
             )
 
         startStrategy = (options.startStrategy or "api").lower()
@@ -1724,7 +1744,7 @@ def sendBambuPrintJob(
             "method": "api",
         }
         if statusCallback:
-            statusCallback(startingEvent)
+            statusCallback(_with_plate_options(startingEvent))
 
         apiResult: Optional[Dict[str, Any]] = None
         try:
@@ -1742,21 +1762,23 @@ def sendBambuPrintJob(
             )
             if statusCallback:
                 statusCallback(
-                    {
-                        "status": "started",
-                        "method": "api",
-                        "acknowledged": apiResult.get("acknowledged") if apiResult else False,
-                        "state": apiResult.get("state") if apiResult else None,
-                        "gcodeState": apiResult.get("gcodeState") if apiResult else None,
-                        "percentage": apiResult.get("percentage") if apiResult else None,
-                        "useAms": apiResult.get("useAms") if apiResult else resolvedUseAms,
-                        "fallback": apiResult.get("fallbackTriggered") if apiResult else False,
-                    }
+                    _with_plate_options(
+                        {
+                            "status": "started",
+                            "method": "api",
+                            "acknowledged": apiResult.get("acknowledged") if apiResult else False,
+                            "state": apiResult.get("state") if apiResult else None,
+                            "gcodeState": apiResult.get("gcodeState") if apiResult else None,
+                            "percentage": apiResult.get("percentage") if apiResult else None,
+                            "useAms": apiResult.get("useAms") if apiResult else resolvedUseAms,
+                            "fallback": apiResult.get("fallbackTriggered") if apiResult else False,
+                        }
+                    )
                 )
         except Exception as error:
             logger.warning("API start failed for %s: %s", options.serialNumber, error, exc_info=True)
             if statusCallback:
-                statusCallback({"status": "apiStartFailed", "error": str(error)})
+                statusCallback(_with_plate_options({"status": "apiStartFailed", "error": str(error)}))
             raise RuntimeError(
                 "API print start failed and MQTT fallback is disabled by policy"
             ) from error
@@ -1766,7 +1788,7 @@ def sendBambuPrintJob(
 
         startMethodResult = "api"
 
-        return {
+        resultPayload = {
             "method": "lan",
             "remoteFile": uploadedName,
             "originalRemoteFile": remoteName,
@@ -1775,6 +1797,7 @@ def sendBambuPrintJob(
             "api": apiResult,
             "startMethod": startMethodResult,
         }
+        return _with_plate_options(resultPayload)
 
 
 

@@ -165,6 +165,77 @@ def test_dispatchBambuPrintPropagatesTimelapseFlag(tmp_path: Path, monkeypatch: 
     assert selectedOptions.timeLapseDirectory is None
 
 
+def test_dispatchBambuPrintPreservesBrakePlateMetadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    samplePath = tmp_path / "sample.3mf"
+    samplePath.write_bytes(b"dummy")
+
+    entryData = {
+        "savedFile": str(samplePath),
+        "unencryptedData": {
+            "printer": {
+                "printerSerial": "SERIALBP",
+                "ipAddress": "192.168.1.11",
+                "accessCode": "ACCESS",
+                "brand": "Bambu Lab",
+            }
+        },
+        "decryptedData": {
+            "enable_brake_plate": True,
+            "template": "smooth_plate",
+        },
+    }
+
+    statusPayload = {
+        "fileName": "sample.3mf",
+        "lastRequestedAt": "2024-01-01T00:00:00Z",
+        "requestedMode": "full",
+        "success": True,
+    }
+
+    configuredPrinters = [
+        {
+            "serialNumber": "SERIALBP",
+            "ipAddress": "192.168.1.11",
+            "accessCode": "ACCESS",
+            "brand": "Bambu Lab",
+        }
+    ]
+
+    captured: dict[str, Any] = {}
+
+    def fakeSendBambuPrintJob(**kwargs: Any) -> dict[str, Any]:
+        options = kwargs.get("options")
+        captured["options"] = options
+        return {
+            "remoteFile": "uploaded.3mf",
+            "method": "lan",
+            "enableBrakePlate": getattr(options, "enableBrakePlate", None),
+            "plateTemplate": getattr(options, "plateTemplate", None),
+        }
+
+    monkeypatch.setattr(client, "sendBambuPrintJob", fakeSendBambuPrintJob)
+    patchRequestsPost(monkeypatch)
+
+    result = client.dispatchBambuPrintIfPossible(
+        baseUrl="https://example.com",
+        productId="product-1",
+        recipientId="recipient-1",
+        entryData=entryData,
+        statusPayload=statusPayload,
+        configuredPrinters=configuredPrinters,
+    )
+
+    assert result is not None
+    selectedOptions = captured.get("options")
+    assert isinstance(selectedOptions, bambuPrinter.BambuPrintOptions)
+    assert selectedOptions.enableBrakePlate is True
+    assert selectedOptions.plateTemplate == "smooth_plate"
+    assert result["result"]["enableBrakePlate"] is True
+    assert result["result"]["plateTemplate"] == "smooth_plate"
+
+
 def test_dispatchBambuPrintIncludesPrinterDetailsInErrors(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
