@@ -28,7 +28,14 @@ from .base44_client import (
     postReportError,
     postReportPrinterImage,
 )
-from .client import buildBaseUrl, defaultBaseUrl, getPrinterControlEndpointUrl
+from .client import (
+    buildBaseUrl,
+    defaultBaseUrl,
+    extractEnableTimeLapse,
+    extractTimeLapseDirectory,
+    getPrinterControlEndpointUrl,
+    interpretBoolean,
+)
 
 log = logging.getLogger(__name__)
 
@@ -49,6 +56,95 @@ CACHE_FILE_PATH = CACHE_DIRECTORY / "command-cache.json"
 
 _cacheData: Optional[Dict[str, Any]] = None
 _cacheLock = threading.Lock()
+
+
+def ensureTimelapseSessions(cache: Dict[str, Any]) -> Dict[str, Any]:
+    sessions = cache.setdefault("timelapse_sessions", {})
+    if isinstance(sessions, dict):
+        return sessions
+    normalized: Dict[str, Any] = {}
+    cache["timelapse_sessions"] = normalized
+    return normalized
+
+
+def recordTimelapseSession(serial: str, directory: Path) -> None:
+    normalizedSerial = str(serial or "").strip()
+    if not normalizedSerial:
+        return
+    cache = _ensureCacheLoaded()
+    sessions = ensureTimelapseSessions(cache)
+    sessions[normalizedSerial] = {
+        "directory": str(directory),
+        "started_at": _isoTimestamp(),
+    }
+    _writeCache()
+
+
+def clearTimelapseSession(serial: str) -> None:
+    normalizedSerial = str(serial or "").strip()
+    if not normalizedSerial:
+        return
+    cache = _ensureCacheLoaded()
+    sessions = ensureTimelapseSessions(cache)
+    if normalizedSerial in sessions:
+        sessions.pop(normalizedSerial, None)
+        _writeCache()
+
+
+def resolveTimelapsePreferences(metadata: Dict[str, Any]) -> tuple[Optional[bool], Optional[str]]:
+    aliasKeys = ["enableTimeLapse", "enable_timelapse", "timelapse", "timeLapse", "timelapseEnabled"]
+    enableCandidate: Optional[bool] = None
+    for key in aliasKeys:
+        if key in metadata:
+            interpreted = interpretBoolean(metadata[key])
+            if interpreted is not None:
+                enableCandidate = interpreted
+            elif metadata[key] is not None:
+                enableCandidate = bool(metadata[key])
+            break
+    if enableCandidate is None:
+        extracted = extractEnableTimeLapse(metadata)
+        if extracted is not None:
+            enableCandidate = extracted
+    if enableCandidate is None:
+        amsCandidate = metadata.get("ams_configuration") or metadata.get("amsConfiguration")
+        if isinstance(amsCandidate, dict):
+            for key in aliasKeys:
+                if key in amsCandidate:
+                    interpreted = interpretBoolean(amsCandidate[key])
+                    if interpreted is not None:
+                        enableCandidate = interpreted
+                    elif amsCandidate[key] is not None:
+                        enableCandidate = bool(amsCandidate[key])
+                    break
+            if enableCandidate is None:
+                extractedAms = extractEnableTimeLapse(amsCandidate)
+                if extractedAms is not None:
+                    enableCandidate = extractedAms
+    envEnable = os.getenv("PRINTMASTER_TIMELAPSE")
+    if enableCandidate is None and envEnable is not None and str(envEnable).strip():
+        interpreted = interpretBoolean(envEnable)
+        if interpreted is not None:
+            enableCandidate = interpreted
+        else:
+            enableCandidate = bool(str(envEnable).strip())
+
+    directoryCandidate: Optional[str] = None
+    dirAlias = ["timeLapseDirectory", "timelapse_directory", "timelapseDir"]
+    for key in dirAlias:
+        rawValue = metadata.get(key)
+        if rawValue:
+            directoryCandidate = str(rawValue)
+            break
+    if not directoryCandidate:
+        extractedDirectory = extractTimeLapseDirectory(metadata)
+        if extractedDirectory:
+            directoryCandidate = extractedDirectory
+    envDirectory = os.getenv("PRINTMASTER_TIMELAPSE_DIR", "").strip()
+    if not directoryCandidate and envDirectory:
+        directoryCandidate = envDirectory
+
+    return enableCandidate, directoryCandidate
 
 
 cameraDebugEnabled = (
@@ -574,12 +670,16 @@ def _ensureCacheLoaded() -> Dict[str, Any]:
                     if isinstance(loaded, dict):
                         _cacheData = loaded
                     else:
-                        _cacheData = {"commands": {}}
+                        _cacheData = {}
                 else:
-                    _cacheData = {"commands": {}}
+                    _cacheData = {}
             except Exception:
                 log.debug("Unable to load command cache", exc_info=True)
-                _cacheData = {"commands": {}}
+                _cacheData = {}
+        if not isinstance(_cacheData, dict):
+            _cacheData = {}
+        _cacheData.setdefault("commands", {})
+        ensureTimelapseSessions(_cacheData)
         return _cacheData
 
 
@@ -802,6 +902,18 @@ class CommandWorker:
             _finalizeCommand(commandId, "failed")
             return
 
+        extras = getattr(self, "_lastCommandExtras", {})
+        if isinstance(extras, dict):
+            eventPayload = extras.get("timelapseEvent")
+            if commandId and isinstance(eventPayload, dict):
+                try:
+                    self._emitTimelapseEvent(commandId, eventPayload)
+                except Exception:
+                    log.debug("Unable to emit timelapse event for %s", commandId, exc_info=True)
+            timelapseDetails = extras.get("timelapse")
+            if isinstance(timelapseDetails, dict) and timelapseDetails.get("directory") and message:
+                message = f"{message} [timelapse={timelapseDetails.get('directory')}]"
+
         try:
             self._sendCommandResult(commandId, status, message=message)
         except UnsupportedControlEndpointError as resultError:
@@ -901,6 +1013,30 @@ class CommandWorker:
         }
         log.debug("Sending ACK for %s via %s", commandId, self.controlAckUrl)
         return self._postControlPayload(self.controlAckUrl, payload, "ack")
+
+    def _emitTimelapseEvent(self, commandId: str, event: Dict[str, Any]) -> None:
+        statusValue = str(event.get("status") or "update").strip() or "update"
+        messagePayload = json.dumps(event)
+        try:
+            if self.pollMode == "recipient":
+                postCommandResult(commandId, statusValue, message=messagePayload)
+            else:
+                if not self.apiKeyValue or not self.recipientIdValue:
+                    raise RuntimeError("Missing API key or recipientId for CommandWorker")
+                payload = {
+                    "recipientId": self.recipientIdValue,
+                    "printerSerial": self.serial,
+                    "printerIpAddress": self.ipAddress,
+                    "commandId": commandId,
+                    "status": statusValue,
+                    "message": messagePayload,
+                }
+                self._postControlPayload(self.controlResultUrl, payload, "result")
+        except UnsupportedControlEndpointError as error:
+            log.debug("Timelapse event endpoint unavailable for %s: %s", commandId, error)
+        except Exception:
+            log.debug("Unable to submit timelapse event for %s", commandId, exc_info=True)
+
 
     def _sendCommandResult(
         self,
@@ -1489,6 +1625,7 @@ class CommandWorker:
         metadataValue = command.get("metadata")
         metadata = metadataValue if isinstance(metadataValue, dict) else {}
         message = ""
+        self._lastCommandExtras = {}
 
         def callPrinterMethod(name: str, *args: Any, **kwargs: Any) -> None:
             method = getattr(printer, name, None)
@@ -1685,18 +1822,32 @@ class CommandWorker:
             plateIndex = metadata.get("plateIndex")
             paramPath = metadata.get("paramPath")
             useAms = metadata.get("useAms")
+
+            enableTimelapsePref, directoryPreference = resolveTimelapsePreferences(metadata)
+            enableTimelapseFlag = bool(enableTimelapsePref) if enableTimelapsePref is not None else False
+            timelapseDirectory: Optional[Path] = None
+            timelapseDirectoryWarning: Optional[str] = None
+            if directoryPreference:
+                try:
+                    timelapseDirectory = Path(str(directoryPreference)).expanduser()
+                except Exception as error:
+                    timelapseDirectoryWarning = f"invalidTimelapseDirectory:{error}"
+                    log.warning("Invalid timelapse directory from metadata: %s (%s)", directoryPreference, error)
+                    timelapseDirectory = None
+
+            options = bambuPrinter.BambuPrintOptions(
+                ipAddress=self.ipAddress,
+                serialNumber=self.serial,
+                accessCode=self.accessCode,
+                useAms=useAms,
+                plateIndex=plateIndex,
+                enableTimeLapse=enableTimelapseFlag,
+                timeLapseDirectory=timelapseDirectory if timelapseDirectory else None,
+            )
+
+            apiResult: Optional[Dict[str, Any]] = None
             try:
-                callPrinterMethod("start_print", str(fileName), plateIndex or paramPath, use_ams=useAms)
-                message = "Print started"
-            except RuntimeError:
-                options = bambuPrinter.BambuPrintOptions(
-                    ipAddress=self.ipAddress,
-                    serialNumber=self.serial,
-                    accessCode=self.accessCode,
-                    useAms=useAms,
-                    plateIndex=plateIndex,
-                )
-                result = bambuPrinter.startPrintViaApi(
+                apiResult = bambuPrinter.startPrintViaApi(
                     ip=self.ipAddress,
                     serial=self.serial,
                     accessCode=self.accessCode,
@@ -1706,12 +1857,81 @@ class CommandWorker:
                     options=options,
                     job_metadata=metadata if isinstance(metadata, dict) else None,
                 )
-                acknowledged = result.get("acknowledged")
+            except Exception as error:
+                log.warning("API start failed for %s: %s", self.serial, error, exc_info=True)
+                clearTimelapseSession(self.serial)
+                fallbackTimelapseInfo = {
+                    "activated": False,
+                    "configured": False,
+                    "directory": str(timelapseDirectory) if timelapseDirectory else directoryPreference,
+                    "errors": [f"startPrintViaApi:{error}"],
+                }
+                if enableTimelapseFlag:
+                    self._lastCommandExtras = {
+                        "timelapse": dict(fallbackTimelapseInfo),
+                        "timelapseError": True,
+                        "timelapseEvent": {
+                            "status": "timelapseError",
+                            "timelapse": dict(fallbackTimelapseInfo),
+                            "directory": fallbackTimelapseInfo.get("directory"),
+                            "errors": list(fallbackTimelapseInfo.get("errors", [])),
+                        },
+                    }
+                else:
+                    self._lastCommandExtras = {}
+                callPrinterMethod("start_print", str(fileName), plateIndex or paramPath, use_ams=useAms)
+                message = "Print started via printer.start_print fallback"
+            else:
+                acknowledged = apiResult.get("acknowledged") if isinstance(apiResult, dict) else None
                 message = (
                     f"Print started (acknowledged={acknowledged})"
                     if acknowledged is not None
                     else "Print started"
                 )
+                timelapseInfo = apiResult.get("timelapse") if isinstance(apiResult, dict) else None
+                if not isinstance(timelapseInfo, dict):
+                    timelapseInfo = {
+                        "activated": False,
+                        "configured": False,
+                        "directory": str(timelapseDirectory) if timelapseDirectory else directoryPreference,
+                        "errors": [],
+                    }
+                else:
+                    normalizedDirectory = timelapseInfo.get("directory") or directoryPreference
+                    if normalizedDirectory is not None:
+                        timelapseInfo["directory"] = str(normalizedDirectory)
+                if timelapseDirectoryWarning and enableTimelapseFlag:
+                    errorsList = list(timelapseInfo.get("errors", []))
+                    errorsList.append(timelapseDirectoryWarning)
+                    timelapseInfo["errors"] = errorsList
+                timelapseErrorFlag = bool(apiResult.get("timelapseError")) if isinstance(apiResult, dict) else False
+                timelapseErrorFlag = timelapseErrorFlag or bool(timelapseInfo.get("errors"))
+                extras: Dict[str, Any] = {
+                    "timelapse": dict(timelapseInfo),
+                    "timelapseError": timelapseErrorFlag,
+                }
+                if enableTimelapseFlag:
+                    eventPayload = {
+                        "status": "timelapseError" if timelapseErrorFlag else "timelapseConfigured",
+                        "timelapse": dict(timelapseInfo),
+                        "directory": timelapseInfo.get("directory"),
+                        "errors": list(timelapseInfo.get("errors", [])),
+                    }
+                    extras["timelapseEvent"] = eventPayload
+                    if (
+                        not timelapseErrorFlag
+                        and timelapseInfo.get("activated")
+                        and timelapseInfo.get("directory")
+                    ):
+                        try:
+                            recordTimelapseSession(self.serial, Path(str(timelapseInfo.get("directory"))).expanduser())
+                        except Exception:
+                            log.debug("Unable to persist timelapse session for %s", self.serial, exc_info=True)
+                    else:
+                        clearTimelapseSession(self.serial)
+                else:
+                    clearTimelapseSession(self.serial)
+                self._lastCommandExtras = extras
             self._jobActive = True
             try:
                 self._lastRemoteFile = str(fileName)

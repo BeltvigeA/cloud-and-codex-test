@@ -265,6 +265,13 @@ def test_startPrintViaApi_enables_timelapse(monkeypatch: pytest.MonkeyPatch, tmp
     monkeypatch.setattr(bambuPrinter, "bambulabsApi", ApiModuleStub(lambda *_args, **_kwargs: fakePrinter))
     monkeypatch.setattr(bambuPrinter.time, "sleep", lambda _seconds: None)
 
+
+
+def test_startPrintViaApi_emits_timelapse_event(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    fakePrinter = FakeApiPrinter()
+    monkeypatch.setattr(bambuPrinter, "bambulabsApi", ApiModuleStub(lambda *_args, **_kwargs: fakePrinter))
+    monkeypatch.setattr(bambuPrinter.time, "sleep", lambda _seconds: None)
+
     timelapseDir = tmp_path / "timelapse"
     options = bambuPrinter.BambuPrintOptions(
         ipAddress="1.2.3.4",
@@ -275,7 +282,37 @@ def test_startPrintViaApi_enables_timelapse(monkeypatch: pytest.MonkeyPatch, tmp
         timeLapseDirectory=timelapseDir,
     )
 
+    events: list[dict[str, Any]] = []
+
+    def capture(event: Dict[str, Any]) -> None:
+        events.append(dict(event))
+
     bambuPrinter.startPrintViaApi(
+        ip="1.2.3.4",
+        serial="SERIAL",
+        accessCode="CODE",
+        uploaded_name="job.3mf",
+        plate_index=1,
+        param_path="Metadata/plate_1.gcode",
+        options=options,
+        job_metadata=None,
+        ack_timeout_sec=0.2,
+        statusCallback=capture,
+    )
+
+    statuses = [event.get("status") for event in events]
+    assert "timelapseConfigured" in statuses
+    timelapseDir = tmp_path / "timelapse"
+    options = bambuPrinter.BambuPrintOptions(
+        ipAddress="1.2.3.4",
+        serialNumber="SERIAL",
+        accessCode="CODE",
+        waitSeconds=1,
+        enableTimeLapse=True,
+        timeLapseDirectory=timelapseDir,
+    )
+
+    result = bambuPrinter.startPrintViaApi(
         ip="1.2.3.4",
         serial="SERIAL",
         accessCode="CODE",
@@ -291,6 +328,12 @@ def test_startPrintViaApi_enables_timelapse(monkeypatch: pytest.MonkeyPatch, tmp
     assert timelapseDir.exists()
     assert fakePrinter.camera_client.configuredDirectories == [expectedDirectory]
     assert fakePrinter.camera_client.timelapseActivations == [expectedDirectory]
+    assert isinstance(result, dict)
+    assert result.get("timelapseError") is False
+    assert result.get("timelapse", {}).get("activated") is True
+    assert result.get("timelapse", {}).get("configured") is True
+    assert result.get("timelapse", {}).get("directory") == expectedDirectory
+    assert result.get("timelapse", {}).get("errors") == []
 
 
 def test_sendBambuPrintJob_uses_api(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

@@ -18,6 +18,7 @@ import requests
 from .database import LocalDatabase
 from .persistence import storePrintSummary
 from .bambuPrinter import BambuPrintOptions, deleteRemoteFile, postStatus, sendBambuPrintJob
+from .pending import listPending
 
 
 defaultBaseUrl = "https://printer-backend-934564650450.europe-west1.run.app"
@@ -318,7 +319,7 @@ def extractPreferredTransport(*sources: Any) -> Optional[str]:
 
 
 def extractEnableTimeLapse(*sources: Any) -> Optional[bool]:
-    targetKeys = {"enabletimelapse", "timelapseenabled"}
+    targetKeys = {"enabletimelapse", "timelapseenabled", "timelapse"}
 
     def search(value: Any) -> Optional[bool]:
         if isinstance(value, dict):
@@ -349,7 +350,7 @@ def extractEnableTimeLapse(*sources: Any) -> Optional[bool]:
 
 
 def extractTimeLapseDirectory(*sources: Any) -> Optional[str]:
-    targetKeys = {"timelapsedirectory", "timelapsepath"}
+    targetKeys = {"timelapsedirectory", "timelapsepath", "timelapsedir"}
 
     def search(value: Any) -> Optional[str]:
         if isinstance(value, dict):
@@ -1903,25 +1904,26 @@ def sendHandshakeResponse(
         return None
 
 
-def fetchPendingFiles(baseUrl: str, recipientId: str) -> Optional[List[Dict[str, Any]]]:
-    pendingUrl = buildPendingUrl(baseUrl, recipientId)
-    logging.info("Checking for pending files for recipient %s", recipientId)
+def fetchPendingFiles(
+    baseUrl: str,
+    recipientId: str,
+    *,
+    statusApiKey: Optional[str] = None,
+) -> Optional[List[Dict[str, Any]]]:
+    pendingUrl = buildPendingUrl(baseUrl, recipientId.strip())
+    logging.info("Checking for pending files for recipient %s", recipientId.strip())
     try:
-        response = requests.get(pendingUrl, timeout=30)
-        response.raise_for_status()
-    except requests.RequestException as error:
+        pendingFiles = listPending(
+            recipientId.strip(),
+            baseUrl=baseUrl,
+            apiKey=statusApiKey,
+        )
+    except Exception as error:  # pragma: no cover - network issues handled as errors
         logging.error("Failed to fetch pending files: %s", error)
         return None
 
-    try:
-        payload = response.json()
-    except json.JSONDecodeError as error:
-        logging.error("Invalid JSON response when listing pending files: %s", error)
-        return None
-
-    pendingFiles = payload.get("pendingFiles")
     if not isinstance(pendingFiles, list):
-        logging.error("Unexpected response format when listing pending files: %s", payload)
+        logging.error("Unexpected response format when listing pending files: %s", pendingFiles)
         return None
 
     return pendingFiles

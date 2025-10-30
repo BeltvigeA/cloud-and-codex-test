@@ -24,6 +24,13 @@ from tkinter import filedialog, messagebox, ttk
 
 import requests
 
+# Provide overridable handles for tests that monkeypatch printer telemetry helpers.
+bambuApi: Any = None
+
+
+def waitForMqttReady(_printer: Any) -> bool:
+    return False
+
 
 hardcodedBaseUrl = "https://printer-backend-934564650450.europe-west1.run.app"
 hardcodedApiKey = (
@@ -97,6 +104,8 @@ from .client import (
     interpretInteger,
     listenForFiles,
     extractPreferredTransport,
+    extractEnableTimeLapse,
+    extractTimeLapseDirectory,
     registerPrintersConfigChangedListener,
 )
 
@@ -171,6 +180,7 @@ class ListenerGuiApp:
         self.logFilePath: Optional[Path] = None
 
         self.printerStoragePath = Path.home() / ".printmaster" / "printers.json"
+        self.defaultTimeLapseDirectory = str(Path.home() / ".printmaster" / "timelapse")
         self.printers: list[Dict[str, Any]] = self._loadPrinters()
         self.printerStatusQueue: "Queue[tuple[str, Any]]" = Queue()
         self.statusRefreshThread: Optional[threading.Thread] = None
@@ -461,6 +471,8 @@ class ListenerGuiApp:
                                     "remainingTimeSeconds": self._parseOptionalInt(entry.get("remainingTimeSeconds")),
                                     "gcodeState": self._parseOptionalString(entry.get("gcodeState")),
                                     "manualStatusDefaults": entry.get("manualStatusDefaults"),
+                                    "enableTimeLapse": entry.get("enableTimeLapse"),
+                                    "timeLapseDirectory": entry.get("timeLapseDirectory"),
                                 }
                             )
                         )
@@ -555,6 +567,28 @@ class ListenerGuiApp:
         bambuConnect = getattr(self, "bambuConnectMethod", "bambu_connect")
         defaultTransport = getattr(self, "defaultConnectionMethod", "octoprint")
         mqttTransport = getattr(self, "mqttConnectionMethod", "mqtt")
+
+        enableCandidate = printerDetails.get("enableTimeLapse")
+        if isinstance(enableCandidate, bool):
+            enableTimeLapse = enableCandidate
+        else:
+            interpretedEnable = interpretBoolean(enableCandidate)
+            enableTimeLapse = bool(interpretedEnable) if interpretedEnable is not None else False
+        printerDetails["enableTimeLapse"] = enableTimeLapse
+
+        defaultTimelapseDirectory = getattr(
+            self,
+            "defaultTimeLapseDirectory",
+            str(Path.home() / ".printmaster" / "timelapse"),
+        )
+        directoryCandidate = self._parseOptionalString(printerDetails.get("timeLapseDirectory"))
+        if not directoryCandidate:
+            directoryCandidate = defaultTimelapseDirectory
+        try:
+            expandedDirectory = str(Path(directoryCandidate).expanduser())
+        except Exception:
+            expandedDirectory = directoryCandidate
+        printerDetails["timeLapseDirectory"] = expandedDirectory
 
         modelCandidate = self._parseOptionalString(printerDetails.get("bambuModel")) or ""
         canonicalModel = bambuOptionsMap.get(modelCandidate.lower(), modelCandidate)
@@ -960,11 +994,15 @@ class ListenerGuiApp:
             "serialNumber": sanitizedRecord.get("serialNumber", ""),
             "brand": sanitizedRecord.get("brand", ""),
             "bambuModel": sanitizedRecord.get("bambuModel", ""),
+            "enableTimeLapse": bool(sanitizedRecord.get("enableTimeLapse", False)),
+            "timeLapseDirectory": sanitizedRecord.get("timeLapseDirectory", ""),
         }
 
         for key, value in mapping.items():
             variable = variableMap.get(key)
-            if isinstance(variable, tk.StringVar):
+            if isinstance(variable, tk.BooleanVar):
+                variable.set(bool(value))
+            elif isinstance(variable, tk.StringVar):
                 variable.set(str(value or ""))
 
         connectionVariable = variableMap.get("connectionMethod")
@@ -985,6 +1023,10 @@ class ListenerGuiApp:
         updateControls = dialogInfo.get("updateControls")
         if callable(updateControls):
             updateControls()
+
+        timelapseUpdater = dialogInfo.get("updateTimelapseControls")
+        if callable(timelapseUpdater):
+            timelapseUpdater()
 
         dialogInfo["transport"] = sanitizedRecord.get("transport")
         dialogInfo["useCloud"] = sanitizedRecord.get("useCloud")
@@ -1435,6 +1477,16 @@ class ListenerGuiApp:
         brandVar = tk.StringVar(value=(initialValues or {}).get("brand", ""))
         bambuModelVar = tk.StringVar(value=(initialValues or {}).get("bambuModel", ""))
         connectionMethodVar = tk.StringVar(value=(initialValues or {}).get("connectionMethod", ""))
+        enableTimeLapseVar = tk.BooleanVar(
+            value=bool((initialValues or {}).get("enableTimeLapse", False))
+        )
+        initialTimelapseDirectory = (initialValues or {}).get("timeLapseDirectory")
+        timelapseDirectoryDefault = (
+            str(initialTimelapseDirectory)
+            if initialTimelapseDirectory
+            else getattr(self, "defaultTimeLapseDirectory", str(Path.home() / ".printmaster" / "timelapse"))
+        )
+        timeLapseDirectoryVar = tk.StringVar(value=timelapseDirectoryDefault)
         initialStatus = (initialValues or {}).get("status", "Unknown") or "Unknown"
 
         ttk.Label(dialog, text="Nickname:").grid(row=0, column=0, sticky=tk.W, padx=12, pady=(12, 4))
@@ -1559,6 +1611,59 @@ class ListenerGuiApp:
         connectionMethodCombo.config(values=initialTransports)
         updateConnectionControls()
 
+        def browseTimelapseDirectory() -> None:
+            initialDirectory = timeLapseDirectoryVar.get().strip()
+            if not initialDirectory:
+                initialDirectory = timelapseDirectoryDefault
+            selectedDirectory = filedialog.askdirectory(
+                parent=dialog,
+                initialdir=initialDirectory,
+                title="Select timelapse directory",
+            )
+            if selectedDirectory:
+                timeLapseDirectoryVar.set(selectedDirectory)
+
+        enableTimelapseCheck = ttk.Checkbutton(
+            dialog,
+            text="Enable timelapse",
+            variable=enableTimeLapseVar,
+        )
+        enableTimelapseCheck.grid(row=7, column=0, columnspan=2, sticky=tk.W, padx=12, pady=4)
+
+        ttk.Label(dialog, text="Timelapse Directory:").grid(
+            row=8, column=0, sticky=tk.W, padx=12, pady=4
+        )
+        timelapseDirectoryFrame = ttk.Frame(dialog)
+        timelapseDirectoryFrame.grid(row=8, column=1, sticky=tk.EW, padx=12, pady=4)
+        timelapseDirectoryFrame.columnconfigure(0, weight=1)
+        timelapseEntry = ttk.Entry(
+            timelapseDirectoryFrame,
+            textvariable=timeLapseDirectoryVar,
+        )
+        timelapseEntry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        timelapseBrowseButton = ttk.Button(
+            timelapseDirectoryFrame,
+            text="Browse...",
+            command=browseTimelapseDirectory,
+        )
+        timelapseBrowseButton.pack(side=tk.LEFT, padx=(6, 0))
+
+        def updateTimelapseControls(*_args: Any) -> None:
+            defaultDirectory = getattr(
+                self,
+                "defaultTimeLapseDirectory",
+                str(Path.home() / ".printmaster" / "timelapse"),
+            )
+            state = tk.NORMAL if enableTimeLapseVar.get() else tk.DISABLED
+            timelapseEntry.configure(state=state)
+            timelapseBrowseButton.configure(state=state)
+            if enableTimeLapseVar.get() and not timeLapseDirectoryVar.get().strip():
+                timeLapseDirectoryVar.set(defaultDirectory)
+
+        enableTimelapseCheck.configure(command=updateTimelapseControls)
+        enableTimeLapseVar.trace_add("write", lambda *_: updateTimelapseControls())
+        updateTimelapseControls()
+
         def handleDialogDestroyed(event: Any) -> None:
             if event.widget is dialog and isinstance(getattr(self, "activePrinterDialog", None), dict):
                 if self.activePrinterDialog.get("dialog") is dialog:
@@ -1576,9 +1681,15 @@ class ListenerGuiApp:
                 "brand": brandVar,
                 "bambuModel": bambuModelVar,
                 "connectionMethod": connectionMethodVar,
+                "enableTimeLapse": enableTimeLapseVar,
+                "timeLapseDirectory": timeLapseDirectoryVar,
             },
             "accessEntry": accessCodeEntry,
             "updateControls": updateConnectionControls,
+            "updateTimelapseControls": updateTimelapseControls,
+            "timelapseEntry": timelapseEntry,
+            "timelapseBrowse": timelapseBrowseButton,
+            "timelapseCheck": enableTimelapseCheck,
             "isEdit": bool(initialValues),
             "transport": (initialValues or {}).get("transport"),
             "useCloud": (initialValues or {}).get("useCloud"),
@@ -1591,9 +1702,9 @@ class ListenerGuiApp:
         ttk.Label(
             dialog,
             text="Recipient, API key og URL styres fra Listener-panelet.",
-        ).grid(row=7, column=0, columnspan=2, sticky=tk.W, padx=12, pady=(0, 4))
-        statusLabelRow = 8
-        statusInfoLabelRow = 9
+        ).grid(row=9, column=0, columnspan=2, sticky=tk.W, padx=12, pady=(0, 4))
+        statusLabelRow = 10
+        statusInfoLabelRow = 11
 
         ttk.Label(dialog, text=f"Status: {initialStatus}").grid(
             row=statusLabelRow,
@@ -1632,6 +1743,8 @@ class ListenerGuiApp:
                 brandVar,
                 bambuModelVar,
                 connectionMethodVar,
+                enableTimeLapseVar,
+                timeLapseDirectoryVar,
                 onSave,
             ),
         ).pack(side=tk.LEFT, padx=6)
@@ -1649,6 +1762,8 @@ class ListenerGuiApp:
         brandVar: tk.StringVar,
         bambuModelVar: tk.StringVar,
         connectionMethodVar: tk.StringVar,
+        enableTimeLapseVar: tk.BooleanVar,
+        timeLapseDirectoryVar: tk.StringVar,
         onSave: Callable[[Dict[str, Any]], None],
     ) -> None:
         nickname = nicknameVar.get().strip()
@@ -1681,6 +1796,22 @@ class ListenerGuiApp:
             "bambuModel": bambuModel,
             "connectionMethod": connectionMethod,
         }
+
+        enableTimeLapse = bool(enableTimeLapseVar.get())
+        rawTimeLapseDirectory = timeLapseDirectoryVar.get().strip()
+        if not rawTimeLapseDirectory:
+            rawTimeLapseDirectory = getattr(
+                self,
+                "defaultTimeLapseDirectory",
+                str(Path.home() / ".printmaster" / "timelapse"),
+            )
+        try:
+            expandedTimeLapseDirectory = str(Path(rawTimeLapseDirectory).expanduser())
+        except Exception:
+            expandedTimeLapseDirectory = rawTimeLapseDirectory
+
+        printerDetails["enableTimeLapse"] = enableTimeLapse
+        printerDetails["timeLapseDirectory"] = expandedTimeLapseDirectory
 
         bambuConnect = getattr(self, "bambuConnectMethod", "bambu_connect")
         mqttTransport = getattr(self, "mqttConnectionMethod", "mqtt")
@@ -1795,6 +1926,8 @@ class ListenerGuiApp:
             "progressPercent": None,
             "remainingTimeSeconds": None,
             "gcodeState": None,
+            "online": availabilityStatus != "Offline",
+            "mqttReady": False,
         }
         if availabilityStatus == "Offline":
             return telemetry
@@ -1805,6 +1938,20 @@ class ListenerGuiApp:
 
         looksLikeBambu = brand is None or "bambu" in brand.lower()
         if serialNumber and accessCode and looksLikeBambu:
+            printerClient: Any = None
+            if bambuApi is not None:
+                try:
+                    printerClient = bambuApi.Printer(ipAddress, accessCode, serialNumber)
+                except Exception:
+                    printerClient = None
+            if printerClient is not None:
+                try:
+                    telemetry["mqttReady"] = bool(waitForMqttReady(printerClient))
+                except Exception:
+                    telemetry["mqttReady"] = False
+                finally:
+                    with contextlib.suppress(Exception):
+                        printerClient.disconnect()
             try:
                 bambuTelemetry = self._fetchBambuTelemetry(ipAddress, serialNumber, accessCode)
                 if bambuTelemetry:
@@ -1812,7 +1959,20 @@ class ListenerGuiApp:
             except Exception as error:  # noqa: BLE001 - telemetry is best-effort
                 logging.debug("Unable to fetch Bambu telemetry from %s: %s", ipAddress, error)
 
+        telemetry["online"] = self._telemetryIndicatesReadiness(telemetry)
+
         return telemetry
+
+    def _telemetryIndicatesReadiness(self, telemetry: Dict[str, Any]) -> bool:
+        statusCandidate = str(telemetry.get("status") or "").strip().lower()
+        if statusCandidate in {"online", "printing", "idle", "completed", "ready"}:
+            return True
+        progressCandidate = telemetry.get("progressPercent")
+        if isinstance(progressCandidate, (int, float)) and progressCandidate >= 0:
+            return True
+        if telemetry.get("mqttReady"):
+            return True
+        return False
 
     def _sendAutomaticPrinterStatus(
         self,
@@ -1956,15 +2116,21 @@ class ListenerGuiApp:
         accessCode: str,
         timeoutSeconds: float = 4.0,
     ) -> Dict[str, Any]:
-        try:
-            import bambulabs_api as bl  # type: ignore[import]
-        except Exception:
-            return {}
-
-        try:
-            printer = bl.Printer(ipAddress, accessCode, serialNumber)
-        except Exception:
-            return {}
+        printer = None
+        if bambuApi is not None:
+            try:
+                printer = bambuApi.Printer(ipAddress, accessCode, serialNumber)
+            except Exception:
+                printer = None
+        if printer is None:
+            try:
+                import bambulabs_api as bl  # type: ignore[import]
+            except Exception:
+                return {}
+            try:
+                printer = bl.Printer(ipAddress, accessCode, serialNumber)
+            except Exception:
+                return {}
 
         try:
             mqttStart = getattr(printer, "mqtt_start", None)
@@ -2580,6 +2746,47 @@ class ListenerGuiApp:
         if waitSecondsValue is None:
             waitSecondsValue = 8
 
+        metadataEnableTimeLapse = extractEnableTimeLapse(metadata)
+        metadataTimeLapseDirectory = extractTimeLapseDirectory(metadata)
+
+        configEnableCandidate = printerConfig.get("enableTimeLapse")
+        if metadataEnableTimeLapse is not None:
+            enableTimeLapseValue = metadataEnableTimeLapse
+        elif isinstance(configEnableCandidate, bool):
+            enableTimeLapseValue = configEnableCandidate
+        else:
+            interpretedEnable = interpretBoolean(configEnableCandidate)
+            enableTimeLapseValue = bool(interpretedEnable) if interpretedEnable is not None else False
+
+        directoryCandidate: Optional[str]
+        if metadataTimeLapseDirectory:
+            directoryCandidate = metadataTimeLapseDirectory
+        else:
+            directoryCandidate = printerConfig.get("timeLapseDirectory")
+        if not directoryCandidate:
+            directoryCandidate = getattr(
+                self,
+                "defaultTimeLapseDirectory",
+                str(Path.home() / ".printmaster" / "timelapse"),
+            )
+
+        resolvedTimeLapseDirectory: Optional[Path] = None
+        if directoryCandidate:
+            try:
+                resolvedTimeLapseDirectory = Path(str(directoryCandidate)).expanduser()
+            except Exception as error:
+                self.log(f"Ugyldig timelapse-katalog: {directoryCandidate} ({error})")
+                try:
+                    resolvedTimeLapseDirectory = Path(
+                        getattr(
+                            self,
+                            "defaultTimeLapseDirectory",
+                            str(Path.home() / ".printmaster" / "timelapse"),
+                        )
+                    ).expanduser()
+                except Exception:
+                    resolvedTimeLapseDirectory = None
+
         options = BambuPrintOptions(
             ipAddress=ipAddressValue,
             serialNumber=serialValue,
@@ -2596,18 +2803,44 @@ class ListenerGuiApp:
             useCloud=(selectedTransport == "bambu_connect"),
             cloudUrl=cloudUrlValue,
             transport=selectedTransport,
+            enableTimeLapse=bool(enableTimeLapseValue),
+            timeLapseDirectory=resolvedTimeLapseDirectory if enableTimeLapseValue else None,
         )
 
         def worker() -> None:
             try:
                 self.log(f"Sender til Bambu: {path}")
+                def emitStatus(status: Dict[str, Any]) -> None:
+                    try:
+                        if isinstance(status, dict):
+                            statusKind = str(status.get("status") or "").strip()
+                            directoryHint: Optional[str] = None
+                            if statusKind in {"timelapseConfigured", "timelapseError", "timelapseSaved"}:
+                                directoryHint = str(status.get("directory") or "").strip() or None
+                                if not directoryHint:
+                                    details = status.get("timelapse")
+                                    if isinstance(details, dict):
+                                        directoryValue = details.get("directory")
+                                        if directoryValue:
+                                            directoryHint = str(directoryValue)
+                                if statusKind == "timelapseConfigured":
+                                    directorySummary = directoryHint or "default timelapse directory"
+                                    self.log(f"Timelapse configured at {directorySummary}")
+                                elif statusKind == "timelapseSaved":
+                                    directorySummary = directoryHint or "timelapse directory"
+                                    self.log(f"Timelapse saved to {directorySummary}")
+                                elif statusKind == "timelapseError":
+                                    errorDetails = status.get("error") or status.get("errors")
+                                    self.log(f"Timelapse error: {errorDetails}")
+                        self.log(json.dumps(status))
+                    except Exception:
+                        self.log(f"Status event: {status}")
+                    postStatus(status, printerConfig)
+
                 sendBambuPrintJob(
                     filePath=path,
                     options=options,
-                    statusCallback=lambda status: (
-                        self.log(json.dumps(status)),
-                        postStatus(status, printerConfig),
-                    ),
+                    statusCallback=emitStatus,
                 )
                 self.log("Startkommando sendt.")
             except Exception as error:  # noqa: BLE001 - surface errors to log

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 import logging
 import os
 import platform
@@ -11,6 +12,7 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 import requests
@@ -20,6 +22,39 @@ from .base44_client import postReportError, postUpdateStatus
 
 # Reduce noise from third-party SDK logger
 logging.getLogger("bambulabs_api").setLevel(logging.WARNING)
+
+
+CACHE_DIRECTORY = Path(os.path.expanduser("~/.printmaster"))
+CACHE_FILE_PATH = CACHE_DIRECTORY / "command-cache.json"
+_timelapseCacheLock = threading.Lock()
+
+
+def _popTimelapseSession(serial: str) -> Optional[Dict[str, Any]]:
+    normalized = str(serial or "").strip()
+    if not normalized:
+        return None
+    with _timelapseCacheLock:
+        try:
+            CACHE_DIRECTORY.mkdir(parents=True, exist_ok=True)
+            if CACHE_FILE_PATH.exists():
+                cache = json.loads(CACHE_FILE_PATH.read_text(encoding="utf-8"))
+            else:
+                cache = {}
+        except Exception:
+            logging.debug("Unable to load timelapse cache", exc_info=True)
+            return None
+        if not isinstance(cache, dict):
+            cache = {}
+        sessions = cache.get("timelapse_sessions")
+        if not isinstance(sessions, dict):
+            sessions = {}
+        session = sessions.pop(normalized, None)
+        cache["timelapse_sessions"] = sessions
+        try:
+            CACHE_FILE_PATH.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            logging.debug("Unable to persist timelapse cache", exc_info=True)
+        return session if isinstance(session, dict) else None
 
 
 try:  # pragma: no cover - dependency handled dynamically in tests
@@ -227,6 +262,9 @@ class BambuStatusSubscriber:
                                     lastErrorComparable = dict(errorComparable)
                                     lastErrorEmit = time.monotonic()
 
+                    if lastSnapshot is not None and self._timelapseTransitionDetected(lastSnapshot, statusPayload):
+                        self._finalizeTimelapseSession(serial, printerInstance, printerConfig)
+
                     emitNow = False
                     if lastSnapshot is None:
                         emitNow = True
@@ -345,6 +383,60 @@ class BambuStatusSubscriber:
                 )
         except Exception:  # pragma: no cover - readiness wait is best effort
             pass
+
+    def _timelapseTransitionDetected(self, previous: Dict[str, Any], current: Dict[str, Any]) -> bool:
+        prevState = str(previous.get("gcodeState") or previous.get("state") or "").strip().lower()
+        currState = str(current.get("gcodeState") or current.get("state") or "").strip().lower()
+        activeStates = {"printing", "print", "running", "run", "starting", "start", "preparing", "prepare", "heating"}
+        completedStates = {"finish", "finished", "completed", "complete", "idle", "success", "succeeded", "failed", "error", "canceled", "cancelled"}
+        prevProgress = previous.get("progressPercent")
+        currProgress = current.get("progressPercent")
+        wasActive = prevState in activeStates or (isinstance(prevProgress, (int, float)) and 0.0 < prevProgress < 100.0)
+        isCompleted = currState in completedStates or (isinstance(currProgress, (int, float)) and currProgress >= 100.0)
+        return wasActive and isCompleted
+
+    def _finalizeTimelapseSession(self, serial: str, printer: Any, printerConfig: Dict[str, Any]) -> None:
+        session = _popTimelapseSession(serial)
+        if session is None:
+            return
+        directory = session.get("directory")
+        stopErrors: List[str] = []
+        success = False
+        if printer is None:
+            stopErrors.append("printerUnavailable")
+        else:
+            cameraClient = getattr(printer, "camera_client", None)
+            for candidate in (cameraClient, printer):
+                if candidate is None:
+                    continue
+                for methodName in ("stop_timelapse_capture", "stop_timelapse", "disable_timelapse"):
+                    method = getattr(candidate, methodName, None)
+                    if not callable(method):
+                        continue
+                    try:
+                        method()
+                    except Exception as error:  # pragma: no cover - depends on SDK behaviour
+                        stopErrors.append(f"{methodName}:{error}")
+                        self.log.debug("Timelapse stop %s failed: %s", methodName, error, exc_info=True)
+                    else:
+                        success = True
+                        break
+                if success:
+                    break
+        statusValue = "timelapseSaved" if success and not stopErrors else "timelapseStopError"
+        eventPayload: Dict[str, Any] = {
+            "status": statusValue,
+            "directory": directory,
+            "serial": serial,
+        }
+        if stopErrors:
+            eventPayload["error"] = "; ".join(stopErrors)
+        self.log.info("[timelapse] finalize %s status=%s directory=%s", serial, statusValue, directory)
+        try:
+            self.onUpdate(dict(eventPayload), dict(printerConfig))
+        except Exception:  # pragma: no cover - consumer responsibility
+            self.log.exception("Timelapse finalize callback failed")
+
 
     def _collectSnapshot(
         self,

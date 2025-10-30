@@ -3,7 +3,7 @@
 from importlib import import_module
 from typing import TYPE_CHECKING, Any
 
-__all__ = ["client", "gui"]
+__all__ = ["client", "gui", "commands", "base44Status", "pending"]
 
 if TYPE_CHECKING:  # pragma: no cover - imported only for typing support
     from . import client as clientModule

@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from client.command_controller import CommandWorker, _normalizeCommandMetadata
 from client.gui import ListenerGuiApp
+from client import bambuPrinter
 
 
 class DummyResponse:
@@ -736,3 +737,98 @@ def testRecipientModeResultMapsSuccessStatuses(monkeypatch: pytest.MonkeyPatch) 
     assert captured[4] == ("cmd-failed", "failed", "details", None)
     assert captured[5] == ("cmd-error", "failed", None, "boom")
 
+
+
+def testCommandWorkerStartPrintUsesApiWithTimelapse(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    worker = CommandWorker(
+        serial="SERIAL999",
+        ipAddress="10.0.0.99",
+        accessCode="code",
+        apiKey="api-key",
+        recipientId="recipient-x",
+        baseUrl="https://example.com",
+    )
+
+    monkeypatch.setattr("client.command_controller._reserveCommand", lambda commandId: True)
+    monkeypatch.setattr("client.command_controller._finalizeCommand", lambda commandId, status: None)
+
+    ackCalls: list[tuple[str, str]] = []
+    resultCalls: list[Dict[str, Any]] = []
+    emittedEvents: list[Dict[str, Any]] = []
+    recordedSessions: list[tuple[str, Path]] = []
+
+    def fakeAck(self: CommandWorker, commandId: str, status: str) -> bool:
+        ackCalls.append((commandId, status))
+        return True
+
+    def fakeResult(
+        self: CommandWorker,
+        commandId: str,
+        status: str,
+        *,
+        message: Optional[str] = None,
+        errorMessage: Optional[str] = None,
+    ) -> None:
+        resultCalls.append(
+            {
+                "commandId": commandId,
+                "status": status,
+                "message": message,
+                "errorMessage": errorMessage,
+            }
+        )
+
+    def fakeEmit(self: CommandWorker, commandId: str, event: Dict[str, Any]) -> None:
+        emittedEvents.append(dict(event))
+
+    def fakeRecord(serial: str, directory: Path) -> None:
+        recordedSessions.append((serial, directory))
+
+    monkeypatch.setattr(CommandWorker, "_sendCommandAck", fakeAck)
+    monkeypatch.setattr(CommandWorker, "_sendCommandResult", fakeResult)
+    monkeypatch.setattr(CommandWorker, "_emitTimelapseEvent", fakeEmit)
+    monkeypatch.setattr("client.command_controller.recordTimelapseSession", fakeRecord)
+    monkeypatch.setattr("client.command_controller.clearTimelapseSession", lambda serial: None)
+
+    startOptions: Dict[str, Any] = {}
+
+    def fakeStart(**kwargs: Any) -> Dict[str, Any]:
+        startOptions.update(kwargs)
+        return {
+            "acknowledged": True,
+            "timelapse": {
+                "activated": True,
+                "configured": True,
+                "directory": str(tmp_path / "timelapse"),
+                "errors": [],
+            },
+            "timelapseError": False,
+        }
+
+    monkeypatch.setattr(bambuPrinter, "startPrintViaApi", fakeStart)
+    monkeypatch.setattr(CommandWorker, "_connectPrinter", lambda self: object())
+
+    command = {
+        "commandId": "cmd-42",
+        "commandType": "start_print",
+        "metadata": {
+            "fileName": "model.3mf",
+            "enableTimeLapse": True,
+            "timeLapseDirectory": str(tmp_path / "timelapse"),
+            "plateIndex": 1,
+        },
+    }
+
+    worker._processCommand(command)
+
+    assert ackCalls == [("cmd-42", "processing")]
+    assert resultCalls and resultCalls[0]["status"] == "completed"
+    message = resultCalls[0]["message"] or ""
+    assert "timelapse" in message
+    options = startOptions.get("options")
+    assert isinstance(options, bambuPrinter.BambuPrintOptions)
+    assert options.enableTimeLapse is True
+    assert options.timeLapseDirectory == (tmp_path / "timelapse")
+    assert any(event.get("status") == "timelapseConfigured" for event in emittedEvents)
+    assert recordedSessions and recordedSessions[0][0] == "SERIAL999"
+    assert recordedSessions[0][1] == (tmp_path / "timelapse")
