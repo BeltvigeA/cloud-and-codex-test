@@ -9,3 +9,16 @@ google-auth>=2.41.1
 bambulabs_api>=2.6.5
 rich>=13.7.0
 
+# Computer Vision dependencies for plate verification
+opencv-python>=4.8.1,<5.0
+scikit-image>=0.22.0,<1.0
+numpy>=1.24.3,<2.0
+Pillow>=10.1.0,<11.0
+imagehash>=4.3.1,<5.0
+PyYAML>=6.0,<7.0
+
+# Testing dependencies
+pytest>=7.4.3,<8.0
+pytest-cov>=4.1.0,<5.0
+pytest-benchmark>=4.0.0,<5.0
+

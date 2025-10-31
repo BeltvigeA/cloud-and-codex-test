@@ -1,0 +1,49 @@
+cv_detection:
+  preprocessing:
+    target_size: [960, 540]
+    clahe_clip_limit: 2.0
+    clahe_tile_grid: [8, 8]
+    gaussian_blur_kernel: [31, 31]
+
+  perceptual_hash:
+    hash_size: 16
+    match_threshold: 5  # Hamming distance for exact match
+
+  ssim:
+    window_size: 7
+    gaussian_weights: true
+
+  region_analysis:
+    min_area_pixels: 100
+    max_aspect_ratio: 5.0
+    difference_threshold: 0.5
+
+  adaptive_threshold:
+    base_threshold: 0.90
+    z_height_zones:
+      - z_max: 5.0
+        threshold: 0.95
+      - z_max: 20.0
+        threshold: 0.92
+      - z_max: 1000.0
+        threshold: 0.90
+    fp_rate_adjustment: 0.02
+    min_threshold: 0.85
+    max_threshold: 0.97
+
+  file_paths:
+    calibration_root: "/print_farm_data/calibration"
+    checkpoints_root: "/print_farm_data/checkpoints"
+    analysis_root: "/print_farm_data/cv_analysis"
+
+  performance:
+    preprocessing_target_ms: 10
+    hash_target_ms: 3
+    ssim_target_ms: 20
+    region_analysis_target_ms: 5
+    total_detection_target_ms: 50
+
+  logging:
+    level: "INFO"
+    log_all_detections: true
+    save_comparison_images: true
