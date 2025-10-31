@@ -43,7 +43,7 @@ def _resolveControlPollSeconds() -> float:
 
 
 CONTROL_POLL_SECONDS = _resolveControlPollSeconds()
-CONNECT_TIMEOUT_SECONDS = 10.0
+CONNECT_TIMEOUT_SECONDS = 30.0
 
 CACHE_DIRECTORY = Path(os.path.expanduser("~/.printmaster"))
 CACHE_FILE_PATH = CACHE_DIRECTORY / "command-cache.json"
