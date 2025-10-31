@@ -1596,11 +1596,11 @@ class CommandWorker:
                 return "completed", "Nothing to stop"
 
             controlConfig = {
-                "pause": (["pause_print"], "pause", "Paused"),
-                "resume": (["resume_print"], "resume", "Resumed"),
-                "stop": (["stop_print", "cancel_print"], "stop", "Stopped"),
-                "stop_print": (["stop_print", "cancel_print"], "stop", "Stopped"),
-                "cancel": (["cancel_print", "stop_print"], "stop", "Cancelled"),
+                "pause": (["pause_printer"], "pause", "Paused"),
+                "resume": (["resume_printer"], "resume", "Resumed"),
+                "stop": (["stop_printer"], "stop", "Stopped"),
+                "stop_print": (["stop_printer"], "stop", "Stopped"),
+                "cancel": (["stop_printer"], "stop", "Cancelled"),
             }
             methods, transportCmd, okMessage = controlConfig[normalizedType]
 
