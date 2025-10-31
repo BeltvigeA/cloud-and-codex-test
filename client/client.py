@@ -1060,6 +1060,12 @@ def dispatchBambuPrintIfPossible(
 
     jobId = extractPrintJobId(entryData, entryData.get("productStatus"), statusPayload)
     printerId = str(serialNumber or resolvedDetails.get("nickname") or "") or "unknown"
+    
+    # Combine all metadata sources for passing to sendBambuPrintJob
+    combinedJobMetadata: Dict[str, Any] = {}
+    for metadataSource in (entryData.get("unencryptedData"), entryData.get("decryptedData"), statusPayload):
+        if isinstance(metadataSource, dict):
+            combinedJobMetadata.update(metadataSource)
 
     rawPayloadTransport = extractPreferredTransport(entryData, statusPayload)
     rawClientTransport = extractPreferredTransport(resolvedDetails)
@@ -1311,6 +1317,7 @@ def dispatchBambuPrintIfPossible(
             options=options,
             statusCallback=capture,
             skippedObjects=skippedTargets,
+            jobMetadata=combinedJobMetadata,
         )
         capture(
             {
