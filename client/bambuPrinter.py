@@ -139,9 +139,6 @@ def _preselect_project_file(
         payload["print"]["param"] = startParam
     payload["print"].update({key: value for key, value in sendControlFlags.items() if value is not None})
     if START_DEBUG:
-        timelapseEnabled = payload["print"].get("timelapse", False)
-        if timelapseEnabled:
-            logger.info("[start] timelapse ENABLED in project_file command")
         logger.info("[start] preselect send_control payload=%s", payload)
     try:
         controlMethod(payload)
@@ -491,117 +488,6 @@ def uploadViaFtps(
             pass
 
 
-def downloadTimelapseViaFtps(
-    *,
-    ip: str,
-    accessCode: str,
-    serial: str,
-    localDirectory: Path,
-    insecureTls: bool = True,
-    timeout: int = 120,
-) -> Optional[Path]:
-    """Download the latest timelapse video from the printer via FTPS."""
-
-    tlsContext = makeTlsContext(insecure=insecureTls)
-    ftps = ImplicitFtpTls(context=tlsContext)
-    port = 990
-
-    try:
-        logger.info("[timelapse] Connecting to FTPS at %s:%s", ip, port)
-        ftps.connect(ip, port, timeout=timeout)
-    except (OSError, socket.timeout, ssl.SSLError, EOFError) as connectionError:
-        errorMessage = f"[timelapse] ✗ Failed to connect to printer FTPS: {connectionError}"
-        logger.error(errorMessage)
-        return None
-
-    ftps.timeout = timeout
-
-    try:
-        ftps.login("bblp", accessCode)
-        logger.info("[timelapse] Logging in to FTPS")
-        ftps.prot_p()
-        ftps.set_pasv(True)
-        ftps.voidcmd("TYPE I")
-
-        # Navigate to /timelapse directory
-        try:
-            ftps.cwd("/timelapse")
-            logger.info("[timelapse] Changed to /timelapse directory")
-        except Exception as cdError:
-            logger.warning("[timelapse] ✗ Could not access /timelapse directory: %s", cdError)
-            return None
-
-        # List files in directory
-        fileList = []
-        try:
-            ftps.retrlines("LIST", fileList.append)
-            logger.info("[timelapse] Found %d items in /timelapse directory", len(fileList))
-        except Exception as listError:
-            logger.warning("[timelapse] ✗ Could not list /timelapse directory: %s", listError)
-            return None
-
-        # Parse file list and find .avi files
-        timelapseFiles = []
-        for line in fileList:
-            parts = line.split()
-            if len(parts) >= 9:
-                filename = " ".join(parts[8:])
-                if filename.lower().endswith(".avi"):
-                    timelapseFiles.append(filename)
-
-        if not timelapseFiles:
-            logger.info("[timelapse] ✗ No timelapse files (.avi) found in /timelapse directory")
-            return None
-
-        # Get the latest file (last in alphabetical order usually means newest)
-        latestFile = sorted(timelapseFiles)[-1]
-        logger.info("[timelapse] Latest timelapse file: %s", latestFile)
-
-        # Create local directory if it doesn't exist
-        localDirectory.mkdir(parents=True, exist_ok=True)
-
-        # Build local filename with serial number prefix
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        localFilename = f"{serial}_{timestamp}_{latestFile}"
-        localPath = localDirectory / localFilename
-
-        # Download the file
-        logger.info("[timelapse] Downloading %s to %s", latestFile, localPath)
-        downloadStartTime = time.time()
-
-        with open(localPath, "wb") as localFile:
-            try:
-                ftps.retrbinary(f"RETR {latestFile}", localFile.write)
-            except Exception as downloadError:
-                logger.error("[timelapse] ✗ Download failed: %s", downloadError)
-                # Clean up partial file
-                try:
-                    localPath.unlink()
-                except Exception:
-                    pass
-                return None
-
-        downloadDuration = time.time() - downloadStartTime
-        fileSize = localPath.stat().st_size / (1024 * 1024)  # MB
-        speed = fileSize / downloadDuration if downloadDuration > 0 else 0
-
-        logger.info(
-            "[timelapse] Download complete: %.1f MB in %.1f seconds (%.2f MB/s)",
-            fileSize,
-            downloadDuration,
-            speed
-        )
-        logger.info("[timelapse] ✓ Timelapse successfully saved to: %s", localPath)
-
-        return localPath
-
-    finally:
-        try:
-            ftps.quit()
-        except Exception:
-            pass
-
-
 def uploadViaBambulabsApi(
     *,
     ip: str,
@@ -833,46 +719,6 @@ def _resolveTimeLapseDirectory(
     if ensure:
         directory.mkdir(parents=True, exist_ok=True)
     return directory
-
-
-def _enableTimelapseViaMqtt(printer: Any) -> bool:
-    """Send MQTT command to enable timelapse recording on the printer."""
-    command = {
-        "camera": {
-            "sequence_id": "0",
-            "command": "ipcam_timelapse",
-            "control": "enable"
-        }
-    }
-
-    # Try multiple methods to send the MQTT command
-    methods_to_try = [
-        ("publish", lambda: getattr(printer, "publish", None)),
-        ("send_control", lambda: getattr(printer, "send_control", None)),
-        ("send_message", lambda: getattr(printer, "send_message", None)),
-    ]
-
-    for method_name, method_getter in methods_to_try:
-        method = method_getter()
-        if not callable(method):
-            continue
-        try:
-            method(command)
-            if START_DEBUG:
-                logger.info("[timelapse] ✓ Enabled via %s", method_name)
-            return True
-        except Exception as error:  # pragma: no cover - diagnostic logging only
-            if START_DEBUG:
-                logger.debug(
-                    "[timelapse] %s failed: %s",
-                    method_name,
-                    error,
-                    exc_info=True
-                )
-
-    if START_DEBUG:
-        logger.info("[timelapse] ✗ Could not find method to enable timelapse via MQTT")
-    return False
 
 
 def _activateTimelapseCapture(printer: Any, directory: Path) -> None:
@@ -1316,7 +1162,6 @@ def startPrintViaApi(
         "layer_inspect": bool(options.layerInspect),
         "flow_cali": bool(options.flowCalibration),
         "vibration_cali": bool(options.vibrationCalibration),
-        "timelapse": bool(timelapsePath is not None),
     }
 
     if START_DEBUG:
@@ -1380,8 +1225,6 @@ def startPrintViaApi(
         _preselect_project_file(printer, remoteUrl, startParam, sendControlFlags)
 
     if timelapsePath is not None:
-        # Send MQTT command to enable timelapse on the printer
-        _enableTimelapseViaMqtt(printer)
         _activateTimelapseCapture(printer, timelapsePath)
 
     def _invokeStart() -> None:
@@ -1392,9 +1235,6 @@ def startPrintViaApi(
             try:
                 positionalArgs = [uploaded_name, plateArgument]
                 keywordArgs = dict(startKeywordArgs)
-                # Add timelapse parameter if timelapse is enabled
-                if timelapsePath is not None:
-                    keywordArgs["timelapse"] = True
                 startMethod(*positionalArgs, **keywordArgs)
                 started = True
                 logger.info(
