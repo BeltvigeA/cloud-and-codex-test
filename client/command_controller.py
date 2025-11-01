@@ -1379,7 +1379,25 @@ class CommandWorker:
             log.info("Print completed on %s — ready for next job", self.serial)
         self._jobActive = False
         self._sawActivityDuringJob = False
+        
+        # Download timelapse if it was enabled for this print
+        self._downloadCompletedTimelapse()
+        
         self._deleteRemoteFile()
+    
+    def _downloadCompletedTimelapse(self) -> None:
+        """Download the timelapse video from the printer if timelapse was enabled."""
+        printer = self._printerInstance
+        if printer is None:
+            return
+        
+        try:
+            from .bambuPrinter import _retrieveTimelapseIfEnabled
+            timelapseFile = _retrieveTimelapseIfEnabled(printer)
+            if timelapseFile:
+                log.info("Timelapse video saved to: %s", timelapseFile)
+        except Exception as error:
+            log.warning("Failed to download timelapse: %s", error, exc_info=True)
 
     def _checkForPrinterError(self, status: Dict[str, Any]) -> None:
         printer = self._printerInstance
