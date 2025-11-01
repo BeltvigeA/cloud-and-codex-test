@@ -679,6 +679,8 @@ class CommandWorker:
         self._cameraLoopThread: Optional[threading.Thread] = None
         self._cameraLoopStopEvent = threading.Event()
         self._idleConnectErrorCount = 0
+        self._timelapseEnabledForCurrentJob = False
+        self._timelapseSaveDirectory: Optional[Path] = None
         log.debug(
             "CommandWorker configured for %s using control endpoint %s", self.serial, self.controlEndpointUrl
         )
@@ -1377,8 +1379,15 @@ class CommandWorker:
             return
         if self._jobActive:
             log.info("Print completed on %s — ready for next job", self.serial)
+
+            # Download timelapse if it was enabled for this job
+            if self._timelapseEnabledForCurrentJob and self._timelapseSaveDirectory:
+                self._downloadTimelapse()
+
         self._jobActive = False
         self._sawActivityDuringJob = False
+        self._timelapseEnabledForCurrentJob = False
+        self._timelapseSaveDirectory = None
         self._deleteRemoteFile()
 
     def _checkForPrinterError(self, status: Dict[str, Any]) -> None:
@@ -1415,6 +1424,39 @@ class CommandWorker:
             log.info("Skip delete for remote file %s on %s", remoteFile, self.serial, exc_info=True)
         finally:
             self._lastRemoteFile = None
+
+    def _downloadTimelapse(self) -> None:
+        """Download timelapse video after print completion."""
+        if not self._timelapseSaveDirectory:
+            return
+
+        log.info("[timelapse] Waiting 10 seconds for printer to finish generating timelapse...")
+        time.sleep(10)
+
+        log.info("[timelapse] Starting timelapse download to %s", self._timelapseSaveDirectory)
+
+        try:
+            downloadHelper = getattr(bambuPrinter, "downloadTimelapseViaFtps", None)
+            if not callable(downloadHelper):
+                log.warning("[timelapse] ✗ downloadTimelapseViaFtps not available in bambuPrinter module")
+                return
+
+            result = downloadHelper(
+                ip=self.ipAddress,
+                accessCode=self.accessCode,
+                serial=self.serial,
+                localDirectory=self._timelapseSaveDirectory,
+                insecureTls=True,
+                timeout=120,
+            )
+
+            if result is None:
+                log.warning("[timelapse] ✗ Timelapse download failed or no files found")
+            else:
+                log.info("[timelapse] ✓ Timelapse downloaded successfully: %s", result)
+
+        except Exception as error:
+            log.warning("[timelapse] ✗ Error downloading timelapse: %s", error, exc_info=True)
 
     def _readPrinterErrorCode(self, printer: Any) -> Optional[Any]:
         if printer is None:
@@ -1724,6 +1766,13 @@ class CommandWorker:
             enable_timelapse = _search_bool(metadata or {})
             tl_dir_raw = _search_str(metadata or {})
             tl_dir = Path(tl_dir_raw).expanduser() if tl_dir_raw else None
+
+            # Track timelapse settings for this job
+            self._timelapseEnabledForCurrentJob = enable_timelapse
+            if enable_timelapse:
+                self._timelapseSaveDirectory = tl_dir or (Path.home() / ".printmaster" / "timelapse")
+            else:
+                self._timelapseSaveDirectory = None
 
             options = bambuPrinter.BambuPrintOptions(
                 ipAddress=self.ipAddress,
