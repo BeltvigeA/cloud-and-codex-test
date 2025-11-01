@@ -721,91 +721,163 @@ def _resolveTimeLapseDirectory(
     return directory
 
 
-def _activateTimelapseCapture(printer: Any, directory: Path) -> None:
-    directoryString = str(directory)
-    cameraClient = getattr(printer, "camera_client", None)
-    cameraConfigured = False
+def _activateOnboardTimelapse(printer: Any, directory: Path) -> bool:
+    """
+    Enable the printer's built-in timelapse feature using the BambuLabs API.
 
-    if cameraClient is not None:
-        for methodName in (
-            "set_timelapse_directory",
-            "set_output_directory",
-            "set_save_directory",
-            "set_directory",
-        ):
-            configureMethod = getattr(cameraClient, methodName, None)
-            if callable(configureMethod):
-                try:
-                    configureMethod(directoryString)
-                    cameraConfigured = True
-                    break
-                except Exception:  # pragma: no cover - diagnostic logging only
-                    logger.debug("timelapse configure %s failed", methodName, exc_info=START_DEBUG)
-        if not cameraConfigured:
-            for attributeName in (
-                "timelapseDirectory",
-                "timelapse_directory",
-                "outputDirectory",
-                "output_directory",
-            ):
-                if hasattr(cameraClient, attributeName):
-                    try:
-                        setattr(cameraClient, attributeName, directoryString)
-                        cameraConfigured = True
-                        break
-                    except Exception:  # pragma: no cover - diagnostic logging only
-                        logger.debug(
-                            "timelapse attribute %s assignment failed",
-                            attributeName,
-                            exc_info=START_DEBUG,
-                        )
-        if not bool(getattr(cameraClient, "alive", False)):
-            startMethod = getattr(printer, "camera_start", None)
-            if callable(startMethod):
-                try:
-                    startMethod()
-                except Exception:  # pragma: no cover - best effort
-                    logger.debug("camera_start() failed during timelapse activation", exc_info=START_DEBUG)
+    Args:
+        printer: The printer instance from bambulabs_api.Printer
+        directory: Path where timelapse files will be stored locally (for reference)
 
-    activated = False
-    for candidate in (cameraClient, printer):
-        if candidate is None:
-            continue
-        for methodName in ("start_timelapse_capture", "start_timelapse", "enable_timelapse"):
-            activationMethod = getattr(candidate, methodName, None)
-            if not callable(activationMethod):
-                continue
-            try:
-                activationMethod(directoryString)
-                activated = True
-                break
-            except TypeError:
-                try:
-                    activationMethod()
-                    activated = True
-                    break
-                except Exception:  # pragma: no cover - diagnostic logging only
-                    logger.debug(
-                        "timelapse activation %s without args failed",
-                        methodName,
-                        exc_info=START_DEBUG,
-                    )
-            except Exception:  # pragma: no cover - diagnostic logging only
-                logger.debug("timelapse activation %s failed", methodName, exc_info=START_DEBUG)
-        if activated:
-            break
+    Returns:
+        bool: True if timelapse was enabled successfully
+    """
+    # Try to enable the onboard printer timelapse feature
+    setTimelapseMethod = getattr(printer, "set_onboard_printer_timelapse", None)
 
-    if hasattr(printer, "timelapse_directory"):
-        try:
-            setattr(printer, "timelapse_directory", directoryString)
-        except Exception:  # pragma: no cover - diagnostic logging only
-            logger.debug("setting printer.timelapse_directory failed", exc_info=START_DEBUG)
+    if not callable(setTimelapseMethod):
+        logger.warning("[timelapse] set_onboard_printer_timelapse method not available on printer")
+        return False
 
-    if START_DEBUG:
-        if activated:
-            logger.info("[timelapse] capture activated for %s", directoryString)
+    try:
+        # Enable the onboard timelapse - returns bool indicating success
+        result = setTimelapseMethod(enable=True)
+
+        if START_DEBUG:
+            logger.info("[timelapse] set_onboard_printer_timelapse(enable=True) returned: %s", result)
+
+        if result:
+            logger.info("[timelapse] Onboard timelapse enabled successfully, files will be saved to printer")
+            return True
         else:
-            logger.info("[timelapse] capture requested for %s but no activation hooks succeeded", directoryString)
+            logger.warning("[timelapse] Failed to enable onboard timelapse")
+            return False
+
+    except Exception as error:
+        logger.warning("[timelapse] Error enabling onboard timelapse: %s", error, exc_info=START_DEBUG)
+        return False
+
+
+def _downloadTimelapseFromPrinter(printer: Any, serial: str, directory: Path) -> Optional[Path]:
+    """
+    Download the timelapse video from the printer's SD card via FTP.
+
+    Args:
+        printer: The printer instance from bambulabs_api.Printer
+        serial: Printer serial number
+        directory: Local directory to save the timelapse file
+
+    Returns:
+        Path to the downloaded file, or None if download failed
+    """
+    try:
+        # Get the FTP client from the printer
+        ftpClient = getattr(printer, "ftp_client", None)
+        if ftpClient is None:
+            logger.warning("[timelapse] FTP client not available on printer")
+            return None
+
+        # List files in the timelapse directory
+        listMethod = getattr(ftpClient, "list_timelapse_dir", None)
+        if not callable(listMethod):
+            logger.warning("[timelapse] list_timelapse_dir method not available")
+            return None
+
+        ftpResult, fileList = listMethod()
+
+        if START_DEBUG:
+            logger.info("[timelapse] FTP result: %s, Files found: %s", ftpResult, fileList)
+
+        if not fileList:
+            logger.info("[timelapse] No timelapse files found on printer")
+            return None
+
+        # Get the most recent timelapse file (last in the list)
+        latestFile = fileList[-1] if isinstance(fileList, list) else None
+        if not latestFile:
+            logger.warning("[timelapse] Could not identify latest timelapse file")
+            return None
+
+        # Construct the remote path
+        remoteFilePath = f"timelapse/{latestFile}" if not latestFile.startswith("/") else latestFile
+
+        # Generate local filename with timestamp
+        from datetime import datetime, timezone
+
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        localFilename = f"{serial}_{timestamp}_{Path(latestFile).name}"
+        localPath = directory / localFilename
+
+        # Ensure directory exists
+        directory.mkdir(parents=True, exist_ok=True)
+
+        # Download the file using FTP
+        downloadMethod = getattr(ftpClient, "download", None)
+        if not callable(downloadMethod):
+            logger.warning("[timelapse] download method not available on FTP client")
+            return None
+
+        logger.info("[timelapse] Downloading %s to %s", remoteFilePath, localPath)
+        downloadMethod(remoteFilePath, str(localPath))
+
+        if localPath.exists():
+            logger.info("[timelapse] Successfully downloaded timelapse to %s", localPath)
+            return localPath
+        else:
+            logger.warning("[timelapse] Download completed but file not found at %s", localPath)
+            return None
+
+    except Exception as error:
+        logger.error("[timelapse] Error downloading timelapse from printer: %s", error, exc_info=True)
+        return None
+
+
+def _storeTimelapseReference(printer: Any, serial: str, directory: Path) -> None:
+    """
+    Store a reference to where the timelapse will be retrieved from.
+    This is called when a print job starts with timelapse enabled.
+    """
+    if not hasattr(printer, "_printmaster_timelapse_info"):
+        try:
+            printer._printmaster_timelapse_info = {
+                "serial": serial,
+                "directory": directory,
+                "enabled": True,
+            }
+        except Exception:
+            logger.debug("[timelapse] Could not store timelapse reference", exc_info=START_DEBUG)
+
+
+def _retrieveTimelapseIfEnabled(printer: Any) -> Optional[Path]:
+    """
+    Check if timelapse was enabled for this printer and download it if so.
+    This should be called when a print job completes.
+    """
+    timelapseInfo = getattr(printer, "_printmaster_timelapse_info", None)
+    if not timelapseInfo or not timelapseInfo.get("enabled"):
+        return None
+
+    try:
+        serial = timelapseInfo.get("serial")
+        directory = timelapseInfo.get("directory")
+
+        if not serial or not directory:
+            return None
+
+        # Download the timelapse from the printer
+        downloadedPath = _downloadTimelapseFromPrinter(printer, serial, directory)
+
+        # Clear the reference
+        try:
+            del printer._printmaster_timelapse_info
+        except Exception:
+            pass
+
+        return downloadedPath
+
+    except Exception as error:
+        logger.error("[timelapse] Error retrieving timelapse: %s", error, exc_info=True)
+        return None
 
 
 @dataclass(frozen=True)
@@ -1225,7 +1297,13 @@ def startPrintViaApi(
         _preselect_project_file(printer, remoteUrl, startParam, sendControlFlags)
 
     if timelapsePath is not None:
-        _activateTimelapseCapture(printer, timelapsePath)
+        timelapseEnabled = _activateOnboardTimelapse(printer, timelapsePath)
+        if timelapseEnabled:
+            _storeTimelapseReference(printer, serial, timelapsePath)
+        else:
+            logger.warning("[start] Failed to enable onboard timelapse feature")
+            if START_DEBUG:
+                logger.info("[start] Timelapse was requested but could not be activated")
 
     def _invokeStart() -> None:
         localErrors: List[str] = []
