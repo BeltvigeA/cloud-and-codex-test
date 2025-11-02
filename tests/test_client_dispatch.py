@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import json
 import logging
 import sys
 import zipfile
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import pytest
 
@@ -163,6 +164,108 @@ def test_dispatchBambuPrintPropagatesTimelapseFlag(tmp_path: Path, monkeypatch: 
     assert isinstance(selectedOptions, bambuPrinter.BambuPrintOptions)
     assert selectedOptions.enableTimeLapse is True
     assert selectedOptions.timeLapseDirectory is None
+
+
+def test_dispatchBambuPrintParsesStringMetadataTimelapse(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    samplePath = tmp_path / "sample.3mf"
+    samplePath.write_bytes(b"dummy")
+
+    metadataPayload = {
+        "unencryptedData": json.dumps(
+            {
+                "printer": {
+                    "printerSerial": "SERIALJSON",
+                    "ipAddress": "192.168.1.12",
+                    "accessCode": "ACCESS",
+                    "brand": "Bambu Lab",
+                },
+                "enable_timelapse": True,
+            }
+        ),
+        "decryptedData": None,
+        "originalFilename": "sample.3mf",
+    }
+
+    class DummyMetadataResponse:
+        headers: Dict[str, str] = {}
+        url: str = "https://example.com/file"
+
+        def __init__(self, payload: Dict[str, Any]) -> None:
+            self._payload = payload
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> Dict[str, Any]:
+            return self._payload
+
+    class DummySession:
+        def get(
+            self,
+            _url: str,
+            *,
+            timeout: Any = None,
+            params: Optional[Dict[str, Any]] = None,
+            stream: Optional[bool] = None,
+        ) -> DummyMetadataResponse:
+            assert params == {"mode": "metadata"}
+            return DummyMetadataResponse(metadataPayload)
+
+    monkeypatch.setattr(client.requests, "Session", lambda: DummySession())
+
+    fetchedMetadata = client.performFetch(
+        baseUrl="https://example.com",
+        fetchToken="token",
+        outputDir=str(tmp_path),
+        requestMode="metadata",
+    )
+
+    assert fetchedMetadata is not None
+    assert isinstance(fetchedMetadata.get("unencryptedData"), dict)
+
+    entryData = dict(fetchedMetadata)
+    entryData["savedFile"] = str(samplePath)
+
+    statusPayload = {
+        "fileName": "sample.3mf",
+        "lastRequestedAt": "2024-01-01T00:00:00Z",
+        "requestedMode": "metadata",
+        "success": True,
+    }
+
+    configuredPrinters = [
+        {
+            "serialNumber": "SERIALJSON",
+            "ipAddress": "192.168.1.12",
+            "accessCode": "ACCESS",
+            "brand": "Bambu Lab",
+        }
+    ]
+
+    capturedOptions: Dict[str, bambuPrinter.BambuPrintOptions] = {}
+
+    def fakeSendBambuPrintJob(**kwargs: Any) -> Dict[str, Any]:
+        capturedOptions["options"] = kwargs.get("options")
+        return {"remoteFile": "uploaded.3mf", "method": "lan"}
+
+    monkeypatch.setattr(client, "sendBambuPrintJob", fakeSendBambuPrintJob)
+    patchRequestsPost(monkeypatch)
+
+    result = client.dispatchBambuPrintIfPossible(
+        baseUrl="https://example.com",
+        productId="product-json",
+        recipientId="recipient-json",
+        entryData=entryData,
+        statusPayload=statusPayload,
+        configuredPrinters=configuredPrinters,
+    )
+
+    assert result is not None
+    selectedOptions = capturedOptions.get("options")
+    assert isinstance(selectedOptions, bambuPrinter.BambuPrintOptions)
+    assert selectedOptions.enableTimeLapse is True
 
 
 def test_dispatchBambuPrintPreservesBrakePlateMetadata(
