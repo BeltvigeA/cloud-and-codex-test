@@ -1062,8 +1062,14 @@ def dispatchBambuPrintIfPossible(
     printerId = str(serialNumber or resolvedDetails.get("nickname") or "") or "unknown"
     
     # Combine all metadata sources for passing to sendBambuPrintJob
+    normalizedUnencryptedMetadata = entryData.get("unencryptedData")
+    normalizedDecryptedMetadata = entryData.get("decryptedData")
     combinedJobMetadata: Dict[str, Any] = {}
-    for metadataSource in (entryData.get("unencryptedData"), entryData.get("decryptedData"), statusPayload):
+    for metadataSource in (
+        normalizedUnencryptedMetadata,
+        normalizedDecryptedMetadata,
+        statusPayload,
+    ):
         if isinstance(metadataSource, dict):
             combinedJobMetadata.update(metadataSource)
 
@@ -1168,7 +1174,12 @@ def dispatchBambuPrintIfPossible(
 
     resolvedAccessCode = "" if accessCode in {None, ""} else str(accessCode)
 
-    enableTimeLapseOverride = extractEnableTimeLapse(entryData, statusPayload)
+    enableTimeLapseOverride = extractEnableTimeLapse(
+        normalizedUnencryptedMetadata,
+        combinedJobMetadata,
+        entryData,
+        statusPayload,
+    )
     configEnableTimeLapse = resolvedDetails.get("enableTimeLapse")
     if enableTimeLapseOverride is not None:
         enableTimeLapse = enableTimeLapseOverride
@@ -1651,6 +1662,26 @@ def saveDownloadedFile(response: requests.Response, outputDir: Path) -> Path:
     return outputPath
 
 
+def normalizeMetadataPayload(rawValue: Any, fieldName: str) -> Any:
+    if isinstance(rawValue, str):
+        trimmedValue = rawValue.strip()
+        if not trimmedValue:
+            return {}
+        try:
+            parsedValue = json.loads(trimmedValue)
+        except json.JSONDecodeError as error:
+            logging.warning(
+                "Failed to parse %s metadata JSON string: %s",
+                fieldName,
+                error,
+            )
+            return {}
+        return parsedValue
+    if rawValue is None:
+        return {}
+    return rawValue
+
+
 def performFetch(
     baseUrl: str,
     fetchToken: str,
@@ -1686,8 +1717,8 @@ def performFetch(
         logging.error("Invalid JSON response: %s", error)
         return None
 
-    unencryptedData = payload.get("unencryptedData") or {}
-    decryptedData = payload.get("decryptedData") or {}
+    unencryptedData = normalizeMetadataPayload(payload.get("unencryptedData"), "unencryptedData")
+    decryptedData = normalizeMetadataPayload(payload.get("decryptedData"), "decryptedData")
     metadataFileName = payload.get("originalFilename") or payload.get("fileName")
     printJobId = extractPrintJobId(payload, unencryptedData, decryptedData)
 
