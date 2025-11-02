@@ -1763,11 +1763,33 @@ class CommandWorker:
                 job_metadata=metadata if isinstance(metadata, dict) else None,
             )
             acknowledged = result.get("acknowledged")
-            message = (
-                f"Print started (acknowledged={acknowledged})"
-                if acknowledged is not None
-                else "Print started"
-            )
+            state = result.get("state")
+            gcodeState = result.get("gcodeState")
+            percentage = result.get("percentage")
+            fallbackTriggered = result.get("fallbackTriggered", False)
+
+            if acknowledged is False:
+                errorMessage = (
+                    f"Print start not acknowledged - "
+                    f"state={state}, gcodeState={gcodeState}, percentage={percentage}, "
+                    f"fallbackTriggered={fallbackTriggered}"
+                )
+                log.error("PRINT START FAILED for %s: %s", self.serial, errorMessage)
+                try:
+                    from . import base44_client
+                    base44_client.postReportError({
+                        "printerSerial": self.serial,
+                        "errorType": "PRINT_START_NOT_ACKNOWLEDGED",
+                        "errorMessage": errorMessage,
+                        "printerState": state,
+                        "percentage": percentage,
+                    })
+                except Exception as reportError:
+                    log.warning("Failed to report error to Base44: %s", reportError)
+                raise RuntimeError(errorMessage)
+
+            message = f"Print started successfully (acknowledged={acknowledged}, state={state})"
+            log.info("✓ %s", message)
             self._jobActive = True
             try:
                 self._lastRemoteFile = str(fileName)
