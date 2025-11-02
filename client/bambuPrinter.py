@@ -725,15 +725,24 @@ def _activateTimelapseCapture(printer: Any, directory: Path) -> None:
     """Activate timelapse capture with comprehensive logging."""
     directoryString = str(directory)
 
+    # STEP 1: Log startup
     logger.info("[timelapse] ===== STARTING TIMELAPSE ACTIVATION =====")
     logger.info("[timelapse] Directory: %s", directoryString)
     logger.info("[timelapse] Printer type: %s", type(printer).__name__)
+
     cameraClient = getattr(printer, "camera_client", None)
     logger.info("[timelapse] Camera client found: %s", cameraClient is not None)
     cameraConfigured = False
 
+    # STEP 2: Configure camera client
     if cameraClient is not None:
-        for methodName in ("configure_timelapse", "start_timelapse_capture", "enable_timelapse"):
+        logger.info("[timelapse] Configuring camera client...")
+        for methodName in (
+            "set_timelapse_directory",
+            "set_output_directory",
+            "set_save_directory",
+            "set_directory",
+        ):
             configureMethod = getattr(cameraClient, methodName, None)
             if callable(configureMethod):
                 try:
@@ -742,8 +751,9 @@ def _activateTimelapseCapture(printer: Any, directory: Path) -> None:
                     cameraConfigured = True
                     logger.info("[timelapse] ✓ Successfully configured via camera_client.%s", methodName)
                     break
-                except Exception:
-                    logger.warning("[timelapse] ✗ camera_client.%s failed", methodName, exc_info=True)
+                except Exception as error:
+                    logger.warning("[timelapse] ✗ camera_client.%s failed: %s", methodName, error, exc_info=True)
+
         if not cameraConfigured:
             logger.info("[timelapse] Trying camera_client attribute assignment...")
             for attributeName in (
@@ -759,12 +769,8 @@ def _activateTimelapseCapture(printer: Any, directory: Path) -> None:
                         cameraConfigured = True
                         logger.info("[timelapse] ✓ Successfully set camera_client.%s", attributeName)
                         break
-                    except Exception:
-                        logger.warning(
-                            "[timelapse] ✗ camera_client.%s assignment failed",
-                            attributeName,
-                            exc_info=True,
-                        )
+                    except Exception as error:
+                        logger.warning("[timelapse] ✗ camera_client.%s assignment failed: %s", attributeName, error, exc_info=True)
 
         logger.info("[timelapse] Camera client alive status: %s", bool(getattr(cameraClient, "alive", False)))
         if not bool(getattr(cameraClient, "alive", False)):
@@ -775,14 +781,14 @@ def _activateTimelapseCapture(printer: Any, directory: Path) -> None:
                     logger.info("[timelapse] Calling camera_start()")
                     startMethod()
                     logger.info("[timelapse] ✓ camera_start() succeeded")
-                except Exception:
-                    logger.warning("[timelapse] ✗ camera_start() failed", exc_info=True)
+                except Exception as error:
+                    logger.warning("[timelapse] ✗ camera_start() failed: %s", error, exc_info=True)
             else:
                 logger.info("[timelapse] camera_start method not found")
 
     activated = False
 
-    # Try the official set_onboard_printer_timelapse method first (bambulabs_api specific)
+    # STEP 3: Try the official Bambu Labs API method FIRST
     logger.info("[timelapse] ===== TRYING set_onboard_printer_timelapse METHOD =====")
     if hasattr(printer, "set_onboard_printer_timelapse"):
         timelapseMethod = getattr(printer, "set_onboard_printer_timelapse")
@@ -801,6 +807,7 @@ def _activateTimelapseCapture(printer: Any, directory: Path) -> None:
                         logger.error("[timelapse] The printer returned False - timelapse was NOT activated")
                 else:
                     logger.warning("[timelapse] set_onboard_printer_timelapse returned non-boolean: %s", result)
+                    # Assume success if no exception was raised
                     activated = True
                     logger.info("[timelapse] ✓ Assuming success (no exception raised)")
             except Exception as error:
@@ -811,7 +818,7 @@ def _activateTimelapseCapture(printer: Any, directory: Path) -> None:
     else:
         logger.warning("[timelapse] printer.set_onboard_printer_timelapse method not found, trying fallback methods...")
 
-    # If the official method didn't work or doesn't exist, try fallback methods
+    # STEP 4: If the official method didn't work, try fallback methods
     if not activated:
         logger.info("[timelapse] ===== TRYING FALLBACK ACTIVATION METHODS =====")
         for candidate in (cameraClient, printer):
@@ -819,11 +826,13 @@ def _activateTimelapseCapture(printer: Any, directory: Path) -> None:
                 continue
             candidateName = "camera_client" if candidate is cameraClient else "printer"
             logger.info("[timelapse] Trying methods on %s...", candidateName)
+
             for methodName in ("start_timelapse_capture", "start_timelapse", "enable_timelapse"):
                 activationMethod = getattr(candidate, methodName, None)
                 if not callable(activationMethod):
                     logger.debug("[timelapse] %s.%s not found or not callable", candidateName, methodName)
                     continue
+
                 try:
                     logger.info("[timelapse] Calling %s.%s(%s)", candidateName, methodName, directoryString)
                     activationMethod(directoryString)
@@ -837,27 +846,25 @@ def _activateTimelapseCapture(printer: Any, directory: Path) -> None:
                         activated = True
                         logger.info("[timelapse] ✓ %s.%s() without args succeeded!", candidateName, methodName)
                         break
-                    except Exception:
-                        logger.warning(
-                            "[timelapse] ✗ %s.%s without args failed",
-                            candidateName,
-                            methodName,
-                            exc_info=True,
-                        )
-                except Exception:
-                    logger.warning("[timelapse] ✗ %s.%s failed", candidateName, methodName, exc_info=True)
+                    except Exception as error:
+                        logger.warning("[timelapse] ✗ %s.%s without args failed: %s", candidateName, methodName, error, exc_info=True)
+                except Exception as error:
+                    logger.warning("[timelapse] ✗ %s.%s failed: %s", candidateName, methodName, error, exc_info=True)
+
             if activated:
                 logger.info("[timelapse] Breaking out of loop - activation successful")
                 break
 
+    # STEP 5: Set printer.timelapse_directory attribute
     if hasattr(printer, "timelapse_directory"):
         try:
             logger.info("[timelapse] Setting printer.timelapse_directory = %s", directoryString)
             setattr(printer, "timelapse_directory", directoryString)
             logger.info("[timelapse] ✓ printer.timelapse_directory set successfully")
-        except Exception:
-            logger.warning("[timelapse] ✗ setting printer.timelapse_directory failed", exc_info=True)
+        except Exception as error:
+            logger.warning("[timelapse] ✗ setting printer.timelapse_directory failed: %s", error, exc_info=True)
 
+    # STEP 6: Log final result
     logger.info("[timelapse] ===== TIMELAPSE ACTIVATION COMPLETE =====")
     if activated:
         logger.info("[timelapse] ✓✓✓ SUCCESS: Timelapse capture activated for %s ✓✓✓", directoryString)
