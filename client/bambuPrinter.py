@@ -1336,8 +1336,7 @@ def startPrintViaApi(
             # default: ~/.printmaster/timelapse
             timelapsePath = Path.home() / ".printmaster" / "timelapse"
             timelapsePath.mkdir(parents=True, exist_ok=True)
-            if START_DEBUG:
-                logger.info("[start] timelapse enabled by metadata -> %s", timelapsePath)
+            logger.info("[start] ✓✓✓ TIMELAPSE ENABLED BY METADATA -> %s", timelapsePath)
 
     startKeywordArgs: Dict[str, Any] = {}
     if resolvedUseAms is not None:
@@ -1351,6 +1350,16 @@ def startPrintViaApi(
         "flow_cali": bool(options.flowCalibration),
         "vibration_cali": bool(options.vibrationCalibration),
     }
+
+    # Log timelapse status regardless of START_DEBUG
+    if timelapsePath is not None:
+        logger.info("[start] ✓✓✓ TIMELAPSE PATH RESOLVED: %s", timelapsePath)
+        logger.info("[start] Will call _activateTimelapseCapture next")
+    else:
+        logger.warning("[start] ✗✗✗ TIMELAPSE PATH IS NONE - timelapse will NOT be activated")
+        logger.warning("[start] options.enableTimeLapse = %s", getattr(options, "enableTimeLapse", None))
+        if job_metadata:
+            logger.warning("[start] job_metadata keys: %s", list(job_metadata.keys()))
 
     if START_DEBUG:
         logger.info(
