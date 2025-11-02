@@ -1453,6 +1453,14 @@ def startPrintViaApi(
             ackResult.get("gcodeState"),
             ackResult.get("percentage"),
         )
+        if not acknowledged:
+            logger.warning("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+            logger.warning("⚠️  PRINT START NOT ACKNOWLEDGED by %s", serial)
+            logger.warning("   Printer state: %s", ackResult.get("state") or "unknown")
+            logger.warning("   Gcode state: %s", ackResult.get("gcodeState") or "unknown")
+            logger.warning("   Percentage: %s", ackResult.get("percentage") or "unknown")
+            logger.warning("   Fallback triggered: %s", fallbackTriggered)
+            logger.warning("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
         ackResult.pop("statePayload", None)
         ackResult["useAms"] = finalUseAms
         ackResult["fallbackTriggered"] = fallbackTriggered
