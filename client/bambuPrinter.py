@@ -734,6 +734,24 @@ def _activateTimelapseCapture(printer: Any, directory: Path) -> None:
     logger.info("[timelapse] Camera client found: %s", cameraClient is not None)
     cameraConfigured = False
 
+    mqttClient = None
+    mqttClientAttribute = None
+    for attributeName in ("mqtt_client", "mqttClient", "mqttClientInstance"):
+        candidate = getattr(printer, attributeName, None)
+        if candidate is None:
+            continue
+        if callable(getattr(candidate, "set_onboard_printer_timelapse", None)):
+            mqttClient = candidate
+            mqttClientAttribute = attributeName
+            break
+
+    if mqttClient is not None:
+        logger.info(
+            "[timelapse] MQTT client found via printer.%s", mqttClientAttribute
+        )
+    else:
+        logger.info("[timelapse] No MQTT client found on printer")
+
     # STEP 2: Configure camera client
     if cameraClient is not None:
         logger.info("[timelapse] Configuring camera client...")
@@ -789,38 +807,84 @@ def _activateTimelapseCapture(printer: Any, directory: Path) -> None:
     activated = False
 
     # STEP 3: Try the official Bambu Labs API method FIRST
-    logger.info("[timelapse] ===== TRYING set_onboard_printer_timelapse METHOD =====")
-    if hasattr(printer, "set_onboard_printer_timelapse"):
-        timelapseMethod = getattr(printer, "set_onboard_printer_timelapse")
-        if callable(timelapseMethod):
-            try:
-                logger.info("[timelapse] Calling printer.set_onboard_printer_timelapse(enable=True)")
-                result = timelapseMethod(enable=True)
-                logger.info("[timelapse] ✓✓✓ set_onboard_printer_timelapse RETURNED: %s (type: %s)", result, type(result).__name__)
+    def trySetOnboardTimelapse(ownerName: str, owner: Any) -> bool:
+        method = getattr(owner, "set_onboard_printer_timelapse", None)
+        if method is None:
+            logger.info(
+                "[timelapse] %s.set_onboard_printer_timelapse not found", ownerName
+            )
+            return False
+        if not callable(method):
+            logger.warning(
+                "[timelapse] %s.set_onboard_printer_timelapse exists but is not callable",
+                ownerName,
+            )
+            return False
 
-                if isinstance(result, bool):
-                    if result:
-                        logger.info("[timelapse] ✓✓✓ TIMELAPSE SUCCESSFULLY ENABLED ON PRINTER! ✓✓✓")
-                        activated = True
-                    else:
-                        logger.error("[timelapse] ✗✗✗ TIMELAPSE FAILED TO ENABLE ON PRINTER! ✗✗✗")
-                        logger.error("[timelapse] The printer returned False - timelapse was NOT activated")
-                else:
-                    logger.warning("[timelapse] set_onboard_printer_timelapse returned non-boolean: %s", result)
-                    # Assume success if no exception was raised
-                    activated = True
-                    logger.info("[timelapse] ✓ Assuming success (no exception raised)")
-            except Exception as error:
-                logger.error("[timelapse] ✗✗✗ set_onboard_printer_timelapse FAILED WITH EXCEPTION ✗✗✗", exc_info=True)
-                logger.error("[timelapse] Exception: %s", str(error))
-        else:
-            logger.warning("[timelapse] printer.set_onboard_printer_timelapse exists but is not callable")
-    else:
-        logger.warning("[timelapse] printer.set_onboard_printer_timelapse method not found, trying fallback methods...")
+        try:
+            logger.info(
+                "[timelapse] Calling %s.set_onboard_printer_timelapse(enable=True)",
+                ownerName,
+            )
+            result = method(enable=True)
+            logger.info(
+                "[timelapse] ✓✓✓ %s.set_onboard_printer_timelapse returned: %s (type: %s)",
+                ownerName,
+                result,
+                type(result).__name__,
+            )
+
+            if isinstance(result, bool):
+                if result:
+                    logger.info(
+                        "[timelapse] ✓✓✓ Timelapse successfully enabled via %s ✓✓✓",
+                        ownerName,
+                    )
+                    return True
+                logger.error(
+                    "[timelapse] ✗✗✗ %s.set_onboard_printer_timelapse returned False ✗✗✗",
+                    ownerName,
+                )
+                return False
+
+            logger.warning(
+                "[timelapse] %s.set_onboard_printer_timelapse returned non-boolean: %s",
+                ownerName,
+                result,
+            )
+            logger.info("[timelapse] ✓ Assuming success (no exception raised)")
+            return True
+        except Exception as error:
+            logger.error(
+                "[timelapse] ✗✗✗ %s.set_onboard_printer_timelapse failed ✗✗✗",
+                ownerName,
+                exc_info=True,
+            )
+            logger.error("[timelapse] Exception: %s", str(error))
+            return False
+
+    logger.info("[timelapse] ===== TRYING printer.set_onboard_printer_timelapse METHOD =====")
+    activated = trySetOnboardTimelapse("printer", printer)
+
+    if not activated and mqttClient is not None:
+        logger.info(
+            "[timelapse] ===== TRYING %s.set_onboard_printer_timelapse METHOD =====",
+            f"printer.{mqttClientAttribute}",
+        )
+        activated = trySetOnboardTimelapse(
+            f"printer.{mqttClientAttribute}", mqttClient
+        )
+
+    if activated:
+        logger.info(
+            "[timelapse] Timelapse enabled without needing fallback activation methods"
+        )
 
     # STEP 4: If the official method didn't work, try fallback methods
     if not activated:
-        logger.info("[timelapse] ===== TRYING FALLBACK ACTIVATION METHODS =====")
+        logger.info(
+            "[timelapse] ===== USING FALLBACK TIMELAPSE ACTIVATION METHODS ====="
+        )
         for candidate in (cameraClient, printer):
             if candidate is None:
                 continue

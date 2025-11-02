@@ -293,6 +293,26 @@ def test_startPrintViaApi_enables_timelapse(monkeypatch: pytest.MonkeyPatch, tmp
     assert fakePrinter.camera_client.timelapseActivations == [expectedDirectory]
 
 
+def test_activateTimelapseCapture_prefers_mqtt_client(tmp_path: Path) -> None:
+    fakePrinter = FakeApiPrinter()
+
+    class FakeMqttClient:
+        def __init__(self) -> None:
+            self.enableCalls: list[bool] = []
+
+        def set_onboard_printer_timelapse(self, *, enable: bool) -> bool:
+            self.enableCalls.append(bool(enable))
+            return True
+
+    mqttClient = FakeMqttClient()
+    fakePrinter.mqtt_client = mqttClient
+
+    bambuPrinter._activateTimelapseCapture(fakePrinter, tmp_path)
+
+    assert mqttClient.enableCalls == [True]
+    assert fakePrinter.timelapseRequests == []
+
+
 def test_sendBambuPrintJob_uses_api(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     samplePath = tmp_path / "model.3mf"
     createSampleThreeMf(samplePath)
