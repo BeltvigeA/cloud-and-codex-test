@@ -1752,11 +1752,11 @@ class ListenerGuiApp:
 
         def task() -> None:
             try:
-                frames = worker.captureReferenceSequence()
+                frames = worker.captureBedReference(frames=40, zStepMm=2.0)
             except Exception as error:
-                self.log(f"Failed to capture bed reference for {serial}: {error}")
+                self.log(f"Reference capture failed: {error}")
             else:
-                self.log(f"Captured {len(frames)} bed reference frame(s) for {serial}")
+                self.log(f"Saved {len(frames)} reference frame(s)")
 
         threading.Thread(target=task, name=f"CaptureReference-{serial}", daemon=True).start()
 
