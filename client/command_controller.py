@@ -365,26 +365,27 @@ def _lowerBuildPlateOnce(
 ) -> bool:
     """
     Try to increase Z by +dzMm (on Bambu, +Z raises tool / lowers plate).
-    Prefer official API; fall back to G-code in LAN/dev environments.
+    Prefer G-code for relative stepping; abort safely if unavailable.
     Return True if movement was issued; False otherwise.
     """
-
-    moveMethod = getattr(printer, "move_z_axis", None)
-    if callable(moveMethod):
-        try:
-            return bool(moveMethod(str(dzMm)))
-        except Exception:
-            pass
 
     gcodeMethod = getattr(printer, "gcode", None)
     if callable(gcodeMethod):
         try:
-            gcodeMethod("G91")
-            gcodeMethod(f"G1 Z{dzMm} F{feedrate}")
-            gcodeMethod("G90")
+            result = gcodeMethod(["G91", f"G1 Z{dzMm} F{feedrate}", "G90"], gcode_check=False)
+            if result is False:
+                raise RuntimeError("G-code command rejected")
             return True
+        except TypeError:
+            try:
+                gcodeMethod("G91")
+                gcodeMethod(f"G1 Z{dzMm} F{feedrate}")
+                gcodeMethod("G90")
+                return True
+            except Exception:
+                pass
         except Exception:
-            return False
+            pass
 
     return False
 
@@ -397,7 +398,7 @@ def captureBedReference(
     zStepMm: float = 2.0,
     feedrate: int = 1200,
     homeXy: bool = True,
-) -> List[Path]:
+) -> List[str]:
     """
     Capture a vertical sweep of reference images while lowering the build plate.
     Hard-stop if motion is not supported (no useless pictures).
@@ -423,9 +424,11 @@ def captureBedReference(
             except Exception:
                 pass
 
-        savedPaths: List[Path] = []
+        savedPaths: List[str] = []
 
-        if not _lowerBuildPlateOnce(printer, dzMm=0.0, feedrate=feedrate):
+        hasMoveApi = callable(getattr(printer, "move_z_axis", None))
+        hasGcode = callable(getattr(printer, "gcode", None))
+        if not (hasMoveApi or hasGcode):
             log.warning(
                 "[ref] unable to lower build plate for %s: no supported motion control",
                 serialNumber,
@@ -445,11 +448,7 @@ def captureBedReference(
         if not savedPaths:
             raise RuntimeError("Bed reference aborted: could not move Z to take any frames")
 
-        log.info(
-            "[ref] completed reference capture for %s (%d frame(s))",
-            serialNumber,
-            len(savedPaths),
-        )
+        log.info("[ref] completed reference capture for %s (%d frame(s))", serialNumber, len(savedPaths))
         return savedPaths
     finally:
         if callable(cameraOffMethod):
