@@ -1379,25 +1379,7 @@ class CommandWorker:
             log.info("Print completed on %s — ready for next job", self.serial)
         self._jobActive = False
         self._sawActivityDuringJob = False
-        
-        # Download timelapse if it was enabled for this print
-        self._downloadCompletedTimelapse()
-        
         self._deleteRemoteFile()
-    
-    def _downloadCompletedTimelapse(self) -> None:
-        """Download the timelapse video from the printer if timelapse was enabled."""
-        printer = self._printerInstance
-        if printer is None:
-            return
-        
-        try:
-            from .bambuPrinter import _retrieveTimelapseIfEnabled
-            timelapseFile = _retrieveTimelapseIfEnabled(printer)
-            if timelapseFile:
-                log.info("Timelapse video saved to: %s", timelapseFile)
-        except Exception as error:
-            log.warning("Failed to download timelapse: %s", error, exc_info=True)
 
     def _checkForPrinterError(self, status: Dict[str, Any]) -> None:
         printer = self._printerInstance
@@ -1763,33 +1745,11 @@ class CommandWorker:
                 job_metadata=metadata if isinstance(metadata, dict) else None,
             )
             acknowledged = result.get("acknowledged")
-            state = result.get("state")
-            gcodeState = result.get("gcodeState")
-            percentage = result.get("percentage")
-            fallbackTriggered = result.get("fallbackTriggered", False)
-
-            if acknowledged is False:
-                errorMessage = (
-                    f"Print start not acknowledged - "
-                    f"state={state}, gcodeState={gcodeState}, percentage={percentage}, "
-                    f"fallbackTriggered={fallbackTriggered}"
-                )
-                log.error("PRINT START FAILED for %s: %s", self.serial, errorMessage)
-                try:
-                    from . import base44_client
-                    base44_client.postReportError({
-                        "printerSerial": self.serial,
-                        "errorType": "PRINT_START_NOT_ACKNOWLEDGED",
-                        "errorMessage": errorMessage,
-                        "printerState": state,
-                        "percentage": percentage,
-                    })
-                except Exception as reportError:
-                    log.warning("Failed to report error to Base44: %s", reportError)
-                raise RuntimeError(errorMessage)
-
-            message = f"Print started successfully (acknowledged={acknowledged}, state={state})"
-            log.info("✓ %s", message)
+            message = (
+                f"Print started (acknowledged={acknowledged})"
+                if acknowledged is not None
+                else "Print started"
+            )
             self._jobActive = True
             try:
                 self._lastRemoteFile = str(fileName)
