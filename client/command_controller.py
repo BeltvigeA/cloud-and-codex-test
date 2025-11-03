@@ -7,6 +7,7 @@ import logging
 import os
 import queue
 import re
+import shutil
 import threading
 import time
 from datetime import datetime, timezone
@@ -22,6 +23,8 @@ except Exception:  # pragma: no cover - surfaced through logs and callbacks
 
 from . import bambuPrinter
 from pathlib import Path
+from .autoprint.brake_flow import BrakeFlow, BrakeFlowContext, buildBrakeFlowErrorPayload
+from .autoprint.plate_reference import captureReferenceSequence
 from .base44_client import (
     acknowledgeCommand,
     listPendingCommandsForRecipient,
@@ -673,6 +676,13 @@ class CommandWorker:
         self._statusWarningLogged = False
         self._jobActive = False
         self._sawActivityDuringJob = False
+        self._activeJobMetadata: Dict[str, Any] = {}
+        self._activeJobKey: str = "job"
+        self._checkpointSnapshots: Dict[int, Path] = {}
+        self._capturedCheckpoints: set[int] = set()
+        self._brakeFlowThread: Optional[threading.Thread] = None
+        self._brakeFlowLock = threading.Lock()
+        self._brakeFlowBlocked = False
         self._lastErrorCodeReported: Optional[str] = None
         self._printErrorCodeUnsupportedLogged = False
         self.cameraSnapshotIntervalSeconds = cameraSnapshotIntervalSeconds
@@ -708,6 +718,10 @@ class CommandWorker:
         self._drainQueue()
         self._stopStatusMonitor()
         self._stopCameraSnapshotLoop()
+        if self._brakeFlowThread and self._brakeFlowThread.is_alive():
+            self._brakeFlowThread.join(timeout=2.0)
+        self._brakeFlowThread = None
+        self._resetBrakeJobState()
         self._disconnectPrinter()
 
     def _run(self) -> None:
@@ -1125,6 +1139,38 @@ class CommandWorker:
         )
         return True
 
+    def _obtainPrinterInstance(self) -> Any:
+        with self._printerLock:
+            printer = self._printerInstance
+        if printer is not None:
+            return printer
+        return self._connectPrinter()
+
+    def captureReferenceSequence(self) -> List[Path]:
+        printer = self._obtainPrinterInstance()
+        return captureReferenceSequence(printer, self.serial, captureCameraSnapshot)
+
+    def runBrakeDemo(
+        self,
+        context: Optional[BrakeFlowContext] = None,
+        *,
+        reportFailure: bool = False,
+    ) -> bool:
+        with self._brakeFlowLock:
+            printer = self._obtainPrinterInstance()
+            activeContext = context or self._buildBrakeFlowContext()
+            if activeContext is None:
+                log.debug("[brake] no context available for %s", self.serial)
+                return True
+            result = BrakeFlow.run_demo(printer, activeContext, captureCameraSnapshot)
+        if result:
+            if self._brakeFlowBlocked:
+                log.info("[brake] clearing obstruction block for %s", self.serial)
+            self._brakeFlowBlocked = False
+        elif reportFailure:
+            self._handleBrakeFailure(activeContext)
+        return result
+
     def _statusMonitorLoop(self, printer: Any) -> None:
         startTime = time.monotonic()
         while not self._statusStopEvent.is_set():
@@ -1331,9 +1377,61 @@ class CommandWorker:
             if remoteFileText != self._lastRemoteFile and not self._jobActive:
                 self._sawActivityDuringJob = False
             self._lastRemoteFile = remoteFileText
+        self._recordCheckpointIfNeeded(normalized)
         self._logProgressIfNeeded(normalized)
         self._checkForCompletion(normalized)
         self._checkForPrinterError(normalized)
+
+    def _recordCheckpointIfNeeded(self, status: Dict[str, Any]) -> None:
+        if not self._jobActive or not self._activeJobMetadata:
+            return
+        percentValue = status.get("mc_percent")
+        try:
+            percentFloat = float(percentValue)
+        except (TypeError, ValueError):
+            return
+        percentFloat = max(0.0, min(100.0, percentFloat))
+        thresholds = (0, 33, 66, 100)
+        pending = [value for value in thresholds if value not in self._capturedCheckpoints]
+        if not pending:
+            return
+        with self._printerLock:
+            printer = self._printerInstance
+        if printer is None:
+            return
+        for checkpoint in pending:
+            if percentFloat + 0.5 < checkpoint:
+                continue
+            try:
+                snapshotPath = captureCameraSnapshot(printer, self.serial)
+            except Exception as error:  # noqa: BLE001
+                log.warning(
+                    "[checkpoint] capture failed for %s at %d%%: %s",
+                    self.serial,
+                    checkpoint,
+                    error,
+                )
+                continue
+            targetDirectory = Path.home() / ".printmaster" / "bed-checkpoints" / self.serial / self._activeJobKey
+            try:
+                targetDirectory.mkdir(parents=True, exist_ok=True)
+            except Exception as error:  # noqa: BLE001 - filesystem issues should not crash
+                log.warning("[checkpoint] failed to prepare directory %s: %s", targetDirectory, error)
+            targetPath = targetDirectory / f"pct_{checkpoint:03d}.jpg"
+            storedPath = snapshotPath
+            try:
+                shutil.copy2(snapshotPath, targetPath)
+                storedPath = targetPath
+            except Exception as error:  # noqa: BLE001
+                log.debug("[checkpoint] copy failed for %s: %s", targetPath, error)
+            self._checkpointSnapshots[checkpoint] = storedPath
+            self._capturedCheckpoints.add(checkpoint)
+            log.info(
+                "[checkpoint] stored capture for %s at %d%% → %s",
+                self.serial,
+                checkpoint,
+                storedPath,
+            )
 
     def _logProgressIfNeeded(self, status: Dict[str, Any]) -> None:
         percent = status.get("mc_percent")
@@ -1348,6 +1446,113 @@ class CommandWorker:
             log.info("Progress %s%% on %s (%s)", percent, self.serial, state)
         else:
             log.info("Progress %s%% on %s", percent, self.serial)
+
+    def _resetBrakeJobState(self) -> None:
+        self._activeJobMetadata = {}
+        self._activeJobKey = "job"
+        self._checkpointSnapshots.clear()
+        self._capturedCheckpoints.clear()
+
+    def _extractJobValue(self, metadata: Dict[str, Any], aliases: List[str]) -> Any:
+        normalizedAliases = {self._normalizeKeyName(alias) for alias in aliases}
+        return self._searchStatusValue(metadata, normalizedAliases)
+
+    @staticmethod
+    def _interpretBoolean(value: Any) -> Optional[bool]:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"1", "true", "yes", "on"}:
+                return True
+            if normalized in {"0", "false", "no", "off"}:
+                return False
+        return None
+
+    def _sanitizeJobKey(self, candidate: Any) -> str:
+        text = self._coerceStringValue(candidate) or "job"
+        sanitized = "".join(character if character.isalnum() or character in {"-", "_"} else "_" for character in text)
+        return sanitized or "job"
+
+    def _prepareBrakeMetadata(self, metadata: Dict[str, Any], fileName: Optional[str]) -> None:
+        rawMetadata = dict(metadata) if isinstance(metadata, dict) else {}
+        enableRaw = self._extractJobValue(rawMetadata, ["enable_brake_plate", "enableBrakePlate"])
+        platesRaw = self._extractJobValue(rawMetadata, ["plates_requested", "platesRequested"])
+        heightRaw = self._extractJobValue(rawMetadata, ["print_z_height", "printZHeight"])
+        jobRaw = self._extractJobValue(rawMetadata, ["job_key", "jobKey", "fileName", "filename"])
+        jobKeyCandidate = jobRaw or fileName or self._lastRemoteFile
+        jobKey = self._sanitizeJobKey(jobKeyCandidate)
+        enableFlag = self._interpretBoolean(enableRaw)
+        platesValue = self._coerceIntValue(platesRaw) or 0
+        heightValue = self._coerceFloatValue(heightRaw)
+        self._activeJobKey = jobKey
+        self._activeJobMetadata = {
+            "raw": rawMetadata,
+            "enableBrakePlate": bool(enableFlag) if enableFlag is not None else False,
+            "platesRequested": max(0, int(platesValue)),
+            "printZHeight": heightValue,
+            "fileName": fileName,
+            "jobKey": jobKey,
+        }
+        self._checkpointSnapshots.clear()
+        self._capturedCheckpoints.clear()
+
+    def _buildBrakeFlowContext(self) -> Optional[BrakeFlowContext]:
+        if not self._activeJobMetadata:
+            return None
+        metadata = self._activeJobMetadata
+        return BrakeFlowContext(
+            serial=self.serial,
+            ipAddress=self.ipAddress,
+            jobKey=str(metadata.get("jobKey") or self._activeJobKey),
+            enableBrakePlate=bool(metadata.get("enableBrakePlate")),
+            platesRequested=int(metadata.get("platesRequested") or 0),
+            printZHeight=metadata.get("printZHeight"),
+            checkpointPaths=dict(self._checkpointSnapshots),
+            metadata=dict(metadata.get("raw") or {}),
+        )
+
+    def _handleBrakeFailure(self, context: BrakeFlowContext) -> None:
+        if not self._brakeFlowBlocked:
+            payload = buildBrakeFlowErrorPayload(context)
+            try:
+                postReportError(payload)
+            except Exception as error:  # noqa: BLE001
+                log.warning("[brake] failed to report obstruction for %s: %s", self.serial, error)
+        self._brakeFlowBlocked = True
+
+    def _runBrakeDemoIfNeeded(self) -> None:
+        context = self._buildBrakeFlowContext()
+        self._resetBrakeJobState()
+        if context is None:
+            return
+        if not context.shouldTrigger():
+            log.debug(
+                "[brake] skip brake demo for %s (plates=%s enable=%s)",
+                self.serial,
+                context.platesRequested,
+                context.enableBrakePlate,
+            )
+            return
+        if self._brakeFlowThread and self._brakeFlowThread.is_alive():
+            log.debug("[brake] demo already running for %s", self.serial)
+            return
+
+        def _runner() -> None:
+            try:
+                if not self.runBrakeDemo(context, reportFailure=True):
+                    log.warning("[brake] obstruction confirmed for %s", self.serial)
+            except Exception as error:  # noqa: BLE001
+                log.error("[brake] brake demo failed for %s: %s", self.serial, error, exc_info=True)
+            finally:
+                self._brakeFlowThread = None
+
+        log.info("[brake] scheduling brake demo for %s job=%s", self.serial, context.normalizedJobKey())
+        thread = threading.Thread(target=_runner, name=f"BrakeFlow-{self.serial}", daemon=True)
+        self._brakeFlowThread = thread
+        thread.start()
 
     def _checkForCompletion(self, status: Dict[str, Any]) -> None:
         rawPercent = status.get("mc_percent")
@@ -1380,6 +1585,7 @@ class CommandWorker:
         self._jobActive = False
         self._sawActivityDuringJob = False
         self._deleteRemoteFile()
+        self._runBrakeDemoIfNeeded()
 
     def _checkForPrinterError(self, status: Dict[str, Any]) -> None:
         printer = self._printerInstance
@@ -1683,6 +1889,11 @@ class CommandWorker:
             fileName = metadata.get("fileName")
             if not fileName:
                 raise ValueError("start_print requires metadata.fileName")
+            if self._brakeFlowBlocked:
+                message = "Brake flow blocked: obstruction pending manual clear"
+                log.warning("[brake] blocking start_print on %s: %s", self.serial, message)
+                return "failed", message
+            self._prepareBrakeMetadata(metadata, fileName)
             plateIndex = metadata.get("plateIndex")
             paramPath = metadata.get("paramPath")
             useAms = metadata.get("useAms")
