@@ -1579,15 +1579,32 @@ class CommandWorker:
         zStepMm: float = 2.0,
         feedrate: int = 1200,
         homeXy: bool = True,
+        use_job_fallback: Optional[bool] = None,
+        **kwargs: Any,
     ) -> List[Path]:
-        printer = self._obtainPrinterInstance()
+        printer = (
+            getattr(self, "_printerClient", None)
+            or getattr(self, "client", None)
+            or getattr(self, "printer", None)
+            or getattr(self, "_printer", None)
+            or self._obtainPrinterInstance()
+        )
+        serialNumber = str(
+            getattr(self, "serialNumber", None)
+            or getattr(self, "serial", "")
+        )
+
+        if use_job_fallback is None:
+            use_job_fallback = bool(kwargs.get("use_job_fallback", False))
+
         return captureBedReference(
             printer,
-            self.serial,
+            serialNumber,
             frames=frames,
             zStepMm=zStepMm,
             feedrate=feedrate,
             homeXy=homeXy,
+            use_job_fallback=use_job_fallback,
         )
 
     def runBrakeDemo(
