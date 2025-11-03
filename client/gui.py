@@ -1752,7 +1752,7 @@ class ListenerGuiApp:
 
         def task() -> None:
             try:
-                frames = worker.captureBedReference(frames=40, zStepMm=2.0)
+                frames = worker.captureBedReference(frames=40, zStepMm=2.0, use_job_fallback=True)
             except Exception as error:
                 self.log(f"Reference capture failed: {error}")
             else:
