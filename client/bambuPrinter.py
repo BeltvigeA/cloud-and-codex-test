@@ -728,6 +728,7 @@ def _activateTimelapseCapture(printer: Any, directory: Path) -> None:
 
     activated = False
     mqttClient = getattr(printer, "mqtt_client", None)
+    mqttResult: Optional[bool] = None
     if mqttClient is not None:
         setTimelapseMethod = getattr(mqttClient, "set_onboard_printer_timelapse", None)
         if callable(setTimelapseMethod):
@@ -736,10 +737,15 @@ def _activateTimelapseCapture(printer: Any, directory: Path) -> None:
                 if mqttResult:
                     activated = True
                 else:
-                    logger.debug("timelapse activation via mqtt returned falsy result")
-            except Exception:  # pragma: no cover - diagnostic logging only
-                logger.debug(
-                    "timelapse activation via mqtt failed",
+                    logger.warning(
+                        "[timelapse] mqtt activation returned False for %s",
+                        directoryString,
+                    )
+            except Exception as error:  # pragma: no cover - diagnostic logging only
+                logger.warning(
+                    "[timelapse] mqtt activation raised %s while configuring %s",
+                    error,
+                    directoryString,
                     exc_info=START_DEBUG,
                 )
 
@@ -755,9 +761,20 @@ def _activateTimelapseCapture(printer: Any, directory: Path) -> None:
                 try:
                     configureMethod(directoryString)
                     cameraConfigured = True
+                    logger.info(
+                        "[timelapse] camera client configured via %s for %s",
+                        methodName,
+                        directoryString,
+                    )
                     break
-                except Exception:  # pragma: no cover - diagnostic logging only
-                    logger.debug("timelapse configure %s failed", methodName, exc_info=START_DEBUG)
+                except Exception as error:  # pragma: no cover - diagnostic logging only
+                    logger.warning(
+                        "[timelapse] camera configure %s failed for %s: %s",
+                        methodName,
+                        directoryString,
+                        error,
+                        exc_info=START_DEBUG,
+                    )
         if not cameraConfigured:
             for attributeName in (
                 "timelapseDirectory",
@@ -769,11 +786,18 @@ def _activateTimelapseCapture(printer: Any, directory: Path) -> None:
                     try:
                         setattr(cameraClient, attributeName, directoryString)
                         cameraConfigured = True
-                        break
-                    except Exception:  # pragma: no cover - diagnostic logging only
-                        logger.debug(
-                            "timelapse attribute %s assignment failed",
+                        logger.info(
+                            "[timelapse] camera attribute %s set for %s",
                             attributeName,
+                            directoryString,
+                        )
+                        break
+                    except Exception as error:  # pragma: no cover - diagnostic logging only
+                        logger.warning(
+                            "[timelapse] camera attribute %s assignment failed for %s: %s",
+                            attributeName,
+                            directoryString,
+                            error,
                             exc_info=START_DEBUG,
                         )
         if not bool(getattr(cameraClient, "alive", False)):
@@ -781,8 +805,16 @@ def _activateTimelapseCapture(printer: Any, directory: Path) -> None:
             if callable(startMethod):
                 try:
                     startMethod()
+                    logger.info(
+                        "[timelapse] camera_start invoked while configuring %s",
+                        directoryString,
+                    )
                 except Exception:  # pragma: no cover - best effort
-                    logger.debug("camera_start() failed during timelapse activation", exc_info=START_DEBUG)
+                    logger.warning(
+                        "[timelapse] camera_start() failed during timelapse activation for %s",
+                        directoryString,
+                        exc_info=START_DEBUG,
+                    )
 
     if not activated:
         for candidate in (cameraClient, printer):
@@ -795,34 +827,63 @@ def _activateTimelapseCapture(printer: Any, directory: Path) -> None:
                 try:
                     activationMethod(directoryString)
                     activated = True
+                    logger.info(
+                        "[timelapse] activation %s succeeded for %s",
+                        methodName,
+                        directoryString,
+                    )
                     break
                 except TypeError:
                     try:
                         activationMethod()
                         activated = True
-                        break
-                    except Exception:  # pragma: no cover - diagnostic logging only
-                        logger.debug(
-                            "timelapse activation %s without args failed",
+                        logger.info(
+                            "[timelapse] activation %s succeeded without args for %s",
                             methodName,
+                            directoryString,
+                        )
+                        break
+                    except Exception as error:  # pragma: no cover - diagnostic logging only
+                        logger.warning(
+                            "[timelapse] activation %s without args failed for %s: %s",
+                            methodName,
+                            directoryString,
+                            error,
                             exc_info=START_DEBUG,
                         )
-                except Exception:  # pragma: no cover - diagnostic logging only
-                    logger.debug("timelapse activation %s failed", methodName, exc_info=START_DEBUG)
+                except Exception as error:  # pragma: no cover - diagnostic logging only
+                    logger.warning(
+                        "[timelapse] activation %s failed for %s: %s",
+                        methodName,
+                        directoryString,
+                        error,
+                        exc_info=START_DEBUG,
+                    )
             if activated:
                 break
 
     if hasattr(printer, "timelapse_directory"):
         try:
             setattr(printer, "timelapse_directory", directoryString)
-        except Exception:  # pragma: no cover - diagnostic logging only
-            logger.debug("setting printer.timelapse_directory failed", exc_info=START_DEBUG)
+            logger.info(
+                "[timelapse] printer timelapse_directory set for %s",
+                directoryString,
+            )
+        except Exception as error:  # pragma: no cover - diagnostic logging only
+            logger.warning(
+                "[timelapse] setting printer.timelapse_directory failed for %s: %s",
+                directoryString,
+                error,
+                exc_info=START_DEBUG,
+            )
 
-    if START_DEBUG:
-        if activated:
-            logger.info("[timelapse] capture activated for %s", directoryString)
-        else:
-            logger.info("[timelapse] capture requested for %s but no activation hooks succeeded", directoryString)
+    logger.info(
+        "[timelapse] activation summary for %s activated=%s mqttResult=%s cameraConfigured=%s",
+        directoryString,
+        activated,
+        mqttResult,
+        cameraConfigured,
+    )
 
 
 @dataclass(frozen=True)
