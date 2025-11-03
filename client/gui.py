@@ -82,6 +82,7 @@ def addPrinterIdentityToPayload(
         payload["accessCode"] = accessCode
     return payload
 
+from .autoprint.brake_flow import BrakeFlowContext
 from .bambuPrinter import BambuPrintOptions, postStatus, sendBambuPrintJob
 from .status_subscriber import BambuStatusSubscriber
 from .command_controller import CommandWorker
@@ -373,6 +374,20 @@ class ListenerGuiApp:
             state=tk.NORMAL,
         )
         self.connectPrintersButton.pack(side=tk.LEFT, padx=8)
+        self.captureReferenceButton = ttk.Button(
+            actionFrame,
+            text="Capture Bed Reference",
+            command=self._captureSelectedBedReference,
+            state=tk.DISABLED,
+        )
+        self.captureReferenceButton.pack(side=tk.LEFT, padx=8)
+        self.runBrakeDemoButton = ttk.Button(
+            actionFrame,
+            text="Run Brake Demo",
+            command=self._runBrakeDemoForSelected,
+            state=tk.DISABLED,
+        )
+        self.runBrakeDemoButton.pack(side=tk.LEFT, padx=8)
         actionFrame.columnconfigure(0, weight=1)
 
         treeFrame = ttk.Frame(parent)
@@ -1716,6 +1731,69 @@ class ListenerGuiApp:
         self.editPrinterButton.config(state=state)
         if hasattr(self, "sendTestStatusButton"):
             self.sendTestStatusButton.config(state=state)
+        if hasattr(self, "captureReferenceButton"):
+            self.captureReferenceButton.config(state=state)
+        if hasattr(self, "runBrakeDemoButton"):
+            self.runBrakeDemoButton.config(state=state)
+
+    def _captureSelectedBedReference(self) -> None:
+        index = self._getSelectedPrinterIndex()
+        if index is None:
+            return
+        printer = self.printers[index]
+        serial = str(printer.get("serialNumber") or "").strip()
+        if not serial:
+            self.log("Unable to capture reference – printer is missing a serial number.")
+            return
+        worker = self.commandWorkers.get(serial)
+        if worker is None:
+            self.log(f"No active command worker for {serial}. Connect printers first.")
+            return
+
+        def task() -> None:
+            try:
+                frames = worker.captureReferenceSequence()
+            except Exception as error:
+                self.log(f"Failed to capture bed reference for {serial}: {error}")
+            else:
+                self.log(f"Captured {len(frames)} bed reference frame(s) for {serial}")
+
+        threading.Thread(target=task, name=f"CaptureReference-{serial}", daemon=True).start()
+
+    def _runBrakeDemoForSelected(self) -> None:
+        index = self._getSelectedPrinterIndex()
+        if index is None:
+            return
+        printer = self.printers[index]
+        serial = str(printer.get("serialNumber") or "").strip()
+        if not serial:
+            self.log("Unable to run brake demo – printer is missing a serial number.")
+            return
+        worker = self.commandWorkers.get(serial)
+        if worker is None:
+            self.log(f"No active command worker for {serial}. Connect printers first.")
+            return
+        ipAddress = str(printer.get("ipAddress") or "").strip() or None
+        context = BrakeFlowContext(
+            serial=serial,
+            ipAddress=ipAddress,
+            jobKey="manual-demo",
+            enableBrakePlate=True,
+            platesRequested=2,
+            checkpointPaths={},
+            metadata={"source": "manual"},
+        )
+
+        def task() -> None:
+            try:
+                result = worker.runBrakeDemo(context)
+            except Exception as error:
+                self.log(f"Brake demo failed for {serial}: {error}")
+            else:
+                outcome = "clear" if result else "obstructed"
+                self.log(f"Brake demo for {serial}: {outcome}")
+
+        threading.Thread(target=task, name=f"BrakeDemo-{serial}", daemon=True).start()
 
     def refreshPrintersNow(self) -> None:
         if self.statusRefreshThread and self.statusRefreshThread.is_alive():
