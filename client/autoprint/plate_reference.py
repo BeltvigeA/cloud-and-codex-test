@@ -223,7 +223,7 @@ def captureReferenceSequence(
             sanitizedSerial,
         )
 
-    if homeTransport in {"method", "control"}:
+    if homeTransport is not None:
         if not _waitForMotionCompletion(printer, "home_all"):
             log.debug("[ref] motion completion wait skipped or timed out for %s", sanitizedSerial)
 
@@ -292,6 +292,10 @@ def captureReferenceSequence(
                 elif homeTransport is not None:
                     log.warning("[ref] unable to park print head for %s", sanitizedSerial)
 
+    if parkTransport is not None:
+        if not _waitForMotionCompletion(printer, "park head"):
+            log.debug("[ref] park wait skipped or timed out for %s", sanitizedSerial)
+
     if homeTransport is not None or parkTransport is not None:
         preCaptureDelaySeconds = max(delayValue, _HOME_AND_PARK_SETTLE_SECONDS)
 
@@ -316,8 +320,8 @@ def captureReferenceSequence(
                 moveMethod = getattr(printer, "move", None)
                 if callable(moveMethod):
                     try:
-                        moveMethod("z", _MOVEMENT_DISTANCE_MM, int(_MOVEMENT_FEEDRATE_MM_PER_MINUTE))
-                        log.info("[ref] move('z', %.1f) invoked for %s", _MOVEMENT_DISTANCE_MM, sanitizedSerial)
+                        moveMethod("z", -float(_MOVEMENT_DISTANCE_MM), int(_MOVEMENT_FEEDRATE_MM_PER_MINUTE))
+                        log.info("[ref] move('z', -%.1f) invoked for %s", _MOVEMENT_DISTANCE_MM, sanitizedSerial)
                         lowered = True
                     except Exception as error:
                         log.debug("[ref] move('z') failed for %s: %s", sanitizedSerial, error)
@@ -326,7 +330,7 @@ def captureReferenceSequence(
                         "motion": {
                             "command": "move",
                             "axis": "z",
-                            "distance": float(_MOVEMENT_DISTANCE_MM),
+                            "distance": -float(_MOVEMENT_DISTANCE_MM),
                             "feedrate": int(_MOVEMENT_FEEDRATE_MM_PER_MINUTE),
                         }
                     }
@@ -335,6 +339,8 @@ def captureReferenceSequence(
                 if not lowered and sendGcodeSequence(_GCODE_LOWER_SEQUENCE, "lower build plate"):
                     lowered = True
                 if lowered:
+                    if not _waitForMotionCompletion(printer, "lower build plate"):
+                        log.debug("[ref] lower wait skipped or timed out for %s", sanitizedSerial)
                     frameDelaySeconds = max(delayValue, _MOVEMENT_SETTLE_SECONDS)
                 else:
                     log.warning(
