@@ -726,7 +726,24 @@ def _activateTimelapseCapture(printer: Any, directory: Path) -> None:
     cameraClient = getattr(printer, "camera_client", None)
     cameraConfigured = False
 
-    if cameraClient is not None:
+    activated = False
+    mqttClient = getattr(printer, "mqtt_client", None)
+    if mqttClient is not None:
+        setTimelapseMethod = getattr(mqttClient, "set_onboard_printer_timelapse", None)
+        if callable(setTimelapseMethod):
+            try:
+                mqttResult = setTimelapseMethod(enable=True)
+                if mqttResult:
+                    activated = True
+                else:
+                    logger.debug("timelapse activation via mqtt returned falsy result")
+            except Exception:  # pragma: no cover - diagnostic logging only
+                logger.debug(
+                    "timelapse activation via mqtt failed",
+                    exc_info=START_DEBUG,
+                )
+
+    if not activated and cameraClient is not None:
         for methodName in (
             "set_timelapse_directory",
             "set_output_directory",
@@ -767,33 +784,33 @@ def _activateTimelapseCapture(printer: Any, directory: Path) -> None:
                 except Exception:  # pragma: no cover - best effort
                     logger.debug("camera_start() failed during timelapse activation", exc_info=START_DEBUG)
 
-    activated = False
-    for candidate in (cameraClient, printer):
-        if candidate is None:
-            continue
-        for methodName in ("start_timelapse_capture", "start_timelapse", "enable_timelapse"):
-            activationMethod = getattr(candidate, methodName, None)
-            if not callable(activationMethod):
+    if not activated:
+        for candidate in (cameraClient, printer):
+            if candidate is None:
                 continue
-            try:
-                activationMethod(directoryString)
-                activated = True
-                break
-            except TypeError:
+            for methodName in ("start_timelapse_capture", "start_timelapse", "enable_timelapse"):
+                activationMethod = getattr(candidate, methodName, None)
+                if not callable(activationMethod):
+                    continue
                 try:
-                    activationMethod()
+                    activationMethod(directoryString)
                     activated = True
                     break
+                except TypeError:
+                    try:
+                        activationMethod()
+                        activated = True
+                        break
+                    except Exception:  # pragma: no cover - diagnostic logging only
+                        logger.debug(
+                            "timelapse activation %s without args failed",
+                            methodName,
+                            exc_info=START_DEBUG,
+                        )
                 except Exception:  # pragma: no cover - diagnostic logging only
-                    logger.debug(
-                        "timelapse activation %s without args failed",
-                        methodName,
-                        exc_info=START_DEBUG,
-                    )
-            except Exception:  # pragma: no cover - diagnostic logging only
-                logger.debug("timelapse activation %s failed", methodName, exc_info=START_DEBUG)
-        if activated:
-            break
+                    logger.debug("timelapse activation %s failed", methodName, exc_info=START_DEBUG)
+            if activated:
+                break
 
     if hasattr(printer, "timelapse_directory"):
         try:
