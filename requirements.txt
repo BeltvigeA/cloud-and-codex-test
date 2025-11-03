@@ -10,11 +10,12 @@ bambulabs_api>=2.6.5
 rich>=13.7.0
 
 # Computer Vision dependencies for plate verification
-opencv-python>=4.8.0
-scikit-image>=0.22.0
-numpy>=1.24.0,<2.0
-Pillow>=10.0.0
+# Updated for Python 3.13 compatibility
+opencv-python>=4.10.0
+scikit-image>=0.24.0
+numpy>=1.26.0,<3.0
+Pillow>=10.4.0
 imagehash>=4.3.0
-pytest>=7.4.0
+pytest>=8.0.0
 PyYAML>=6.0
 
