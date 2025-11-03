@@ -521,6 +521,13 @@ def _lowerBuildPlateOnce(
         gcode_fn = gcode_fn or resolvedGcode
         move_fn = move_fn or resolvedMove
 
+    # Ensure MQTT is connected before attempting gcode commands
+    if callable(gcode_fn):
+        try:
+            _ensurePrinterConnected(printer, timeout=5.0)
+        except Exception as connError:  # noqa: BLE001 - third-party SDK raises generic Exception
+            log.debug("[ref] connection check before gcode failed: %s", connError, exc_info=log.isEnabledFor(logging.DEBUG))
+
     if callable(gcode_fn):
         try:
             result = gcode_fn(
