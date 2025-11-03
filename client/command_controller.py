@@ -322,6 +322,143 @@ def captureCameraSnapshot(printer: Any, serial: str) -> Path:
     raise RuntimeError(f"Camera capture failed – tried: {attemptedMessage}")
 
 
+# ---------- Bed reference helpers ----------
+def _ensurePrinterConnected(
+    printer: Any,
+    *,
+    timeout: float = 15.0,
+) -> None:
+    """
+    Best-effort: start MQTT, connect(), and wait until camera/mqtt is usable.
+    Safe to call multiple times.
+    """
+
+    mqttStarter = getattr(printer, "mqtt_start", None)
+    if callable(mqttStarter):
+        try:
+            mqttStarter()
+        except Exception as error:  # noqa: BLE001 - third-party SDK raises generic Exception
+            raise RuntimeError(f"Unable to start printer MQTT: {error}") from error
+
+    connectMethod = getattr(printer, "connect", None)
+    if callable(connectMethod):
+        try:
+            connectMethod()
+        except Exception as error:  # noqa: BLE001 - third-party SDK raises generic Exception
+            raise RuntimeError(f"Unable to connect to printer: {error}") from error
+
+    try:
+        from . import bambuPrinter as _bambuPrinter
+
+        waitMethod = getattr(_bambuPrinter, "_waitForMqttReady", None)
+        if callable(waitMethod):
+            waitMethod(printer, timeout=timeout)
+    except Exception:
+        pass
+
+
+def _lowerBuildPlateOnce(
+    printer: Any,
+    *,
+    dzMm: float = 2.0,
+    feedrate: int = 1200,
+) -> bool:
+    """
+    Try to increase Z by +dzMm (on Bambu, +Z raises tool / lowers plate).
+    Prefer official API; fall back to G-code in LAN/dev environments.
+    Return True if movement was issued; False otherwise.
+    """
+
+    moveMethod = getattr(printer, "move_z_axis", None)
+    if callable(moveMethod):
+        try:
+            return bool(moveMethod(str(dzMm)))
+        except Exception:
+            pass
+
+    gcodeMethod = getattr(printer, "gcode", None)
+    if callable(gcodeMethod):
+        try:
+            gcodeMethod("G91")
+            gcodeMethod(f"G1 Z{dzMm} F{feedrate}")
+            gcodeMethod("G90")
+            return True
+        except Exception:
+            return False
+
+    return False
+
+
+def captureBedReference(
+    printer: Any,
+    serialNumber: str,
+    *,
+    frames: int = 30,
+    zStepMm: float = 2.0,
+    feedrate: int = 1200,
+    homeXy: bool = True,
+) -> List[Path]:
+    """
+    Capture a vertical sweep of reference images while lowering the build plate.
+    Hard-stop if motion is not supported (no useless pictures).
+    """
+
+    _ensurePrinterConnected(printer)
+
+    cameraOnMethod = getattr(printer, "camera_start", None) or getattr(printer, "camera_on", None)
+    cameraOffMethod = getattr(printer, "camera_stop", None) or getattr(printer, "camera_off", None)
+
+    if callable(cameraOnMethod):
+        try:
+            cameraOnMethod()
+        except Exception:
+            pass
+
+    try:
+        if homeXy:
+            try:
+                gcodeMethod = getattr(printer, "gcode", None)
+                if callable(gcodeMethod):
+                    gcodeMethod("G28 X Y")
+            except Exception:
+                pass
+
+        savedPaths: List[Path] = []
+
+        if not _lowerBuildPlateOnce(printer, dzMm=0.0, feedrate=feedrate):
+            log.warning(
+                "[ref] unable to lower build plate for %s: no supported motion control",
+                serialNumber,
+            )
+            raise RuntimeError("No supported motion control available for bed reference capture")
+
+        for _ in range(max(1, int(frames))):
+            moved = _lowerBuildPlateOnce(printer, dzMm=zStepMm, feedrate=feedrate)
+            if not moved:
+                log.warning(
+                    "[ref] unable to lower build plate for %s: no supported motion control",
+                    serialNumber,
+                )
+                break
+            savedPaths.append(captureCameraSnapshot(printer, serialNumber))
+
+        if not savedPaths:
+            raise RuntimeError("Bed reference aborted: could not move Z to take any frames")
+
+        log.info(
+            "[ref] completed reference capture for %s (%d frame(s))",
+            serialNumber,
+            len(savedPaths),
+        )
+        return savedPaths
+    finally:
+        if callable(cameraOffMethod):
+            try:
+                cameraOffMethod()
+            except Exception:
+                pass
+
+
 def _determinePollMode() -> str:
     candidate = (os.getenv("CONTROL_POLL_MODE", "recipient") or "recipient").strip().lower()
     if candidate == "printer":
@@ -1149,6 +1286,24 @@ class CommandWorker:
     def captureReferenceSequence(self) -> List[Path]:
         printer = self._obtainPrinterInstance()
         return captureReferenceSequence(printer, self.serial, captureCameraSnapshot)
+
+    def captureBedReference(
+        self,
+        *,
+        frames: int = 40,
+        zStepMm: float = 2.0,
+        feedrate: int = 1200,
+        homeXy: bool = True,
+    ) -> List[Path]:
+        printer = self._obtainPrinterInstance()
+        return captureBedReference(
+            printer,
+            self.serial,
+            frames=frames,
+            zStepMm=zStepMm,
+            feedrate=feedrate,
+            homeXy=homeXy,
+        )
 
     def runBrakeDemo(
         self,
