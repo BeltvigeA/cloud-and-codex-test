@@ -1,0 +1,189 @@
+# Computer Vision Detection Configuration
+# Tunable parameters for build plate object detection system
+
+cv_detection:
+  # Image preprocessing parameters
+  preprocessing:
+    # Target image size after downsampling (width, height)
+    # Smaller = faster processing, larger = more detail
+    target_size: [960, 540]
+
+    # CLAHE (Contrast Limited Adaptive Histogram Equalization) parameters
+    # Normalizes lighting variations across the build plate
+    clahe_clip_limit: 2.0  # Higher = more contrast enhancement
+    clahe_tile_grid: [8, 8]  # Grid size for local enhancement
+
+    # Gaussian blur kernel for background subtraction
+    # Must be odd numbers
+    gaussian_blur_kernel: [31, 31]
+
+  # Perceptual hashing parameters
+  perceptual_hash:
+    # Hash size (hash_size x hash_size grid)
+    # Larger = more precise, 16x16 = 256-bit hash
+    hash_size: 16
+
+    # Maximum Hamming distance for exact match
+    # Lower = stricter matching, higher = more tolerance
+    match_threshold: 5  # Out of 256 bits
+
+  # SSIM (Structural Similarity Index) parameters
+  ssim:
+    # Window size for SSIM calculation (must be odd, >= 3)
+    # Larger = considers more context, smaller = more local
+    window_size: 7
+
+    # Use Gaussian weighting for local windows
+    gaussian_weights: true
+
+  # Region analysis parameters
+  region_analysis:
+    # Minimum area in pixels to consider as a region
+    # Smaller = detects tiny objects (more false positives)
+    # Larger = ignores small debris (fewer false positives)
+    min_area_pixels: 100
+
+    # Maximum aspect ratio (width/height) to filter edge artifacts
+    # Long thin regions are usually lighting artifacts, not objects
+    max_aspect_ratio: 5.0
+
+    # Threshold for binarizing difference map (0.0-1.0)
+    # Higher = only very different pixels count
+    difference_threshold: 0.5
+
+    # Percent of image border to exclude (reduces edge artifacts)
+    exclude_border_percent: 0.05
+
+    # Overlap threshold for merging regions (0.0-1.0)
+    # Higher = requires more overlap to merge
+    overlap_threshold: 0.3
+
+  # Adaptive threshold configuration
+  adaptive_threshold:
+    # Base threshold for standard Z-heights
+    base_threshold: 0.90
+
+    # Z-height zones with specific thresholds
+    # Lower Z = higher threshold (more conservative)
+    z_height_zones:
+      - z_max: 5.0
+        threshold: 0.95  # Very conservative for low heights
+        description: "Near build plate - high collision risk"
+
+      - z_max: 20.0
+        threshold: 0.92  # Conservative for mid-low heights
+        description: "Low height - moderate collision risk"
+
+      - z_max: 1000.0
+        threshold: 0.90  # Standard for higher heights
+        description: "Normal height - standard threshold"
+
+    # Adjustment based on false positive rate
+    # If FP rate is high, threshold is lowered by this amount
+    fp_rate_adjustment: 0.02
+
+    # Safety bounds - never exceed these limits
+    min_threshold: 0.85  # Never go below (too many false negatives)
+    max_threshold: 0.97  # Never go above (too many false positives)
+
+  # File path configuration
+  file_paths:
+    # Root directory for calibration references
+    calibration_root: "/print_farm_data/calibration"
+
+    # Root directory for print checkpoint images
+    checkpoints_root: "/print_farm_data/checkpoints"
+
+    # Root directory for CV analysis outputs
+    analysis_root: "/print_farm_data/cv_analysis"
+
+    # Tolerance for finding nearest calibration reference (mm)
+    calibration_tolerance_mm: 3.0
+
+  # Performance tuning
+  performance:
+    # Enable parallel processing for batch operations
+    parallel_processing: false
+
+    # Number of worker threads for parallel processing
+    num_workers: 4
+
+    # Enable performance profiling
+    enable_profiling: false
+
+  # Visualization settings
+  visualization:
+    # Automatically save visualizations for non-clean detections
+    auto_save_on_detection: true
+
+    # Save visualizations for clean plates (for validation)
+    save_clean_visualizations: false
+
+    # Colormap for difference heatmaps
+    # Options: COLORMAP_JET, COLORMAP_HOT, COLORMAP_VIRIDIS
+    difference_colormap: "COLORMAP_JET"
+
+    # Save individual region detail images
+    save_region_details: true
+
+  # Logging configuration
+  logging:
+    # Log level: DEBUG, INFO, WARNING, ERROR, CRITICAL
+    level: "INFO"
+
+    # Log all detection decisions (for analysis)
+    log_all_detections: true
+
+    # Save detection logs to file
+    save_logs: true
+
+    # Log file path
+    log_file: "/print_farm_data/logs/cv_detection.log"
+
+# Calibration configuration
+calibration:
+  # Z-height increment for calibration images (mm)
+  z_increment: 5
+
+  # Z-height range for calibration
+  z_min: 0
+  z_max: 235
+
+  # Number of calibration images to capture per printer
+  # (z_max - z_min) / z_increment + 1 = 48 images (0 to 235mm in 5mm steps)
+
+  # Recalibration frequency (days)
+  recalibration_days: 90
+
+  # Trigger recalibration after maintenance events
+  recalibrate_after_maintenance: true
+
+# Checkpoint configuration
+checkpoints:
+  # Checkpoint capture percentages
+  capture_at_percentages: [0, 33, 66, 100]
+
+  # Also capture at specific Z-heights (mm)
+  capture_at_z_heights: []
+
+  # Retention policy (days)
+  retention_days: 30
+
+# Alert configuration
+alerts:
+  # Enable alerts for detected objects
+  enable_alerts: true
+
+  # Alert only after multiple consecutive detections
+  consecutive_detections_required: 2
+
+  # Alert confidence threshold (0.0-1.0)
+  min_confidence_for_alert: 0.7
+
+# Maintenance mode
+maintenance:
+  # Disable detection during maintenance
+  enabled: false
+
+  # Bypass detection (always return clean)
+  bypass_detection: false
