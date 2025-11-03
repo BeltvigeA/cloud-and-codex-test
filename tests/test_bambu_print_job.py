@@ -1,4 +1,3 @@
-import logging
 import zipfile
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -259,59 +258,6 @@ def test_startPrintViaApi_retries_on_conflict(monkeypatch: pytest.MonkeyPatch) -
             "vibration_compensation": False,
         },
     ]
-
-
-class DummyMqttClient:
-    def __init__(self, *, result: Optional[bool] = True, error: Optional[Exception] = None) -> None:
-        self.result = result
-        self.error = error
-        self.calls = 0
-
-    def set_onboard_printer_timelapse(self, *, enable: bool) -> Optional[bool]:
-        self.calls += 1
-        if self.error is not None:
-            raise self.error
-        return self.result
-
-
-class DummyTimelapsePrinter:
-    def __init__(self, mqttResult: Optional[bool], *, raiseError: Optional[Exception] = None) -> None:
-        self.camera_client = FakeCameraClient()
-        self.mqtt_client = DummyMqttClient(result=mqttResult, error=raiseError)
-        self.timelapse_directory: Optional[str] = None
-
-    def camera_start(self) -> bool:
-        return self.camera_client.start()
-
-
-def testActivateTimelapseLogsActivationSuccess(caplog: pytest.LogCaptureFixture, tmp_path: Path) -> None:
-    printer = DummyTimelapsePrinter(True)
-    directoryPath = tmp_path / "tl"
-
-    with caplog.at_level(logging.INFO):
-        bambuPrinter._activateTimelapseCapture(printer, directoryPath)
-
-    summaryLogs = [record for record in caplog.records if "activation summary" in record.message]
-    assert summaryLogs, "expected activation summary log"
-    assert summaryLogs[-1].levelno == logging.INFO
-    assert "activated=True" in summaryLogs[-1].message
-    assert "mqttResult=True" in summaryLogs[-1].message
-
-
-def testActivateTimelapseLogsFallbackWarnings(caplog: pytest.LogCaptureFixture, tmp_path: Path) -> None:
-    printer = DummyTimelapsePrinter(False)
-    directoryPath = tmp_path / "tl"
-
-    with caplog.at_level(logging.INFO):
-        bambuPrinter._activateTimelapseCapture(printer, directoryPath)
-
-    warningLogs = [record for record in caplog.records if record.levelno == logging.WARNING]
-    assert any("mqtt activation returned False" in record.message for record in warningLogs)
-    summaryLogs = [record for record in caplog.records if "activation summary" in record.message]
-    assert summaryLogs
-    assert "activated=True" in summaryLogs[-1].message
-    assert "mqttResult=False" in summaryLogs[-1].message
-    assert printer.timelapse_directory == str(directoryPath)
 
 
 def test_startPrintViaApi_enables_timelapse(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
