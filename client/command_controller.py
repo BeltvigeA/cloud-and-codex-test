@@ -22,6 +22,7 @@ except Exception:  # pragma: no cover - surfaced through logs and callbacks
     bambuApi = None
 
 from . import bambuPrinter
+from .autoprint.bedref_capture import run_bed_reference_capture
 from .autoprint.brake_flow import BrakeFlow, BrakeFlowContext, buildBrakeFlowErrorPayload
 from .autoprint.plate_reference import captureReferenceSequence
 from .base44_client import (
@@ -1339,39 +1340,31 @@ class CommandWorker:
         printer = self._obtainPrinterInstance()
         return captureReferenceSequence(printer, self.serial, captureCameraSnapshot)
 
-    def captureBedReference(
-        self,
-        *,
-        frames: int = 40,
-        zStepMm: float = 2.0,
-        feedrate: int = 1200,
-        homeXy: bool = True,
-        use_job_fallback: Optional[bool] = None,
-        **kwargs: Any,
-    ) -> List[Path]:
-        printer = (
-            getattr(self, "_printerClient", None)
-            or getattr(self, "client", None)
-            or getattr(self, "printer", None)
-            or getattr(self, "_printer", None)
-            or self._obtainPrinterInstance()
-        )
-        serialNumber = str(
-            getattr(self, "serialNumber", None)
-            or getattr(self, "serial", "")
-        )
-
-        if use_job_fallback is None:
-            use_job_fallback = bool(kwargs.get("use_job_fallback", False))
-
-        return captureBedReference(
-            printer,
-            serialNumber,
-            frames=frames,
-            zStepMm=zStepMm,
-            feedrate=feedrate,
-            homeXy=homeXy,
-            use_job_fallback=use_job_fallback,
+    def captureBedReference(self, frames: int = 40, zStepMm: float = 2.0, use_job_fallback: bool = True) -> List[Path]:
+        """
+        Ny implementasjon:
+          - Kjører .3mf (bedRefCaputre.gcode.3mf) via API
+          - Tar bilder i 3s-pauser og lagrer nummerert i ~/.printmaster/bed-reference/<serial>/
+        """
+        serial = str(getattr(self, "serial", getattr(self, "printerSerial", "")) or "").strip()
+        ip = str(getattr(self, "ipAddress", "") or "").strip()
+        access = str(getattr(self, "accessCode", "") or "").strip()
+        if not (serial and ip and access):
+            raise RuntimeError("captureBedReference krever serial, ipAddress og accessCode")
+        # Finn snapshot-funksjon på worker (brukes allerede andre steder i klienten)
+        captureFunc = getattr(self, "_captureCameraSnapshot", None) or getattr(self, "captureCameraSnapshot", None)
+        if not callable(captureFunc):
+            raise RuntimeError("Fant ikke snapshot-funksjon på CommandWorker")
+        log.info("[bedref] .3mf capture start for %s (frames=%d)", serial, frames)
+        return run_bed_reference_capture(
+            ip=ip,
+            serial=serial,
+            accessCode=access,
+            captureFunc=captureFunc,
+            frames=max(1, int(frames)),
+            optionsFactory=bambuPrinter.BambuPrintOptions,
+            sendJobFunc=bambuPrinter.sendBambuPrintJob,
+            bambuApiModule=bambuApi,
         )
 
     def runBrakeDemo(
