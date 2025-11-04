@@ -10,17 +10,14 @@ import re
 import shutil
 import threading
 import time
+import requests
+
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-import requests
-
-try:  # pragma: no cover - optional dependency resolved at runtime
-    import bambulabs_api as bambuApi
-except Exception:  # pragma: no cover - surfaced through logs and callbacks
-    bambuApi = None
-
+from . import bambuPrinter
+from .bambuPrinter import BambuPrintOptions, sendBambuPrintJob, bambulabsApi
 from . import bambuPrinter
 from .autoprint.bedref_capture import run_bed_reference_capture
 from .autoprint.brake_flow import BrakeFlow, BrakeFlowContext, buildBrakeFlowErrorPayload
@@ -1362,9 +1359,9 @@ class CommandWorker:
             accessCode=access,
             captureFunc=captureFunc,
             frames=max(1, int(frames)),
-            optionsFactory=bambuPrinter.BambuPrintOptions,
-            sendJobFunc=bambuPrinter.sendBambuPrintJob,
-            bambuApiModule=bambuApi,
+            optionsFactory=BambuPrintOptions,
+            sendJobFunc=sendBambuPrintJob,
+            bambuApiModule=bambulabsApi,
         )
 
     def runBrakeDemo(
