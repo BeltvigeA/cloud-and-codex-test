@@ -12,7 +12,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import requests
 
@@ -386,259 +386,33 @@ def _ensurePrinterConnected(
         pass
 
 
-def _resolve_motion_source(
-    obj: Any,
-) -> Tuple[Optional[Callable[..., Any]], Optional[Callable[..., Any]]]:
-    """Locate available motion helpers on the printer wrapper."""
+def runBedReferenceCaptureJob(printer: Any) -> None:
+    """Upload and start the prebuilt bed reference capture job."""
 
-    searchChain = (
-        obj,
-        getattr(obj, "api", None),
-        getattr(obj, "client", None),
-        getattr(obj, "_client", None),
-        getattr(obj, "raw", None),
-        getattr(obj, "printer", None),
-        getattr(obj, "conn", None),
-    )
+    _ensurePrinterConnected(printer)
 
-    for candidate in searchChain:
-        if candidate is None:
-            continue
-        gcodeCandidate = getattr(candidate, "gcode", None)
-        moveCandidate = getattr(candidate, "move_z_axis", None)
-        gcodeCallable = gcodeCandidate if callable(gcodeCandidate) else None
-        moveCallable = moveCandidate if callable(moveCandidate) else None
-        if gcodeCallable or moveCallable:
-            assert gcodeCallable or moveCallable
-            return gcodeCallable, moveCallable
+    uploadMethod = getattr(printer, "upload_file", None)
+    startMethod = getattr(printer, "start_print", None)
 
-    return None, None
+    if not callable(uploadMethod) or not callable(startMethod):
+        raise RuntimeError("Printer does not support bed reference capture job")
 
+    gcodeBundlePath = Path(__file__).resolve().parent / "autoprintGcode" / "bedRefCaputre.gcode.3mf"
+    if not gcodeBundlePath.is_file():
+        raise FileNotFoundError(f"Bed reference capture bundle missing: {gcodeBundlePath}")
 
-def _extractFloatCandidate(value: Any) -> Optional[float]:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
+    with open(gcodeBundlePath, "rb") as bundleHandle:
+        bundleBytes = bundleHandle.read()
 
-
-def _resolveCurrentZHeight(printer: Any) -> Optional[float]:
-    """Try to obtain the current Z height from available printer state."""
-
-    def _searchMapping(payload: Any) -> Optional[float]:
-        if isinstance(payload, dict):
-            for key, value in payload.items():
-                normalizedKey = str(key).lower()
-                if normalizedKey in {
-                    "z",
-                    "pos_z",
-                    "z_pos",
-                    "axis_z",
-                    "zheight",
-                    "z_height",
-                    "zposition",
-                    "z_position",
-                }:
-                    candidateValue = _extractFloatCandidate(value)
-                    if candidateValue is not None:
-                        return candidateValue
-                nested = _searchMapping(value)
-                if nested is not None:
-                    return nested
-        elif isinstance(payload, (list, tuple)):
-            for item in payload:
-                nested = _searchMapping(item)
-                if nested is not None:
-                    return nested
-        return None
-
-    searchChain = (
-        printer,
-        getattr(printer, "api", None),
-        getattr(printer, "client", None),
-        getattr(printer, "_client", None),
-        getattr(printer, "raw", None),
-        getattr(printer, "printer", None),
-        getattr(printer, "conn", None),
-    )
-
-    attributeNames = (
-        "current_z",
-        "currentZ",
-        "z_height",
-        "zHeight",
-        "z_position",
-        "zPosition",
-        "pos_z",
-        "z_pos",
-        "axis_z",
-    )
-
-    for candidate in searchChain:
-        if candidate is None:
-            continue
-        for attributeName in attributeNames:
-            attributeValue = getattr(candidate, attributeName, None)
-            zValue = _extractFloatCandidate(attributeValue)
-            if zValue is not None:
-                return zValue
-        stateAttribute = getattr(candidate, "state", None)
-        if stateAttribute is not None:
-            resolvedState = _searchMapping(stateAttribute)
-            if resolvedState is not None:
-                return resolvedState
-
-    stateMethod = getattr(printer, "get_state", None)
-    if callable(stateMethod):
-        try:
-            statePayload = stateMethod()
-        except Exception:  # noqa: BLE001 - third-party SDK raises generic Exception
-            statePayload = None
-        if statePayload is not None:
-            resolved = _searchMapping(statePayload)
-            if resolved is not None:
-                return resolved
-
-    return None
-
-
-def _lowerBuildPlateOnce(
-    printer: Any,
-    *,
-    dzMm: float = 2.0,
-    feedrate: int = 1200,
-    gcode_fn: Optional[Callable[..., Any]] = None,
-    move_fn: Optional[Callable[..., Any]] = None,
-) -> bool:
-    """
-    Try to increase Z by +dzMm (on Bambu, +Z raises tool / lowers plate).
-    Prefer G-code for relative stepping; abort safely if unavailable.
-    Return True if movement was issued; False otherwise.
-    """
-
-    if gcode_fn is None or move_fn is None:
-        resolvedGcode, resolvedMove = _resolve_motion_source(printer)
-        gcode_fn = gcode_fn or resolvedGcode
-        move_fn = move_fn or resolvedMove
-
-    # Ensure MQTT is connected before attempting gcode commands
-    if callable(gcode_fn):
-        try:
-            _ensurePrinterConnected(printer, timeout=5.0)
-        except Exception as connError:  # noqa: BLE001 - third-party SDK raises generic Exception
-            log.debug("[ref] connection check before gcode failed: %s", connError, exc_info=log.isEnabledFor(logging.DEBUG))
-
-    if callable(gcode_fn):
-        try:
-            result = gcode_fn(
-                ["G91", f"G1 Z{dzMm} F{feedrate}", "M400", "G90"],
-                gcode_check=False,
-            )
-            if result is False:
-                raise RuntimeError("G-code rejected")
-            return True
-        except TypeError as error:
-            log.debug(
-                "[ref] gcode() signature mismatch: %s",
-                error,
-                exc_info=log.isEnabledFor(logging.DEBUG),
-            )
-            try:
-                gcode_fn("G91")
-                gcode_fn(f"G1 Z{dzMm} F{feedrate}")
-                gcode_fn("M400")
-                gcode_fn("G90")
-                return True
-            except Exception as nested_error:  # noqa: BLE001 - third-party SDK raises generic Exception
-                log.debug(
-                    "[ref] gcode() sequential commands failed: %s",
-                    nested_error,
-                    exc_info=log.isEnabledFor(logging.DEBUG),
-                )
-        except Exception as error:  # noqa: BLE001 - third-party SDK raises generic Exception
-            log.debug("[ref] gcode() relative step failed: %s", error, exc_info=log.isEnabledFor(logging.DEBUG))
-
-    if callable(move_fn):
-        currentZ = _resolveCurrentZHeight(printer)
-        if currentZ is None:
-            log.debug("[ref] unable to resolve current Z height for move_z_axis() fallback")
-            return False
-        targetZ = max(0.0, float(currentZ + dzMm))
-        try:
-            move_fn(str(targetZ))
-            return True
-        except TypeError:
-            try:
-                move_fn(targetZ)
-                return True
-            except Exception as error:  # noqa: BLE001 - third-party SDK raises generic Exception
-                log.debug("[ref] move_z_axis() fallback failed: %s", error, exc_info=log.isEnabledFor(logging.DEBUG))
-        except Exception as error:  # noqa: BLE001 - third-party SDK raises generic Exception
-            log.debug("[ref] move_z_axis() fallback failed: %s", error, exc_info=log.isEnabledFor(logging.DEBUG))
-
-    return False
-
-
-def _startBedSweepFallback(
-    printer: Any,
-    zStepMm: float,
-    frames: int,
-    homeXy: bool,
-) -> None:
-    """Upload and start the fallback bed sweep job via FTPS."""
+    buffer = io.BytesIO(bundleBytes)
+    buffer.seek(0)
 
     try:
-        from .autoprint.bed_sweep_job import (
-            build_bed_sweep_gcode,
-            upload_and_start_bed_sweep,
-        )
-    except Exception as error:  # noqa: BLE001 - import-time optional dependency
-        log.error("[ref] fallback bed sweep unavailable: %s", error)
-        raise RuntimeError("Bed sweep fallback unavailable") from error
+        uploadMethod(buffer, gcodeBundlePath.name)
+    except TypeError:
+        uploadMethod(str(gcodeBundlePath))
 
-    stepValue = float(zStepMm)
-    frameCount = max(1, int(frames))
-
-    try:
-        gcodePayload = build_bed_sweep_gcode(stepValue, frameCount, home_xy=homeXy)
-        upload_and_start_bed_sweep(printer, gcodePayload)
-        log.info(
-            "[ref] started bed-sweep fallback job (%.2f mm × %d frame(s))",
-            stepValue,
-            frameCount,
-        )
-    except Exception as error:  # noqa: BLE001 - third-party SDK raises generic Exception
-        log.error("[ref] failed to start bed-sweep fallback job: %s", error)
-        raise
-
-
-def _captureBedSweepFallbackFrames(
-    printer: Any,
-    serialNumber: str,
-    *,
-    frameCount: int,
-    stepValue: float,
-    homeXy: bool,
-) -> List[Path]:
-    """Run the bed-sweep fallback job and capture frames during dwell pauses."""
-
-    _startBedSweepFallback(printer, stepValue, frameCount, homeXy)
-
-    dwellSeconds = 0.8  # must match bed_sweep_job: G4 P800
-    capturedPaths: List[Path] = []
-    for _ in range(max(1, int(frameCount))):
-        time.sleep(dwellSeconds * 0.75)  # sample slightly before dwell end
-        capturedPaths.append(captureCameraSnapshot(printer, serialNumber))
-
-    if not capturedPaths:
-        raise RuntimeError("Bed reference fallback produced no frames")
-
-    log.info(
-        "[ref] completed reference capture via fallback for %s (%d frame(s))",
-        serialNumber,
-        len(capturedPaths),
-    )
-    return capturedPaths
+    startMethod("bedRefCaputre.gcode.3mf", "Metadata/plate_1.gcode")
 
 
 def captureBedReference(
@@ -651,23 +425,16 @@ def captureBedReference(
     homeXy: bool = True,
     use_job_fallback: bool = False,
 ) -> List[Path]:
-    """
-    Capture a vertical sweep of reference images while lowering the build plate.
-    Hard-stop if motion is not supported (no useless pictures).
-    """
+    """Capture bed reference images using the bundled automation job."""
 
+    # Retained keyword-only arguments maintain backwards compatibility with previous
+    # motion-based implementations even though they are no longer used.
     _ensurePrinterConnected(printer)
 
     frameCount = max(1, int(frames))
 
-    if not use_job_fallback:
-        envFlag = (os.getenv("BED_REF_JOB_FALLBACK", "") or "").strip().lower()
-        use_job_fallback = envFlag in {"1", "true", "yes", "on"}
-
     cameraOnMethod = getattr(printer, "camera_start", None) or getattr(printer, "camera_on", None)
     cameraOffMethod = getattr(printer, "camera_stop", None) or getattr(printer, "camera_off", None)
-
-    motionWarningIssued = False
 
     if callable(cameraOnMethod):
         try:
@@ -675,80 +442,73 @@ def captureBedReference(
         except Exception:
             pass
 
+    savedPaths: List[Path] = []
+
     try:
-        gcodeFn, moveFn = _resolve_motion_source(printer)
-        if not (gcodeFn or moveFn):
-            log.warning(
-                "[ref] motion not available for %s: no supported motion control",
-                serialNumber,
-            )
-            if use_job_fallback:
-                return _captureBedSweepFallbackFrames(
-                    printer,
-                    serialNumber,
-                    frameCount=frameCount,
-                    stepValue=float(zStepMm),
-                    homeXy=homeXy,
-                )
-            raise RuntimeError(
-                "No supported motion control available for bed reference capture"
-            )
+        runBedReferenceCaptureJob(printer)
 
-        if gcodeFn:
-            log.info("[ref] using gcode() relative stepping for bed reference")
-        elif moveFn:
-            log.info("[ref] using move_z_axis() fallback for bed reference")
+        getGcodeStateMethod = getattr(printer, "get_gcode_state", None)
 
-        if homeXy and gcodeFn:
-            try:
-                gcodeFn("G28 X Y")
-            except TypeError:
+        def waitForPause() -> None:
+            if not callable(getGcodeStateMethod):
+                time.sleep(3.0)
+                return
+
+            pauseDeadline = time.monotonic() + 30.0
+            while time.monotonic() < pauseDeadline:
                 try:
-                    gcodeFn("G28 X Y", gcode_check=False)
-                except Exception:
-                    pass
+                    statePayload = getGcodeStateMethod()
+                except Exception:  # noqa: BLE001 - third-party SDK raises generic Exception
+                    time.sleep(0.25)
+                    continue
+
+                stateText = ""
+                if isinstance(statePayload, dict):
+                    for key in ("gcode_line", "line", "gcode", "current_line"):
+                        value = statePayload.get(key)
+                        if isinstance(value, str):
+                            stateText = value
+                            break
+                    else:
+                        stateText = str(statePayload)
+                else:
+                    stateText = str(statePayload)
+
+                if "G4" in stateText.upper():
+                    time.sleep(0.5)
+                    return
+
+                time.sleep(0.25)
+
+            time.sleep(3.0)
+
+        for _ in range(frameCount):
+            waitForPause()
+            savedPaths.append(captureCameraSnapshot(printer, serialNumber))
+    finally:
+        stopMethod = getattr(printer, "stop_print", None)
+        if callable(stopMethod):
+            try:
+                stopMethod()
             except Exception:
                 pass
 
-        savedPaths: List[Path] = []
-
-        for _ in range(frameCount):
-            moved = _lowerBuildPlateOnce(
-                printer,
-                dzMm=zStepMm,
-                feedrate=feedrate,
-                gcode_fn=gcodeFn,
-                move_fn=moveFn,
-            )
-            if not moved:
-                if not motionWarningIssued:
-                    log.warning(
-                        "[ref] motion not available for %s: unable to move Z",
-                        serialNumber,
-                    )
-                    motionWarningIssued = True
-                break
-            savedPaths.append(captureCameraSnapshot(printer, serialNumber))
-
-        if not savedPaths:
-            if use_job_fallback:
-                return _captureBedSweepFallbackFrames(
-                    printer,
-                    serialNumber,
-                    frameCount=frameCount,
-                    stepValue=float(zStepMm),
-                    homeXy=homeXy,
-                )
-            raise RuntimeError("Bed reference aborted: could not move Z to take any frames")
-
-        log.info("[ref] completed reference capture for %s (%d frame(s))", serialNumber, len(savedPaths))
-        return savedPaths
-    finally:
         if callable(cameraOffMethod):
             try:
                 cameraOffMethod()
             except Exception:
                 pass
+
+    if not savedPaths:
+        raise RuntimeError("Bed reference job produced no frames")
+
+    log.info(
+        "[ref] completed reference capture for %s (%d frame(s))",
+        serialNumber,
+        len(savedPaths),
+    )
+    return savedPaths
+
 
 
 def _determinePollMode() -> str:
