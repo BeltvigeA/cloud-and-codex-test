@@ -13,7 +13,11 @@ from requests import HTTPError
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from client.command_controller import CommandWorker, _normalizeCommandMetadata
+from client.command_controller import (
+    CommandWorker,
+    _normalizeCommandMetadata,
+    captureBedReference,
+)
 from client.gui import ListenerGuiApp
 
 
@@ -402,6 +406,94 @@ def testCameraCommandOffInvokesCameraOff(monkeypatch: pytest.MonkeyPatch) -> Non
     assert finalizeCalls == [("camera-2", "completed")]
     assert resultCalls[0]["status"] == "completed"
     assert fakePrinter.cameraOffCalls == 1
+
+
+def testCaptureBedReferenceUsesBedReferenceJob(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    frames = 3
+
+    uploadCalls: List[tuple[object, str]] = []
+    startCalls: List[tuple[str, str]] = []
+    snapshotCalls: List[Path] = []
+
+    class FakePrinter:
+        def __init__(self) -> None:
+            self.connectCalls = 0
+            self.mqttStartCalls = 0
+            self.readyChecks = 0
+            self.cameraStartCalls = 0
+            self.cameraStopCalls = 0
+            self.stopCalls = 0
+            self.stateCalls = 0
+            self.stateSequence = [
+                {"line": "G4 P800"} for _ in range(frames)
+            ]
+
+        def connect(self) -> None:
+            self.connectCalls += 1
+
+        def mqtt_start(self) -> None:
+            self.mqttStartCalls += 1
+
+        def mqtt_client_ready(self) -> bool:
+            self.readyChecks += 1
+            return True
+
+        def camera_start(self) -> None:
+            self.cameraStartCalls += 1
+
+        def camera_stop(self) -> None:
+            self.cameraStopCalls += 1
+
+        def upload_file(self, payload: object, name: str) -> str:
+            uploadCalls.append((payload, name))
+            return "226"
+
+        def start_print(self, project: str, gcode: str) -> None:
+            startCalls.append((project, gcode))
+
+        def get_gcode_state(self) -> Dict[str, str]:
+            self.stateCalls += 1
+            if self.stateSequence:
+                return self.stateSequence.pop(0)
+            return {"line": "G4 P800"}
+
+        def stop_print(self) -> None:
+            self.stopCalls += 1
+
+    fakePrinter = FakePrinter()
+
+    monkeypatch.setattr(
+        "client.command_controller.bambuPrinter._waitForMqttReady",
+        lambda *_, **__: None,
+        raising=False,
+    )
+
+    def fakeCapture(printerObj: Any, serial: str) -> Path:
+        snapshotPath = tmp_path / f"{serial}-{len(snapshotCalls) + 1}.jpg"
+        snapshotCalls.append(snapshotPath)
+        return snapshotPath
+
+    monkeypatch.setattr(
+        "client.command_controller.captureCameraSnapshot", fakeCapture
+    )
+
+    monkeypatch.setattr("client.command_controller.time.sleep", lambda *_: None)
+
+    result = captureBedReference(fakePrinter, "SERIAL999", frames=frames)
+
+    assert len(uploadCalls) == 1
+    assert uploadCalls[0][1] == "bedRefCaputre.gcode.3mf"
+    assert startCalls == [("bedRefCaputre.gcode.3mf", "Metadata/plate_1.gcode")]
+    assert len(snapshotCalls) == frames
+    assert result == snapshotCalls
+    assert fakePrinter.stopCalls == 1
+    assert fakePrinter.cameraStartCalls == 1
+    assert fakePrinter.cameraStopCalls == 1
+    assert fakePrinter.connectCalls >= 1
+    assert fakePrinter.mqttStartCalls >= 1
+    assert fakePrinter.readyChecks >= 1
 
 
 def testCameraSnapshotLoopUploads(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
