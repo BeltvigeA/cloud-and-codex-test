@@ -711,6 +711,13 @@ def _resolveTimeLapseDirectory(
     enableTimeLapse = getattr(options, "enableTimeLapse", False)
     logger.info("[timelapse] _resolveTimeLapseDirectory kalles - enableTimeLapse=%s", enableTimeLapse)
 
+    # DEBUG: Logg ALLE options-verdier
+    import traceback
+    logger.info("[timelapse] options objekt: %s", options)
+    logger.info("[timelapse] Stacktrace for å finne hvem som kalte:")
+    for line in traceback.format_stack()[-5:]:
+        logger.info("[timelapse] %s", line.strip())
+
     if not enableTimeLapse:
         logger.warning("[timelapse] enableTimeLapse er False - returnerer None")
         return None
@@ -1629,19 +1636,34 @@ def sendBambuPrintJob(
 
     # --- NEW: løft timelapse fra jobMetadata → options før vi lager/mappe ---
     try:
+        logger.info("[timelapse] sendBambuPrintJob - jobMetadata mottatt: %s", jobMetadata)
+        logger.info("[timelapse] sendBambuPrintJob - options.enableTimeLapse FØR: %s", getattr(options, "enableTimeLapse", False))
+
         if jobMetadata:
             tl_hint = _findMetadataValue(jobMetadata, {"enable_timelapse", "enabletimelapse", "timelapseenabled"})
+            logger.info("[timelapse] sendBambuPrintJob - _findMetadataValue returnerte: %s", tl_hint)
+
             tl_bool = _interpretFlexibleBoolean(tl_hint) if tl_hint is not None else None
+            logger.info("[timelapse] sendBambuPrintJob - _interpretFlexibleBoolean returnerte: %s", tl_bool)
+
             tl_dir  = _findMetadataValue(jobMetadata, {"timelapse_directory", "timelapsedirectory", "timelapsepath"})
+            logger.info("[timelapse] sendBambuPrintJob - timelapse directory funnet: %s", tl_dir)
+
             if tl_bool and not getattr(options, "enableTimeLapse", False):
+                logger.info("[timelapse] sendBambuPrintJob - Setter enableTimeLapse=True på options!")
                 options = replace(options, enableTimeLapse=True)
             if tl_dir and not getattr(options, "timeLapseDirectory", None):
                 try:
                     options = replace(options, timeLapseDirectory=Path(str(tl_dir)).expanduser())
-                except Exception:
-                    pass
-    except Exception:
-        logger.debug("timelapse metadata merge failed (ignored)", exc_info=START_DEBUG)
+                    logger.info("[timelapse] sendBambuPrintJob - Satte timeLapseDirectory=%s", tl_dir)
+                except Exception as ex:
+                    logger.warning("[timelapse] sendBambuPrintJob - Kunne ikke sette timeLapseDirectory: %s", ex)
+        else:
+            logger.warning("[timelapse] sendBambuPrintJob - jobMetadata er None eller tomt!")
+
+        logger.info("[timelapse] sendBambuPrintJob - options.enableTimeLapse ETTER: %s", getattr(options, "enableTimeLapse", False))
+    except Exception as ex:
+        logger.warning("[timelapse] timelapse metadata merge failed: %s", ex, exc_info=START_DEBUG)
 
     timelapsePath = _resolveTimeLapseDirectory(options, ensure=True)
 

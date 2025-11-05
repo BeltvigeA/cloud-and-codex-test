@@ -1322,21 +1322,51 @@ class CommandWorker:
         capturedPaths: List[Path] = []
 
         try:
-            # 1. Koble til printer
+            # 1. Koble til printer via connect() og MQTT
             log.info("[bedref] kobler til printer %s", serial)
+
+            # Start MQTT først
+            mqttStartMethod = getattr(printer, "mqtt_start", None)
+            if callable(mqttStartMethod):
+                try:
+                    mqttStartMethod()
+                    log.info("[bedref] MQTT startet for %s", serial)
+                except Exception as error:
+                    log.warning("[bedref] kunne ikke starte MQTT for %s: %s", serial, error)
+            else:
+                log.warning("[bedref] printer har ikke mqtt_start() metode")
+
+            # Deretter connect()
             connectMethod = getattr(printer, "connect", None)
             if callable(connectMethod):
                 try:
                     connectMethod()
-                    log.info("[bedref] tilkoblet printer %s", serial)
+                    log.info("[bedref] connect() kalt for %s", serial)
                 except Exception as error:
                     log.error("[bedref] kunne ikke koble til printer %s: %s", serial, error)
                     raise RuntimeError(f"Kunne ikke koble til printer: {error}") from error
             else:
                 log.warning("[bedref] printer har ikke connect() metode")
 
-            # Vent litt for at tilkobling skal etableres
-            time.sleep(2.0)
+            # Vent på at MQTT-tilkobling etableres
+            log.info("[bedref] venter 5 sekunder på at MQTT-tilkobling etableres")
+            time.sleep(5.0)
+
+            # Sjekk om MQTT er klar
+            mqttReadyMethod = getattr(printer, "mqtt_client_ready", None)
+            if callable(mqttReadyMethod):
+                for attempt in range(10):
+                    try:
+                        if mqttReadyMethod():
+                            log.info("[bedref] MQTT-tilkobling bekreftet klar for %s", serial)
+                            break
+                    except Exception:
+                        pass
+                    time.sleep(1.0)
+                else:
+                    log.warning("[bedref] kunne ikke bekrefte MQTT-tilkobling - fortsetter likevel")
+            else:
+                log.warning("[bedref] printer har ikke mqtt_client_ready() - antar tilkobling er OK")
 
             # 2. Home printer
             log.info("[bedref] starter homing for %s", serial)
@@ -1356,18 +1386,19 @@ class CommandWorker:
                 log.error("[bedref] printer har ikke home_printer() metode")
                 raise RuntimeError("Printer mangler home_printer() metode")
 
-            # Vent på at homing fullføres
-            time.sleep(3.0)
+            # Vent på at homing fullføres - homing kan ta lang tid!
+            log.info("[bedref] venter 45 sekunder på at homing fullføres komplett")
+            time.sleep(45.0)
 
-            # 3. Flytt print head bakover (X=0, Y=250)
-            log.info("[bedref] flytter print head bakover (X=0, Y=250) for %s", serial)
+            # 3. Flytt print head bakover (midten av X, helt bak på Y)
+            log.info("[bedref] flytter print head bakover (X=128, Y=250) for %s", serial)
             gcodeMethod = getattr(printer, "gcode", None)
             if callable(gcodeMethod):
                 try:
                     # Sett til absolutt posisjonering
                     gcodeMethod("G90")
-                    # Flytt til bak posisjon
-                    gcodeMethod("G1 X0 Y250 F6000")
+                    # Flytt til bak posisjon (X=128 er midten på 256mm bed)
+                    gcodeMethod("G1 X128 Y250 F6000")
                     log.info("[bedref] print head flyttet til bak posisjon for %s", serial)
                 except Exception as error:
                     log.warning("[bedref] kunne ikke flytte print head via gcode for %s: %s",
@@ -1376,8 +1407,9 @@ class CommandWorker:
             else:
                 log.warning("[bedref] printer har ikke gcode() metode - hopper over head parking")
 
-            # Vent på at bevegelse fullføres
-            time.sleep(2.0)
+            # Vent på at bevegelse fullføres - økt til 4 sekunder
+            log.info("[bedref] venter 4 sekunder på at print head bevegelse fullføres")
+            time.sleep(4.0)
 
             # 4. Ta bilde ved Z=0
             log.info("[bedref] tar bilde 1 ved Z=0 for %s", serial)
@@ -1386,6 +1418,8 @@ class CommandWorker:
             log.info("[bedref] bilde 1 lagret: %s", imagePath)
 
             # 5. Senk bed og ta bilder
+            # VIKTIG: move_z_axis(height) flytter Z-aksen til absolutt posisjon
+            # Etter homing er Z=0 på toppen. For å senke bed, må vi flytte Z OPP (positive verdier)
             currentHeight = 0.0
             imageNumber = 1
 
@@ -1397,29 +1431,63 @@ class CommandWorker:
 
                 imageNumber += 1
 
-                log.info("[bedref] beveger bed ned til Z=%.1fmm for %s", currentHeight, serial)
+                log.info("[bedref] beveger bed ned (Z-akse opp til %.1fmm) for %s", currentHeight, serial)
 
-                # Flytt Z-aksen
+                # Sjekk MQTT-tilkobling før Z-bevegelse
+                mqttReadyMethod = getattr(printer, "mqtt_client_ready", None)
+                if callable(mqttReadyMethod):
+                    try:
+                        if not mqttReadyMethod():
+                            log.warning("[bedref] MQTT ikke klar, prøver å reconnect...")
+                            # Prøv å reconnect
+                            mqttStartMethod = getattr(printer, "mqtt_start", None)
+                            if callable(mqttStartMethod):
+                                mqttStartMethod()
+                                time.sleep(2.0)
+                    except Exception as error:
+                        log.warning("[bedref] kunne ikke sjekke MQTT-status: %s", error)
+
+                # Flytt Z-aksen (absolutt posisjon)
                 moveZMethod = getattr(printer, "move_z_axis", None)
                 if callable(moveZMethod):
                     try:
-                        moveResult = moveZMethod(int(currentHeight))
+                        # Konverter til integer for move_z_axis
+                        zPosition = int(round(currentHeight))
+                        log.info("[bedref] kaller move_z_axis(%d) for %s", zPosition, serial)
+                        moveResult = moveZMethod(zPosition)
+
                         if moveResult:
-                            log.info("[bedref] bed flyttet til Z=%.1fmm for %s", currentHeight, serial)
+                            log.info("[bedref] move_z_axis(%d) returnerte True - bevegelse OK", zPosition)
                         else:
-                            log.warning("[bedref] move_z_axis() returnerte False for %s ved Z=%.1fmm",
-                                       serial, currentHeight)
-                            # Fortsett likevel
+                            log.warning("[bedref] move_z_axis(%d) returnerte False/None - sjekker feilmelding", zPosition)
+
+                            # Hvis move_z_axis returnerer False, kan det være MQTT-problem
+                            # Prøv å reconnect og prøv igjen EN gang
+                            log.info("[bedref] prøver å reconnect MQTT og kjøre move_z_axis på nytt...")
+                            mqttStartMethod = getattr(printer, "mqtt_start", None)
+                            if callable(mqttStartMethod):
+                                try:
+                                    mqttStartMethod()
+                                    time.sleep(3.0)
+                                    # Prøv igjen
+                                    moveResult = moveZMethod(zPosition)
+                                    if moveResult:
+                                        log.info("[bedref] move_z_axis(%d) suksess etter reconnect!", zPosition)
+                                    else:
+                                        log.error("[bedref] move_z_axis(%d) feilet også etter reconnect", zPosition)
+                                except Exception as reconnectError:
+                                    log.error("[bedref] reconnect feilet: %s", reconnectError)
+
                     except Exception as error:
-                        log.error("[bedref] kunne ikke flytte bed til Z=%.1fmm for %s: %s",
-                                 currentHeight, serial, error)
-                        raise RuntimeError(f"Z-akse bevegelse feilet ved {currentHeight}mm: {error}") from error
+                        log.error("[bedref] move_z_axis(%d) kastet exception: %s", zPosition, error)
+                        # Ikke raise - fortsett med neste bilde
                 else:
                     log.error("[bedref] printer har ikke move_z_axis() metode")
                     raise RuntimeError("Printer mangler move_z_axis() metode")
 
-                # Vent på at bevegelse fullføres
-                time.sleep(2.0)
+                # Vent lengre på at bevegelse fullføres - økt til 5 sekunder
+                log.info("[bedref] venter 5 sekunder på at Z-akse bevegelse fullføres")
+                time.sleep(5.0)
 
                 # Ta bilde
                 log.info("[bedref] tar bilde %d ved Z=%.1fmm for %s", imageNumber, currentHeight, serial)
@@ -2222,6 +2290,9 @@ class CommandWorker:
             useAms = metadata.get("useAms")
             # --- NEW: alltid bruk API-stien (sikrer timelapse-aktivering) ---
             def _norm_key(s: str) -> str:
+                # Normaliserer nøkler: fjerner alt utenom bokstaver og tall
+                # "enable_timelapse" -> "enabletimelapse"
+                # "enableTimeLapse" -> "enabletimelapse"
                 return "".join(ch for ch in str(s).lower() if ch.isalnum())
 
             def _search_bool(obj) -> bool:
@@ -2255,15 +2326,30 @@ class CommandWorker:
                             return sv
                 return None
 
+            # DEBUG: Logg RAW metadata FØRST
+            log.info("[timelapse] ===== START TIMELAPSE DEBUG =====")
+            log.info("[timelapse] RAW metadata mottatt (type=%s): %s", type(metadata), metadata)
+
+            # Søk etter timelapse i metadata
             enable_timelapse = _search_bool(metadata or {})
             tl_dir_raw = _search_str(metadata or {})
             tl_dir = Path(tl_dir_raw).expanduser() if tl_dir_raw else None
 
-            # DEBUG: Logg metadata og timelapse-innstillinger
-            log.info("[timelapse] metadata mottatt: %s", metadata)
+            # DEBUG: Logg resultat av søk
             log.info("[timelapse] enable_timelapse funnet: %s", enable_timelapse)
             log.info("[timelapse] tl_dir_raw funnet: %s", tl_dir_raw)
             log.info("[timelapse] tl_dir etter parsing: %s", tl_dir)
+
+            # DEBUG: Sjekk om unencryptedData finnes
+            if isinstance(metadata, dict):
+                if "unencryptedData" in metadata:
+                    log.info("[timelapse] metadata inneholder 'unencryptedData': %s", metadata["unencryptedData"])
+                    udata = metadata.get("unencryptedData")
+                    if isinstance(udata, dict) and "enable_timelapse" in udata:
+                        log.info("[timelapse] FUNNET enable_timelapse i unencryptedData: %s", udata.get("enable_timelapse"))
+                else:
+                    log.warning("[timelapse] metadata inneholder IKKE 'unencryptedData'")
+            log.info("[timelapse] ===== SLUTT TIMELAPSE DEBUG =====")
 
             options = bambuPrinter.BambuPrintOptions(
                 ipAddress=self.ipAddress,
