@@ -19,7 +19,8 @@ from typing import Any, Dict, List, Optional
 from . import bambuPrinter
 from .bambuPrinter import BambuPrintOptions, sendBambuPrintJob, bambulabsApi
 from . import bambuPrinter
-from .autoprint.bedref_capture import run_bed_reference_capture
+# TODO: Bed reference capture import fjernet - må implementeres på nytt
+# from .autoprint.bedref_capture import run_bed_reference_capture
 from .autoprint.brake_flow import BrakeFlow, BrakeFlowContext, buildBrakeFlowErrorPayload
 from .autoprint.plate_reference import (
     captureReferenceSequence, captureZAxisReferenceSequence
@@ -391,43 +392,54 @@ def _ensurePrinterConnected(
 
 
 
-def captureBedReference(
-    printer: Any,
-    serialNumber: str,
-    *,
-    frames: int = 30,
-    zStepMm: float = 2.0,
-    feedrate: int = 1200,
-    homeXy: bool = True,
-    use_job_fallback: bool = False,
-) -> List[Path]:
-    """
-    Capture bed reference via Bambu-API bevegelse:
-      - home alltid
-      - Z-akse i absolutte steg
-      - bilde pr. steg
-    """
-    from .plate_reference import captureZAxisReferenceSequence
-
-    _ensurePrinterConnected(printer)
-
-    # frames=40 → ~41 bilder (inkl. Z=0). Vi låser total vandring til 200 mm.
-    total_mm = 200.0
-    log.info("[bedref] z-axis capture start for %s (step=%.1f, total=%.1f)", serialNumber, float(zStepMm), total_mm)
-
-    paths = captureZAxisReferenceSequence(
-        printer,
-        serialNumber,
-        captureCameraSnapshot,
-        step_mm=float(zStepMm),
-        total_mm=float(total_mm),
-        delaySeconds=DEFAULT_REFERENCE_DELAY_SECONDS,
-        home_first=True,               # alltid
-        limit_frames=int(frames),      # styr antall steg → stabilt antall bilder
-    )
-
-    log.info("[bedref] saved %d reference frame(s) for %s", len(paths), serialNumber)
-    return paths
+# TODO: captureBedReference modul-funksjon må implementeres på nytt
+#
+# Forventet funksjonalitet:
+# - Capture bed reference via Bambu-API bevegelse
+# - Home printer alltid
+# - Z-akse bevegelse i absolutte steg
+# - Ta bilde ved hvert steg
+#
+# Parametere som må støttes:
+# - printer: Any (printer instans fra bambulabs_api)
+# - serialNumber: str (printer serial number)
+# - frames: int = 30 (antall rammer/bilder)
+# - zStepMm: float = 2.0 (Z-akse steg i millimeter)
+# - feedrate: int = 1200 (bevegelseshastighet)
+# - homeXy: bool = True (om XY skal homes)
+# - use_job_fallback: bool = False (legacy parameter)
+#
+# Må implementere:
+# 1. Sørg for at printer er tilkoblet (_ensurePrinterConnected)
+# 2. Kalkuler total_mm basert på frames og zStepMm
+# 3. Kjør Z-akse sekvensfangst via captureZAxisReferenceSequence
+# 4. Logg resultat
+# 5. Returner liste med Path-objekter til lagrede bilder
+#
+# Eksempel implementasjon (må kodes):
+# def captureBedReference(
+#     printer: Any,
+#     serialNumber: str,
+#     *,
+#     frames: int = 30,
+#     zStepMm: float = 2.0,
+#     feedrate: int = 1200,
+#     homeXy: bool = True,
+#     use_job_fallback: bool = False,
+# ) -> List[Path]:
+#     from .plate_reference import captureZAxisReferenceSequence
+#
+#     _ensurePrinterConnected(printer)
+#
+#     total_mm = 200.0  # eller beregn basert på frames
+#     log.info("[bedref] z-axis capture start for %s (step=%.1f, total=%.1f)",
+#              serialNumber, float(zStepMm), total_mm)
+#
+#     # TODO: Implementer capture-logikk her
+#     paths = []  # Plasseholder
+#
+#     log.info("[bedref] saved %d reference frame(s) for %s", len(paths), serialNumber)
+#     return paths
 
 
 def _determinePollMode() -> str:
@@ -1267,64 +1279,199 @@ class CommandWorker:
     
     def captureBedReference(
         self,
-        frames: int = 40,
         zStepMm: float = 5.0,
         totalMm: float = 200.0,
-        use_job_fallback: bool = False,   # aksepter legacy-argument (ignoreres)
-        **kwargs,                         # aksepter evt. andre legacy kwargs
-    ) -> List[Path]:        
+        **kwargs,
+    ) -> List[Path]:
         """
-        Z-akse-basert referansefangst med bambulabs_api ONLY:
-          - Home printer
-          - Bilde ved Z≈0
-          - Deretter move_z_axis i absolutte steg (zStepMm) opp til totalMm, bilde i hvert steg
+        Capture bed reference bilder ved ulike Z-høyder.
+
+        Prosess:
+        1. Koble til printer
+        2. Home printer
+        3. Flytt print head bakover (X=0, Y=250)
+        4. Ta bilde ved Z=0
+        5. Senk bed 5mm og ta bilde (gjenta til totalt 200mm)
+
+        Args:
+            zStepMm: Z-akse steg i millimeter (default 5.0)
+            totalMm: Total Z-akse bevegelse i millimeter (default 200.0)
+
+        Returns:
+            Liste med Path-objekter til lagrede bilder
         """
-        serial = str(getattr(self, "serial", getattr(self, "printerSerial", "")) or "").strip()
+        serial = str(getattr(self, "serial", "")).strip()
         if not serial:
-            raise RuntimeError("captureBedReference requires a printer serial")
+            raise RuntimeError("captureBedReference krever at printer har serial number")
+
+        log.info("[bedref] starter bed reference capture for %s (steg=%.1fmm, total=%.1fmm)",
+                 serial, zStepMm, totalMm)
+
+        # Hent printer instans
         printer = self._obtainPrinterInstance()
 
-        # Stans periodisk 30s-kameraloop for deterministiske bilder (hvis støttet)
+        # Stopp periodisk kameraloop for å unngå konflikter
         stopLoop = getattr(self, "_stopCameraSnapshotLoop", None)
         if callable(stopLoop):
-            try: stopLoop()
-            except Exception: pass
+            try:
+                stopLoop()
+                log.info("[bedref] stoppet periodisk kameraloop for %s", serial)
+            except Exception as error:
+                log.warning("[bedref] kunne ikke stoppe kameraloop: %s", error)
+
+        capturedPaths: List[Path] = []
+
         try:
-            captureFunc = getattr(self, "_captureCameraSnapshot", None) or getattr(self, "captureCameraSnapshot", None)
-            if not callable(captureFunc):
-                raise RuntimeError("Snapshot-funksjon mangler på CommandWorker")
-
-            # Hvis caller fortsatt sender 'frames' fra gammel .3mf-flyt,
-            # oversett til totalMm slik at (frames-1) steg * zStepMm = totalMm.
-            if frames and frames > 1 and kwargs.get("map_frames_to_total", True):
+            # 1. Koble til printer
+            log.info("[bedref] kobler til printer %s", serial)
+            connectMethod = getattr(printer, "connect", None)
+            if callable(connectMethod):
                 try:
-                    totalMm = max(float(totalMm), float((frames - 1) * zStepMm))
-                except Exception:
-                    pass
+                    connectMethod()
+                    log.info("[bedref] tilkoblet printer %s", serial)
+                except Exception as error:
+                    log.error("[bedref] kunne ikke koble til printer %s: %s", serial, error)
+                    raise RuntimeError(f"Kunne ikke koble til printer: {error}") from error
+            else:
+                log.warning("[bedref] printer har ikke connect() metode")
 
-            log.info(
-                "[bedref] z-axis capture start for %s (step=%.1f, total=%.1f)",
-                serial,
-                zStepMm,
-                totalMm,
-            )
-            paths = captureZAxisReferenceSequence(
-                printer,
-                serial,
-                captureFunc,
-                step_mm=float(zStepMm),
-                total_mm=float(totalMm),
-                delaySeconds=0.2,
-                home_first=True,
-            )
-            log.info("[bedref] saved %d reference frame(s) for %s", len(paths), serial)
-            return paths
+            # Vent litt for at tilkobling skal etableres
+            time.sleep(2.0)
+
+            # 2. Home printer
+            log.info("[bedref] starter homing for %s", serial)
+            homeMethod = getattr(printer, "home_printer", None)
+            if callable(homeMethod):
+                try:
+                    homeResult = homeMethod()
+                    if homeResult:
+                        log.info("[bedref] homing fullført for %s", serial)
+                    else:
+                        log.warning("[bedref] home_printer() returnerte False for %s", serial)
+                        raise RuntimeError("Homing feilet - home_printer() returnerte False")
+                except Exception as error:
+                    log.error("[bedref] homing feilet for %s: %s", serial, error)
+                    raise RuntimeError(f"Homing feilet: {error}") from error
+            else:
+                log.error("[bedref] printer har ikke home_printer() metode")
+                raise RuntimeError("Printer mangler home_printer() metode")
+
+            # Vent på at homing fullføres
+            time.sleep(3.0)
+
+            # 3. Flytt print head bakover (X=0, Y=250)
+            log.info("[bedref] flytter print head bakover (X=0, Y=250) for %s", serial)
+            gcodeMethod = getattr(printer, "gcode", None)
+            if callable(gcodeMethod):
+                try:
+                    # Sett til absolutt posisjonering
+                    gcodeMethod("G90")
+                    # Flytt til bak posisjon
+                    gcodeMethod("G1 X0 Y250 F6000")
+                    log.info("[bedref] print head flyttet til bak posisjon for %s", serial)
+                except Exception as error:
+                    log.warning("[bedref] kunne ikke flytte print head via gcode for %s: %s",
+                               serial, error)
+                    # Fortsett likevel - ikke kritisk
+            else:
+                log.warning("[bedref] printer har ikke gcode() metode - hopper over head parking")
+
+            # Vent på at bevegelse fullføres
+            time.sleep(2.0)
+
+            # 4. Ta bilde ved Z=0
+            log.info("[bedref] tar bilde 1 ved Z=0 for %s", serial)
+            imagePath = self._captureBedReferenceImage(printer, serial, 0, 0.0)
+            capturedPaths.append(imagePath)
+            log.info("[bedref] bilde 1 lagret: %s", imagePath)
+
+            # 5. Senk bed og ta bilder
+            currentHeight = 0.0
+            imageNumber = 1
+
+            while currentHeight < totalMm:
+                # Beregn neste høyde
+                currentHeight += zStepMm
+                if currentHeight > totalMm:
+                    currentHeight = totalMm
+
+                imageNumber += 1
+
+                log.info("[bedref] beveger bed ned til Z=%.1fmm for %s", currentHeight, serial)
+
+                # Flytt Z-aksen
+                moveZMethod = getattr(printer, "move_z_axis", None)
+                if callable(moveZMethod):
+                    try:
+                        moveResult = moveZMethod(int(currentHeight))
+                        if moveResult:
+                            log.info("[bedref] bed flyttet til Z=%.1fmm for %s", currentHeight, serial)
+                        else:
+                            log.warning("[bedref] move_z_axis() returnerte False for %s ved Z=%.1fmm",
+                                       serial, currentHeight)
+                            # Fortsett likevel
+                    except Exception as error:
+                        log.error("[bedref] kunne ikke flytte bed til Z=%.1fmm for %s: %s",
+                                 currentHeight, serial, error)
+                        raise RuntimeError(f"Z-akse bevegelse feilet ved {currentHeight}mm: {error}") from error
+                else:
+                    log.error("[bedref] printer har ikke move_z_axis() metode")
+                    raise RuntimeError("Printer mangler move_z_axis() metode")
+
+                # Vent på at bevegelse fullføres
+                time.sleep(2.0)
+
+                # Ta bilde
+                log.info("[bedref] tar bilde %d ved Z=%.1fmm for %s", imageNumber, currentHeight, serial)
+                imagePath = self._captureBedReferenceImage(printer, serial, imageNumber, currentHeight)
+                capturedPaths.append(imagePath)
+                log.info("[bedref] bilde %d lagret: %s", imageNumber, imagePath)
+
+            log.info("[bedref] bed reference capture fullført for %s - %d bilder lagret",
+                    serial, len(capturedPaths))
+
+            return capturedPaths
+
         finally:
-            # Start periodisk kameraloop igjen (uansett hvilken metode som finnes)
+            # Start periodisk kameraloop igjen
             startLoop = getattr(self, "_startCameraSnapshotLoop", None) or getattr(self, "_ensureCameraSnapshotLoop", None)
             if callable(startLoop):
-                try: startLoop(printer)
-                except Exception: pass
+                try:
+                    startLoop(printer)
+                    log.info("[bedref] startet periodisk kameraloop igjen for %s", serial)
+                except Exception as error:
+                    log.warning("[bedref] kunne ikke starte kameraloop igjen: %s", error)
+
+    def _captureBedReferenceImage(self, printer: Any, serial: str, imageNumber: int, zHeight: float) -> Path:
+        """
+        Tar et enkelt bed reference bilde og lagrer det i riktig mappe.
+
+        Args:
+            printer: Printer instans
+            serial: Printer serial number
+            imageNumber: Bildenummer (starter på 0)
+            zHeight: Z-høyde for dette bildet
+
+        Returns:
+            Path til lagret bilde
+        """
+        # Opprett målmappe: .printmaster/bed-reference/<serial>/
+        bedRefDirectory = Path.home() / ".printmaster" / "bed-reference" / serial
+        bedRefDirectory.mkdir(parents=True, exist_ok=True)
+
+        # Ta snapshot ved hjelp av eksisterende funksjon
+        tempImagePath = captureCameraSnapshot(printer, serial)
+
+        # Flytt til riktig plassering med riktig navn: bedRef001.jpg, bedRef002.jpg, etc.
+        targetFileName = f"bedRef{imageNumber:03d}.jpg"
+        targetPath = bedRefDirectory / targetFileName
+
+        # Kopier filen
+        shutil.copy2(tempImagePath, targetPath)
+
+        log.info("[bedref] kopierte %s til %s", tempImagePath, targetPath)
+
+        return targetPath
 
     def runBrakeDemo(
         self,

@@ -1737,28 +1737,57 @@ class ListenerGuiApp:
             self.runBrakeDemoButton.config(state=state)
 
     def _captureSelectedBedReference(self) -> None:
+        """
+        Starter bed reference capture for valgt printer.
+
+        Prosess:
+        1. Henter valgt printer fra GUI
+        2. Validerer at printer har serial number
+        3. Henter command worker for printeren
+        4. Kjører bed reference capture i en separat tråd
+        5. Logger resultat til GUI
+        """
+        # Hent valgt printer
         index = self._getSelectedPrinterIndex()
         if index is None:
+            self.log("Ingen printer valgt. Velg en printer først.")
             return
+
         printer = self.printers[index]
         serial = str(printer.get("serialNumber") or "").strip()
         if not serial:
-            self.log("Unable to capture reference – printer is missing a serial number.")
+            self.log("Kan ikke starte bed reference capture - printer mangler serial number.")
             return
+
+        # Hent command worker
         worker = self.commandWorkers.get(serial)
         if worker is None:
-            self.log(f"No active command worker for {serial}. Connect printers first.")
+            self.log(f"Ingen aktiv command worker for {serial}. Koble til printer først.")
             return
 
-        def task() -> None:
-            try:
-                frames = worker.captureBedReference(frames=40, zStepMm=2.0, use_job_fallback=True)
-            except Exception as error:
-                self.log(f"Reference capture failed: {error}")
-            else:
-                self.log(f"Saved {len(frames)} reference frame(s)")
+        self.log(f"Starter bed reference capture for {serial}...")
 
-        threading.Thread(target=task, name=f"CaptureReference-{serial}", daemon=True).start()
+        def task() -> None:
+            """Kjører bed reference capture i bakgrunnen"""
+            try:
+                # Kjør capture med standard verdier: 5mm steg, 200mm total
+                frames = worker.captureBedReference(zStepMm=5.0, totalMm=200.0)
+                self.log(f"Bed reference capture fullført for {serial} - {len(frames)} bilder lagret")
+
+                # Vis hvor bildene ble lagret
+                if frames:
+                    bedRefDir = frames[0].parent
+                    self.log(f"Bilder lagret i: {bedRefDir}")
+
+            except Exception as error:
+                self.log(f"Bed reference capture feilet for {serial}: {error}")
+
+        # Start capture i separat tråd for å ikke blokkere GUI
+        threading.Thread(
+            target=task,
+            name=f"CaptureReference-{serial}",
+            daemon=True
+        ).start()
 
     def _runBrakeDemoForSelected(self) -> None:
         index = self._getSelectedPrinterIndex()
