@@ -708,40 +708,59 @@ def postStatus(status: Dict[str, Any], printerConfig: Dict[str, Any]) -> None:
 def _resolveTimeLapseDirectory(
     options: "BambuPrintOptions", *, ensure: bool = False
 ) -> Optional[Path]:
-    if not getattr(options, "enableTimeLapse", False):
+    enableTimeLapse = getattr(options, "enableTimeLapse", False)
+    logger.info("[timelapse] _resolveTimeLapseDirectory kalles - enableTimeLapse=%s", enableTimeLapse)
+
+    if not enableTimeLapse:
+        logger.warning("[timelapse] enableTimeLapse er False - returnerer None")
         return None
 
     rawDirectory = options.timeLapseDirectory
+    logger.info("[timelapse] options.timeLapseDirectory=%s", rawDirectory)
+
     if rawDirectory is None:
         rawDirectory = Path.home() / ".printmaster" / "timelapse"
+        logger.info("[timelapse] Ingen directory spesifisert, bruker standard: %s", rawDirectory)
 
     directory = Path(rawDirectory).expanduser()
     if ensure:
         directory.mkdir(parents=True, exist_ok=True)
+        logger.info("[timelapse] Mappe opprettet/bekreftet: %s", directory)
+
     return directory
 
 
 def _activateTimelapseCapture(printer: Any, directory: Path) -> None:
+    logger.info("[timelapse] _activateTimelapseCapture kalles med directory: %s", directory)
     directoryString = str(directory)
     cameraClient = getattr(printer, "camera_client", None)
     cameraConfigured = False
 
     activated = False
     mqttClient = getattr(printer, "mqtt_client", None)
+    logger.info("[timelapse] mqttClient: %s", mqttClient)
+
     if mqttClient is not None:
         setTimelapseMethod = getattr(mqttClient, "set_onboard_printer_timelapse", None)
+        logger.info("[timelapse] setTimelapseMethod funnet: %s", setTimelapseMethod is not None)
+
         if callable(setTimelapseMethod):
             try:
+                logger.info("[timelapse] Kaller set_onboard_printer_timelapse(enable=True)...")
                 mqttResult = setTimelapseMethod(enable=True)
+                logger.info("[timelapse] set_onboard_printer_timelapse returnerte: %s", mqttResult)
+
                 if mqttResult:
                     activated = True
+                    logger.info("[timelapse] Timelapse AKTIVERT via MQTT!")
                 else:
-                    logger.debug("timelapse activation via mqtt returned falsy result")
-            except Exception:  # pragma: no cover - diagnostic logging only
-                logger.debug(
-                    "timelapse activation via mqtt failed",
-                    exc_info=START_DEBUG,
-                )
+                    logger.warning("[timelapse] set_onboard_printer_timelapse returnerte False/None")
+            except Exception as error:
+                logger.error("[timelapse] set_onboard_printer_timelapse feilet: %s", error, exc_info=True)
+        else:
+            logger.warning("[timelapse] set_onboard_printer_timelapse er ikke callable")
+    else:
+        logger.warning("[timelapse] mqttClient er None - kan ikke aktivere timelapse via MQTT")
 
     if not activated and cameraClient is not None:
         for methodName in (
@@ -1242,7 +1261,10 @@ def startPrintViaApi(
         _preselect_project_file(printer, remoteUrl, startParam, sendControlFlags)
 
     if timelapsePath is not None:
+        logger.info("[timelapse] timelapsePath er satt, aktiverer timelapse: %s", timelapsePath)
         _activateTimelapseCapture(printer, timelapsePath)
+    else:
+        logger.warning("[timelapse] timelapsePath er None - timelapse vil IKKE aktiveres")
 
     def _invokeStart() -> None:
         localErrors: List[str] = []

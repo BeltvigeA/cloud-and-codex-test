@@ -2259,6 +2259,12 @@ class CommandWorker:
             tl_dir_raw = _search_str(metadata or {})
             tl_dir = Path(tl_dir_raw).expanduser() if tl_dir_raw else None
 
+            # DEBUG: Logg metadata og timelapse-innstillinger
+            log.info("[timelapse] metadata mottatt: %s", metadata)
+            log.info("[timelapse] enable_timelapse funnet: %s", enable_timelapse)
+            log.info("[timelapse] tl_dir_raw funnet: %s", tl_dir_raw)
+            log.info("[timelapse] tl_dir etter parsing: %s", tl_dir)
+
             options = bambuPrinter.BambuPrintOptions(
                 ipAddress=self.ipAddress,
                 serialNumber=self.serial,
@@ -2268,6 +2274,9 @@ class CommandWorker:
                 enableTimeLapse=enable_timelapse,
                 timeLapseDirectory=tl_dir,
             )
+
+            log.info("[timelapse] BambuPrintOptions opprettet med enableTimeLapse=%s, timeLapseDirectory=%s",
+                    enable_timelapse, tl_dir)
             result = bambuPrinter.startPrintViaApi(
                 ip=self.ipAddress,
                 serial=self.serial,
