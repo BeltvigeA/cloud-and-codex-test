@@ -1,4 +1,5 @@
 from __future__ import annotations
+import os
 
 import logging
 import shutil
@@ -372,4 +373,229 @@ def capture_reference_sequence(
         frameCount=frameCount,
         delaySeconds=delaySeconds,
     )
+
+
+# --- Z-axis reference capture using bambulabs_api.Printer.move_z_axis (API ONLY) ---
+from .bedref_capture import storeBedReferenceFrame
+
+
+# ------- NYTT: eksakt tilkoblings- og homelogikk (som i home_printer.py) -------
+def _mqtt_ready(printer) -> bool:
+    try:
+        fn = getattr(printer, "mqtt_client_ready", None)
+        if callable(fn) and fn():
+            return True
+    except Exception:
+        pass
+    try:
+        fn = getattr(printer, "is_connected", None)
+        if callable(fn) and fn():
+            return True
+    except Exception:
+        pass
+    try:
+        client = getattr(printer, "mqtt_client", None)
+        if client and getattr(client, "is_connected", None):
+            return bool(client.is_connected())
+    except Exception:
+        pass
+    return False
+
+def _connect_and_wait(printer, retries: int = 3, connect_timeout_s: float = 15.0, retry_delay_s: float = 1.5) -> None:
+    for attempt in range(1, retries + 1):
+        try:
+            printer.connect()
+        except Exception as ex:  # best effort, prøv videre
+            log.debug("connect() attempt %d/%d raised: %s", attempt, retries, ex)
+        t0 = time.time()
+        while time.time() - t0 < connect_timeout_s:
+            if _mqtt_ready(printer):
+                return
+            time.sleep(0.4)
+        log.debug("Not connected (attempt %d). Retrying in %.1fs ...", attempt, retry_delay_s)
+        try:
+            d = getattr(printer, "disconnect", None)
+            if callable(d):
+                d()
+        except Exception:
+            pass
+        time.sleep(retry_delay_s)
+    raise RuntimeError("Could not establish MQTT session with the printer")
+
+def _home_printer_exact(printer) -> bool:
+    """Eksakt Bambu-SDK-kall, samme flyt som i enkeltskripta: home_printer() -> bool."""
+    home_fn = getattr(printer, "home_printer", None)
+    if not callable(home_fn):
+        log.warning("home_printer() not available on printer object")
+        return False
+    try:
+        ok = bool(home_fn())
+        log.info("home_printer() returned: %s", ok)
+        return ok
+    except Exception as ex:
+        log.debug("home_printer() raised: %s", ex)
+        return False
+# -------------------------------------------------------------------------------
+
+def _awaitPrinterReady(printer: Any, *, timeout: float = 12.0, poll: float = 0.25) -> bool:
+    deadline = time.monotonic() + max(0.0, timeout)
+    while time.monotonic() < deadline:
+        try:
+            state = printer.get_state()
+            if state:
+                return True
+        except Exception:
+            pass
+        time.sleep(poll)
+    return False
+
+def _ensure_connected_and_mqtt(printer: Any, *, timeout: float = 12.0) -> None:
+    """
+    Streng tilkobling før bevegelses-API:
+      - connect()
+      - mqtt_start() og vent på mqtt_client_ready() når tilgjengelig
+    """
+    # Koble til
+    connect = getattr(printer, "connect", None)
+    if callable(connect):
+        try:
+            connect()
+        except Exception as e:
+            raise RuntimeError(f"Unable to connect to printer: {e}") from e
+
+    # Start MQTT og vent (best-effort)
+    mqtt_start = getattr(printer, "mqtt_start", None)
+    mqtt_ready = getattr(printer, "mqtt_client_ready", None)
+    if callable(mqtt_start):
+        deadline = time.monotonic() + max(2.0, min(10.0, timeout))
+        last_err: Exception | None = None
+        while True:
+            try:
+                mqtt_start()
+            except Exception as e:
+                last_err = e
+                break
+            if not callable(mqtt_ready):
+                break
+            try:
+                if mqtt_ready():
+                    break
+            except Exception as e:
+                last_err = e
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.25)
+        # Ikke fatal hvis MQTT ikke blir klar, men vi forsøker å hente state under.
+        if last_err:
+            # kun debug – ikke raise, vi håndterer senere
+            pass
+
+
+def _safe_wait_motion(printer: Any, label: str, fallback_seconds: float = 2.0) -> None:
+    """
+    Vent på at bevegelsen er ferdig. Forsøk modulens _waitForMotionCompletion om den finnes,
+    ellers sov et konservativt antall sekunder. Dette gjør oss robuste dersom MQTT/state ikke er tilgjengelig.
+    """
+    _wait_func = None
+    try:
+        # Importer hvis tilgjengelig i denne klienten
+        from .bedref_capture import _waitForMotionCompletion as _wait_func  # type: ignore
+    except Exception:
+        _wait_func = None
+    if _wait_func:
+        try:
+            _wait_func(printer, label)  # kan bruke printer.get_state() internt
+            return
+        except Exception:
+            pass
+    time.sleep(max(0.0, float(fallback_seconds)))
+
+def captureZAxisReferenceSequence(
+    printer: Any,
+    serial: str,
+    captureFunc: SnapshotCaptureFunc,
+    *,
+    step_mm: float = 5.0,
+    total_mm: float = 200.0,
+    delaySeconds: float = DEFAULT_REFERENCE_DELAY_SECONDS,
+    home_first: bool = True,
+    limit_frames: int | None = None,
+) -> List[Path]:
+    """
+    Home → bilde @Z≈0 → flytt i absolutte Z-steg og ta bilde for hvert steg.
+    Hvis 'limit_frames' (eller env BEDREF_FRAMES) settes, velges effektivt steg som total_mm/limit_frames
+    slik at du får nøyaktig limit_frames+1 bilder (inkludert Z=0).
+    """
+    sanitizedSerial = str(serial or "").strip()
+    if not sanitizedSerial:
+        raise ValueError("Serial number is required for Z-axis reference capture")
+
+    # Robust tilkobling før homing og Z-bevegelse
+    # 1) Koble til og vent faktisk MQTT-ready (som i home_printer.py)
+    _connect_and_wait(printer, retries=3, connect_timeout_s=15.0, retry_delay_s=1.5)
+
+    moveZ = getattr(printer, "move_z_axis", None)
+    if not callable(moveZ):
+        raise RuntimeError("bambulabs_api.Printer.move_z_axis is not available on this printer object")
+
+    # Home først med EKSPLISITT API: home_printer() → bool, så Z=0 fallback via move_z_axis(0)
+    if home_first:
+        if not _home_printer_exact(printer):
+            raise RuntimeError("Unable to home printer via API method home_printer()")
+        # liten settle uansett
+        time.sleep(3.0)
+
+    # Målmappe
+
+    # Antall rammer og effektivt steg
+    frames_env = os.getenv("BEDREF_FRAMES")
+    if limit_frames is None:
+        if frames_env:
+            try:
+                limit_frames = int(frames_env)
+            except ValueError:
+                limit_frames = None
+        else:
+            limit_frames = 40  # standard: 40 steg → ~41 bilder inkl. Z=0
+    if limit_frames and limit_frames > 0:
+        effective_step = float(total_mm) / float(limit_frames)
+    else:
+        effective_step = max(0.1, float(step_mm))
+
+    # Første ramme @Z≈0
+    capturedPaths: List[Path] = []
+    firstTmp = captureFunc(printer, sanitizedSerial)
+    firstOut = storeBedReferenceFrame(sanitizedSerial, 1, firstTmp)  # frame_001.jpg
+    capturedPaths.append(firstOut)
+
+    # Steg i absolutte høyder
+    steps = int(round(float(total_mm) / effective_step))
+    for i in range(1, steps + 1):
+        height = int(round(i * effective_step))
+        ok = False
+        try:
+            result = moveZ(height)
+            ok = bool(result)
+        except Exception as ex:
+            log.error("[ref] move_z_axis(%d) raised: %s", height, ex)
+            raise
+        if not ok:
+            raise RuntimeError(f"move_z_axis({height}) returned False/failed")
+
+        _safe_wait_motion(printer, f"move_z_axis({height})", fallback_seconds=2.0)
+        if delaySeconds > 0.0:
+            time.sleep(max(0.0, float(delaySeconds)))
+        tmp = captureFunc(printer, sanitizedSerial)
+        out = storeBedReferenceFrame(sanitizedSerial, len(capturedPaths) + 1, tmp)
+        capturedPaths.append(out)
+
+    log.info(
+        "[ref] completed Z-axis reference capture for %s (step=%.3f, total=%.1f) -> %d frame(s)",
+        sanitizedSerial,
+        effective_step,
+        float(total_mm),
+        len(capturedPaths),
+    )
+    return capturedPaths
+
 

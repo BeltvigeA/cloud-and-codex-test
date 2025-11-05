@@ -21,7 +21,9 @@ from .bambuPrinter import BambuPrintOptions, sendBambuPrintJob, bambulabsApi
 from . import bambuPrinter
 from .autoprint.bedref_capture import run_bed_reference_capture
 from .autoprint.brake_flow import BrakeFlow, BrakeFlowContext, buildBrakeFlowErrorPayload
-from .autoprint.plate_reference import captureReferenceSequence
+from .autoprint.plate_reference import (
+    captureReferenceSequence, captureZAxisReferenceSequence
+)
 from .base44_client import (
     acknowledgeCommand,
     listPendingCommandsForRecipient,
@@ -32,6 +34,8 @@ from .base44_client import (
 from .client import buildBaseUrl, defaultBaseUrl, getPrinterControlEndpointUrl
 
 log = logging.getLogger(__name__)
+
+bambuApi = bambulabsApi
 
 
 def _resolveControlPollSeconds() -> float:
@@ -384,33 +388,7 @@ def _ensurePrinterConnected(
         pass
 
 
-def runBedReferenceCaptureJob(printer: Any) -> None:
-    """Upload and start the prebuilt bed reference capture job."""
 
-    _ensurePrinterConnected(printer)
-
-    uploadMethod = getattr(printer, "upload_file", None)
-    startMethod = getattr(printer, "start_print", None)
-
-    if not callable(uploadMethod) or not callable(startMethod):
-        raise RuntimeError("Printer does not support bed reference capture job")
-
-    gcodeBundlePath = Path(__file__).resolve().parent / "autoprintGcode" / "bedRefCaputre.gcode.3mf"
-    if not gcodeBundlePath.is_file():
-        raise FileNotFoundError(f"Bed reference capture bundle missing: {gcodeBundlePath}")
-
-    with open(gcodeBundlePath, "rb") as bundleHandle:
-        bundleBytes = bundleHandle.read()
-
-    buffer = io.BytesIO(bundleBytes)
-    buffer.seek(0)
-
-    try:
-        uploadMethod(buffer, gcodeBundlePath.name)
-    except TypeError:
-        uploadMethod(str(gcodeBundlePath))
-
-    startMethod("bedRefCaputre.gcode.3mf", "Metadata/plate_1.gcode")
 
 
 def captureBedReference(
@@ -423,90 +401,33 @@ def captureBedReference(
     homeXy: bool = True,
     use_job_fallback: bool = False,
 ) -> List[Path]:
-    """Capture bed reference images using the bundled automation job."""
+    """
+    Capture bed reference via Bambu-API bevegelse:
+      - home alltid
+      - Z-akse i absolutte steg
+      - bilde pr. steg
+    """
+    from .plate_reference import captureZAxisReferenceSequence
 
-    # Retained keyword-only arguments maintain backwards compatibility with previous
-    # motion-based implementations even though they are no longer used.
     _ensurePrinterConnected(printer)
 
-    frameCount = max(1, int(frames))
+    # frames=40 → ~41 bilder (inkl. Z=0). Vi låser total vandring til 200 mm.
+    total_mm = 200.0
+    log.info("[bedref] z-axis capture start for %s (step=%.1f, total=%.1f)", serialNumber, float(zStepMm), total_mm)
 
-    cameraOnMethod = getattr(printer, "camera_start", None) or getattr(printer, "camera_on", None)
-    cameraOffMethod = getattr(printer, "camera_stop", None) or getattr(printer, "camera_off", None)
-
-    if callable(cameraOnMethod):
-        try:
-            cameraOnMethod()
-        except Exception:
-            pass
-
-    savedPaths: List[Path] = []
-
-    try:
-        runBedReferenceCaptureJob(printer)
-
-        getGcodeStateMethod = getattr(printer, "get_gcode_state", None)
-
-        def waitForPause() -> None:
-            if not callable(getGcodeStateMethod):
-                time.sleep(3.0)
-                return
-
-            pauseDeadline = time.monotonic() + 30.0
-            while time.monotonic() < pauseDeadline:
-                try:
-                    statePayload = getGcodeStateMethod()
-                except Exception:  # noqa: BLE001 - third-party SDK raises generic Exception
-                    time.sleep(0.25)
-                    continue
-
-                stateText = ""
-                if isinstance(statePayload, dict):
-                    for key in ("gcode_line", "line", "gcode", "current_line"):
-                        value = statePayload.get(key)
-                        if isinstance(value, str):
-                            stateText = value
-                            break
-                    else:
-                        stateText = str(statePayload)
-                else:
-                    stateText = str(statePayload)
-
-                if "G4" in stateText.upper():
-                    time.sleep(0.5)
-                    return
-
-                time.sleep(0.25)
-
-            time.sleep(3.0)
-
-        for _ in range(frameCount):
-            waitForPause()
-            savedPaths.append(captureCameraSnapshot(printer, serialNumber))
-    finally:
-        stopMethod = getattr(printer, "stop_print", None)
-        if callable(stopMethod):
-            try:
-                stopMethod()
-            except Exception:
-                pass
-
-        if callable(cameraOffMethod):
-            try:
-                cameraOffMethod()
-            except Exception:
-                pass
-
-    if not savedPaths:
-        raise RuntimeError("Bed reference job produced no frames")
-
-    log.info(
-        "[ref] completed reference capture for %s (%d frame(s))",
+    paths = captureZAxisReferenceSequence(
+        printer,
         serialNumber,
-        len(savedPaths),
+        captureCameraSnapshot,
+        step_mm=float(zStepMm),
+        total_mm=float(total_mm),
+        delaySeconds=DEFAULT_REFERENCE_DELAY_SECONDS,
+        home_first=True,               # alltid
+        limit_frames=int(frames),      # styr antall steg → stabilt antall bilder
     )
-    return savedPaths
 
+    log.info("[bedref] saved %d reference frame(s) for %s", len(paths), serialNumber)
+    return paths
 
 
 def _determinePollMode() -> str:
@@ -1325,6 +1246,13 @@ class CommandWorker:
             self.serial,
         )
         return True
+    # --- Adapter for bed-reference capture ---
+    # Enkel adapter slik at andre deler av klienten kan be worker ta et snapshot
+    # via en instansmetode. Selve implementasjonen ligger som modul-funksjon.
+    def _captureCameraSnapshot(self, printer: Any, serial: str) -> Path:
+        """Returnerer sti til lagret snapshot-bilde for gitt printer/serial."""
+        return captureCameraSnapshot(printer, serial)
+
 
     def _obtainPrinterInstance(self) -> Any:
         with self._printerLock:
@@ -1336,33 +1264,67 @@ class CommandWorker:
     def captureReferenceSequence(self) -> List[Path]:
         printer = self._obtainPrinterInstance()
         return captureReferenceSequence(printer, self.serial, captureCameraSnapshot)
-
-    def captureBedReference(self, frames: int = 40, zStepMm: float = 2.0, use_job_fallback: bool = True) -> List[Path]:
+    
+    def captureBedReference(
+        self,
+        frames: int = 40,
+        zStepMm: float = 5.0,
+        totalMm: float = 200.0,
+        use_job_fallback: bool = False,   # aksepter legacy-argument (ignoreres)
+        **kwargs,                         # aksepter evt. andre legacy kwargs
+    ) -> List[Path]:        
         """
-        Ny implementasjon:
-          - Kjører .3mf (bedRefCaputre.gcode.3mf) via API
-          - Tar bilder i 3s-pauser og lagrer nummerert i ~/.printmaster/bed-reference/<serial>/
+        Z-akse-basert referansefangst med bambulabs_api ONLY:
+          - Home printer
+          - Bilde ved Z≈0
+          - Deretter move_z_axis i absolutte steg (zStepMm) opp til totalMm, bilde i hvert steg
         """
         serial = str(getattr(self, "serial", getattr(self, "printerSerial", "")) or "").strip()
-        ip = str(getattr(self, "ipAddress", "") or "").strip()
-        access = str(getattr(self, "accessCode", "") or "").strip()
-        if not (serial and ip and access):
-            raise RuntimeError("captureBedReference krever serial, ipAddress og accessCode")
-        # Finn snapshot-funksjon på worker (brukes allerede andre steder i klienten)
-        captureFunc = getattr(self, "_captureCameraSnapshot", None) or getattr(self, "captureCameraSnapshot", None)
-        if not callable(captureFunc):
-            raise RuntimeError("Fant ikke snapshot-funksjon på CommandWorker")
-        log.info("[bedref] .3mf capture start for %s (frames=%d)", serial, frames)
-        return run_bed_reference_capture(
-            ip=ip,
-            serial=serial,
-            accessCode=access,
-            captureFunc=captureFunc,
-            frames=max(1, int(frames)),
-            optionsFactory=BambuPrintOptions,
-            sendJobFunc=sendBambuPrintJob,
-            bambuApiModule=bambulabsApi,
-        )
+        if not serial:
+            raise RuntimeError("captureBedReference requires a printer serial")
+        printer = self._obtainPrinterInstance()
+
+        # Stans periodisk 30s-kameraloop for deterministiske bilder (hvis støttet)
+        stopLoop = getattr(self, "_stopCameraSnapshotLoop", None)
+        if callable(stopLoop):
+            try: stopLoop()
+            except Exception: pass
+        try:
+            captureFunc = getattr(self, "_captureCameraSnapshot", None) or getattr(self, "captureCameraSnapshot", None)
+            if not callable(captureFunc):
+                raise RuntimeError("Snapshot-funksjon mangler på CommandWorker")
+
+            # Hvis caller fortsatt sender 'frames' fra gammel .3mf-flyt,
+            # oversett til totalMm slik at (frames-1) steg * zStepMm = totalMm.
+            if frames and frames > 1 and kwargs.get("map_frames_to_total", True):
+                try:
+                    totalMm = max(float(totalMm), float((frames - 1) * zStepMm))
+                except Exception:
+                    pass
+
+            log.info(
+                "[bedref] z-axis capture start for %s (step=%.1f, total=%.1f)",
+                serial,
+                zStepMm,
+                totalMm,
+            )
+            paths = captureZAxisReferenceSequence(
+                printer,
+                serial,
+                captureFunc,
+                step_mm=float(zStepMm),
+                total_mm=float(totalMm),
+                delaySeconds=0.2,
+                home_first=True,
+            )
+            log.info("[bedref] saved %d reference frame(s) for %s", len(paths), serial)
+            return paths
+        finally:
+            # Start periodisk kameraloop igjen (uansett hvilken metode som finnes)
+            startLoop = getattr(self, "_startCameraSnapshotLoop", None) or getattr(self, "_ensureCameraSnapshotLoop", None)
+            if callable(startLoop):
+                try: startLoop(printer)
+                except Exception: pass
 
     def runBrakeDemo(
         self,

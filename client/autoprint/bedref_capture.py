@@ -1,5 +1,5 @@
 from __future__ import annotations
-
+import os
 import contextlib
 import logging
 import shutil
@@ -78,36 +78,73 @@ def _wait_for_motion(apiPrinter: Any, *, target: bool, timeout: float, poll: flo
     return False
 
 
+def _await_printer_ready(printer: Any, *, timeout: float = 20.0, poll: float = 0.25) -> bool:
+    """
+    Vent til vi kan lese en gyldig state fra bambulabs_api. Uten dette får vi
+    'Printer Values Not Available Yet' og klarer ikke å oppdage pauser.
+    """
+    deadline = time.monotonic() + max(0.0, timeout)
+    last_error = None
+    while time.monotonic() < deadline:
+        try:
+            state = printer.get_state()
+            if state:  # tom dict/None regnes som ikke klar
+                return True
+        except Exception as ex:
+            last_error = ex
+        time.sleep(poll)
+    if last_error:
+        log.warning("[bedref] printer state not ready within %.1fs: %s", timeout, last_error)
+    else:
+        log.warning("[bedref] printer state not ready within %.1fs", timeout)
+    return False
+
 def capture_during_pauses(
     apiPrinter: Any,
     serial: str,
     captureFunc: SnapshotCaptureFunc,
     frames: int,
     *,
-    settle: float = 0.15,
-    poll: float = 0.15,
-    timeout: float = 900.0,
+    settle: float = float(os.getenv("BEDREF_SETTLE_SECONDS", "1.5")),
+    poll: float = float(os.getenv("BEDREF_POLL_SECONDS", "0.15")),
+    fallback_every: float = float(os.getenv("BEDREF_FALLBACK_SECONDS", "3.2")),
+    timeout: float = float(os.getenv("BEDREF_TIMEOUT_SECONDS", "300"))
 ) -> List[Path]:
     """
-    Tar ett bilde hver gang maskinen stopper (G4-dwell). Vi legger oss
-    litt ut i pausen (settle) for å treffe midt i 3s-vinduet.
+    Tar ett bilde hver gang maskinen stopper (G4-dwell). Vi legger oss midt i
+    3s-vinduet ('settle'). Dersom vi ikke klarer å detektere pauser via status
+    (MQTT), faller vi tilbake til tidsstyrt snapping hvert ~3.2s.
     """
     results: List[Path] = []
+    # Først: sikre at state faktisk er lesbar
+    _await_printer_ready(apiPrinter, timeout=20.0, poll=poll)
     _wait_for_motion(apiPrinter, target=True, timeout=60.0, poll=poll)  # best-effort
     deadline = time.monotonic() + max(timeout, 0.0)
+    last_fallback = 0.0
+
     while len(results) < max(1, frames) and time.monotonic() < deadline:
-        if not _wait_for_motion(apiPrinter, target=False, timeout=30.0, poll=poll):
-            log.info("[bedref] no further pause detected – stop")
-            break
-        time.sleep(max(0.0, settle))
-        shot = captureFunc(apiPrinter, serial)  # skal gi Path til midlertidig snapshot
-        saved = storeBedReferenceFrame(serial, len(results) + 1, shot)
-        results.append(saved)
-        if len(results) >= frames:
-            break
-        if not _wait_for_motion(apiPrinter, target=True, timeout=30.0, poll=poll):
-            log.info("[bedref] no further movement – stop")
-            break
+        if _wait_for_motion(apiPrinter, target=False, timeout=30.0, poll=poll):
+            time.sleep(max(0.0, settle))
+            shot = captureFunc(apiPrinter, serial)  # midlertidig snapshot
+            saved = storeBedReferenceFrame(serial, len(results) + 1, shot)
+            results.append(saved)
+            if len(results) >= frames:
+                break
+            # Vent på bevegelse før neste pause
+            if not _wait_for_motion(apiPrinter, target=True, timeout=30.0, poll=poll):
+                log.info("[bedref] no further movement – stop")
+                break
+            continue
+        # Fallback: ta et bilde med jevne mellomrom hvis state ikke kan leses
+        now = time.monotonic()
+        if (now - last_fallback) >= fallback_every:
+            shot = captureFunc(apiPrinter, serial)
+            saved = storeBedReferenceFrame(serial, len(results) + 1, shot)
+            results.append(saved)
+            last_fallback = now
+            log.warning("[bedref] fallback snapshot taken (state unavailable)")
+            continue
+        time.sleep(poll)
     return results
 
 
@@ -157,6 +194,8 @@ def run_bed_reference_capture(
     except Exception:
         pass
     try:
+        # Sørg for at vi er tilkoblet og at state er klar før pause-deteksjon
+        _await_printer_ready(printer, timeout=20.0, poll=0.25)
         return capture_during_pauses(printer, serial, captureFunc, frames)
     finally:
         for meth in ("disconnect", "mqtt_stop"):
