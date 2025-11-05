@@ -1157,10 +1157,13 @@ def startPrintViaApi(
     resolvedUseAms = resolveUseAmsAuto(options, job_metadata, None)
 
     # Resolve requested timelapse directory from options first
+    logger.info("[timelapse] startPrintViaApi - timelapse_directory parameter: %s", timelapse_directory)
     timelapsePath = timelapse_directory or _resolveTimeLapseDirectory(options, ensure=True)
+    logger.info("[timelapse] startPrintViaApi - timelapsePath etter _resolveTimeLapseDirectory: %s", timelapsePath)
 
     # --- NEW: metadata fallback (covers MQTT→API fallback where options.enableTimeLapse wasn't set) ---
     if timelapsePath is None and job_metadata:
+        logger.info("[timelapse] timelapsePath er None, sjekker job_metadata for fallback...")
         def _norm_key(s):
             try:
                 return "".join(ch for ch in str(s).lower() if ch.isalnum())
@@ -1184,8 +1187,9 @@ def startPrintViaApi(
             # default: ~/.printmaster/timelapse
             timelapsePath = Path.home() / ".printmaster" / "timelapse"
             timelapsePath.mkdir(parents=True, exist_ok=True)
-            if START_DEBUG:
-                logger.info("[start] timelapse enabled by metadata -> %s", timelapsePath)
+            logger.info("[timelapse] FALLBACK aktivert - timelapse funnet i metadata -> %s", timelapsePath)
+        else:
+            logger.warning("[timelapse] job_metadata inneholder IKKE enableTimeLapse")
 
     startKeywordArgs: Dict[str, Any] = {}
     if resolvedUseAms is not None:
