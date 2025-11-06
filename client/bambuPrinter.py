@@ -1385,6 +1385,20 @@ def startPrintViaApi(
             _extract_gcode_state(preflightState),
         )
     if _state_is_completed_like(preflightState):
+        # Printer is in FINISH state - try to force it out of FINISH state first
+        logger.info("[start] Printer in FINISH state, attempting to reset/clear state...")
+        try:
+            # Try to stop/clear the current print to get out of FINISH state
+            stopMethod = getattr(printer, "stop_print", None)
+            if callable(stopMethod):
+                try:
+                    stopMethod()
+                    logger.info("[start] Sent stop_print to clear FINISH state")
+                    time.sleep(1.0)  # Give printer time to process
+                except Exception as error:
+                    logger.debug("[start] stop_print failed (may already be stopped): %s", error)
+        except Exception as error:
+            logger.debug("[start] Error trying to clear FINISH state: %s", error)
         _preselect_project_file(printer, remoteUrl, startParam, sendControlFlags)
 
     if timelapsePath is not None:
@@ -1479,14 +1493,27 @@ def startPrintViaApi(
                 completedLike = True
             pctOk = percentageFloat is not None and 0.0 < percentageFloat < 100.0
             activeOk = _is_active_state(stateIndicator) and not completedLike
+            # Also accept if printer has transitioned from FINISH to IDLE/ready state
+            # This handles the case where printer is ready but not yet actively printing
+            stateNormalized = (stateIndicator or "").strip().upper()
+            idleOrReady = stateNormalized in ("IDLE", "READY", "STANDBY") and not completedLike
+            # Accept if printer is no longer in FINISH state (even if still at 100%)
+            # This handles the case where printer has exited FINISH but hasn't started printing yet
+            exitedFinish = (
+                completedLike
+                and stateNormalized not in ("FINISH", "FINISHED", "COMPLETE", "COMPLETED")
+                and (percentageFloat is None or percentageFloat < 100.0)
+            )
             if START_DEBUG:
                 logger.info(
-                    "[start] poll state=%s percent=%s completedLike=%s",
+                    "[start] poll state=%s percent=%s completedLike=%s idleOrReady=%s exitedFinish=%s",
                     stateIndicator,
                     lastPercentage,
                     completedLike,
+                    idleOrReady,
+                    exitedFinish,
                 )
-            if pctOk or activeOk:
+            if pctOk or activeOk or idleOrReady or exitedFinish:
                 return {
                     "acknowledged": True,
                     "statePayload": lastStatePayload,
@@ -1518,6 +1545,17 @@ def startPrintViaApi(
         _invokeStart()
         ackResult = _pollForAcknowledgement(ack_timeout_sec)
         acknowledged = bool(ackResult.get("acknowledged"))
+        # If printer was in FINISH state and we sent the start command, 
+        # accept it even if acknowledged is False (printer may start anyway)
+        wasInFinishState = _state_is_completed_like(preflightState)
+        if wasInFinishState and not acknowledged:
+            logger.info(
+                "[start] Printer was in FINISH state, start command sent. "
+                "Accepting as acknowledged even though printer state hasn't changed yet."
+            )
+            acknowledged = True
+            # Update ackResult to reflect this
+            ackResult["acknowledged"] = True
         conflictDetected = _looksLikeAmsFilamentConflict(ackResult.get("statePayload"))
         if (resolvedUseAms is None) and (conflictDetected or not acknowledged):
             logger.warning(
