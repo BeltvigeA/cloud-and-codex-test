@@ -451,7 +451,7 @@ def normalizePrinterDetails(details: Dict[str, Any]) -> Dict[str, Any]:
             serialValue = normalizeTextValue(rawValue)
             if serialValue is not None:
                 normalized["serialNumber"] = serialValue
-        elif key in {"ip", "ipaddress", "printerip", "host", "hostname"}:
+        elif key in {"ip", "ipaddress", "printerip", "printeripaddress", "host", "hostname"}:
             ipValue = normalizeTextValue(rawValue)
             if ipValue is not None:
                 normalized["ipAddress"] = ipValue
@@ -1041,9 +1041,49 @@ def dispatchBambuPrintIfPossible(
     if not savedFile:
         return None
 
-    printerAssignment = extractPrinterAssignment(entryData.get("unencryptedData"), entryData.get("decryptedData"))
+    decryptedData = entryData.get("decryptedData")
+    unencryptedData = entryData.get("unencryptedData")
+    
+    # Check if decryptedData is empty
+    isDecryptedDataEmpty = not decryptedData or (isinstance(decryptedData, dict) and not decryptedData)
+    
+    # If decryptedData is empty, try to extract printer info from unencryptedData using printer_ip_address
+    if isDecryptedDataEmpty:
+        if not unencryptedData or (isinstance(unencryptedData, dict) and not unencryptedData):
+            # Both are empty - return error
+            jobId = extractPrintJobId(entryData, entryData.get("productStatus"), statusPayload)
+            errorMessage = f"Kan ikke finne printerinformasjon: både decryptedData og unencryptedData er tomme for jobb {jobId or productId}"
+            logging.error(errorMessage)
+            return {
+                "success": False,
+                "details": {},
+                "error": errorMessage,
+                "events": [],
+            }
+        # Try to extract printer info from unencryptedData
+        printerAssignment = extractPrinterAssignment(unencryptedData)
+        if not printerAssignment:
+            # Check if unencryptedData has printer_ip_address directly
+            if isinstance(unencryptedData, dict):
+                printerIpAddress = unencryptedData.get("printer_ip_address")
+                if printerIpAddress:
+                    # Create a printer assignment from the IP address
+                    printerAssignment = {"ipAddress": printerIpAddress}
+    else:
+        # Normal case: use both decryptedData and unencryptedData
+        printerAssignment = extractPrinterAssignment(unencryptedData, decryptedData)
+    
     if not printerAssignment:
-        return None
+        # Both are empty or no printer info found - return error
+        jobId = extractPrintJobId(entryData, entryData.get("productStatus"), statusPayload)
+        errorMessage = f"Kan ikke finne printerinformasjon: ingen printerinformasjon funnet i decryptedData eller unencryptedData for jobb {jobId or productId}"
+        logging.error(errorMessage)
+        return {
+            "success": False,
+            "details": {},
+            "error": errorMessage,
+            "events": [],
+        }
 
     printers = configuredPrinters if configuredPrinters is not None else loadConfiguredPrinters()
     resolvedDetails = resolvePrinterDetails(printerAssignment, printers)
@@ -2266,7 +2306,7 @@ def listenForFiles(
                             entryData=entryData,
                             statusPayload=statusPayload,
                         )
-                        if dispatchResult:
+                        if dispatchResult is not None:
                             entryData["printerDispatch"] = dispatchResult
 
                     summaryDirectory: Optional[Path] = None
