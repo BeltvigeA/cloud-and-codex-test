@@ -1044,12 +1044,25 @@ def dispatchBambuPrintIfPossible(
     decryptedData = entryData.get("decryptedData")
     unencryptedData = entryData.get("unencryptedData")
     
-    # Check if decryptedData is empty
-    isDecryptedDataEmpty = not decryptedData or (isinstance(decryptedData, dict) and not decryptedData)
+    # Check if decryptedData is empty (handle None, empty dict, empty list, empty string)
+    isDecryptedDataEmpty = (
+        not decryptedData 
+        or (isinstance(decryptedData, dict) and not decryptedData)
+        or (isinstance(decryptedData, list) and not decryptedData)
+        or (isinstance(decryptedData, str) and not decryptedData.strip())
+    )
     
     # If decryptedData is empty, try to extract printer info from unencryptedData using printer_ip_address
     if isDecryptedDataEmpty:
-        if not unencryptedData or (isinstance(unencryptedData, dict) and not unencryptedData):
+        # Check if unencryptedData is also empty
+        isUnencryptedDataEmpty = (
+            not unencryptedData
+            or (isinstance(unencryptedData, dict) and not unencryptedData)
+            or (isinstance(unencryptedData, list) and not unencryptedData)
+            or (isinstance(unencryptedData, str) and not unencryptedData.strip())
+        )
+        
+        if isUnencryptedDataEmpty:
             # Both are empty - return error
             jobId = extractPrintJobId(entryData, entryData.get("productStatus"), statusPayload)
             errorMessage = f"Kan ikke finne printerinformasjon: både decryptedData og unencryptedData er tomme for jobb {jobId or productId}"
@@ -1060,30 +1073,48 @@ def dispatchBambuPrintIfPossible(
                 "error": errorMessage,
                 "events": [],
             }
+        
         # Try to extract printer info from unencryptedData
         printerAssignment = extractPrinterAssignment(unencryptedData)
         if not printerAssignment:
-            # Check if unencryptedData has printer_ip_address directly
+            # Check if unencryptedData has printer_ip_address or printerIpAddress directly
             if isinstance(unencryptedData, dict):
-                printerIpAddress = unencryptedData.get("printer_ip_address")
-                if printerIpAddress:
+                printerIpAddress = (
+                    unencryptedData.get("printer_ip_address")
+                    or unencryptedData.get("printerIpAddress")
+                    or unencryptedData.get("printer_ip")
+                    or unencryptedData.get("printerIp")
+                )
+                if printerIpAddress and isinstance(printerIpAddress, str) and printerIpAddress.strip():
                     # Create a printer assignment from the IP address
-                    printerAssignment = {"ipAddress": printerIpAddress}
+                    printerAssignment = {"ipAddress": printerIpAddress.strip()}
+        
+        # If still no assignment found, return error
+        if not printerAssignment:
+            jobId = extractPrintJobId(entryData, entryData.get("productStatus"), statusPayload)
+            errorMessage = f"Kan ikke finne printerinformasjon: ingen printerinformasjon funnet i unencryptedData for jobb {jobId or productId}"
+            logging.error(errorMessage)
+            return {
+                "success": False,
+                "details": {},
+                "error": errorMessage,
+                "events": [],
+            }
     else:
         # Normal case: use both decryptedData and unencryptedData
         printerAssignment = extractPrinterAssignment(unencryptedData, decryptedData)
-    
-    if not printerAssignment:
-        # Both are empty or no printer info found - return error
-        jobId = extractPrintJobId(entryData, entryData.get("productStatus"), statusPayload)
-        errorMessage = f"Kan ikke finne printerinformasjon: ingen printerinformasjon funnet i decryptedData eller unencryptedData for jobb {jobId or productId}"
-        logging.error(errorMessage)
-        return {
-            "success": False,
-            "details": {},
-            "error": errorMessage,
-            "events": [],
-        }
+        
+        if not printerAssignment:
+            # Both are empty or no printer info found - return error
+            jobId = extractPrintJobId(entryData, entryData.get("productStatus"), statusPayload)
+            errorMessage = f"Kan ikke finne printerinformasjon: ingen printerinformasjon funnet i decryptedData eller unencryptedData for jobb {jobId or productId}"
+            logging.error(errorMessage)
+            return {
+                "success": False,
+                "details": {},
+                "error": errorMessage,
+                "events": [],
+            }
 
     printers = configuredPrinters if configuredPrinters is not None else loadConfiguredPrinters()
     resolvedDetails = resolvePrinterDetails(printerAssignment, printers)
