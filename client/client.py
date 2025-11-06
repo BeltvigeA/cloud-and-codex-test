@@ -659,8 +659,6 @@ def upsertPrinterFromJob(entryData: Dict[str, Any]) -> Optional[Path]:
         or _extractText(entryData, "serialNumber", "serial_number", "serial")
         or _extractText(unencryptedPayload, "serial_number", "serialNumber")
     )
-    if not serialNumber:
-        return None
 
     ipAddress = (
         _extractText(decryptedPayload, "printer_ip")
@@ -671,12 +669,6 @@ def upsertPrinterFromJob(entryData: Dict[str, Any]) -> Optional[Path]:
     nickname = _extractText(unencryptedPayload, "printer_name") or _extractText(entryData, "nickname")
     transportRaw = _extractText(unencryptedPayload, "transport") or _extractText(entryData, "transport")
     transportNormalized = normalizeTransportPreference(transportRaw)
-    logging.debug(
-        "Job transport %r normalized to %r for printer %s",
-        transportRaw,
-        transportNormalized,
-        serialNumber,
-    )
 
     connectionUpdates: Dict[str, Any] = {}
     writeAccessCode = False
@@ -699,26 +691,48 @@ def upsertPrinterFromJob(entryData: Dict[str, Any]) -> Optional[Path]:
     printerEntries = loadConfiguredPrinters()
     matchedIndex: Optional[int] = None
 
-    for index, printer in enumerate(printerEntries):
-        existingSerial = str(printer.get("serialNumber", "")).strip()
-        if existingSerial == serialNumber:
-            matchedIndex = index
-            break
+    # First try to match by serialNumber if we have it
+    if serialNumber:
+        for index, printer in enumerate(printerEntries):
+            existingSerial = str(printer.get("serialNumber", "")).strip()
+            if existingSerial == serialNumber:
+                matchedIndex = index
+                break
 
+    # If no match by serial, try by IP address (this allows updating when we only have IP)
+    if matchedIndex is None and ipAddress:
+        for index, printer in enumerate(printerEntries):
+            printerIp = str(printer.get("ipAddress", "")).strip()
+            if printerIp and printerIp == ipAddress:
+                matchedIndex = index
+                # If we found a printer by IP but don't have serialNumber, use the printer's serialNumber
+                if not serialNumber:
+                    serialNumber = str(printer.get("serialNumber", "")).strip()
+                break
+
+    # If still no match, try by nickname
     if matchedIndex is None and nickname:
         loweredNickname = nickname.lower()
         for index, printer in enumerate(printerEntries):
             printerNickname = str(printer.get("nickname", "")).strip().lower()
             if printerNickname and printerNickname == loweredNickname:
                 matchedIndex = index
+                # If we found a printer by nickname but don't have serialNumber, use the printer's serialNumber
+                if not serialNumber:
+                    serialNumber = str(printer.get("serialNumber", "")).strip()
                 break
 
-    if matchedIndex is None and ipAddress:
-        for index, printer in enumerate(printerEntries):
-            printerIp = str(printer.get("ipAddress", "")).strip()
-            if printerIp and printerIp == ipAddress:
-                matchedIndex = index
-                break
+    # If we still don't have a serialNumber, we can't create a new printer entry
+    if not serialNumber:
+        return None
+
+    if transportNormalized:
+        logging.debug(
+            "Job transport %r normalized to %r for printer %s",
+            transportRaw,
+            transportNormalized,
+            serialNumber,
+        )
 
     if matchedIndex is None:
         bambuModel = _extractText(
@@ -1144,6 +1158,32 @@ def dispatchBambuPrintIfPossible(
     if not resolvedDetails:
         logging.info("No matching printer configuration for product %s", productId)
         return None
+
+    # Validate that the resolved printer matches the requested IP address if we only had IP
+    if (
+        isDecryptedDataEmpty
+        and printerAssignment
+        and printerAssignment.get("ipAddress")
+        and not printerAssignment.get("serialNumber")
+    ):
+        requestedIp = printerAssignment.get("ipAddress")
+        resolvedIp = resolvedDetails.get("ipAddress")
+        if requestedIp and resolvedIp and str(requestedIp).strip() != str(resolvedIp).strip():
+            logging.warning(
+                "IP address mismatch for product %s: requested %s but resolved to %s (serialNumber=%s). "
+                "This job will be sent to the wrong printer!",
+                productId,
+                requestedIp,
+                resolvedIp,
+                resolvedDetails.get("serialNumber"),
+            )
+            # Return error instead of sending to wrong printer
+            return {
+                "success": False,
+                "details": {},
+                "error": f"IP address mismatch: job specifies {requestedIp} but matched printer has {resolvedIp}",
+                "events": [],
+            }
 
     brand = str(resolvedDetails.get("brand", "")).strip()
     if brand and "bambu" not in brand.lower():
