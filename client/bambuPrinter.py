@@ -1138,6 +1138,58 @@ def _applyPostStartControls(printer: Any, options: "BambuPrintOptions") -> None:
             logger.debug("calibrate_printer failed", exc_info=True)
 
 
+def _extract_ams_and_skips_from_metadata(job_metadata: Optional[Dict[str, Any]]) -> tuple[Optional[List[int]], Optional[List[int]]]:
+    """Returner (ams_mapping, skip_objects) fra job-metadata.
+    - AMS: sorter `ams_configuration.slots` på colorIndex (0,1,2,...) og bruk slotNumber/slot (0-basert) i den rekkefølgen.
+    - Skip: flat liste av identify_id (ints) i `skipped_objects`.
+    Aksepterer varianter av feltnavn (colorIndex/color_index/index/order og slot/slotNumber/slotNummer/tray).
+    """
+    ams_mapping: Optional[List[int]] = None
+    skip_objects: Optional[List[int]] = None
+    try:
+        if not isinstance(job_metadata, dict):
+            return (None, None)
+        root = job_metadata
+        inner = root.get("unencryptedData") or root
+
+        # --- Skipped objects ---
+        raw_skips = inner.get("skipped_objects") or root.get("skipped_objects")
+        if isinstance(raw_skips, (list, tuple)):
+            out: List[int] = []
+            for x in raw_skips:
+                try:
+                    out.append(int(x))
+                except Exception:
+                    continue
+            if out:
+                skip_objects = out
+
+        # --- AMS mapping ---
+        cfg = inner.get("ams_configuration") or {}
+        slots = cfg.get("slots") or []
+        parsed: List[tuple[int, int]] = []
+        if isinstance(slots, (list, tuple)):
+            def _norm(k: str) -> str:
+                return "".join(ch for ch in str(k).lower() if ch.isalnum())
+            for s in slots:
+                if not isinstance(s, dict):
+                    continue
+                kv = { _norm(k): v for k, v in s.items() }
+                color_val = kv.get("colorindex", kv.get("color_index", kv.get("index", kv.get("order"))))
+                slot_val  = kv.get("slot", kv.get("slotnumber", kv.get("slotnummer", kv.get("tray"))))
+                try:
+                    parsed.append((int(color_val), int(slot_val)))
+                except Exception:
+                    continue
+        if parsed:
+            parsed.sort(key=lambda t: t[0])
+            ams_mapping = [slot for _, slot in parsed]
+    except Exception:
+        logger.debug("AMS/skip parse error", exc_info=True)
+    return (ams_mapping, skip_objects)
+
+
+
 def startPrintViaApi(
     *,
     ip: str,
@@ -1203,6 +1255,15 @@ def startPrintViaApi(
         startKeywordArgs["use_ams"] = resolvedUseAms
     startKeywordArgs["flow_calibration"] = bool(options.flowCalibration)
 
+    # --- NYTT: trekk ut AMS/skip fra metadata og logg det ---
+    amsMapping, skipObjects = _extract_ams_and_skips_from_metadata(job_metadata)
+    if skipObjects:
+        startKeywordArgs["skip_objects"] = skipObjects
+        logger.info("[start] skip_objects preselected in job: %s", skipObjects)
+    if amsMapping:
+        startKeywordArgs["ams_mapping"] = amsMapping
+        logger.info("[start] ams_mapping requested: %s", amsMapping)
+
     sendControlFlags: Dict[str, Any] = {
         "use_ams": resolvedUseAms,
         "bed_levelling": bool(options.bedLeveling),
@@ -1210,6 +1271,61 @@ def startPrintViaApi(
         "flow_cali": bool(options.flowCalibration),
         "vibration_cali": bool(options.vibrationCalibration),
     }
+
+    # --- NEW: parse AMS mapping and skip_objects from job metadata -------------------------
+    amsMapping: Optional[List[int]] = None
+    skipObjects: Optional[List[int]] = None
+    try:
+        meta = job_metadata if isinstance(job_metadata, dict) else None
+        if meta:
+            # Some callers wrap data inside "unencryptedData". Fall back to root if not present.
+            root = meta
+            inner = root.get("unencryptedData") or root
+
+            # skipped objects: a flat list of identify_id integers
+            raw_skips = inner.get("skipped_objects") or root.get("skipped_objects")
+            if isinstance(raw_skips, (list, tuple)):
+                skipObjects = []
+                for x in raw_skips:
+                    try:
+                        skipObjects.append(int(x))
+                    except Exception:
+                        continue
+
+            # ams mapping: sort slots by colorIndex and collect slot numbers (0-based across AMS units)
+            cfg = inner.get("ams_configuration") or {}
+            slots = cfg.get("slots") or []
+            parsed: List[tuple] = []
+            for s in slots if isinstance(slots, (list, tuple)) else []:
+                if not isinstance(s, dict):
+                    continue
+                def _norm(k: str) -> str:
+                    return "".join(ch for ch in str(k).lower() if ch.isalnum())
+                kv = { _norm(k): v for k, v in s.items() }
+                # Accept multiple spellings: colorIndex / color_index / index / order
+                color_val = kv.get("colorindex", kv.get("color_index", kv.get("index", kv.get("order"))))
+                # Accept slot / slotNumber / slotNummer / tray
+                slot_val = kv.get("slot", kv.get("slotnumber", kv.get("slotnummer", kv.get("tray"))))
+                try:
+                    color_int = int(color_val)
+                    slot_int = int(slot_val)
+                    parsed.append((color_int, slot_int))
+                except Exception:
+                    continue
+            if parsed:
+                parsed.sort(key=lambda t: t[0])
+                amsMapping = [slot for _, slot in parsed]
+
+    except Exception:
+        logger.debug("Failed to parse AMS/skip metadata", exc_info=True)
+
+    if skipObjects:
+        startKeywordArgs["skip_objects"] = skipObjects
+        logger.info("[start] skip_objects preselected in job: %s", skipObjects)
+    if amsMapping:
+        startKeywordArgs["ams_mapping"] = amsMapping
+        logger.info("[start] ams_mapping requested: %s", amsMapping)
+
 
     if START_DEBUG:
         logger.info(
@@ -1306,6 +1422,11 @@ def startPrintViaApi(
                     if startParam:
                         payload["print"]["param"] = startParam
                     payload["print"].update({key: value for key, value in sendControlFlags.items() if value is not None})
+                    # speil verdiene også i send_control payload for fallback-sti
+                    if amsMapping:
+                        payload["print"]["ams_mapping"] = amsMapping
+                    if skipObjects:
+                        payload["print"]["skip_objects"] = skipObjects
                     if START_DEBUG:
                         logger.info("[start] send_control payload=%s", payload)
                     controlMethod(payload)

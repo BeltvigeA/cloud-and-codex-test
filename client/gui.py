@@ -2715,6 +2715,8 @@ class ListenerGuiApp:
                         self.log(json.dumps(status)),
                         postStatus(status, printerConfig),
                     ),
+                    # Pass hele metadata-objektet videre slik at AMS/skip kan brukes
+                    jobMetadata=metadata,
                 )
                 self.log("Startkommando sendt.")
             except Exception as error:  # noqa: BLE001 - surface errors to log
