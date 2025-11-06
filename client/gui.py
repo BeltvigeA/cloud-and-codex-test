@@ -2745,6 +2745,14 @@ class ListenerGuiApp:
                 logMessage += f" | Failed to write log: {error}"
         self.logQueue.put(logMessage)
 
+        # Check for printer dispatch errors
+        printerDispatch = details.get("printerDispatch")
+        if isinstance(printerDispatch, dict):
+            if not printerDispatch.get("success", True):
+                errorMessage = printerDispatch.get("error", "Ukjent feil ved printer-tilordning")
+                self.logQueue.put(f"FEIL: {errorMessage}")
+                return  # Don't proceed with file download if printer assignment failed
+
         savedPathValue = details.get("savedFile")
         if isinstance(savedPathValue, (str, Path)):
             combinedMetadata: Dict[str, Any] = {}
