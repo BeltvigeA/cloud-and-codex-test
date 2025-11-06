@@ -666,6 +666,7 @@ def upsertPrinterFromJob(entryData: Dict[str, Any]) -> Optional[Path]:
         _extractText(decryptedPayload, "printer_ip")
         or _extractText(entryData, "ipAddress")
         or _extractText(unencryptedPayload, "ipAddress")
+        or _extractText(unencryptedPayload, "printer_ip_address", "printerIpAddress", "printer_ip", "printerIp")
     )
     nickname = _extractText(unencryptedPayload, "printer_name") or _extractText(entryData, "nickname")
     transportRaw = _extractText(unencryptedPayload, "transport") or _extractText(entryData, "transport")
@@ -1116,7 +1117,29 @@ def dispatchBambuPrintIfPossible(
                 "events": [],
             }
 
+    # If printerAssignment only has ipAddress (no serialNumber), try to create/update printer config
+    # This handles the case where printer_ip_address is in unencryptedData but no matching printer exists
     printers = configuredPrinters if configuredPrinters is not None else loadConfiguredPrinters()
+    if (
+        isDecryptedDataEmpty
+        and printerAssignment
+        and printerAssignment.get("ipAddress")
+        and not printerAssignment.get("serialNumber")
+    ):
+        logging.info(
+            "printerAssignment only has ipAddress for product %s, attempting to create/update printer config",
+            productId,
+        )
+        upsertResult = upsertPrinterFromJob(entryData)
+        if upsertResult:
+            logging.info("Successfully created/updated printer config from job metadata for product %s", productId)
+            # Reload printers to include the newly created/updated printer
+            printers = loadConfiguredPrinters()
+        else:
+            logging.warning(
+                "Could not create/update printer config from job metadata for product %s (missing serialNumber?)",
+                productId,
+            )
     resolvedDetails = resolvePrinterDetails(printerAssignment, printers)
     if not resolvedDetails:
         logging.info("No matching printer configuration for product %s", productId)
