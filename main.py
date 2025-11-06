@@ -889,49 +889,6 @@ def buildHandshakeResponseMetadata(fileMetadata: dict) -> dict:
     return {}
 
 
-def fetchProductFromPrintFlowPro(fetchToken: str) -> Optional[Dict[str, Any]]:
-    """
-    Fetch printer details from PrintFlow Pro's fetchProduct function.
-    Returns the decryptedData dict if successful, None otherwise.
-    """
-    functionsBase = os.getenv('PFP_FUNCTIONS_BASE') or os.getenv(
-        'BASE44_FUNCTIONS_BASE',
-        'https://print-flow-pro-eb683cc6.base44.app/api/apps/68b61486e7c52405eb683cc6/functions'
-    )
-    apiKey = os.getenv('BASE44_FUNCTIONS_API_KEY') or os.getenv('BASE44_API_KEY', '')
-    
-    if not apiKey:
-        logging.warning('Missing API key for PrintFlow Pro functions')
-        return None
-    
-    url = f"{functionsBase}/fetchProduct/{fetchToken}"
-    headers = {'X-API-Key': apiKey, 'Content-Type': 'application/json'}
-    
-    try:
-        logging.info('Fetching printer details from PrintFlow Pro for token %s', fetchToken)
-        response = requests.get(url, headers=headers, timeout=10)
-        response.raise_for_status()
-        
-        payload = response.json() if response.content else {}
-        if not isinstance(payload, dict):
-            logging.warning('Invalid response format from PrintFlow Pro fetchProduct')
-            return None
-        
-        decryptedData = payload.get('decryptedData')
-        if isinstance(decryptedData, dict) and decryptedData:
-            logging.info('Successfully fetched printer details from PrintFlow Pro')
-            return decryptedData
-        else:
-            logging.warning('PrintFlow Pro fetchProduct returned empty or invalid decryptedData')
-            return None
-            
-    except requests.RequestException as error:
-        logging.error('Failed to fetch from PrintFlow Pro fetchProduct: %s', error)
-        return None
-    except (json.JSONDecodeError, ValueError) as error:
-        logging.error('Invalid JSON response from PrintFlow Pro: %s', error)
-        return None
-
 
 @app.route('/products/<productId>/handshake', methods=['POST'])
 def productHandshake(productId: str):
@@ -1344,49 +1301,6 @@ def fetchFile(fetchToken: str):
                 documentSnapshot.id,
             )
 
-        # Fallback: If decryptedData is empty or missing, fetch from PrintFlow Pro
-        if not decryptedData or not isinstance(decryptedData, dict):
-            logging.info(
-                'decryptedData is empty or missing for file %s; attempting to fetch from PrintFlow Pro',
-                documentSnapshot.id,
-            )
-            fetchedData = fetchProductFromPrintFlowPro(fetchToken)
-            
-            if fetchedData and isinstance(fetchedData, dict) and fetchedData:
-                # Encrypt and store the fetched data back to Firestore
-                try:
-                    encryptResponse = kmsClient.encrypt(
-                        request={
-                            'name': kmsKeyPath,
-                            'plaintext': json.dumps(fetchedData).encode('utf-8'),
-                        }
-                    )
-                    encryptedDataCipherTextHex = encryptResponse.ciphertext.hex()
-                    
-                    # Update Firestore with the encrypted data
-                    firestoreClient.collection(firestoreCollectionFiles).document(
-                        documentSnapshot.id
-                    ).update({'encryptedData': encryptedDataCipherTextHex})
-                    
-                    logging.info(
-                        'Fetched printer details from PrintFlow Pro and stored encrypted copy for file %s',
-                        documentSnapshot.id,
-                    )
-                    decryptedData = fetchedData
-                except GoogleAPICallError as error:
-                    logging.error(
-                        'KMS encryption failed when storing fetched data for file %s: %s',
-                        documentSnapshot.id,
-                        error,
-                    )
-                    # Still use the fetched data in response even if encryption fails
-                    decryptedData = fetchedData
-            else:
-                logging.warning(
-                    'Failed to fetch printer details from PrintFlow Pro for file %s; decryptedData will be empty',
-                    documentSnapshot.id,
-                )
-                # decryptedData remains empty, but we continue to return the response
 
         requestArgs = getattr(request, 'args', {}) or {}
         fetchMode = str(requestArgs.get('mode', 'full')).lower()
@@ -2684,5 +2598,4 @@ def healthCheck():
 
 if __name__ == '__main__':
     # For Cloud Run, use the PORT environment variable
-    port = int(os.environ.get('PORT', 8080))
     app.run(debug=False, host='0.0.0.0', port=port)
