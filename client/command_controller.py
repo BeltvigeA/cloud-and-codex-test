@@ -1279,8 +1279,8 @@ class CommandWorker:
     
     def captureBedReference(
         self,
-        zStepMm: float = 5.0,
-        totalMm: float = 200.0,
+        zStepMm: float = 2.0,
+        totalMm: float = 220.0,
         **kwargs,
     ) -> List[Path]:
         """
@@ -1291,11 +1291,11 @@ class CommandWorker:
         2. Home printer
         3. Flytt print head bakover (X=0, Y=250)
         4. Ta bilde ved Z=0
-        5. Senk bed 5mm og ta bilde (gjenta til totalt 200mm)
+        5. Senk bed 2mm og ta bilde (gjenta til totalt 220mm)
 
         Args:
-            zStepMm: Z-akse steg i millimeter (default 5.0)
-            totalMm: Total Z-akse bevegelse i millimeter (default 200.0)
+            zStepMm: Z-akse steg i millimeter (default 2.0)
+            totalMm: Total Z-akse bevegelse i millimeter (default 220.0)
 
         Returns:
             Liste med Path-objekter til lagrede bilder
@@ -1387,8 +1387,53 @@ class CommandWorker:
                 raise RuntimeError("Printer mangler home_printer() metode")
 
             # Vent på at homing fullføres - homing kan ta lang tid!
-            log.info("[bedref] venter 45 sekunder på at homing fullføres komplett")
-            time.sleep(45.0)
+            log.info("[bedref] venter på at homing fullføres komplett")
+
+            # Sjekk printer state for å vente til homing er ferdig
+            homingTimeout = time.monotonic() + 120.0  # Maks 2 minutter
+            homingDetected = False
+
+            getStateMethod = getattr(printer, "get_state", None)
+            if callable(getStateMethod):
+                while time.monotonic() < homingTimeout:
+                    try:
+                        state = getStateMethod()
+                        if state:
+                            # Sjekk ulike state-felt for "homing"
+                            stateStr = str(state).lower()
+                            gcodeState = str(state.get("gcode_state", "")).lower() if isinstance(state, dict) else ""
+                            motionState = str(state.get("motion_state", "")).lower() if isinstance(state, dict) else ""
+
+                            # Detekter om vi holder på med homing
+                            if "homing" in stateStr or "homing" in gcodeState or "homing" in motionState:
+                                homingDetected = True
+                                log.info("[bedref] homing pågår, venter...")
+                                time.sleep(1.0)
+                                continue
+
+                            # Hvis vi har sett homing og nå er den ferdig (idle/ready)
+                            if homingDetected:
+                                if any(status in gcodeState or status in motionState for status in ["idle", "ready", "finish"]):
+                                    log.info("[bedref] homing fullført (state bekreftet)")
+                                    break
+
+                        time.sleep(0.5)
+                    except Exception as error:
+                        log.warning("[bedref] kunne ikke lese state under homing: %s", error)
+                        time.sleep(1.0)
+
+                # Hvis vi aldri så homing, eller timeout, gi en advarsel men fortsett
+                if not homingDetected:
+                    log.warning("[bedref] kunne ikke bekrefte homing via state, venter 45 sekunder ekstra")
+                    time.sleep(45.0)
+                else:
+                    # Vent litt ekstra etter at homing er bekreftet ferdig
+                    log.info("[bedref] venter 3 sekunder ekstra etter homing")
+                    time.sleep(3.0)
+            else:
+                # Fallback hvis get_state ikke finnes
+                log.warning("[bedref] get_state() ikke tilgjengelig, bruker fast ventetid på 45 sekunder")
+                time.sleep(45.0)
 
             # 3. Flytt print head bakover (midten av X, helt bak på Y)
             log.info("[bedref] flytter print head bakover (X=128, Y=250) for %s", serial)
