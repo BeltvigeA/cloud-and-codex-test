@@ -1249,6 +1249,17 @@ def dispatchBambuPrintIfPossible(
         return None
     if payloadTransport and payloadTransport != clientTransport:
         logging.warning(
+            "[DISPATCH] Transport Mismatch - Job Rejected",
+            extra={
+                "product_id": productId,
+                "printer_serial": serialNumber,
+                "payload_transport": payloadTransport,
+                "client_transport": clientTransport,
+                "reason": "transport_mismatch",
+                "action": "job_rejected"
+            }
+        )
+        logging.warning(
             "Bambu dispatch skipped job %s for printer %s: reason=%s transport=%s clientTransport=%s",
             jobId or "unknown",
             printerId,
@@ -1265,6 +1276,18 @@ def dispatchBambuPrintIfPossible(
         useCloudActive = True
     resolvedDetails.setdefault("transport", selectedTransport)
     resolvedDetails.setdefault("connectionMethod", selectedTransport)
+
+    logging.info(
+        "[DISPATCH] Transport Resolved",
+        extra={
+            "product_id": productId,
+            "printer_serial": serialNumber,
+            "payload_transport": payloadTransport,
+            "client_transport": clientTransport,
+            "selected_transport": selectedTransport,
+            "action": "transport_resolution"
+        }
+    )
 
     if (not ipAddress) or (not serialNumber) or (not accessCode and not useCloudActive):
         logging.warning(
@@ -1472,6 +1495,18 @@ def dispatchBambuPrintIfPossible(
         return {"success": False, "details": printerDetails, "error": str(error), "events": statusEvents}
 
     try:
+        logging.info(
+            "[DISPATCH] Calling sendBambuPrintJob",
+            extra={
+                "product_id": productId,
+                "printer_serial": serialNumber,
+                "printer_ip": ipAddress,
+                "printer_nickname": resolvedDetails.get("nickname"),
+                "file_path": str(filePath),
+                "has_skipped_objects": len(skippedTargets) > 0,
+                "action": "invoke_send_job"
+            }
+        )
         logging.info("[timelapse] client.py - Kaller sendBambuPrintJob med:")
         logging.info("[timelapse] client.py - options.enableTimeLapse = %s", getattr(options, "enableTimeLapse", None))
         logging.info("[timelapse] client.py - combinedJobMetadata = %s", combinedJobMetadata)
