@@ -331,6 +331,20 @@ def uploadViaFtps(
     port = 990
     try:
         ftps.connect(ip, port, timeout=timeout)
+        logger.info(
+            "[PRINTER_COMM] FTPS Upload Start",
+            extra={
+                "method": "FTPS",
+                "protocol": "FTP_TLS",
+                "port": 990,
+                "destination": ip,
+                "serial": "N/A",
+                "action": "upload_file",
+                "filename": remoteName,
+                "filesize_bytes": localPath.stat().st_size if localPath.exists() else 0,
+                "comm_direction": "client_to_printer"
+            }
+        )
     except (OSError, socket.timeout, ssl.SSLError, EOFError) as connectionError:
         errorMessage = f"Failed to connect to Bambu printer FTPS endpoint {ip}:{port}: {connectionError}"
         logger.error(errorMessage)
@@ -423,6 +437,16 @@ def uploadViaFtps(
                 raise
 
         def performUpload() -> str:
+            logger.info(
+                "[PRINTER_COMM] FTPS Sending File Data",
+                extra={
+                    "method": "FTPS",
+                    "port": 990,
+                    "action": "storbinary_command",
+                    "remote_path": f"/cache/{remoteName}",
+                    "comm_direction": "client_to_printer"
+                }
+            )
             if dataStream is not None:
                 try:
                     dataStream.seek(0)
@@ -434,6 +458,16 @@ def uploadViaFtps(
                     response = ftps.storbinary(storageCommand, handle, blocksize=64 * 1024)
             if not response or not response.startswith("226"):
                 raise RuntimeError(f"FTPS transfer did not complete successfully for {fileName}: {response}")
+            logger.info(
+                "[PRINTER_COMM] FTPS Upload Complete",
+                extra={
+                    "method": "FTPS",
+                    "port": 990,
+                    "action": "upload_complete",
+                    "remote_filename": remoteName,
+                    "success": True
+                }
+            )
             return response
 
         try:
@@ -509,6 +543,18 @@ def uploadViaBambulabsApi(
     connectionMethod = getattr(printer, "mqtt_start", None) or getattr(printer, "connect", None)
     if connectionMethod:
         connectionMethod()
+        logger.info(
+            "[PRINTER_COMM] Bambu API Upload Start",
+            extra={
+                "method": "BAMBU_API",
+                "protocol": "HTTPS",
+                "port": 443,
+                "destination": ip,
+                "serial": serial,
+                "action": "api_connect",
+                "comm_direction": "client_to_printer"
+            }
+        )
 
     uploadMethod = None
     for candidate in ("upload_file", "upload_project", "upload"):
@@ -520,6 +566,19 @@ def uploadViaBambulabsApi(
         raise RuntimeError("Unable to locate an upload method on bambulabs_api.Printer")
 
     try:
+        logger.info(
+            "[PRINTER_COMM] Bambu API Uploading File",
+            extra={
+                "method": "BAMBU_API",
+                "protocol": "HTTPS",
+                "port": 443,
+                "serial": serial,
+                "action": "api_upload",
+                "filename": remoteName,
+                "filesize_bytes": localPath.stat().st_size if localPath.exists() else 0,
+                "comm_direction": "client_to_printer"
+            }
+        )
         # bambulabs_api 2.6.x expects a binary file handle rather than a path string
         with open(localPath, "rb") as fileHandle:
             try:
@@ -527,6 +586,17 @@ def uploadViaBambulabsApi(
             except TypeError:
                 fileHandle.seek(0)
                 uploadMethod(fileHandle)
+        logger.info(
+            "[PRINTER_COMM] Bambu API Upload Complete",
+            extra={
+                "method": "BAMBU_API",
+                "port": 443,
+                "serial": serial,
+                "action": "upload_complete",
+                "remote_filename": remoteName,
+                "success": True
+            }
+        )
     finally:
         disconnectMethod = getattr(printer, "disconnect", None)
         if disconnectMethod:
@@ -618,6 +688,22 @@ def deleteRemoteFile(printer: Any, remotePath: str) -> bool:
 
     if not remotePath:
         return False
+
+    # Extract serial number for logging if available
+    serialForLogging = "N/A"
+    if isinstance(printer, dict):
+        serialForLogging = printer.get("serialNumber") or printer.get("serial") or "N/A"
+
+    logger.info(
+        "[PRINTER_COMM] Deleting Remote File",
+        extra={
+            "method": "BAMBU_API",
+            "serial": serialForLogging,
+            "action": "delete_file",
+            "remote_path": remotePath,
+            "comm_direction": "client_to_printer"
+        }
+    )
 
     def tryDelete(target: Any, path: str) -> bool:
         if target is None:
@@ -1105,10 +1191,22 @@ def safeDisconnectPrinter(printer: Any) -> None:
 def _applyPostStartControls(printer: Any, options: "BambuPrintOptions") -> None:
     """Apply print-time toggles that are not supported directly by start_print."""
 
+    serialForLogging = getattr(options, "serialNumber", "N/A")
+
     autoStepMethod = getattr(printer, "set_auto_step_recovery", None)
     desiredLayerInspect = bool(getattr(options, "layerInspect", True))
     if callable(autoStepMethod):
         try:
+            logger.info(
+                "[PRINTER_COMM] Setting Layer Inspect",
+                extra={
+                    "method": "BAMBU_API",
+                    "serial": serialForLogging,
+                    "action": "set_layer_inspect",
+                    "enabled": desiredLayerInspect,
+                    "comm_direction": "client_to_printer"
+                }
+            )
             autoStepMethod(desiredLayerInspect)
             if START_DEBUG:
                 logger.info("[start] set_auto_step_recovery(%s) invoked", desiredLayerInspect)
@@ -1123,6 +1221,17 @@ def _applyPostStartControls(printer: Any, options: "BambuPrintOptions") -> None:
     calibrateMethod = getattr(printer, "calibrate_printer", None)
     if callable(calibrateMethod):
         try:
+            logger.info(
+                "[PRINTER_COMM] Setting Calibration",
+                extra={
+                    "method": "BAMBU_API",
+                    "serial": serialForLogging,
+                    "action": "set_calibration",
+                    "bed_leveling": bedEnabled,
+                    "vibration_calibration": vibrationEnabled,
+                    "comm_direction": "client_to_printer"
+                }
+            )
             calibrateMethod(
                 bed_level=bedEnabled,
                 motor_noise_calibration=vibrationEnabled,
@@ -1413,6 +1522,20 @@ def startPrintViaApi(
         startMethod = getattr(printer, "start_print", None)
         if callable(startMethod):
             try:
+                logger.info(
+                    "[PRINTER_COMM] Starting Print via API",
+                    extra={
+                        "method": "BAMBU_API",
+                        "protocol": "HTTPS",
+                        "port": 443,
+                        "serial": serial,
+                        "action": "start_print_command",
+                        "filename": uploaded_name,
+                        "plate_index": plate_index,
+                        "use_ams": options.useAms if options else None,
+                        "comm_direction": "client_to_printer"
+                    }
+                )
                 positionalArgs = [uploaded_name, plateArgument]
                 keywordArgs = dict(startKeywordArgs)
                 startMethod(*positionalArgs, **keywordArgs)
@@ -1576,6 +1699,18 @@ def startPrintViaApi(
             _invokeStart()
             ackResult = _pollForAcknowledgement(ack_timeout_sec)
             acknowledged = bool(ackResult.get("acknowledged"))
+        logger.info(
+            "[PRINTER_COMM] Print Start Acknowledged",
+            extra={
+                "method": "BAMBU_API",
+                "port": 443,
+                "serial": serial,
+                "action": "print_start_ack",
+                "acknowledged": ackResult.get("acknowledged", False),
+                "gcode_state": ackResult.get("gcodeState"),
+                "success": True
+            }
+        )
         logger.info(
             "API start acknowledgement for %s: acknowledged=%s state=%s gcodeState=%s pct=%s",
             serial,
@@ -1786,6 +1921,21 @@ def sendBambuPrintJob(
 ) -> Dict[str, Any]:
     """Upload a file and start a Bambu print job."""
 
+    logger.info(
+        "[PRINT_JOB] Dispatch Started",
+        extra={
+            "serial": options.serialNumber,
+            "ip": options.ipAddress,
+            "nickname": options.nickname,
+            "transport": options.transport,
+            "use_cloud": options.useCloud,
+            "lan_strategy": options.lanStrategy,
+            "start_strategy": options.startStrategy,
+            "filename": filePath.name,
+            "action": "dispatch_begin"
+        }
+    )
+
     resolvedPath = filePath.expanduser().resolve()
     if not resolvedPath.exists():
         raise FileNotFoundError(resolvedPath)
@@ -1926,6 +2076,15 @@ def sendBambuPrintJob(
             lanStrategy = "bambuapi"
 
         if options.useCloud and options.cloudUrl:
+            logger.info(
+                "[PRINT_JOB] Using Cloud Transport",
+                extra={
+                    "serial": options.serialNumber,
+                    "transport": "cloud",
+                    "cloud_url": options.cloudUrl,
+                    "action": "transport_selected"
+                }
+            )
             useAmsForCloud = resolvedUseAms if resolvedUseAms is not None else True
             payload = buildCloudJobPayload(
                 ip=options.ipAddress,
@@ -1955,7 +2114,29 @@ def sendBambuPrintJob(
 
         uploadedName: Optional[str] = None
 
+        logger.info(
+            "[PRINT_JOB] Using LAN Transport",
+            extra={
+                "serial": options.serialNumber,
+                "ip": options.ipAddress,
+                "transport": "lan",
+                "upload_method": lanStrategy,
+                "start_method": options.startStrategy,
+                "action": "transport_selected"
+            }
+        )
+
         if lanStrategy == "bambuapi":
+            logger.info(
+                "[PRINT_JOB] Upload Method Selected",
+                extra={
+                    "serial": options.serialNumber,
+                    "upload_method": "bambu_api",
+                    "will_use_protocol": "HTTPS",
+                    "will_use_port": 443,
+                    "action": "upload_method_selected"
+                }
+            )
             uploadedName = uploadViaBambulabsApi(
                 ip=options.ipAddress,
                 serial=options.serialNumber,
@@ -1964,6 +2145,16 @@ def sendBambuPrintJob(
                 remoteName=printerFileName,
             )
         else:
+            logger.info(
+                "[PRINT_JOB] Upload Method Selected",
+                extra={
+                    "serial": options.serialNumber,
+                    "upload_method": "ftps",
+                    "will_use_protocol": "FTP_TLS",
+                    "will_use_port": 990,
+                    "action": "upload_method_selected"
+                }
+            )
             try:
                 uploadedName = uploadViaFtps(
                     ip=options.ipAddress,
@@ -2006,6 +2197,19 @@ def sendBambuPrintJob(
             raise RuntimeError("API-only policy requires startStrategy='api'")
         if bambulabsApi is None:
             raise RuntimeError("bambulabs_api is required for API-only policy")
+
+        logger.info(
+            "[PRINT_JOB] Start Method Selected",
+            extra={
+                "serial": options.serialNumber,
+                "start_method": "api",
+                "will_use_protocol": "HTTPS",
+                "will_use_port": 443,
+                "wait_seconds": options.waitSeconds,
+                "action": "start_method_selected"
+            }
+        )
+
         startingEvent = {
             "status": "starting",
             "param": paramPath,
@@ -2067,6 +2271,18 @@ def sendBambuPrintJob(
             "api": apiResult,
             "startMethod": startMethodResult,
         }
+
+        logger.info(
+            "[PRINT_JOB] Dispatch Complete",
+            extra={
+                "serial": options.serialNumber,
+                "success": True,
+                "remote_file": uploadedName,
+                "start_method": startMethodResult,
+                "action": "dispatch_complete"
+            }
+        )
+
         return _with_plate_options(resultPayload)
 
 

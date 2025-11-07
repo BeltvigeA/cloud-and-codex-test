@@ -308,9 +308,24 @@ class BambuStatusSubscriber:
             return True
 
     def _connectPrinter(self, printer: Any) -> None:
+        # Extract serial for logging if available
+        serialForLogging = getattr(printer, "serial", None) or getattr(printer, "serial_number", None) or "N/A"
+
         mqttStart = getattr(printer, "mqtt_start", None)
         if callable(mqttStart):
             try:
+                self.log.info(
+                    "[PRINTER_COMM] MQTT Status Subscription Started",
+                    extra={
+                        "method": "MQTT",
+                        "protocol": "MQTT_TLS",
+                        "port": 8883,
+                        "serial": serialForLogging,
+                        "topic": f"device/{serialForLogging}/report",
+                        "action": "mqtt_subscribe_status",
+                        "comm_direction": "printer_to_client"
+                    }
+                )
                 startTime = time.perf_counter()
                 mqttStart()
                 self.log.info(
