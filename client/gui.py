@@ -1770,8 +1770,8 @@ class ListenerGuiApp:
         def task() -> None:
             """Kjører bed reference capture i bakgrunnen"""
             try:
-                # Kjør capture med standard verdier: 5mm steg, 200mm total
-                frames = worker.captureBedReference(zStepMm=5.0, totalMm=200.0)
+                # Kjør capture med standard verdier: 2mm steg, 220mm total
+                frames = worker.captureBedReference(zStepMm=2.0, totalMm=220.0)
                 self.log(f"Bed reference capture fullført for {serial} - {len(frames)} bilder lagret")
 
                 # Vis hvor bildene ble lagret
