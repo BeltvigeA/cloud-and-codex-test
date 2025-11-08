@@ -272,6 +272,8 @@ class ListenerGuiApp:
         self.startButton.pack(side=tk.LEFT, padx=6)
         self.stopButton = ttk.Button(buttonFrame, text="Stop", command=self.stopListening, state=tk.DISABLED)
         self.stopButton.pack(side=tk.LEFT, padx=6)
+        self.closeButton = ttk.Button(buttonFrame, text="Lukk", command=self.closeApplication)
+        self.closeButton.pack(side=tk.LEFT, padx=6)
 
         currentRow += 1
         ttk.Label(parent, text="Event Log:").grid(row=currentRow, column=0, sticky=tk.W, **paddingOptions)
@@ -2792,6 +2794,10 @@ class ListenerGuiApp:
             self.root.mainloop()
         finally:
             self.stopListening()
+
+    def closeApplication(self) -> None:
+        """Lukk programmet og stopp listening hvis aktiv."""
+        self._handleWindowClose()
 
     def _handleWindowClose(self) -> None:
         try:

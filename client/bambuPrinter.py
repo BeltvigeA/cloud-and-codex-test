@@ -340,7 +340,7 @@ def uploadViaFtps(
                 "destination": ip,
                 "serial": "N/A",
                 "action": "upload_file",
-                "filename": remoteName,
+                "file_name": remoteName,
                 "filesize_bytes": localPath.stat().st_size if localPath.exists() else 0,
                 "comm_direction": "client_to_printer"
             }
@@ -574,7 +574,7 @@ def uploadViaBambulabsApi(
                 "port": 443,
                 "serial": serial,
                 "action": "api_upload",
-                "filename": remoteName,
+                "file_name": remoteName,
                 "filesize_bytes": localPath.stat().st_size if localPath.exists() else 0,
                 "comm_direction": "client_to_printer"
             }
@@ -1322,6 +1322,39 @@ def startPrintViaApi(
         raise RuntimeError("bambulabs_api.Printer class is unavailable")
 
     printer = printerClass(ip, accessCode, serial)
+
+    # Connect to printer via MQTT
+    connectionMethod = getattr(printer, "mqtt_start", None) or getattr(printer, "connect", None)
+    if connectionMethod:
+        connectionMethod()
+        logger.info(
+            "[PRINTER_COMM] Bambu API Start Print Connection",
+            extra={
+                "method": "BAMBU_API",
+                "protocol": "MQTT",
+                "port": 8883,
+                "destination": ip,
+                "serial": serial,
+                "action": "mqtt_connect",
+                "comm_direction": "client_to_printer"
+            }
+        )
+        # Wait for MQTT connection to establish and receive printer state
+        max_wait = 5.0  # Maximum 5 seconds
+        wait_interval = 0.5
+        elapsed = 0.0
+        while elapsed < max_wait:
+            time.sleep(wait_interval)
+            elapsed += wait_interval
+            # Try to get printer state to verify connection is ready
+            state = _safe_get_state(printer)
+            if state is not None:
+                logger.info("[PRINTER_COMM] MQTT connection established and printer state received (waited %.1fs)", elapsed)
+                break
+        else:
+            # Timed out waiting for state, but continue anyway
+            logger.warning("[PRINTER_COMM] MQTT connection timeout - proceeding anyway (waited %.1fs)", elapsed)
+
     resolvedUseAms = resolveUseAmsAuto(options, job_metadata, None)
 
     # Resolve requested timelapse directory from options first
@@ -1530,7 +1563,7 @@ def startPrintViaApi(
                         "port": 443,
                         "serial": serial,
                         "action": "start_print_command",
-                        "filename": uploaded_name,
+                        "file_name": uploaded_name,
                         "plate_index": plate_index,
                         "use_ams": options.useAms if options else None,
                         "comm_direction": "client_to_printer"
@@ -1668,19 +1701,42 @@ def startPrintViaApi(
         _invokeStart()
         ackResult = _pollForAcknowledgement(ack_timeout_sec)
         acknowledged = bool(ackResult.get("acknowledged"))
-        # If printer was in FINISH state and we sent the start command, 
-        # accept it even if acknowledged is False (printer may start anyway)
-        wasInFinishState = _state_is_completed_like(preflightState)
-        if wasInFinishState and not acknowledged:
-            logger.info(
-                "[start] Printer was in FINISH state, start command sent. "
-                "Accepting as acknowledged even though printer state hasn't changed yet."
-            )
-            acknowledged = True
-            # Update ackResult to reflect this
-            ackResult["acknowledged"] = True
+
+        # Check if printer is in FINISH state (from ackResult, not preflight)
+        currentState = ackResult.get("state")
+        isInFinishState = (
+            currentState == "FINISH" or
+            _state_is_completed_like(preflightState) or
+            _state_is_completed_like(ackResult.get("statePayload"))
+        )
+
+        # Debug logging to understand why FINISH detection might not trigger
+        logger.info(
+            "[start] FINISH state check: currentState=%s, preflightState=%s, isInFinishState=%s, acknowledged=%s",
+            currentState, preflightState, isInFinishState, acknowledged
+        )
+
+        # If printer is in FINISH state, we need to clear it first
+        finishStateHandled = False
+        if isInFinishState and not acknowledged:
+            logger.info("[start] Printer is in FINISH state - sending stop_print to clear state...")
+            try:
+                stopMethod = getattr(printer, "stop_print", None)
+                if callable(stopMethod):
+                    stopMethod()
+                    logger.info("[start] Sent stop_print to clear FINISH state")
+                    time.sleep(2.0)  # Give printer time to process
+                    # Try starting again
+                    _invokeStart()
+                    ackResult = _pollForAcknowledgement(ack_timeout_sec)
+                    acknowledged = bool(ackResult.get("acknowledged"))
+                    finishStateHandled = True
+                    logger.info("[start] After FINISH state clear: acknowledged=%s", acknowledged)
+            except Exception as error:
+                logger.warning("[start] Failed to clear FINISH state: %s", error)
         conflictDetected = _looksLikeAmsFilamentConflict(ackResult.get("statePayload"))
-        if (resolvedUseAms is None) and (conflictDetected or not acknowledged):
+        # Only trigger AMS fallback if we haven't already handled FINISH state
+        if (resolvedUseAms is None) and (conflictDetected or not acknowledged) and not finishStateHandled:
             logger.warning(
                 "API start detected possible AMS filament conflict for %s – retrying with use_ams=False",
                 serial,
@@ -1931,7 +1987,7 @@ def sendBambuPrintJob(
             "use_cloud": options.useCloud,
             "lan_strategy": options.lanStrategy,
             "start_strategy": options.startStrategy,
-            "filename": filePath.name,
+            "file_name": filePath.name,
             "action": "dispatch_begin"
         }
     )
