@@ -1549,6 +1549,16 @@ def startPrintViaApi(
     else:
         logger.warning("[timelapse] timelapsePath er None - timelapse vil IKKE aktiveres")
 
+    finishStateNames = {"FINISH", "FINISHED", "COMPLETE", "COMPLETED"}
+
+    def _normalizeStateName(stateText: Optional[str]) -> str:
+        return (stateText or "").strip().upper()
+
+    observedFinishState = False
+    preflightStateText = _extract_gcode_state(preflightState) or extractStateText(preflightState)
+    if _normalizeStateName(preflightStateText) in finishStateNames:
+        observedFinishState = True
+
     def _invokeStart() -> None:
         localErrors: List[str] = []
         started = False
@@ -1612,6 +1622,7 @@ def startPrintViaApi(
             raise RuntimeError(f"Unable to start print via API: {summary}")
 
     def _pollForAcknowledgement(timeoutSeconds: float) -> Dict[str, Any]:
+        nonlocal observedFinishState
         deadline = time.monotonic() + max(5.0, float(timeoutSeconds))
         lastStatePayload: Any = None
         lastPercentage: Any = None
@@ -1624,6 +1635,10 @@ def startPrintViaApi(
                     candidateState = _extract_gcode_state(statePayload)
                     if candidateState is not None:
                         lastGcodeState = candidateState
+                        if _normalizeStateName(candidateState) in finishStateNames:
+                            observedFinishState = True
+                    elif _normalizeStateName(extractStateText(statePayload)) in finishStateNames:
+                        observedFinishState = True
             except Exception as error:
                 if START_DEBUG:
                     logger.info("[start] poll get_state failed: %s", error)
@@ -1651,23 +1666,27 @@ def startPrintViaApi(
             activeOk = _is_active_state(stateIndicator) and not completedLike
             # Also accept if printer has transitioned from FINISH to IDLE/ready state
             # This handles the case where printer is ready but not yet actively printing
-            stateNormalized = (stateIndicator or "").strip().upper()
-            idleOrReady = stateNormalized in ("IDLE", "READY", "STANDBY") and not completedLike
+            stateNormalized = _normalizeStateName(stateIndicator)
+            if stateNormalized in finishStateNames:
+                observedFinishState = True
+            finishTransitionReady = observedFinishState and stateNormalized not in finishStateNames
+            idleOrReady = finishTransitionReady and stateNormalized in ("IDLE", "READY", "STANDBY") and not completedLike
             # Accept if printer is no longer in FINISH state (even if still at 100%)
             # This handles the case where printer has exited FINISH but hasn't started printing yet
             exitedFinish = (
-                completedLike
-                and stateNormalized not in ("FINISH", "FINISHED", "COMPLETE", "COMPLETED")
+                finishTransitionReady
+                and completedLike
                 and (percentageFloat is None or percentageFloat < 100.0)
             )
             if START_DEBUG:
                 logger.info(
-                    "[start] poll state=%s percent=%s completedLike=%s idleOrReady=%s exitedFinish=%s",
+                    "[start] poll state=%s percent=%s completedLike=%s idleOrReady=%s exitedFinish=%s finishObserved=%s",
                     stateIndicator,
                     lastPercentage,
                     completedLike,
                     idleOrReady,
                     exitedFinish,
+                    observedFinishState,
                 )
             if pctOk or activeOk or idleOrReady or exitedFinish:
                 return {
