@@ -121,8 +121,32 @@ def _state_is_completed_like(payload: Any) -> bool:
     if not stateText:
         return False
     normalized = stateText.strip().lower()
-    completedStates = {"finish", "finished", "completed", "idle", "complete"}
+    completedStates = {"finish", "finished", "completed", "complete"}
     return normalized in completedStates
+
+
+def _state_is_error_like(payload: Any) -> bool:
+    if payload is None:
+        return False
+    stateText = _extract_gcode_state(payload) or _extractStateText(payload)
+    if not stateText:
+        return False
+    normalized = stateText.strip().upper()
+    explicitErrorStates = {
+        "ERROR",
+        "FAILED",
+        "FAIL",
+        "FAULT",
+        "ALARM",
+        "ABORT",
+        "ABORTED",
+        "CANCELED",
+        "CANCELLED",
+        "STOPPED",
+    }
+    if normalized in explicitErrorStates:
+        return True
+    return any(token in normalized for token in ("ERROR", "FAIL", "FAULT", "ALARM"))
 
 
 def _preselect_project_file(
@@ -1627,6 +1651,19 @@ def startPrintViaApi(
         lastStatePayload: Any = None
         lastPercentage: Any = None
         lastGcodeState: Optional[str] = None
+        observedActivity = False
+        errorStateNames = {
+            "ERROR",
+            "FAILED",
+            "FAIL",
+            "FAULT",
+            "ALARM",
+            "ABORT",
+            "ABORTED",
+            "CANCELED",
+            "CANCELLED",
+            "STOPPED",
+        }
         while time.monotonic() < deadline:
             try:
                 statePayload = printer.get_state()
@@ -1650,6 +1687,10 @@ def startPrintViaApi(
                 if START_DEBUG:
                     logger.info("[start] poll get_percentage failed: %s", error)
             stateIndicator = lastGcodeState or extractStateText(lastStatePayload)
+            stateNormalized = _normalizeStateName(stateIndicator)
+            isErrorState = (
+                stateNormalized in errorStateNames or _state_is_error_like(lastStatePayload)
+            )
             percentageFloat: Optional[float]
             try:
                 percentageFloat = float(lastPercentage) if lastPercentage is not None else None
@@ -1659,18 +1700,35 @@ def startPrintViaApi(
                 embeddedPercent = _extract_mc_percent(lastStatePayload)
                 if embeddedPercent is not None:
                     percentageFloat = float(embeddedPercent)
-            completedLike = _state_is_completed_like(lastStatePayload)
-            if not completedLike and percentageFloat is not None and percentageFloat >= 100.0:
+            if isErrorState and percentageFloat is not None and percentageFloat >= 100.0:
+                percentageFloat = None
+            completedLike = False if isErrorState else _state_is_completed_like(lastStatePayload)
+            if (
+                not completedLike
+                and not isErrorState
+                and percentageFloat is not None
+                and percentageFloat >= 100.0
+            ):
                 completedLike = True
             pctOk = percentageFloat is not None and 0.0 < percentageFloat < 100.0
             activeOk = _is_active_state(stateIndicator) and not completedLike
+            if pctOk or activeOk:
+                observedActivity = True
             # Also accept if printer has transitioned from FINISH to IDLE/ready state
             # This handles the case where printer is ready but not yet actively printing
-            stateNormalized = _normalizeStateName(stateIndicator)
             if stateNormalized in finishStateNames:
                 observedFinishState = True
-            finishTransitionReady = observedFinishState and stateNormalized not in finishStateNames
-            idleOrReady = finishTransitionReady and stateNormalized in ("IDLE", "READY", "STANDBY") and not completedLike
+            finishTransitionReady = (
+                observedFinishState
+                and stateNormalized not in finishStateNames
+                and not isErrorState
+            )
+            idleOrReady = (
+                finishTransitionReady
+                and stateNormalized in ("IDLE", "READY", "STANDBY")
+                and not completedLike
+                and observedActivity
+            )
             # Accept if printer is no longer in FINISH state (even if still at 100%)
             # This handles the case where printer has exited FINISH but hasn't started printing yet
             exitedFinish = (
@@ -1688,6 +1746,15 @@ def startPrintViaApi(
                     exitedFinish,
                     observedFinishState,
                 )
+            if isErrorState:
+                return {
+                    "acknowledged": False,
+                    "statePayload": lastStatePayload,
+                    "state": extractStateText(lastStatePayload) or stateIndicator,
+                    "gcodeState": lastGcodeState or stateIndicator,
+                    "percentage": percentageFloat,
+                    "errorState": stateNormalized or None,
+                }
             if pctOk or activeOk or idleOrReady or exitedFinish:
                 return {
                     "acknowledged": True,

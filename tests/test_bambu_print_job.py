@@ -151,6 +151,27 @@ class IdleLoopPrinter(FakeApiPrinter):
         self.started = True
 
 
+class IdleDictPrinter(FakeApiPrinter):
+    def __init__(self) -> None:
+        super().__init__()
+
+    def get_state(self) -> Any:
+        return {"gcode_state": "IDLE", "mc_percent": 0}
+
+    def get_percentage(self) -> float:
+        return 0.0
+
+
+class ErrorStatePrinter(FakeApiPrinter):
+    def __init__(self) -> None:
+        super().__init__()
+
+    def get_state(self) -> Any:
+        return {"gcode_state": "ERROR", "mc_percent": 0}
+
+    def get_percentage(self) -> float:
+        return 0.0
+
 def test_resolveUseAmsAuto_respects_explicit_option() -> None:
     optionsTrue = bambuPrinter.BambuPrintOptions(
         ipAddress="1.2.3.4",
@@ -269,6 +290,85 @@ def test_startPrintViaApi_printer_stays_idle(monkeypatch: pytest.MonkeyPatch) ->
         ("job.3mf", "Metadata/plate_1.gcode"),
     ]
     assert idlePrinter.disconnectCalls == 1
+
+
+def test_startPrintViaApi_idle_state_payload(monkeypatch: pytest.MonkeyPatch) -> None:
+    idlePrinter = IdleDictPrinter()
+    monkeypatch.setattr(bambuPrinter, "bambulabsApi", ApiModuleStub(lambda *_args, **_kwargs: idlePrinter))
+    monkeypatch.setattr(bambuPrinter.time, "sleep", lambda _seconds: None)
+
+    monotonicState = {"value": 0.0}
+
+    def monotonicStub() -> float:
+        monotonicState["value"] += 1.0
+        return monotonicState["value"]
+
+    monkeypatch.setattr(bambuPrinter.time, "monotonic", monotonicStub)
+
+    options = bambuPrinter.BambuPrintOptions(
+        ipAddress="1.2.3.4",
+        serialNumber="SERIAL",
+        accessCode="CODE",
+        waitSeconds=1,
+        useAms=False,
+    )
+
+    result = bambuPrinter.startPrintViaApi(
+        ip="1.2.3.4",
+        serial="SERIAL",
+        accessCode="CODE",
+        uploaded_name="job.3mf",
+        plate_index=1,
+        param_path="Metadata/plate_1.gcode",
+        options=options,
+        job_metadata=None,
+        ack_timeout_sec=0.1,
+    )
+
+    assert result["acknowledged"] is False
+    assert result["fallbackTriggered"] is False
+    assert result["useAms"] is False
+    assert idlePrinter.startArgs == [("job.3mf", "Metadata/plate_1.gcode")]
+
+
+def test_startPrintViaApi_error_state_detected(monkeypatch: pytest.MonkeyPatch) -> None:
+    errorPrinter = ErrorStatePrinter()
+    monkeypatch.setattr(bambuPrinter, "bambulabsApi", ApiModuleStub(lambda *_args, **_kwargs: errorPrinter))
+    monkeypatch.setattr(bambuPrinter.time, "sleep", lambda _seconds: None)
+
+    monotonicState = {"value": 0.0}
+
+    def monotonicStub() -> float:
+        monotonicState["value"] += 1.0
+        return monotonicState["value"]
+
+    monkeypatch.setattr(bambuPrinter.time, "monotonic", monotonicStub)
+
+    options = bambuPrinter.BambuPrintOptions(
+        ipAddress="1.2.3.4",
+        serialNumber="SERIAL",
+        accessCode="CODE",
+        waitSeconds=1,
+        useAms=False,
+    )
+
+    result = bambuPrinter.startPrintViaApi(
+        ip="1.2.3.4",
+        serial="SERIAL",
+        accessCode="CODE",
+        uploaded_name="job.3mf",
+        plate_index=1,
+        param_path="Metadata/plate_1.gcode",
+        options=options,
+        job_metadata=None,
+        ack_timeout_sec=0.1,
+    )
+
+    assert result["acknowledged"] is False
+    assert result["fallbackTriggered"] is False
+    assert result["useAms"] is False
+    assert result.get("errorState") == "ERROR"
+    assert errorPrinter.startArgs == [("job.3mf", "Metadata/plate_1.gcode")]
 
 
 def test_startPrintViaApi_retries_on_conflict(monkeypatch: pytest.MonkeyPatch) -> None:
