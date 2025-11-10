@@ -79,10 +79,11 @@ cameraSnapshotIntervalSeconds = _resolveCameraSnapshotIntervalSeconds()
 def captureCameraSnapshot(printer: Any, serial: str) -> Path:
     cameraBaseDirectory = Path.home() / ".printmaster" / "camera"
     currentTimestamp = datetime.now(timezone.utc)
-    cameraDirectory = cameraBaseDirectory / currentTimestamp.strftime("%Y-%m-%d")
-    timestampString = currentTimestamp.strftime("%Y%m%dT%H%M%SZ")
-    filePath = cameraDirectory / f"{serial}-{timestampString}.jpg"
-    cameraDirectory.mkdir(parents=True, exist_ok=True)
+    dateDirectory = cameraBaseDirectory / currentTimestamp.strftime("%Y-%m-%d")
+    serialDirectory = dateDirectory / serial
+    timeString = currentTimestamp.strftime("%H-%M-%S-%fZ")
+    filePath = serialDirectory / f"{serial}-{timeString}.jpg"
+    serialDirectory.mkdir(parents=True, exist_ok=True)
 
     startTime = time.perf_counter()
     log.info("[camera] starting capture for %s → %s", serial, filePath)

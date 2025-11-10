@@ -319,9 +319,10 @@ def testCameraCommandCapturesSnapshot(
     assert "sent to Base44" in message
     cameraDir = tmp_path / ".printmaster" / "camera"
     dateDir = cameraDir / "2024-05-07"
-    savedFiles = list(dateDir.glob("SERIAL777-*.jpg"))
+    serialDir = dateDir / "SERIAL777"
+    savedFiles = list(serialDir.glob("SERIAL777-*.jpg"))
     assert len(savedFiles) == 1
-    expectedPath = dateDir / "SERIAL777-20240507T120000Z.jpg"
+    expectedPath = serialDir / "SERIAL777-12-00-00-000000Z.jpg"
     assert savedFiles[0] == expectedPath
     assert str(expectedPath) in message
     assert fakePrinter.connectCalls >= 1
@@ -439,7 +440,14 @@ def testCameraSnapshotLoopUploads(monkeypatch: pytest.MonkeyPatch, tmp_path: Pat
 
     worker.cameraSnapshotIntervalSeconds = 0.05
 
-    snapshotPath = tmp_path / ".printmaster" / "camera" / "2024-05-07" / "SERIAL888-test.jpg"
+    snapshotPath = (
+        tmp_path
+        / ".printmaster"
+        / "camera"
+        / "2024-05-07"
+        / "SERIAL888"
+        / "SERIAL888-test.jpg"
+    )
     snapshotPath.parent.mkdir(parents=True, exist_ok=True)
     snapshotPath.write_bytes(b"fake-camera-bytes")
 
