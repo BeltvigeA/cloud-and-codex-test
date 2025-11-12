@@ -5,6 +5,9 @@ import printerRoutes from './routes/printers.js';
 import printJobRoutes from './routes/print-jobs.js';
 import printerCommandRoutes from './routes/printer-commands.js';
 import printerStatusRoutes from './routes/printer-status.js';
+import posOrderRoutes from './routes/pos-orders.js';
+import paymentSettingsRoutes from './routes/payment-settings.js';
+import stockTransactionRoutes from './routes/stock-transactions.js';
 import { checkPrinterBackendHealth } from './services/printerBackend.js';
 
 // Load environment variables
@@ -57,19 +60,25 @@ app.use('/api/printers', printerRoutes);
 app.use('/api/print-jobs', printJobRoutes);
 app.use('/api/printer-commands', printerCommandRoutes);
 app.use('/api/printer-status', printerStatusRoutes);
+app.use('/api/pos-orders', posOrderRoutes);
+app.use('/api/payment-settings', paymentSettingsRoutes);
+app.use('/api/stock-transactions', stockTransactionRoutes);
 
 // Root endpoint
 app.get('/', (req, res) => {
   res.json({
     service: 'PrintPro3D Backend API',
     version: '1.0.0',
-    phase: 'Phase 4: Printer Management & Print Queue',
+    phase: 'Phase 5: Point of Sale (POS) System',
     endpoints: {
       health: '/health',
       printers: '/api/printers',
       printJobs: '/api/print-jobs',
       printerCommands: '/api/printer-commands',
-      printerStatus: '/api/printer-status'
+      printerStatus: '/api/printer-status',
+      posOrders: '/api/pos-orders',
+      paymentSettings: '/api/payment-settings',
+      stockTransactions: '/api/stock-transactions'
     },
     documentation: 'See README.md for API documentation'
   });
@@ -99,7 +108,7 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log('');
   console.log('╔════════════════════════════════════════════════════════════════╗');
   console.log('║                    PrintPro3D Backend API                      ║');
-  console.log('║              Phase 4: Printer Management & Print Queue        ║');
+  console.log('║           Phase 5: Point of Sale (POS) System                 ║');
   console.log('╚════════════════════════════════════════════════════════════════╝');
   console.log('');
   console.log(`🚀 Server running on port ${PORT}`);
@@ -117,6 +126,12 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log('   POST /api/printer-commands');
   console.log('   GET  /api/printer-status');
   console.log('   POST /api/printer-status');
+  console.log('   GET  /api/pos-orders');
+  console.log('   POST /api/pos-orders');
+  console.log('   POST /api/pos-orders/:id/pay');
+  console.log('   GET  /api/payment-settings');
+  console.log('   PUT  /api/payment-settings');
+  console.log('   GET  /api/stock-transactions');
   console.log('');
   console.log('✅ Ready to accept requests');
   console.log('');

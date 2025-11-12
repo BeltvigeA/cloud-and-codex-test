@@ -348,5 +348,339 @@ COMMENT ON TABLE printer_status IS 'Real-time printer status updates (keep last 
 COMMENT ON TABLE printer_commands IS 'Command queue for printer-agent to poll and execute';
 
 -- ========================================================================
+-- PHASE 5: POINT OF SALE (POS) SYSTEM
+-- ========================================================================
+
+-- ========================================================================
+-- 6. POS_ORDERS TABLE
+-- ========================================================================
+CREATE TABLE IF NOT EXISTS pos_orders (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    organization_id UUID NOT NULL,
+
+    -- Status
+    status VARCHAR(50) DEFAULT 'Open' CHECK (status IN ('Open', 'Paid', 'Cancelled', 'Refunded')),
+
+    -- Customer info (optional)
+    customer_name VARCHAR(255),
+    customer_email VARCHAR(255),
+    customer_phone VARCHAR(50),
+
+    -- Totals
+    subtotal DECIMAL(10,2) NOT NULL DEFAULT 0,
+    discount_amount DECIMAL(10,2) DEFAULT 0,
+    discount_percentage DECIMAL(5,2) DEFAULT 0,
+    tax_amount DECIMAL(10,2) DEFAULT 0,
+    tax_percentage DECIMAL(5,2) DEFAULT 0,
+    total_amount DECIMAL(10,2) NOT NULL DEFAULT 0,
+
+    -- Payment
+    payment_method VARCHAR(50) CHECK (payment_method IN ('Cash', 'Stripe', 'MobilePay', 'Vipps', 'Invoice')),
+    payment_status VARCHAR(50) DEFAULT 'pending' CHECK (payment_status IN ('pending', 'processing', 'completed', 'failed', 'refunded')),
+    payment_intent_id VARCHAR(255),        -- Stripe Payment Intent ID
+    payment_reference VARCHAR(255),        -- Vipps/MobilePay reference
+    amount_paid DECIMAL(10,2),
+    amount_due DECIMAL(10,2),
+    change_given DECIMAL(10,2),
+
+    -- Timestamps
+    sale_timestamp TIMESTAMP,
+    paid_at TIMESTAMP,
+    refunded_at TIMESTAMP,
+
+    -- Receipt
+    receipt_number VARCHAR(100),           -- Unique receipt number (auto-generated)
+    receipt_pdf_path TEXT,                 -- Path to PDF receipt in Cloud Storage
+
+    -- Notes
+    note TEXT,
+    internal_notes TEXT,
+
+    -- Finance integration
+    finance_income_id UUID,
+
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW(),
+    created_by UUID
+);
+
+-- Indexes for pos_orders
+CREATE INDEX IF NOT EXISTS idx_pos_orders_org ON pos_orders(organization_id);
+CREATE INDEX IF NOT EXISTS idx_pos_orders_status ON pos_orders(status);
+CREATE INDEX IF NOT EXISTS idx_pos_orders_payment_status ON pos_orders(payment_status);
+CREATE INDEX IF NOT EXISTS idx_pos_orders_receipt_number ON pos_orders(receipt_number);
+CREATE INDEX IF NOT EXISTS idx_pos_orders_sale_timestamp ON pos_orders(sale_timestamp);
+
+-- Create sequence for receipt numbers
+CREATE SEQUENCE IF NOT EXISTS receipt_number_seq START 1;
+
+-- Auto-generate receipt number trigger
+CREATE OR REPLACE FUNCTION generate_receipt_number()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF NEW.receipt_number IS NULL THEN
+        NEW.receipt_number := 'REC-' || TO_CHAR(NOW(), 'YYYYMMDD') || '-' || LPAD(NEXTVAL('receipt_number_seq')::TEXT, 6, '0');
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Create trigger
+DROP TRIGGER IF EXISTS set_receipt_number ON pos_orders;
+CREATE TRIGGER set_receipt_number
+    BEFORE INSERT ON pos_orders
+    FOR EACH ROW
+    EXECUTE FUNCTION generate_receipt_number();
+
+-- ========================================================================
+-- 7. POS_ORDER_LINES TABLE
+-- ========================================================================
+CREATE TABLE IF NOT EXISTS pos_order_lines (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    organization_id UUID NOT NULL,
+    order_id UUID NOT NULL,
+
+    -- Product reference
+    product_id UUID NOT NULL,
+    product_name VARCHAR(255) NOT NULL,   -- Snapshot of product name at sale time
+    product_sku VARCHAR(100),
+
+    -- Quantity and pricing
+    quantity INTEGER NOT NULL CHECK (quantity > 0),
+    unit_price DECIMAL(10,2) NOT NULL,
+    discount_amount DECIMAL(10,2) DEFAULT 0,
+    tax_percentage DECIMAL(5,2) DEFAULT 0,
+    line_total DECIMAL(10,2) NOT NULL,
+
+    -- Stock handling
+    allow_backorder BOOLEAN DEFAULT FALSE,
+    allow_backorder_note TEXT,
+    stock_deducted BOOLEAN DEFAULT FALSE,
+
+    -- Timestamps
+    sale_timestamp TIMESTAMP,
+
+    created_at TIMESTAMP DEFAULT NOW(),
+    created_by UUID
+);
+
+-- Indexes for pos_order_lines
+CREATE INDEX IF NOT EXISTS idx_pos_order_lines_org ON pos_order_lines(organization_id);
+CREATE INDEX IF NOT EXISTS idx_pos_order_lines_order ON pos_order_lines(order_id);
+CREATE INDEX IF NOT EXISTS idx_pos_order_lines_product ON pos_order_lines(product_id);
+
+-- ========================================================================
+-- 8. PAYMENT_SETTINGS TABLE
+-- ========================================================================
+CREATE TABLE IF NOT EXISTS payment_settings (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    organization_id UUID NOT NULL,
+
+    -- Stripe
+    stripe_enabled BOOLEAN DEFAULT FALSE,
+    stripe_publishable_key VARCHAR(255),
+    stripe_secret_key VARCHAR(255),
+    stripe_webhook_secret VARCHAR(255),
+
+    -- MobilePay
+    mobile_pay_enabled BOOLEAN DEFAULT FALSE,
+    mobile_pay_merchant_id VARCHAR(255),
+    mobile_pay_api_key VARCHAR(255),
+
+    -- Vipps
+    vipps_enabled BOOLEAN DEFAULT FALSE,
+    vipps_client_id VARCHAR(255),
+    vipps_client_secret VARCHAR(255),
+    vipps_subscription_key VARCHAR(255),
+    vipps_number VARCHAR(50),
+    vipps_qr_code_url TEXT,
+
+    -- Default settings
+    default_payment_method VARCHAR(50) DEFAULT 'Cash',
+    require_customer_info BOOLEAN DEFAULT FALSE,
+
+    -- Tax and currency
+    country VARCHAR(2) CHECK (country IN ('NO', 'SE', 'DK', 'FI')),
+    currency VARCHAR(3) CHECK (currency IN ('NOK', 'SEK', 'DKK', 'EUR')),
+    default_tax_percentage DECIMAL(5,2) DEFAULT 25.00,
+
+    -- Receipt settings
+    company_logo_url TEXT,
+    receipt_footer_text TEXT,
+
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW(),
+    created_by UUID,
+
+    UNIQUE(organization_id)
+);
+
+-- Index for payment_settings
+CREATE INDEX IF NOT EXISTS idx_payment_settings_org ON payment_settings(organization_id);
+
+-- ========================================================================
+-- 9. STOCK_TRANSACTIONS TABLE (if not exists from Phase 3)
+-- ========================================================================
+CREATE TABLE IF NOT EXISTS stock_transactions (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    organization_id UUID NOT NULL,
+    product_id UUID NOT NULL,
+    stock_product_id UUID,
+
+    -- Transaction
+    transaction_type VARCHAR(50) NOT NULL CHECK (transaction_type IN (
+        'initial', 'restock', 'sale', 'print', 'adjustment', 'return', 'damaged', 'transfer'
+    )),
+    quantity_change INTEGER NOT NULL,
+    quantity_before INTEGER NOT NULL,
+    quantity_after INTEGER NOT NULL,
+
+    -- Reference
+    reference_type VARCHAR(50),            -- pos_order, print_job, etc.
+    reference_id UUID,
+    reason TEXT,
+
+    -- Metadata
+    performed_by UUID,
+    transaction_date TIMESTAMP DEFAULT NOW(),
+    notes TEXT,
+
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+-- Indexes for stock_transactions
+CREATE INDEX IF NOT EXISTS idx_stock_trans_org ON stock_transactions(organization_id);
+CREATE INDEX IF NOT EXISTS idx_stock_trans_product ON stock_transactions(product_id);
+CREATE INDEX IF NOT EXISTS idx_stock_trans_reference ON stock_transactions(reference_type, reference_id);
+CREATE INDEX IF NOT EXISTS idx_stock_trans_date ON stock_transactions(transaction_date);
+
+-- ========================================================================
+-- 10. PRODUCTS TABLE (Basic structure if not exists)
+-- ========================================================================
+CREATE TABLE IF NOT EXISTS products (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    organization_id UUID NOT NULL,
+
+    -- Product info
+    name VARCHAR(255) NOT NULL,
+    sku VARCHAR(100),
+    description TEXT,
+
+    -- Pricing
+    price DECIMAL(10,2),
+    cost DECIMAL(10,2),
+
+    -- Stock
+    stock_tracked BOOLEAN DEFAULT TRUE,
+
+    -- Metadata
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW(),
+    created_by UUID
+);
+
+CREATE INDEX IF NOT EXISTS idx_products_org ON products(organization_id);
+CREATE INDEX IF NOT EXISTS idx_products_sku ON products(sku);
+
+-- ========================================================================
+-- 11. STOCK_PRODUCTS TABLE (if not exists from Phase 3)
+-- ========================================================================
+CREATE TABLE IF NOT EXISTS stock_products (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    organization_id UUID NOT NULL,
+    product_id UUID NOT NULL,
+
+    -- Stock levels
+    quantity INTEGER DEFAULT 0,
+    min_stock INTEGER DEFAULT 0,
+
+    -- Status
+    status VARCHAR(50) DEFAULT 'in_stock' CHECK (status IN ('in_stock', 'low_stock', 'out_of_stock')),
+
+    -- Timestamps
+    last_movement_at TIMESTAMP,
+
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_stock_products_org ON stock_products(organization_id);
+CREATE INDEX IF NOT EXISTS idx_stock_products_product ON stock_products(product_id);
+CREATE INDEX IF NOT EXISTS idx_stock_products_status ON stock_products(status);
+
+-- ========================================================================
+-- 12. FINANCE_INCOMES TABLE (Basic structure if not exists)
+-- ========================================================================
+CREATE TABLE IF NOT EXISTS finance_incomes (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    organization_id UUID NOT NULL,
+
+    -- Income details
+    date DATE NOT NULL,
+    amount DECIMAL(10,2) NOT NULL,
+    vat_pct DECIMAL(5,2),
+    category VARCHAR(100),
+    customer VARCHAR(255),
+    notes TEXT,
+
+    -- POS integration
+    pos_order_id UUID,
+
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW(),
+    created_by UUID
+);
+
+CREATE INDEX IF NOT EXISTS idx_finance_incomes_org ON finance_incomes(organization_id);
+CREATE INDEX IF NOT EXISTS idx_finance_incomes_date ON finance_incomes(date);
+CREATE INDEX IF NOT EXISTS idx_finance_incomes_pos_order ON finance_incomes(pos_order_id);
+
+-- ========================================================================
+-- 13. ORGANIZATIONS TABLE (Basic structure if not exists)
+-- ========================================================================
+CREATE TABLE IF NOT EXISTS organizations (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    name VARCHAR(255) NOT NULL,
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW()
+);
+
+-- ========================================================================
+-- 14. ORGANIZATION_MEMBERS TABLE (if not exists)
+-- ========================================================================
+CREATE TABLE IF NOT EXISTS organization_members (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    organization_id UUID NOT NULL,
+    user_id UUID NOT NULL,
+    role VARCHAR(50) DEFAULT 'member' CHECK (role IN ('owner', 'admin', 'member')),
+    is_active BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_org_members_org ON organization_members(organization_id);
+CREATE INDEX IF NOT EXISTS idx_org_members_user ON organization_members(user_id);
+
+-- ========================================================================
+-- 15. USERS TABLE (Basic structure if not exists)
+-- ========================================================================
+CREATE TABLE IF NOT EXISTS users (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    email VARCHAR(255) UNIQUE NOT NULL,
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
+
+-- ========================================================================
+-- COMMENTS FOR POS TABLES
+-- ========================================================================
+COMMENT ON TABLE pos_orders IS 'Point of Sale orders with payment and receipt tracking';
+COMMENT ON TABLE pos_order_lines IS 'Line items for POS orders';
+COMMENT ON TABLE payment_settings IS 'Payment gateway settings per organization';
+COMMENT ON TABLE stock_transactions IS 'Stock movement history for audit trail';
+
+-- ========================================================================
 -- END OF SCHEMA
 -- ========================================================================

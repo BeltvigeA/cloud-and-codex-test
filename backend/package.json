@@ -1,7 +1,7 @@
 {
   "name": "printpro3d-backend",
   "version": "1.0.0",
-  "description": "PrintPro3D Backend API - Printer Management & Print Queue System",
+  "description": "PrintPro3D Backend API - Point of Sale (POS) System",
   "main": "src/index.js",
   "type": "module",
   "scripts": {
@@ -12,7 +12,9 @@
   "keywords": [
     "3d-printing",
     "printer-management",
-    "print-queue"
+    "print-queue",
+    "pos-system",
+    "point-of-sale"
   ],
   "author": "",
   "license": "ISC",
@@ -22,7 +24,9 @@
     "dotenv": "^16.3.1",
     "cors": "^2.8.5",
     "node-fetch": "^3.3.2",
-    "jsonwebtoken": "^9.0.2"
+    "jsonwebtoken": "^9.0.2",
+    "stripe": "^14.10.0",
+    "pdfkit": "^0.14.0"
   },
   "devDependencies": {
     "nodemon": "^3.0.1"
