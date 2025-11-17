@@ -36,10 +36,13 @@ Typisk flyt for en kommando:
 
 API-endepunkter
 ----------------
-Alle URL-er er prefikset med produksjonsbasen `https://printer-backend-934564650450.europe-west1.run.app`.
+**Base-URL-er**
+
+- `https://printpro3d-api-931368217793.europe-west1.run.app` – Standardverdien for nye frontend- og partnerintegrasjoner. Bruk denne når du tester API-kall manuelt, eller når du kopierer eksemplene nedenfor inn i webklienter.
+- `https://printer-backend-934564650450.europe-west1.run.app` – Legacy-endepunkt for LAN-klienten og andre eksisterende, interne integrasjoner til de er migrert.
 
 ### 1. `POST /control`
-* **Full URL:** `https://printer-backend-934564650450.europe-west1.run.app/control`
+* **Full URL:** `https://printpro3d-api-931368217793.europe-west1.run.app/control`
 * **Formål:** Opprette en ny printer-kommando i `printer_commands`.
 * **Headers:** `Content-Type: application/json`, `X-API-Key: <key>`.
 * **Eksempelrequest:**
@@ -55,17 +58,17 @@ Alle URL-er er prefikset med produksjonsbasen `https://printer-backend-934564650
 * **Resultat:** Dokument i Firestore med status `pending` og automatisk `createdAt`.
 
 ### 2. `POST /products/<productId>/handshake`
-* **Full URL:** `https://printer-backend-934564650450.europe-west1.run.app/products/<productId>/handshake`
+* **Full URL:** `https://printpro3d-api-931368217793.europe-west1.run.app/products/<productId>/handshake`
 * **Formål:** Tilby metadata og filreferanser før opplasting/print.
 * **Klientbruk:** LAN-klienten eller Base44 bruker endepunktet til å gjøre klar nødvendige ressurser.
 
 ### 3. `POST /api/apps/<appId>/functions/updatePrinterStatus`
-* **Full URL:** `https://printer-backend-934564650450.europe-west1.run.app/api/apps/<appId>/functions/updatePrinterStatus`
+* **Full URL:** `https://printpro3d-api-931368217793.europe-west1.run.app/api/apps/<appId>/functions/updatePrinterStatus`
 * **Formål:** Ta imot statusoppdateringer (temperatur, fremdrift osv.) fra LAN-klienten.
 * **Resultat:** Data lagres i `printer_telemetry` og brukes for visning og overvåking.
 
 ### 4. `POST /debug/listPendingCommands`
-* **Full URL:** `https://printer-backend-934564650450.europe-west1.run.app/debug/listPendingCommands`
+* **Full URL:** `https://printpro3d-api-931368217793.europe-west1.run.app/debug/listPendingCommands`
 * **Formål:** Manuell inspeksjon av ventende kommandoer når man feilsøker.
 * **Eksempelrequest:**
   ```json
