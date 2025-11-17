@@ -57,12 +57,16 @@ pip install -r requirements.txt
 
 ## Quick Start
 
+> **API base URLs**
+> - `https://printpro3d-api-931368217793.europe-west1.run.app` – Default for new frontend flows, partner integrations, and any manual testing snippets you copy from this document.
+> - `https://printer-backend-934564650450.europe-west1.run.app` – Legacy host that remains live for the LAN client and other internal scripts until they are redeployed.
+
 ### 1. Initialize Configuration
 
 First run will create the configuration directory:
 
 ```bash
-python -m client.client listen --recipientId YOUR_RECIPIENT_ID --baseUrl https://printer-backend-934564650450.europe-west1.run.app
+python -m client.client listen --recipientId YOUR_RECIPIENT_ID --baseUrl https://printpro3d-api-931368217793.europe-west1.run.app
 ```
 
 This creates `~/.printmaster/` with initial configuration files.
@@ -98,7 +102,7 @@ Edit `~/.printmaster/printers.json`:
 ```bash
 python -m client.client listen \
   --recipientId YOUR_RECIPIENT_ID \
-  --baseUrl https://printer-backend-934564650450.europe-west1.run.app \
+  --baseUrl https://printpro3d-api-931368217793.europe-west1.run.app \
   --outputDir ~/.printmaster/files
 ```
 
@@ -120,7 +124,7 @@ Download a single file using a fetch token.
 ```bash
 python -m client.client fetch \
   --fetchToken <token> \
-  --baseUrl https://printer-backend-934564650450.europe-west1.run.app \
+  --baseUrl https://printpro3d-api-931368217793.europe-west1.run.app \
   --outputDir ~/.printmaster/files
 ```
 
@@ -149,7 +153,7 @@ Send periodic status updates to the backend (for testing).
 python -m client.client status \
   --apiKey YOUR_API_KEY \
   --printerSerial 01P00A381200434 \
-  --baseUrl https://printer-backend-934564650450.europe-west1.run.app \
+  --baseUrl https://printpro3d-api-931368217793.europe-west1.run.app \
   --interval 60 \
   --numUpdates 10
 ```
@@ -180,7 +184,7 @@ Continuously poll for new jobs and auto-dispatch to printers.
 ```bash
 python -m client.client listen \
   --recipientId YOUR_RECIPIENT_ID \
-  --baseUrl https://printer-backend-934564650450.europe-west1.run.app \
+  --baseUrl https://printpro3d-api-931368217793.europe-west1.run.app \
   --pollInterval 15 \
   --outputDir ~/.printmaster/files
 ```
@@ -304,11 +308,15 @@ Configure via environment variables or `.env` file:
 
 ```bash
 # Backend Configuration
-PRINTER_BACKEND_BASE_URL="https://printer-backend-934564650450.europe-west1.run.app"
+PRINTER_BACKEND_BASE_URL="https://printpro3d-api-931368217793.europe-west1.run.app"
+# Legacy fallback (only if an integration cannot reach the PrintPro3D host yet):
+# PRINTER_BACKEND_BASE_URL="https://printer-backend-934564650450.europe-west1.run.app"
 PRINTER_BACKEND_API_KEY="your-api-key"
 
 # Base44 Integration
-BASE44_API_BASE="https://printer-backend-934564650450.europe-west1.run.app"
+BASE44_API_BASE="https://printpro3d-api-931368217793.europe-west1.run.app"
+# Legacy fallback:
+# BASE44_API_BASE="https://printer-backend-934564650450.europe-west1.run.app"
 BASE44_FUNCTIONS_API_KEY="your-functions-key"
 BASE44_API_KEY="fallback-key"
 
@@ -685,7 +693,7 @@ The client uses multiple threads for concurrent operations:
 - Ensure jobs are assigned to your recipient ID in backend
 - Test with debug endpoint:
   ```bash
-  curl https://printer-backend-934564650450.europe-west1.run.app/recipients/{recipientId}/pending
+  curl https://printpro3d-api-931368217793.europe-west1.run.app/recipients/{recipientId}/pending
   ```
 
 ---

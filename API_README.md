@@ -4,7 +4,9 @@
 
 The Cloud Printer Backend is a Flask-based API hosted on Google Cloud Run that manages 3D printer jobs, file uploads, printer commands, and status updates. It integrates with Google Cloud Firestore for data persistence and Google Cloud Storage for file management.
 
-**Production Base URL:** `https://printer-backend-934564650450.europe-west1.run.app`
+**Production Base URLs:**
+- `https://printpro3d-api-931368217793.europe-west1.run.app` – Primary public endpoint. Use this for all new frontend, partner, or mobile integrations so you stay on the supported PrintPro3D host.
+- `https://printer-backend-934564650450.europe-west1.run.app` – Legacy endpoint that remains available for the LAN client and other internal integrations until they are redeployed.
 
 ---
 
@@ -76,7 +78,7 @@ API keys can be configured via:
 ### Example Request
 
 ```bash
-curl -X POST https://printer-backend-934564650450.europe-west1.run.app/control \
+curl -X POST https://printpro3d-api-931368217793.europe-west1.run.app/control \
   -H "Content-Type: application/json" \
   -H "X-API-Key: your-api-key-here" \
   -d '{"recipientId":"RID123","commandType":"pause"}'
