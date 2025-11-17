@@ -639,6 +639,104 @@ def normalizeTimestamp(value: Optional[datetime]) -> Optional[str]:
     return value.astimezone(timezone.utc).isoformat()
 
 
+def parsePrinterStatusQueryParameters():
+    queryArgs = getattr(request, 'args', {}) or {}
+
+    printerSerialValue = queryArgs.get('printerSerial')
+    sanitizedPrinterSerial: Optional[str] = None
+    if printerSerialValue is not None:
+        if not isinstance(printerSerialValue, str) or not printerSerialValue.strip():
+            logging.warning('Invalid printerSerial parameter for status history query.')
+            return None, makeErrorResponse(
+                400,
+                'ValidationError',
+                'printerSerial must be a non-empty string when provided',
+            )
+        sanitizedPrinterSerial = printerSerialValue.strip()
+
+    limitValue = queryArgs.get('limit')
+    limitSize = 50
+    if limitValue is not None:
+        try:
+            limitSize = int(limitValue)
+        except (TypeError, ValueError):
+            logging.warning('Invalid limit parameter for status history query.')
+            return None, makeErrorResponse(
+                400,
+                'ValidationError',
+                'limit must be a positive integer',
+            )
+        if limitSize < 1:
+            logging.warning('Non-positive limit parameter for status history query.')
+            return None, makeErrorResponse(
+                400,
+                'ValidationError',
+                'limit must be a positive integer',
+            )
+        limitSize = min(limitSize, 500)
+
+    sinceValue = queryArgs.get('since')
+    sinceTimestamp: Optional[datetime] = None
+    if sinceValue is not None:
+        if not isinstance(sinceValue, str) or not sinceValue.strip():
+            logging.warning('Empty since parameter for status history query.')
+            return None, makeErrorResponse(
+                400,
+                'ValidationError',
+                'since must be an ISO8601 timestamp string',
+            )
+        sinceTimestamp = parseIso8601Timestamp(sinceValue)
+        if sinceTimestamp is None:
+            logging.warning('Failed to parse since parameter for status history query.')
+            return None, makeErrorResponse(
+                400,
+                'ValidationError',
+                'since must be an ISO8601 timestamp string',
+            )
+
+    queryParameters = {
+        'printerSerial': sanitizedPrinterSerial,
+        'limit': limitSize,
+        'since': sinceTimestamp,
+    }
+    return queryParameters, None
+
+
+def loadRecipientPrinterStatusSnapshots(
+    recipientId: str,
+    printerSerial: Optional[str],
+    sinceTimestamp: Optional[datetime],
+    limitSize: int,
+):
+    clients, clientError = _loadClientsOrError()
+    if clientError:
+        return None, clientError
+
+    firestoreClient = clients.firestoreClient
+    statusCollection = firestoreClient.collection(firestoreCollectionPrinterStatus)
+
+    query = statusCollection.where(filter=FieldFilter('recipientId', '==', recipientId))
+    if printerSerial:
+        query = query.where(filter=FieldFilter('printerSerial', '==', printerSerial))
+    if sinceTimestamp is not None:
+        query = query.where(filter=FieldFilter('timestamp', '>=', sinceTimestamp))
+
+    query = query.order_by('timestamp', direction=firestore.Query.DESCENDING).limit(limitSize)
+
+    try:
+        documentSnapshots = list(query.stream())
+    except Exception as error:  # pylint: disable=broad-except
+        logging.exception('Failed to load printer status history for %s.', recipientId)
+        return None, makeErrorResponse(
+            500,
+            'ServerError',
+            'Failed to load printer status updates',
+            str(error),
+        )
+
+    return documentSnapshots, None
+
+
 def parseIso8601Timestamp(rawTimestamp: object) -> Optional[datetime]:
     if not isinstance(rawTimestamp, str):
         return None
@@ -1697,6 +1795,78 @@ def claimJob(appId: str):
     return makeJsonResponse(responsePayload, 200)
 
 
+@app.route('/api/recipients/<recipientId>/status', methods=['GET'])
+def listRecipientPrinterStatusHistory(recipientId: str):
+    logging.info('Received request to /api/recipients/%s/status', recipientId)
+
+    apiKeyError = ensureValidApiKey()
+    if apiKeyError:
+        return apiKeyError
+
+    if not isinstance(recipientId, str) or not recipientId.strip():
+        logging.warning('Missing recipientId when querying printer status history.')
+        return makeErrorResponse(400, 'ValidationError', 'recipientId is required')
+
+    sanitizedRecipientId = recipientId.strip()
+
+    queryParameters, validationError = parsePrinterStatusQueryParameters()
+    if validationError:
+        return validationError
+
+    documentSnapshots, loadError = loadRecipientPrinterStatusSnapshots(
+        sanitizedRecipientId,
+        queryParameters['printerSerial'],
+        queryParameters['since'],
+        queryParameters['limit'],
+    )
+    if loadError:
+        return loadError
+
+    updates = [serializePrinterStatusDocument(snapshot) for snapshot in documentSnapshots]
+
+    responsePayload = {
+        'ok': True,
+        'updates': updates,
+    }
+    return makeJsonResponse(responsePayload, 200)
+
+
+@app.route('/api/recipients/<recipientId>/status/latest', methods=['GET'])
+def listLatestRecipientPrinterStatuses(recipientId: str):
+    logging.info('Received request to /api/recipients/%s/status/latest', recipientId)
+
+    apiKeyError = ensureValidApiKey()
+    if apiKeyError:
+        return apiKeyError
+
+    if not isinstance(recipientId, str) or not recipientId.strip():
+        logging.warning('Missing recipientId when querying latest printer status.')
+        return makeErrorResponse(400, 'ValidationError', 'recipientId is required')
+
+    sanitizedRecipientId = recipientId.strip()
+
+    queryParameters, validationError = parsePrinterStatusQueryParameters()
+    if validationError:
+        return validationError
+
+    documentSnapshots, loadError = loadRecipientPrinterStatusSnapshots(
+        sanitizedRecipientId,
+        queryParameters['printerSerial'],
+        queryParameters['since'],
+        queryParameters['limit'],
+    )
+    if loadError:
+        return loadError
+
+    printerStatuses = buildLatestPrinterStatusMap(documentSnapshots)
+
+    responsePayload = {
+        'ok': True,
+        'printers': printerStatuses,
+    }
+    return makeJsonResponse(responsePayload, 200)
+
+
 @app.route('/recipients/<recipientId>/pending', methods=['GET'])
 def listPendingFiles(recipientId: str):
     logging.info('Received request to /recipients/%s/pending', recipientId)
@@ -1917,6 +2087,37 @@ def _to_jsonable(value):
         return [_to_jsonable(item) for item in value]
 
     return value
+
+
+def serializePrinterStatusDocument(documentSnapshot):
+    snapshotData = documentSnapshot.to_dict() or {}
+    serializedPayload = _to_jsonable(snapshotData) or {}
+    if not isinstance(serializedPayload, dict):
+        serializedPayload = {'value': serializedPayload}
+
+    serializedPayload['statusId'] = documentSnapshot.id
+
+    timestampValue = snapshotData.get('timestamp')
+    if isinstance(timestampValue, datetime):
+        serializedPayload['timestamp'] = normalizeTimestamp(timestampValue)
+
+    return serializedPayload
+
+
+def buildLatestPrinterStatusMap(documentSnapshots):
+    printerStatuses: Dict[str, dict] = {}
+    for documentSnapshot in documentSnapshots:
+        serializedSnapshot = serializePrinterStatusDocument(documentSnapshot)
+        printerKey = (
+            serializedSnapshot.get('printerSerial')
+            or serializedSnapshot.get('printerId')
+            or serializedSnapshot.get('printerIpAddress')
+        )
+        if not printerKey or printerKey in printerStatuses:
+            continue
+        printerStatuses[printerKey] = serializedSnapshot
+
+    return printerStatuses
 
 
 def _parseExpirationTimestampValue(rawValue):
