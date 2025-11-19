@@ -310,21 +310,18 @@ Configure via environment variables or `.env` file:
 # Backend Configuration
 PRINTER_BACKEND_BASE_URL="https://printpro3d-api-931368217793.europe-west1.run.app"
 # Legacy fallback (only if an integration cannot reach the PrintPro3D host yet):
-# Google Cloud Backend Configuration
-PRINTER_BACKEND_BASE_URL="https://printpro3d-api-931368217793.europe-west1.run.app"
+# PRINTER_BACKEND_BASE_URL="https://printer-backend-934564650450.europe-west1.run.app"
 PRINTER_BACKEND_API_KEY="your-api-key"
 
-# Printer API Integration (self-hosted Google Cloud)
-PRINTER_API_KEY="your-api-key"
-PRINTER_FUNCTIONS_API_KEY="your-functions-key"
+# Base44 Integration
+BASE44_API_BASE="https://printpro3d-api-931368217793.europe-west1.run.app"
+# Legacy fallback:
+# BASE44_API_BASE="https://printer-backend-934564650450.europe-west1.run.app"
+BASE44_FUNCTIONS_API_KEY="your-functions-key"
+BASE44_API_KEY="fallback-key"
 
 # Client Identity
-PRINTER_RECIPIENT_ID="RID123ABC"
-
-# Legacy environment variables (for backwards compatibility during migration)
-# BASE44_API_KEY="fallback-key"
-# BASE44_FUNCTIONS_API_KEY="your-functions-key"
-# BASE44_RECIPIENT_ID="RID123ABC"
+BASE44_RECIPIENT_ID="RID123ABC"
 
 # Command Polling
 CONTROL_POLL_SEC=15              # Poll interval (default: 15s)

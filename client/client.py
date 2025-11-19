@@ -167,7 +167,7 @@ def parseArguments() -> argparse.Namespace:
     statusParser.add_argument(
         "--organizationId",
         default=None,
-        help="Optional organization identifier for access control (can also use PRINTER_ORGANIZATION_ID env var).",
+        help="Optional organization identifier for access control (can also use BASE44_ORGANIZATION_ID env var).",
     )
 
     listenParser = subparsers.add_parser(
@@ -2610,7 +2610,7 @@ def main() -> None:
             arguments.interval,
             arguments.numUpdates,
             arguments.recipientId,
-            arguments.organizationId or os.getenv("PRINTER_ORGANIZATION_ID", "").strip() or os.getenv("BASE44_ORGANIZATION_ID", "").strip() or None,
+            arguments.organizationId or os.getenv("BASE44_ORGANIZATION_ID", "").strip() or None,
         )
     elif arguments.command == "listen":
         if arguments.mode == "offline":
