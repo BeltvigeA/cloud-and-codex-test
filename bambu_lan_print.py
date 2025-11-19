@@ -92,6 +92,7 @@ class BambuLanClient:
         self.accessCode = accessCode
         self.connectCamera = connectCamera
         self.printer: Optional[bl.Printer] = None
+        self.sequence_id: int = 0
 
     def waitForMqttReady(self, timeout: float = 20.0, poll: float = 0.5) -> None:
         if not self.printer:
@@ -165,20 +166,49 @@ class BambuLanClient:
 
         raise RuntimeError("Ingen tilgjengelig API-transport for kontrollpayload (API-only policy)")
 
+    def _getNextSequenceId(self) -> str:
+        """Generer neste sequence_id for MQTT kommandoer"""
+        seq_id = str(self.sequence_id)
+        self.sequence_id += 1
+        if self.sequence_id > 9999:  # Reset ved høye tall
+            self.sequence_id = 0
+        return seq_id
+
+    def _addSequenceId(self, payload: dict) -> dict:
+        """Legg til sequence_id i alle kommandoer som mangler det"""
+        modified = payload.copy()
+
+        # Finn første nivå-nøkkel (print, system, etc.)
+        for key in modified:
+            if isinstance(modified[key], dict):
+                if "sequence_id" not in modified[key]:
+                    modified[key]["sequence_id"] = self._getNextSequenceId()
+
+        return modified
+
     def pausePrint(self) -> None:
+        """Pause den aktive printen"""
         if hasattr(self.printer, "pause_print"):
             return self._safeCall(self.printer.pause_print)
-        return self._publishControl({"print": {"command": "pause"}})
+
+        payload = self._addSequenceId({"print": {"command": "pause"}})
+        return self._publishControl(payload)
 
     def resumePrint(self) -> None:
+        """Fortsett en pauset print"""
         if hasattr(self.printer, "resume_print"):
             return self._safeCall(self.printer.resume_print)
-        return self._publishControl({"print": {"command": "resume"}})
+
+        payload = self._addSequenceId({"print": {"command": "resume"}})
+        return self._publishControl(payload)
 
     def stopPrint(self) -> None:
+        """Stopp den aktive printen"""
         if hasattr(self.printer, "stop_print"):
             return self._safeCall(self.printer.stop_print)
-        return self._publishControl({"print": {"command": "stop"}})
+
+        payload = self._addSequenceId({"print": {"command": "stop"}})
+        return self._publishControl(payload)
 
     def skipCurrentObject(self) -> None:
         if hasattr(self.printer, "skip_object"):

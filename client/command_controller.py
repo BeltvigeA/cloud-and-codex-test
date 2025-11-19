@@ -810,6 +810,7 @@ class CommandWorker:
         self._cameraLoopThread: Optional[threading.Thread] = None
         self._cameraLoopStopEvent = threading.Event()
         self._idleConnectErrorCount = 0
+        self._sequence_id: int = 0
         log.debug(
             "CommandWorker configured for %s using control endpoint %s", self.serial, self.controlEndpointUrl
         )
@@ -844,6 +845,20 @@ class CommandWorker:
         self._brakeFlowThread = None
         self._resetBrakeJobState()
         self._disconnectPrinter()
+
+    def _getNextSequenceId(self) -> str:
+        """Generer neste sequence_id for MQTT kommandoer"""
+        seq_id = str(self._sequence_id)
+        self._sequence_id += 1
+        if self._sequence_id > 9999:  # Reset ved høye tall
+            self._sequence_id = 0
+        return seq_id
+
+    def _addSequenceIdToPayload(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Legg til sequence_id i payload hvis den mangler"""
+        if "sequence_id" not in payload:
+            payload["sequence_id"] = self._getNextSequenceId()
+        return payload
 
     def _run(self) -> None:
         if self.pollMode == "recipient":
@@ -2155,6 +2170,8 @@ class CommandWorker:
             raise RuntimeError("send_gcode is unavailable in bambulabs_api")
 
         def sendControlPayload(payload: Dict[str, Any]) -> None:
+            # Legg til sequence_id i hver kontroll-payload
+            payload = self._addSequenceIdToPayload(payload)
             controlMethod = getattr(printer, "send_control", None)
             if callable(controlMethod):
                 controlMethod(payload)
@@ -2256,15 +2273,24 @@ class CommandWorker:
                     used = meth
                     break
             if not used:
-                payload = {"command": transportCmd}
+                # Bygg korrekt MQTT payload format
+                payload = {
+                    "print": {
+                        "sequence_id": self._getNextSequenceId(),
+                        "command": transportCmd
+                    }
+                }
+
                 controlSender = getattr(printer, "send_control", None)
                 if callable(controlSender):
                     log.info("Control %s → send_control(%s)", normalizedType, payload)
-                    controlSender(payload)
+                    # Send kun "print" delen av payload
+                    controlSender(payload["print"])
                 else:
                     requestSender = getattr(printer, "send_request", None)
                     if callable(requestSender):
                         log.info("Control %s → send_request(%s)", normalizedType, payload)
+                        # send_request forventer hele payload
                         requestSender(payload)
                     else:
                         raise RuntimeError("No API transport available for control payload")
