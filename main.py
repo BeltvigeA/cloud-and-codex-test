@@ -2792,6 +2792,153 @@ def printerStatusUpdate():
     return _handlePrinterStatusUpdate(None)
 
 
+@app.route('/updatePrinterStatus', methods=['POST'])
+def simpleUpdatePrinterStatus():
+    """Handle simple printer status updates from client."""
+    logging.info('Received simple printer status update')
+
+    apiKeyError = ensureValidApiKey()
+    if apiKeyError:
+        return apiKeyError
+
+    payload, payloadError = getJsonPayload()
+    if payloadError:
+        return payloadError
+
+    clients, clientError = _loadClientsOrError()
+    if clientError:
+        return clientError
+
+    firestoreClient = clients.firestoreClient
+
+    # Validate recipientId
+    recipientId = payload.get('recipientId')
+    if not recipientId or not isinstance(recipientId, str) or not recipientId.strip():
+        logging.warning('Invalid or missing recipientId in status update')
+        return makeErrorResponse(400, 'ValidationError', 'recipientId must be a non-empty string')
+
+    # Validate printerIpAddress
+    printerIpAddress = payload.get('printerIpAddress')
+    if not printerIpAddress or not isinstance(printerIpAddress, str) or not printerIpAddress.strip():
+        logging.warning('Invalid or missing printerIpAddress in status update')
+        return makeErrorResponse(400, 'ValidationError', 'printerIpAddress must be a non-empty string')
+
+    # Prepare status data
+    statusData = dict(payload)
+    statusData['timestamp'] = firestore.SERVER_TIMESTAMP
+    statusData['recipientId'] = recipientId.strip()
+    statusData['printerIpAddress'] = printerIpAddress.strip()
+
+    # Store in Firestore
+    try:
+        documentReference = firestoreClient.collection(firestoreCollectionPrinterStatus).add(statusData)
+        logging.info('Stored status update for recipient %s, printer %s', recipientId, printerIpAddress)
+    except Exception as error:
+        logging.exception('Failed to store printer status update')
+        return makeErrorResponse(500, 'ServerError', 'Failed to store printer status update', str(error))
+
+    return makeJsonResponse({
+        'ok': True,
+        'success': True,
+        'message': 'Printer status updated successfully',
+        'statusId': getattr(documentReference, 'id', None)
+    }, 200)
+
+
+@app.route('/reportPrinterError', methods=['POST'])
+def reportPrinterError():
+    """Handle printer error reports from client."""
+    logging.info('Received printer error report')
+
+    apiKeyError = ensureValidApiKey()
+    if apiKeyError:
+        return apiKeyError
+
+    payload, payloadError = getJsonPayload()
+    if payloadError:
+        return payloadError
+
+    clients, clientError = _loadClientsOrError()
+    if clientError:
+        return clientError
+
+    firestoreClient = clients.firestoreClient
+
+    # Validate recipientId
+    recipientId = payload.get('recipientId')
+    if not recipientId or not isinstance(recipientId, str) or not recipientId.strip():
+        logging.warning('Invalid or missing recipientId in error report')
+        return makeErrorResponse(400, 'ValidationError', 'recipientId must be a non-empty string')
+
+    # Prepare error data
+    errorData = dict(payload)
+    errorData['timestamp'] = firestore.SERVER_TIMESTAMP
+    errorData['recipientId'] = recipientId.strip()
+    errorData['type'] = 'error'
+
+    # Store in Firestore (same collection as status updates)
+    try:
+        documentReference = firestoreClient.collection(firestoreCollectionPrinterStatus).add(errorData)
+        logging.warning('Stored error report for recipient %s: %s', recipientId, payload.get('errorMessage', 'Unknown error'))
+    except Exception as error:
+        logging.exception('Failed to store printer error report')
+        return makeErrorResponse(500, 'ServerError', 'Failed to store printer error report', str(error))
+
+    return makeJsonResponse({
+        'ok': True,
+        'success': True,
+        'message': 'Printer error reported successfully',
+        'errorId': getattr(documentReference, 'id', None)
+    }, 200)
+
+
+@app.route('/reportPrinterImage', methods=['POST'])
+def reportPrinterImage():
+    """Handle printer image/camera snapshot uploads from client."""
+    logging.info('Received printer image report')
+
+    apiKeyError = ensureValidApiKey()
+    if apiKeyError:
+        return apiKeyError
+
+    payload, payloadError = getJsonPayload()
+    if payloadError:
+        return payloadError
+
+    clients, clientError = _loadClientsOrError()
+    if clientError:
+        return clientError
+
+    firestoreClient = clients.firestoreClient
+
+    # Validate recipientId
+    recipientId = payload.get('recipientId')
+    if not recipientId or not isinstance(recipientId, str) or not recipientId.strip():
+        logging.warning('Invalid or missing recipientId in image report')
+        return makeErrorResponse(400, 'ValidationError', 'recipientId must be a non-empty string')
+
+    # Prepare image data
+    imageData = dict(payload)
+    imageData['timestamp'] = firestore.SERVER_TIMESTAMP
+    imageData['recipientId'] = recipientId.strip()
+    imageData['type'] = 'image'
+
+    # Store in Firestore (same collection as status updates)
+    try:
+        documentReference = firestoreClient.collection(firestoreCollectionPrinterStatus).add(imageData)
+        logging.info('Stored image report for recipient %s', recipientId)
+    except Exception as error:
+        logging.exception('Failed to store printer image report')
+        return makeErrorResponse(500, 'ServerError', 'Failed to store printer image report', str(error))
+
+    return makeJsonResponse({
+        'ok': True,
+        'success': True,
+        'message': 'Printer image reported successfully',
+        'imageId': getattr(documentReference, 'id', None)
+    }, 200)
+
+
 @app.route('/', methods=['GET'])
 def healthCheck():
     return jsonify({'status': 'ok', 'message': 'Cloud server is running!'}), 200
