@@ -790,17 +790,17 @@ FIRESTORE_COLLECTION_PRINTER_COMMANDS=printer_commands
 
 ---
 
-## Integration with Base44
+## Google Cloud Backend Integration
 
-Base44 is an external service that provides print job management. The integration flow:
+The system uses a self-hosted Google Cloud infrastructure for print job management. The backend is deployed on Google Cloud Run with a PostgreSQL database.
 
 ### 1. Authentication
-- Obtain API key from Base44 administration
-- Store as `BASE44_API_KEY` in Secret Manager
-- All requests to `https://api.base44.com` include `Authorization: Bearer <token>`
+- API key is stored as `PRINTER_API_KEY` in Secret Manager
+- All requests to `https://printpro3d-api-931368217793.europe-west1.run.app` include `X-API-Key: <PRINTER_API_KEY>`
+- Content-Type header: `application/json`
 
 ### 2. Create Job Requisition
-**POST** `https://api.base44.com/v1/print-jobs`
+**POST** `https://printpro3d-api-931368217793.europe-west1.run.app/api/print-jobs`
 ```json
 {
   "recipientId": "RID123",
@@ -832,18 +832,15 @@ Base44 is an external service that provides print job management. The integratio
 - Update command status to `completed`
 
 ### 4. Start Print
-**POST** `https://api.base44.com/v1/print-jobs/{jobId}/start`
-```json
-{
-  "printerIpAddress": "192.168.1.100",
-  "printProfileId": "profile-001"
-}
-```
+- Cloud Run creates a `start` command in `printer_commands`
+- LAN client picks up the command and starts the print locally
 
 ### 5. Status Reporting
-**POST** `https://api.base44.com/v1/print-jobs/{jobId}/status`
+**POST** `https://printpro3d-api-931368217793.europe-west1.run.app/api/printer-status`
 ```json
 {
+  "recipientId": "RID123",
+  "printerIpAddress": "192.168.1.100",
   "progressPercent": 45,
   "bedTemp": 60,
   "nozzleTemp": 220,
