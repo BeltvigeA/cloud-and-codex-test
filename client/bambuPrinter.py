@@ -761,19 +761,42 @@ def deleteRemoteFile(printer: Any, remotePath: str) -> bool:
 
 
 def postStatus(status: Dict[str, Any], printerConfig: Dict[str, Any]) -> None:
-    """Send the latest printer status to the configured remote endpoint."""
+    """
+    Send the latest printer status to the configured remote endpoint.
 
-    url = printerConfig.get("statusBaseUrl")
+    CRITICAL: This function has been updated to send status to the PostgreSQL
+    backend (printpro3d-api) instead of the legacy Firestore backend to ensure
+    the web frontend displays real-time printer status correctly.
+    """
+
+    # Get configuration from printer config - but override URL for PostgreSQL backend
+    configuredUrl = printerConfig.get("statusBaseUrl")
     apiKey = printerConfig.get("statusApiKey")
     recipientId = printerConfig.get("statusRecipientId")
-    if not url or not apiKey:
+
+    if not apiKey:
         return
 
+    # CRITICAL: Always use PostgreSQL backend for status updates, not the configured URL
+    # The configured URL may point to the old Firestore backend
+    # Old: https://printer-backend-934564650450.europe-west1.run.app
+    # New: https://printpro3d-api-931368217793.europe-west1.run.app
+    postgresBackend = "https://printpro3d-api-931368217793.europe-west1.run.app"
+
+    # Build endpoint URL with recipientId if available
+    if recipientId:
+        url = f"{postgresBackend}/api/recipients/{recipientId}/status"
+    else:
+        url = f"{postgresBackend}/api/printer-status"
+
+    # Get organizationId from environment variable or printer config
+    organizationId = printerConfig.get("organizationId") or os.getenv("BASE44_ORGANIZATION_ID", "").strip()
+
+    # Build payload with all required fields for PostgreSQL backend
     payload = {
-        "apiKey": apiKey,
         "recipientId": recipientId,
+        "printerIpAddress": printerConfig.get("ipAddress"),  # CRITICAL: Required for matching
         "serialNumber": printerConfig.get("serialNumber"),
-        "ipAddress": printerConfig.get("ipAddress"),
         "status": status.get("status") or status.get("state"),
         "nozzleTemp": status.get("nozzle_temper") or status.get("nozzleTemp"),
         "bedTemp": status.get("bed_temper") or status.get("bedTemp"),
@@ -785,8 +808,32 @@ def postStatus(status: Dict[str, Any], printerConfig: Dict[str, Any]) -> None:
         "gcodeState": status.get("gcode_state") or status.get("gcodeState"),
     }
 
+    # Add organizationId if available
+    if organizationId:
+        payload["organizationId"] = organizationId
+
+    # CRITICAL: Ensure printerIpAddress is set - this is required for matching in PostgreSQL
+    if not payload.get("printerIpAddress"):
+        logger.warning(
+            "Skipping status update for printer %s - printerIpAddress is required",
+            printerConfig.get("serialNumber") or "unknown"
+        )
+        return
+
+    # Use X-API-Key header instead of including in payload
+    headers = {
+        "X-API-Key": apiKey,
+        "Content-Type": "application/json"
+    }
+
     try:
-        requests.post(url, json=payload, timeout=5)
+        response = requests.post(url, json=payload, headers=headers, timeout=5)
+        response.raise_for_status()
+        logger.debug(
+            "Status update sent successfully for printer %s at %s",
+            printerConfig.get("serialNumber"),
+            printerConfig.get("ipAddress")
+        )
     except Exception:  # pragma: no cover - logging optional
         logger.debug("Failed to post status update", exc_info=True)
 
