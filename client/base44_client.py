@@ -11,7 +11,7 @@ import requests
 log = logging.getLogger(__name__)
 
 # Hardkodet functions-base: ikke per-printer
-BASE44_FUNCTIONS_BASE = "https://print-flow-pro-eb683cc6.base44.app/api/apps/68b61486e7c52405eb683cc6/functions"
+BASE44_FUNCTIONS_BASE = "https://printer-backend-934564650450.europe-west1.run.app"
 DEFAULT_CONTROL_BASE_URL = "https://printer-backend-934564650450.europe-west1.run.app"
 UPDATE_STATUS_URL = f"{BASE44_FUNCTIONS_BASE}/updatePrinterStatus"
 REPORT_ERROR_URL = f"{BASE44_FUNCTIONS_BASE}/reportPrinterError"
