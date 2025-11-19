@@ -69,7 +69,11 @@ class BambuStatusSubscriber:
         self.errorCountBySerial: Dict[str, int] = {}
         self.errorCountLock = threading.Lock()
         self.logEvery = 50
-        self.defaultRecipientId = os.getenv("BASE44_RECIPIENT_ID", "").strip()
+        # Try new environment variable first, then fall back to legacy BASE44_RECIPIENT_ID
+        self.defaultRecipientId = (
+            os.getenv("PRINTER_RECIPIENT_ID", "").strip()
+            or os.getenv("BASE44_RECIPIENT_ID", "").strip()
+        )
 
     def startAll(self, printers: Iterable[Dict[str, Any]]) -> None:
         """Start worker threads for each printer configuration."""
@@ -91,7 +95,11 @@ class BambuStatusSubscriber:
             self.onError(sanitizedMessage, dict(printerConfig))
             return
 
-        self.defaultRecipientId = os.getenv("BASE44_RECIPIENT_ID", "").strip()
+        # Try new environment variable first, then fall back to legacy BASE44_RECIPIENT_ID
+        self.defaultRecipientId = (
+            os.getenv("PRINTER_RECIPIENT_ID", "").strip()
+            or os.getenv("BASE44_RECIPIENT_ID", "").strip()
+        )
 
         if not self._pingHost(ipAddress, 1000):
             if self._shouldLogConnectionFailure(serial):
@@ -175,8 +183,11 @@ class BambuStatusSubscriber:
                 lastErrorEmit = 0.0
 
                 while not stopEvent.is_set():
-                    resolvedApiKey = self._resolveBase44ApiKey(printerConfig)
+                    resolvedApiKey = self._resolveApiKey(printerConfig)
                     if resolvedApiKey:
+                        # Set both new and legacy environment variables for backwards compatibility
+                        self._ensureEnvironmentValue("PRINTER_API_KEY", resolvedApiKey)
+                        self._ensureEnvironmentValue("PRINTER_FUNCTIONS_API_KEY", resolvedApiKey)
                         self._ensureEnvironmentValue("BASE44_FUNCTIONS_API_KEY", resolvedApiKey)
                         self._ensureEnvironmentValue("BASE44_API_KEY", resolvedApiKey)
 
@@ -186,8 +197,8 @@ class BambuStatusSubscriber:
                     statusPayload["nickname"] = nickname
                     statusPayload["status"] = statusPayload.get("status") or "update"
 
-                    base44Package = self._buildBase44Payloads(statusPayload, printerConfig, resolvedApiKey)
-                    if base44Package is not None:
+                    backendPackage = self._buildBackendPayloads(statusPayload, printerConfig, resolvedApiKey)
+                    if backendPackage is not None:
                         (
                             updatePayload,
                             updateComparable,
@@ -206,7 +217,7 @@ class BambuStatusSubscriber:
                                 try:
                                     postUpdateStatus(updatePayload)
                                 except Exception as error:
-                                    self._logBase44Failure("update", error)
+                                    self._logBackendFailure("update", error)
                                 else:
                                     lastBase44Comparable = dict(updateComparable)
                                     lastBase44Emit = time.monotonic()
@@ -222,7 +233,7 @@ class BambuStatusSubscriber:
                                 try:
                                     postReportError(errorPayload)
                                 except Exception as error:
-                                    self._logBase44Failure("error", error)
+                                    self._logBackendFailure("error", error)
                                 else:
                                     lastErrorComparable = dict(errorComparable)
                                     lastErrorEmit = time.monotonic()
@@ -623,7 +634,7 @@ class BambuStatusSubscriber:
                             return textValue
         return None
 
-    def _buildBase44Payloads(
+    def _buildBackendPayloads(
         self,
         snapshot: Dict[str, Any],
         printerConfig: Dict[str, Any],
@@ -631,7 +642,7 @@ class BambuStatusSubscriber:
     ) -> Optional[Tuple[Dict[str, Any], Dict[str, Any], Optional[Dict[str, Any]], Optional[Dict[str, Any]]]]:
         ipAddress = str(printerConfig.get("ipAddress") or "").strip()
         recipientId = self._resolveRecipientId(printerConfig)
-        resolvedApiKey = apiKey or self._resolveBase44ApiKey(printerConfig)
+        resolvedApiKey = apiKey or self._resolveApiKey(printerConfig)
         if not ipAddress or not recipientId or not resolvedApiKey:
             return None
 
@@ -697,8 +708,14 @@ class BambuStatusSubscriber:
 
         return updatePayload, updateComparable, errorPayload, errorComparable
 
-    def _resolveBase44ApiKey(self, printerConfig: Dict[str, Any]) -> str:
-        for envKey in ("BASE44_FUNCTIONS_API_KEY", "BASE44_API_KEY"):
+    def _resolveApiKey(self, printerConfig: Dict[str, Any]) -> str:
+        """Resolve API key from environment variables.
+
+        Tries new PRINTER_* variables first, then falls back to legacy BASE44_* names.
+        """
+        # Try new environment variables first, then fall back to legacy BASE44_* names
+        for envKey in ("PRINTER_API_KEY", "PRINTER_FUNCTIONS_API_KEY",
+                       "BASE44_FUNCTIONS_API_KEY", "BASE44_API_KEY"):
             envCandidate = os.getenv(envKey, "").strip()
             if envCandidate:
                 return envCandidate
@@ -712,7 +729,15 @@ class BambuStatusSubscriber:
         os.environ[key] = value
 
     def _resolveRecipientId(self, printerConfig: Dict[str, Any]) -> Optional[str]:
-        envCandidate = os.getenv("BASE44_RECIPIENT_ID", "").strip()
+        """Resolve recipient ID from environment variables.
+
+        Tries new PRINTER_RECIPIENT_ID first, then falls back to legacy BASE44_RECIPIENT_ID.
+        """
+        # Try new environment variable first, then fall back to legacy BASE44_RECIPIENT_ID
+        envCandidate = (
+            os.getenv("PRINTER_RECIPIENT_ID", "").strip()
+            or os.getenv("BASE44_RECIPIENT_ID", "").strip()
+        )
         if envCandidate:
             return envCandidate
         return self.defaultRecipientId or None
@@ -838,7 +863,7 @@ class BambuStatusSubscriber:
                 return True
         return False
 
-    def _logBase44Failure(self, operation: str, error: Exception) -> None:
+    def _logBackendFailure(self, operation: str, error: Exception) -> None:
         if isinstance(error, requests.HTTPError):
             response = error.response
             statusCode = getattr(response, "status_code", "unknown")
@@ -849,13 +874,13 @@ class BambuStatusSubscriber:
                 except Exception:  # pragma: no cover - defensive logging
                     bodyText = None
             if bodyText:
-                self.log.warning("Base44 %s request failed (%s): %s", operation, statusCode, bodyText)
+                self.log.warning("Backend %s request failed (%s): %s", operation, statusCode, bodyText)
             else:
-                self.log.warning("Base44 %s request failed (%s)", operation, statusCode)
+                self.log.warning("Backend %s request failed (%s)", operation, statusCode)
         elif isinstance(error, requests.RequestException):
-            self.log.warning("Base44 %s request failed: %s", operation, error)
+            self.log.warning("Backend %s request failed: %s", operation, error)
         else:
-            self.log.warning("Base44 %s request failed: %s", operation, error)
+            self.log.warning("Backend %s request failed: %s", operation, error)
 
     def _extractHmsCode(self, sources: List[Any]) -> Optional[str]:
         candidate = self._findValue(sources, {"hms", "hms_code", "error_code", "print_error_code"})

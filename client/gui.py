@@ -804,28 +804,43 @@ class ListenerGuiApp:
             )
         self._onPrinterSelection(None)
 
-    def _applyBase44Environment(self) -> None:
+    def _applyPrinterBackendEnvironment(self) -> None:
+        """Apply environment variables for Google Cloud backend communication."""
         recipientValue = self.listenerRecipientId.strip()
         if recipientValue:
+            # Set new environment variable
+            os.environ["PRINTER_RECIPIENT_ID"] = recipientValue
+            self._managedEnvKeys.add("PRINTER_RECIPIENT_ID")
+            # Keep BASE44_RECIPIENT_ID for backwards compatibility during migration
             os.environ["BASE44_RECIPIENT_ID"] = recipientValue
             self._managedEnvKeys.add("BASE44_RECIPIENT_ID")
-        elif "BASE44_RECIPIENT_ID" in self._managedEnvKeys:
-            os.environ.pop("BASE44_RECIPIENT_ID", None)
-            self._managedEnvKeys.discard("BASE44_RECIPIENT_ID")
+        else:
+            # Clear both old and new variables
+            if "PRINTER_RECIPIENT_ID" in self._managedEnvKeys:
+                os.environ.pop("PRINTER_RECIPIENT_ID", None)
+                self._managedEnvKeys.discard("PRINTER_RECIPIENT_ID")
+            if "BASE44_RECIPIENT_ID" in self._managedEnvKeys:
+                os.environ.pop("BASE44_RECIPIENT_ID", None)
+                self._managedEnvKeys.discard("BASE44_RECIPIENT_ID")
 
         apiKeyValue = self.listenerStatusApiKey.strip()
         if apiKeyValue:
+            # Set new environment variables
+            os.environ["PRINTER_API_KEY"] = apiKeyValue
+            os.environ["PRINTER_FUNCTIONS_API_KEY"] = apiKeyValue
+            self._managedEnvKeys.add("PRINTER_API_KEY")
+            self._managedEnvKeys.add("PRINTER_FUNCTIONS_API_KEY")
+            # Keep BASE44_* for backwards compatibility during migration
             os.environ["BASE44_FUNCTIONS_API_KEY"] = apiKeyValue
             os.environ["BASE44_API_KEY"] = apiKeyValue
             self._managedEnvKeys.add("BASE44_FUNCTIONS_API_KEY")
             self._managedEnvKeys.add("BASE44_API_KEY")
         else:
-            if "BASE44_FUNCTIONS_API_KEY" in self._managedEnvKeys:
-                os.environ.pop("BASE44_FUNCTIONS_API_KEY", None)
-                self._managedEnvKeys.discard("BASE44_FUNCTIONS_API_KEY")
-            if "BASE44_API_KEY" in self._managedEnvKeys:
-                os.environ.pop("BASE44_API_KEY", None)
-                self._managedEnvKeys.discard("BASE44_API_KEY")
+            # Clear all variables
+            for key in ("PRINTER_API_KEY", "PRINTER_FUNCTIONS_API_KEY", "BASE44_FUNCTIONS_API_KEY", "BASE44_API_KEY"):
+                if key in self._managedEnvKeys:
+                    os.environ.pop(key, None)
+                    self._managedEnvKeys.discard(key)
 
         controlKeyValue = self.listenerControlApiKey.strip()
         if controlKeyValue:
@@ -837,19 +852,19 @@ class ListenerGuiApp:
 
     def _updateListenerRecipient(self, *_args: Any) -> None:
         self.listenerRecipientId = self.recipientVar.get().strip() if hasattr(self, "recipientVar") else ""
-        self._applyBase44Environment()
+        self._applyPrinterBackendEnvironment()
 
     def _updateListenerStatusApiKey(self, *_args: Any) -> None:
         self.listenerStatusApiKey = (
             self.statusApiKeyVar.get().strip() if hasattr(self, "statusApiKeyVar") else ""
         )
-        self._applyBase44Environment()
+        self._applyPrinterBackendEnvironment()
 
     def _updateListenerControlApiKey(self, *_args: Any) -> None:
         self.listenerControlApiKey = (
             self.controlApiKeyVar.get().strip() if hasattr(self, "controlApiKeyVar") else ""
         )
-        self._applyBase44Environment()
+        self._applyPrinterBackendEnvironment()
 
     def _updateStatusReporterState(self) -> None:
         listenerActive = bool(getattr(self, "listenerActive", False))
@@ -1946,7 +1961,9 @@ class ListenerGuiApp:
             return
 
         apiKeyCandidate = (
-            getattr(self, "listenerStatusApiKey", "") or os.getenv("BASE44_API_KEY", "").strip()
+            getattr(self, "listenerStatusApiKey", "")
+            or os.getenv("PRINTER_API_KEY", "").strip()
+            or os.getenv("BASE44_API_KEY", "").strip()
         )
         if not apiKeyCandidate:
             logging.warning(
@@ -2001,6 +2018,7 @@ class ListenerGuiApp:
 
         recipientCandidate = (
             getattr(self, "listenerRecipientId", "")
+            or os.getenv("PRINTER_RECIPIENT_ID", "").strip()
             or os.getenv("BASE44_RECIPIENT_ID", "").strip()
         )
         if not recipientCandidate:
@@ -2290,7 +2308,7 @@ class ListenerGuiApp:
             return
         if not self.statusSubscriber:
             return
-        self._applyBase44Environment()
+        self._applyPrinterBackendEnvironment()
         activeLanPrinters = self._collectActiveLanPrinters()
         if activeLanPrinters:
             self.statusSubscriber.startAll(activeLanPrinters)
@@ -2307,7 +2325,7 @@ class ListenerGuiApp:
             return
         if not self.listenerThread or not self.listenerThread.is_alive():
             return
-        self._applyBase44Environment()
+        self._applyPrinterBackendEnvironment()
         controlBaseUrlCandidate = self.baseUrlVar.get().strip() or defaultBaseUrl
         try:
             controlBaseUrl = buildBaseUrl(controlBaseUrlCandidate)
@@ -2506,7 +2524,7 @@ class ListenerGuiApp:
             self.statusApiKeyVar.get().strip() if hasattr(self, "statusApiKeyVar") else ""
         )
         # Gjør API- og mottakerverdier tilgjengelig for alle bakgrunnstråder.
-        self._applyBase44Environment()
+        self._applyPrinterBackendEnvironment()
 
         try:
             ensureOutputDirectory(outputDir)
