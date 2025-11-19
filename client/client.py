@@ -3,6 +3,7 @@
 import argparse
 import json
 import logging
+import os
 import shutil
 import sys
 import time
@@ -20,6 +21,10 @@ from .persistence import storePrintSummary
 from .bambuPrinter import BambuPrintOptions, deleteRemoteFile, postStatus, sendBambuPrintJob
 
 
+# NOTE: This URL is still used for /upload endpoint (print jobs to Firestore)
+# Status updates now use PostgreSQL backend via getPrinterStatusEndpointUrl()
+# Old Firestore: https://printer-backend-934564650450.europe-west1.run.app
+# New PostgreSQL: https://printpro3d-api-931368217793.europe-west1.run.app
 defaultBaseUrl = "https://printer-backend-934564650450.europe-west1.run.app"
 defaultFilesDirectory = Path.home() / ".printmaster" / "files"
 
@@ -50,10 +55,33 @@ def _notifyPrintersConfigChanged(updatedRecord: Dict[str, Any], storagePath: Pat
             logging.exception("Printers config change listener failed")
 
 
-def getPrinterStatusEndpointUrl(baseUrl: Optional[str] = None) -> str:
-    """Resolve the status endpoint for printer updates."""
-    sanitizedBaseUrl = buildBaseUrl(baseUrl or defaultBaseUrl)
-    return f"{sanitizedBaseUrl}/status"
+def getPrinterStatusEndpointUrl(baseUrl: Optional[str] = None, recipientId: Optional[str] = None) -> str:
+    """
+    Resolve the status endpoint for printer updates.
+
+    CRITICAL: This endpoint has been updated to use the PostgreSQL backend
+    instead of the legacy Firestore backend to ensure web frontend can
+    display real-time printer status.
+
+    Args:
+        baseUrl: Base URL for the backend (if None, uses production PostgreSQL URL)
+        recipientId: Optional recipient ID for the endpoint path
+
+    Returns:
+        Full URL to the printer status endpoint
+    """
+    # Use the new PostgreSQL backend for status updates
+    # Old Firestore: https://printer-backend-934564650450.europe-west1.run.app
+    # New PostgreSQL: https://printpro3d-api-931368217793.europe-west1.run.app
+    postgresBackend = "https://printpro3d-api-931368217793.europe-west1.run.app"
+    sanitizedBaseUrl = buildBaseUrl(postgresBackend if not baseUrl else baseUrl)
+
+    if recipientId:
+        # New endpoint format: /api/recipients/{recipientId}/status
+        return f"{sanitizedBaseUrl}/api/recipients/{recipientId}/status"
+    else:
+        # Fallback endpoint (requires recipientId in payload)
+        return f"{sanitizedBaseUrl}/api/printer-status"
 
 
 def getPrinterControlEndpointUrl(baseUrl: Optional[str] = None) -> str:
@@ -135,6 +163,11 @@ def parseArguments() -> argparse.Namespace:
         "--recipientId",
         default=None,
         help="Optional recipient identifier to associate with status updates.",
+    )
+    statusParser.add_argument(
+        "--organizationId",
+        default=None,
+        help="Optional organization identifier for access control (can also use BASE44_ORGANIZATION_ID env var).",
     )
 
     listenParser = subparsers.add_parser(
@@ -2138,6 +2171,7 @@ def generateStatusPayload(
     iteration: int,
     currentJobId: Optional[str],
     recipientId: Optional[str] = None,
+    organizationId: Optional[str] = None,
 ) -> Tuple[Dict[str, Any], Optional[str]]:
     statuses = ["idle", "printing", "pausing", "error", "finished"]
     status = statuses[iteration % len(statuses)]
@@ -2183,6 +2217,9 @@ def generateStatusPayload(
 
     if recipientId:
         payload["recipientId"] = recipientId
+
+    if organizationId:
+        payload["organizationId"] = organizationId
 
     if status == "error":
         payload["errorCode"] = "E123"
@@ -2477,8 +2514,9 @@ def performStatusUpdates(
     intervalSeconds: int,
     numUpdates: int,
     recipientId: Optional[str] = None,
+    organizationId: Optional[str] = None,
 ) -> None:
-    statusUrl = getPrinterStatusEndpointUrl(baseUrl)
+    statusUrl = getPrinterStatusEndpointUrl(baseUrl, recipientId)
     session = requests.Session()
     headers = {"X-API-Key": apiKey, "Content-Type": "application/json"}
 
@@ -2490,6 +2528,7 @@ def performStatusUpdates(
             iteration,
             currentJobId,
             recipientId=recipientId,
+            organizationId=organizationId,
         )
         logging.info(
             "Status payload %d: %s",
@@ -2571,6 +2610,7 @@ def main() -> None:
             arguments.interval,
             arguments.numUpdates,
             arguments.recipientId,
+            arguments.organizationId or os.getenv("BASE44_ORGANIZATION_ID", "").strip() or None,
         )
     elif arguments.command == "listen":
         if arguments.mode == "offline":
