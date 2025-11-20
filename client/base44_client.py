@@ -10,11 +10,8 @@ import requests
 
 log = logging.getLogger(__name__)
 
-# Oppdatert: Bruk PrintPro3D backend for status updates
-PRINTPRO3D_BASE = os.getenv(
-    "PRINTER_BACKEND_BASE_URL",
-    "https://printpro3d-api-931368217793.europe-west1.run.app"
-)
+# Hardkodet PrintPro3D backend URL for status updates
+PRINTPRO3D_BASE = "https://printpro3d-api-931368217793.europe-west1.run.app"
 
 # Legacy Base44 base (beholder for andre funksjoner)
 BASE44_FUNCTIONS_BASE = "https://print-flow-pro-eb683cc6.base44.app/api/apps/68b61486e7c52405eb683cc6/functions"
@@ -109,9 +106,8 @@ def postUpdateStatus(payload: Dict[str, object]) -> Dict[str, object]:
     preparedPayload["recipientId"] = recipientId
     preparedPayload.setdefault("lastUpdateTimestamp", _isoNow())
 
-    # Bygg dynamisk URL med recipientId
-    baseUrl = os.getenv("PRINTER_BACKEND_BASE_URL", PRINTPRO3D_BASE).rstrip("/")
-    statusUrl = f"{baseUrl}/api/recipients/{recipientId}/status/update"
+    # Bygg dynamisk URL med recipientId (bruker hardkodet backend URL)
+    statusUrl = f"{PRINTPRO3D_BASE}/api/recipients/{recipientId}/status/update"
 
     # Bruk control headers (ikke functions headers)
     headers = _buildControlHeaders()
