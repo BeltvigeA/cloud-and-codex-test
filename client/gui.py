@@ -100,6 +100,8 @@ from .client import (
     extractPreferredTransport,
     registerPrintersConfigChangedListener,
 )
+from .config_manager import get_config_manager
+from .settings_window import show_settings_dialog
 
 
 def loadPrinters() -> list[Dict[str, Any]]:
@@ -194,14 +196,92 @@ class ListenerGuiApp:
         self.lastLiveStatusAlerts: Dict[str, str] = {}
         self.commandWorkers: Dict[str, CommandWorker] = {}
 
+        # Initialize config manager
+        self.config_manager = get_config_manager()
+
+        # Load settings from config if available
+        self._loadSettingsFromConfig()
+
+        # Build menu bar
+        self._buildMenuBar()
+
         self._buildLayout()
         self.root.after(200, self._processLogQueue)
         self.root.after(200, self._processPrinterStatusUpdates)
         self._scheduleStatusRefresh(0)
         self._registerPrintersConfigListener()
 
+        # Check if first-time setup is needed
+        self.root.after(500, self._checkFirstTimeSetup)
+
     def log(self, message: str) -> None:
         self.logQueue.put(str(message))
+
+    def _loadSettingsFromConfig(self) -> None:
+        """Load settings from config manager and set environment variables."""
+        api_key = self.config_manager.get_api_key()
+        recipient_id = self.config_manager.get_recipient_id()
+        backend_url = self.config_manager.get_backend_url()
+
+        if api_key:
+            os.environ["PRINTER_BACKEND_API_KEY"] = api_key
+            os.environ["BASE44_API_KEY"] = api_key
+            logging.info(f"Loaded API key from config: {self.config_manager.get_masked_api_key()}")
+
+        if recipient_id:
+            os.environ["BASE44_RECIPIENT_ID"] = recipient_id
+            logging.info(f"Loaded recipient ID from config: {recipient_id}")
+
+        if backend_url:
+            os.environ["BASE44_API_BASE"] = backend_url
+            logging.info(f"Loaded backend URL from config: {backend_url}")
+
+    def _buildMenuBar(self) -> None:
+        """Build the menu bar with File menu."""
+        menubar = tk.Menu(self.root)
+        self.root.config(menu=menubar)
+
+        # File menu
+        file_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="File", menu=file_menu)
+        file_menu.add_command(label="Settings", command=self._openSettings)
+        file_menu.add_separator()
+        file_menu.add_command(label="Exit", command=self._handleWindowClose)
+
+    def _openSettings(self) -> None:
+        """Open the settings dialog."""
+        show_settings_dialog(self.root, self.config_manager, on_save_callback=self._onSettingsSaved)
+
+    def _onSettingsSaved(self) -> None:
+        """Callback when settings are saved."""
+        logging.info("Settings saved, reloading configuration")
+        # Update environment variables from config if needed
+        api_key = self.config_manager.get_api_key()
+        recipient_id = self.config_manager.get_recipient_id()
+        backend_url = self.config_manager.get_backend_url()
+
+        if api_key:
+            os.environ["PRINTER_BACKEND_API_KEY"] = api_key
+            os.environ["BASE44_API_KEY"] = api_key
+
+        if recipient_id:
+            os.environ["BASE44_RECIPIENT_ID"] = recipient_id
+
+        if backend_url:
+            os.environ["BASE44_API_BASE"] = backend_url
+
+        self.log("Settings updated successfully")
+
+    def _checkFirstTimeSetup(self) -> None:
+        """Check if first-time setup is needed and show dialog."""
+        if not self.config_manager.is_configured():
+            from .settings_window import show_first_time_setup
+            setup_completed = show_first_time_setup(self.root, self.config_manager)
+            if setup_completed:
+                # Load settings into environment
+                self._onSettingsSaved()
+            else:
+                self.log("⚠ Configuration incomplete. Please configure via File → Settings.")
 
     def _buildLayout(self) -> None:
         paddingOptions = {"padx": 8, "pady": 4}
