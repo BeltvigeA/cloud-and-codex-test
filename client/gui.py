@@ -2036,7 +2036,7 @@ class ListenerGuiApp:
 
         payload = dict(manualDefaults)
         payload["printerIpAddress"] = printerIpAddress
-        payload["status"] = "Online"
+        payload["status"] = "idle"
 
         jobProgressCandidate: Any = telemetry.get("progressPercent")
         if jobProgressCandidate is None:
@@ -2108,7 +2108,7 @@ class ListenerGuiApp:
         )
 
         manualDefaultsUpdate = dict(manualDefaults)
-        manualDefaultsUpdate["status"] = "Online"
+        manualDefaultsUpdate["status"] = "idle"
         manualDefaultsUpdate["lastUpdateTimestamp"] = payload["lastUpdateTimestamp"]
         if jobProgressValue is not None and jobProgressValue >= 0:
             manualDefaultsUpdate["jobProgress"] = float(jobProgressValue)
