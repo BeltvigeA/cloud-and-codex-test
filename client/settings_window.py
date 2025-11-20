@@ -156,6 +156,15 @@ class SettingsWindow:
         self.test_btn = ttk.Button(button_frame, text="Test Connection", command=self._test_connection)
         self.test_btn.pack(side=tk.LEFT, padx=(0, 5))
 
+        # Note about test connection
+        note_label = ttk.Label(
+            button_frame,
+            text="(Optional - you can save without testing)",
+            font=("", 8),
+            foreground="gray"
+        )
+        note_label.pack(side=tk.LEFT, padx=(5, 0))
+
         # Spacer
         ttk.Frame(button_frame).pack(side=tk.LEFT, fill=tk.X, expand=True)
 
@@ -336,12 +345,17 @@ class SettingsWindow:
                 }
             }
 
+            log.info(f"Testing connection to {status_endpoint}")
+            log.debug(f"Request payload: recipientId={recipient_id}, printerSerial=TEST_PRINTER")
+
             response = requests.post(
                 status_endpoint,
                 json=test_payload,
                 headers=headers,
                 timeout=10
             )
+
+            log.info(f"Response status: {response.status_code}")
 
             if response.status_code == 200:
                 self.status_label.config(text="✓ Connection successful!", foreground="green")
@@ -362,11 +376,32 @@ class SettingsWindow:
                     "Note: You can still save these settings and they will work once "
                     "the Recipient ID is registered in the dashboard."
                 )
+            elif response.status_code == 500:
+                self.status_label.config(text="✗ Server error", foreground="red")
+                error_details = ""
+                try:
+                    error_json = response.json()
+                    error_details = error_json.get('error', str(error_json))
+                except Exception:
+                    error_details = response.text[:200]
+
+                log.error(f"HTTP 500 error during connection test. Response: {response.text}")
+                messagebox.showerror(
+                    "Server Error",
+                    "The server encountered an error while processing your request.\n\n"
+                    "This might mean:\n"
+                    "• The Recipient ID needs to be properly registered in the web dashboard\n"
+                    "• There's a temporary server issue\n\n"
+                    "You can still save your settings. They should work once the "
+                    "server issue is resolved or the Recipient ID is properly registered.\n\n"
+                    f"Technical details: {error_details}"
+                )
             else:
                 self.status_label.config(
                     text=f"✗ Connection failed (HTTP {response.status_code})",
                     foreground="red"
                 )
+                log.error(f"HTTP {response.status_code} error during connection test. Response: {response.text}")
                 messagebox.showerror(
                     "Connection Failed",
                     f"Server returned HTTP {response.status_code}\n\n{response.text[:200]}"
