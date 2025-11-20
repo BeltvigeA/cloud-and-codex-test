@@ -10,6 +10,13 @@ import requests
 
 log = logging.getLogger(__name__)
 
+# Import config manager
+try:
+    from .config_manager import get_config_manager
+    _config_manager_available = True
+except ImportError:
+    _config_manager_available = False
+
 # Hardkodet PrintPro3D backend URL for status updates
 PRINTPRO3D_BASE = "https://printpro3d-api-931368217793.europe-west1.run.app"
 
@@ -24,6 +31,17 @@ REPORT_IMAGE_URL = f"{BASE44_FUNCTIONS_BASE}/reportPrinterImage"
 
 
 def _resolveApiKey(*envKeys: str) -> str:
+    # Try config manager first if available
+    if _config_manager_available:
+        try:
+            config = get_config_manager()
+            api_key = config.get_api_key()
+            if api_key:
+                return api_key
+        except Exception:
+            pass  # Fall back to environment variables
+
+    # Fall back to environment variables
     for envKey in envKeys:
         apiKeyCandidate = os.getenv(envKey, "").strip()
         if apiKeyCandidate:
@@ -42,7 +60,20 @@ def _buildControlHeaders() -> Dict[str, str]:
 
 
 def _ensureRecipient(payload: Dict[str, object]) -> bool:
-    recipientId = os.getenv("BASE44_RECIPIENT_ID", "").strip()
+    recipientId = None
+
+    # Try config manager first if available
+    if _config_manager_available:
+        try:
+            config = get_config_manager()
+            recipientId = config.get_recipient_id()
+        except Exception:
+            pass  # Fall back to environment variable
+
+    # Fall back to environment variable
+    if not recipientId:
+        recipientId = os.getenv("BASE44_RECIPIENT_ID", "").strip()
+
     if not recipientId:
         log.warning("Base44: missing BASE44_RECIPIENT_ID; skipping post.")
         return False
@@ -97,7 +128,20 @@ def postUpdateStatus(payload: Dict[str, object]) -> Dict[str, object]:
     preparedPayload = dict(payload)
 
     # Hent recipientId
-    recipientId = payload.get("recipientId") or os.getenv("BASE44_RECIPIENT_ID", "").strip()
+    recipientId = payload.get("recipientId")
+    if not recipientId:
+        # Try config manager first if available
+        if _config_manager_available:
+            try:
+                config = get_config_manager()
+                recipientId = config.get_recipient_id()
+            except Exception:
+                pass  # Fall back to environment variable
+
+        # Fall back to environment variable
+        if not recipientId:
+            recipientId = os.getenv("BASE44_RECIPIENT_ID", "").strip()
+
     if not recipientId:
         log.warning("postUpdateStatus: missing recipientId; skipping.")
         return {}
