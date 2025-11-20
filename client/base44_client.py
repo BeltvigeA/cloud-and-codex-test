@@ -10,12 +10,20 @@ import requests
 
 log = logging.getLogger(__name__)
 
-# Hardkodet functions-base: ikke per-printer
-BASE44_FUNCTIONS_BASE = "https://printer-backend-934564650450.europe-west1.run.app"
-DEFAULT_CONTROL_BASE_URL = "https://printer-backend-934564650450.europe-west1.run.app"
-UPDATE_STATUS_URL = f"{BASE44_FUNCTIONS_BASE}/updatePrinterStatus"
+# Oppdatert: Bruk PrintPro3D backend for status updates
+PRINTPRO3D_BASE = os.getenv(
+    "PRINTER_BACKEND_BASE_URL",
+    "https://printpro3d-api-931368217793.europe-west1.run.app"
+)
+
+# Legacy Base44 base (beholder for andre funksjoner)
+BASE44_FUNCTIONS_BASE = "https://print-flow-pro-eb683cc6.base44.app/api/apps/68b61486e7c52405eb683cc6/functions"
+
+# Legacy endpoints (kun for error og image reporting)
 REPORT_ERROR_URL = f"{BASE44_FUNCTIONS_BASE}/reportPrinterError"
 REPORT_IMAGE_URL = f"{BASE44_FUNCTIONS_BASE}/reportPrinterImage"
+
+# Note: UPDATE_STATUS_URL er nå dynamisk og bygges i postUpdateStatus()
 
 
 def _resolveApiKey(*envKeys: str) -> str:
@@ -53,31 +61,75 @@ def _resolveControlBaseUrl() -> str:
     baseCandidate = (
         os.getenv("BASE44_API_BASE")
         or os.getenv("PRINTER_BACKEND_BASE_URL")
-        or DEFAULT_CONTROL_BASE_URL
+        or PRINTPRO3D_BASE
     )
     sanitized = baseCandidate.strip()
     if not sanitized:
-        sanitized = DEFAULT_CONTROL_BASE_URL
+        sanitized = PRINTPRO3D_BASE
     if not sanitized.startswith("http://") and not sanitized.startswith("https://"):
         sanitized = f"https://{sanitized}"
     return sanitized.rstrip("/")
 
 
 def postUpdateStatus(payload: Dict[str, object]) -> Dict[str, object]:
-    """POST to updatePrinterStatus. payload MUST match the required schema."""
+    """
+    POST to recipient-based status update endpoint.
 
+    Nytt endpoint: POST /api/recipients/{recipientId}/status/update
+
+    Payload format:
+    {
+        "recipientId": "RID123",
+        "printerSerial": "01P00A381200434",
+        "printerIpAddress": "192.168.1.100",
+        "status": {
+            "status": "Idle",
+            "online": true,
+            "mqttReady": false,
+            "bedTemp": 25.5,
+            "nozzleTemp": 28.0,
+            "fanSpeed": 0,
+            "progress": 0,
+            "timeRemaining": 0,
+            "gcodeState": "idle",
+            "currentJobId": null,
+            "errorMessage": null
+        }
+    }
+    """
     preparedPayload = dict(payload)
-    if not _ensureRecipient(preparedPayload):
+
+    # Hent recipientId
+    recipientId = payload.get("recipientId") or os.getenv("BASE44_RECIPIENT_ID", "").strip()
+    if not recipientId:
+        log.warning("postUpdateStatus: missing recipientId; skipping.")
         return {}
+
+    # Sett recipientId i payload
+    preparedPayload["recipientId"] = recipientId
     preparedPayload.setdefault("lastUpdateTimestamp", _isoNow())
-    response = requests.post(
-        UPDATE_STATUS_URL,
-        json=preparedPayload,
-        headers=_buildFunctionsHeaders(),
-        timeout=10,
-    )
-    response.raise_for_status()
-    return response.json() if response.content else {}
+
+    # Bygg dynamisk URL med recipientId
+    baseUrl = os.getenv("PRINTER_BACKEND_BASE_URL", PRINTPRO3D_BASE).rstrip("/")
+    statusUrl = f"{baseUrl}/api/recipients/{recipientId}/status/update"
+
+    # Bruk control headers (ikke functions headers)
+    headers = _buildControlHeaders()
+
+    try:
+        log.debug(f"Sending status update to {statusUrl}")
+        response = requests.post(
+            statusUrl,
+            json=preparedPayload,
+            headers=headers,
+            timeout=10,
+        )
+        response.raise_for_status()
+        log.info(f"Status update successful for {recipientId}")
+        return response.json() if response.content else {}
+    except requests.RequestException as error:
+        log.error(f"Failed to update status for {recipientId}: {error}")
+        return {}
 
 
 def postReportError(payload: Dict[str, object]) -> Dict[str, object]:
