@@ -180,7 +180,6 @@ class ListenerGuiApp:
         self.statusRefreshIntervalMs = 60_000
         self.pendingImmediateStatusRefresh = False
 
-        self.listenerRecipientId = loadOrCreateRecipientId()
         self.listenerStatusApiKey = hardcodedApiKey
         self.listenerControlApiKey = hardcodedApiKey
         self._managedEnvKeys: set[str] = set()
@@ -290,7 +289,6 @@ class ListenerGuiApp:
 
     def _buildListenerTab(self, parent: ttk.Frame, paddingOptions: Dict[str, int]) -> None:
         self.baseUrlVar = tk.StringVar(value=hardcodedBaseUrl)
-        self.recipientVar = tk.StringVar(value=self.listenerRecipientId)
         self.statusApiKeyVar = tk.StringVar(value=hardcodedApiKey)
         self.controlApiKeyVar = tk.StringVar(value=hardcodedApiKey)
         self.outputDirVar = tk.StringVar(value=hardcodedOutputDirectory)
@@ -298,39 +296,10 @@ class ListenerGuiApp:
         self.pollIntervalVar = tk.IntVar(value=hardcodedPollIntervalSeconds)
         self.liveStatusEnabledVar.set(True)
 
-        self.recipientVar.trace_add("write", lambda *_: self._updateListenerRecipient())
         self.statusApiKeyVar.trace_add("write", lambda *_: self._updateListenerStatusApiKey())
         self.controlApiKeyVar.trace_add("write", lambda *_: self._updateListenerControlApiKey())
 
         currentRow = 0
-        ttk.Label(parent, text="Channel (Recipient ID):").grid(
-            row=currentRow, column=0, sticky=tk.W, **paddingOptions
-        )
-        recipientFrame = ttk.Frame(parent)
-        recipientFrame.grid(row=currentRow, column=1, sticky=tk.EW, **paddingOptions)
-        self.recipientEntry = ttk.Entry(
-            recipientFrame,
-            textvariable=self.recipientVar,
-            width=40,
-            show="•",
-            state="readonly",
-        )
-        self.recipientEntry.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        self.recipientVisibleVar = tk.BooleanVar(value=False)
-
-        def toggleRecipientVisibility() -> None:
-            self.recipientVisibleVar.set(not self.recipientVisibleVar.get())
-            self.refreshRecipientVisibility()
-
-        self.recipientToggleButton = ttk.Button(
-            recipientFrame, text="Show", command=toggleRecipientVisibility
-        )
-        self.recipientToggleButton.pack(side=tk.LEFT, padx=4)
-        ttk.Button(recipientFrame, text="Copy", command=self.copyRecipientIdToClipboard).pack(
-            side=tk.LEFT
-        )
-
-        currentRow += 1
         ttk.Label(
             parent,
             text="Connection settings are preconfigured for this installation.",
@@ -354,38 +323,8 @@ class ListenerGuiApp:
         parent.columnconfigure(1, weight=1)
         parent.rowconfigure(currentRow, weight=1)
 
-        self._updateListenerRecipient()
         self._updateListenerStatusApiKey()
         self._updateListenerControlApiKey()
-        self.refreshRecipientVisibility()
-
-    def refreshRecipientVisibility(self) -> None:
-        entryWidget = getattr(self, "recipientEntry", None)
-        toggleButton = getattr(self, "recipientToggleButton", None)
-        visibleVar = getattr(self, "recipientVisibleVar", None)
-        if entryWidget is None or not isinstance(visibleVar, tk.BooleanVar):
-            return
-
-        if visibleVar.get():
-            entryWidget.configure(show="")
-            if toggleButton is not None:
-                toggleButton.configure(text="Hide")
-        else:
-            entryWidget.configure(show="•")
-            if toggleButton is not None:
-                toggleButton.configure(text="Show")
-
-    def copyRecipientIdToClipboard(self) -> None:
-        recipientValue = self.recipientVar.get().strip() if hasattr(self, "recipientVar") else ""
-        if not recipientValue:
-            return
-        try:
-            self.root.clipboard_clear()
-            self.root.clipboard_append(recipientValue)
-            self.root.update_idletasks()
-            self.logQueue.put("Recipient ID copied to clipboard.")
-        except Exception:
-            logging.exception("Failed to copy recipient ID to clipboard")
 
     def _buildPrintersTab(self, parent: ttk.Frame) -> None:
         self.printerSearchVar = tk.StringVar()
@@ -876,13 +815,8 @@ class ListenerGuiApp:
         self._onPrinterSelection(None)
 
     def _applyBase44Environment(self) -> None:
-        recipientValue = self.listenerRecipientId.strip()
-        if recipientValue:
-            os.environ["BASE44_RECIPIENT_ID"] = recipientValue
-            self._managedEnvKeys.add("BASE44_RECIPIENT_ID")
-        elif "BASE44_RECIPIENT_ID" in self._managedEnvKeys:
-            os.environ.pop("BASE44_RECIPIENT_ID", None)
-            self._managedEnvKeys.discard("BASE44_RECIPIENT_ID")
+        # Recipient ID is managed through config_manager in _loadSettingsFromConfig()
+        # and _onSettingsSaved(), so we don't need to handle it here
 
         apiKeyValue = self.listenerStatusApiKey.strip()
         if apiKeyValue:
@@ -906,10 +840,6 @@ class ListenerGuiApp:
             os.environ.pop("PRINTER_BACKEND_API_KEY", None)
             self._managedEnvKeys.discard("PRINTER_BACKEND_API_KEY")
 
-    def _updateListenerRecipient(self, *_args: Any) -> None:
-        self.listenerRecipientId = self.recipientVar.get().strip() if hasattr(self, "recipientVar") else ""
-        self._applyBase44Environment()
-
     def _updateListenerStatusApiKey(self, *_args: Any) -> None:
         self.listenerStatusApiKey = (
             self.statusApiKeyVar.get().strip() if hasattr(self, "statusApiKeyVar") else ""
@@ -925,7 +855,11 @@ class ListenerGuiApp:
     def _updateStatusReporterState(self) -> None:
         listenerActive = bool(getattr(self, "listenerActive", False))
         listenerReady = bool(getattr(self, "listenerReady", False))
-        recipientId = str(getattr(self, "listenerRecipientId", "") or "").strip()
+        # Get recipient ID from config_manager or environment variable
+        recipientId = (
+            self.config_manager.get_recipient_id()
+            or os.getenv("BASE44_RECIPIENT_ID", "").strip()
+        )
         commandPoller = getattr(self, "commandPoller", None)
         reporter = getattr(self, "base44Reporter", None)
 
@@ -1122,8 +1056,10 @@ class ListenerGuiApp:
         apiKeyDefault = (
             self.statusApiKeyVar.get().strip() if hasattr(self, "statusApiKeyVar") else ""
         )
+        # Get recipient ID from config_manager or environment variable
         recipientDefault = (
-            self.recipientVar.get().strip() if hasattr(self, "recipientVar") else ""
+            self.config_manager.get_recipient_id()
+            or os.getenv("BASE44_RECIPIENT_ID", "").strip()
         )
 
         baseUrlVar = tk.StringVar(value=baseUrlDefault)
@@ -2070,8 +2006,9 @@ class ListenerGuiApp:
 
         payload["lastUpdateTimestamp"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
 
+        # Get recipient ID from config_manager or environment variable
         recipientCandidate = (
-            getattr(self, "listenerRecipientId", "")
+            self.config_manager.get_recipient_id()
             or os.getenv("BASE44_RECIPIENT_ID", "").strip()
         )
         if not recipientCandidate:
@@ -2398,13 +2335,18 @@ class ListenerGuiApp:
             if serialNumber in self.commandWorkers:
                 continue
             try:
+                # Get recipient ID from config_manager or environment variable
+                recipient_id = (
+                    self.config_manager.get_recipient_id()
+                    or os.getenv("BASE44_RECIPIENT_ID", "").strip()
+                )
                 worker = CommandWorker(
                     serial=serialNumber,
                     ipAddress=ipAddress,
                     accessCode=accessCode,
                     nickname=printer.get("nickname"),
                     apiKey=self.listenerControlApiKey or None,
-                    recipientId=self.listenerRecipientId,
+                    recipientId=recipient_id,
                     baseUrl=controlBaseUrl,
                     pollInterval=pollIntervalSeconds,
                 )
@@ -2562,7 +2504,11 @@ class ListenerGuiApp:
             return
 
         baseUrl = self.baseUrlVar.get().strip()
-        recipientId = self.recipientVar.get().strip()
+        # Get recipient ID from config_manager or environment variable
+        recipientId = (
+            self.config_manager.get_recipient_id()
+            or os.getenv("BASE44_RECIPIENT_ID", "").strip()
+        )
         outputDir = self.outputDirVar.get().strip()
         logFile = self.logFileVar.get().strip()
         pollInterval = max(5, int(self.pollIntervalVar.get()))
@@ -2571,12 +2517,11 @@ class ListenerGuiApp:
             messagebox.showerror("Missing Information", "Base URL and recipient ID are required.")
             return
 
-        # Bruk samme Recipient ID og API-key for status- og command-arbeidere.
-        self.listenerRecipientId = recipientId
+        # Update API key for status and command workers
         self.listenerStatusApiKey = (
             self.statusApiKeyVar.get().strip() if hasattr(self, "statusApiKeyVar") else ""
         )
-        # Gjør API- og mottakerverdier tilgjengelig for alle bakgrunnstråder.
+        # Make API key values available for all background threads
         self._applyBase44Environment()
 
         try:
