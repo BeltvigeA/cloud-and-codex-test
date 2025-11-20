@@ -104,21 +104,31 @@ class SettingsWindow:
             recipient_input_frame,
             textvariable=self.recipient_id_var,
             width=30,
-            state='readonly'
+            state='readonly',
+            show="*"
         )
         self.recipient_id_entry.pack(side=tk.LEFT, padx=(0, 5), fill=tk.X, expand=True)
 
-        # Recipient ID visibility state
-        self.recipient_id_visible = True
+        # Recipient ID visibility state (hidden by default)
+        self.recipient_id_visible = False
 
         # Show/Hide button for Recipient ID
         self.recipient_show_hide_btn = ttk.Button(
             recipient_input_frame,
-            text="🙈",
+            text="👁",
             width=3,
             command=self._toggle_recipient_id_visibility
         )
         self.recipient_show_hide_btn.pack(side=tk.LEFT, padx=(0, 5))
+
+        # Copy to clipboard button for Recipient ID
+        self.recipient_copy_btn = ttk.Button(
+            recipient_input_frame,
+            text="📋",
+            width=3,
+            command=self._copy_recipient_id_to_clipboard
+        )
+        self.recipient_copy_btn.pack(side=tk.LEFT, padx=(0, 5))
 
         # Rotate button for Recipient ID
         self.recipient_rotate_btn = ttk.Button(
@@ -132,7 +142,7 @@ class SettingsWindow:
         # Help text for Recipient ID
         help_text = ttk.Label(
             recipient_frame,
-            text="Auto-generated unique ID. Use 🔄 to generate a new one.",
+            text="Auto-generated unique ID. Use 📋 to copy, 🔄 to generate new.",
             font=("", 8),
             foreground="gray"
         )
@@ -211,6 +221,37 @@ class SettingsWindow:
         alphabet = string.ascii_letters + string.digits
         new_id = "".join(secrets.choice(alphabet) for _ in range(32))
         self.recipient_id_var.set(new_id)
+
+    def _copy_recipient_id_to_clipboard(self) -> None:
+        """Copy Recipient ID to clipboard."""
+        recipient_id = self.recipient_id_var.get()
+        if recipient_id:
+            try:
+                self.dialog.clipboard_clear()
+                self.dialog.clipboard_append(recipient_id)
+                self.dialog.update()  # Required for clipboard to work
+                self.status_label.config(text="✓ Recipient ID copied to clipboard", foreground="green")
+                messagebox.showinfo(
+                    "Copied",
+                    "Recipient ID copied to clipboard!\n\n"
+                    "You can now paste it in your web dashboard.",
+                    parent=self.dialog
+                )
+            except Exception as error:
+                log.error(f"Failed to copy to clipboard: {error}")
+                messagebox.showerror(
+                    "Copy Failed",
+                    f"Failed to copy to clipboard.\n\n"
+                    f"Recipient ID: {recipient_id}\n\n"
+                    "Please copy it manually.",
+                    parent=self.dialog
+                )
+        else:
+            messagebox.showwarning(
+                "No Recipient ID",
+                "No Recipient ID to copy",
+                parent=self.dialog
+            )
 
     def _rotate_recipient_id(self) -> None:
         """Generate a new recipient ID (rotate)."""
@@ -308,6 +349,19 @@ class SettingsWindow:
             elif response.status_code == 401 or response.status_code == 403:
                 self.status_label.config(text="✗ Authentication failed", foreground="red")
                 messagebox.showerror("Authentication Failed", "Invalid API key or insufficient permissions")
+            elif response.status_code == 400:
+                self.status_label.config(text="✗ Recipient ID not registered", foreground="orange")
+                messagebox.showwarning(
+                    "Recipient ID Not Registered",
+                    "The Recipient ID is not yet registered in the system.\n\n"
+                    "To register your Recipient ID:\n"
+                    "1. Copy your Recipient ID (click 👁 to show it)\n"
+                    "2. Go to your web dashboard\n"
+                    "3. Add/register this Recipient ID in your organization settings\n"
+                    "4. Then try testing the connection again\n\n"
+                    "Note: You can still save these settings and they will work once "
+                    "the Recipient ID is registered in the dashboard."
+                )
             else:
                 self.status_label.config(
                     text=f"✗ Connection failed (HTTP {response.status_code})",
