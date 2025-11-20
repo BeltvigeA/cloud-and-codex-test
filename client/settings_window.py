@@ -90,8 +90,8 @@ class SettingsWindow:
         # Bind validation to key release
         self.api_key_var.trace_add("write", self._validate_api_key)
 
-        # Recipient ID section
-        recipient_frame = ttk.LabelFrame(main_frame, text="Recipient ID", padding="10")
+        # Recipient ID section (auto-generated, read-only with show/hide/rotate)
+        recipient_frame = ttk.LabelFrame(main_frame, text="Recipient ID (Auto-generated)", padding="10")
         recipient_frame.pack(fill=tk.X, pady=(0, 10))
 
         recipient_input_frame = ttk.Frame(recipient_frame)
@@ -100,26 +100,39 @@ class SettingsWindow:
         ttk.Label(recipient_input_frame, text="Recipient ID:").pack(side=tk.LEFT, padx=(0, 5))
 
         self.recipient_id_var = tk.StringVar()
-        self.recipient_id_entry = ttk.Entry(recipient_input_frame, textvariable=self.recipient_id_var, width=35)
-        self.recipient_id_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.recipient_id_entry = ttk.Entry(
+            recipient_input_frame,
+            textvariable=self.recipient_id_var,
+            width=30,
+            state='readonly'
+        )
+        self.recipient_id_entry.pack(side=tk.LEFT, padx=(0, 5), fill=tk.X, expand=True)
 
-        # Backend URL section (optional)
-        backend_frame = ttk.LabelFrame(main_frame, text="Backend URL (Optional)", padding="10")
-        backend_frame.pack(fill=tk.X, pady=(0, 10))
+        # Recipient ID visibility state
+        self.recipient_id_visible = True
 
-        backend_input_frame = ttk.Frame(backend_frame)
-        backend_input_frame.pack(fill=tk.X)
+        # Show/Hide button for Recipient ID
+        self.recipient_show_hide_btn = ttk.Button(
+            recipient_input_frame,
+            text="🙈",
+            width=3,
+            command=self._toggle_recipient_id_visibility
+        )
+        self.recipient_show_hide_btn.pack(side=tk.LEFT, padx=(0, 5))
 
-        ttk.Label(backend_input_frame, text="Backend URL:").pack(side=tk.LEFT, padx=(0, 5))
+        # Rotate button for Recipient ID
+        self.recipient_rotate_btn = ttk.Button(
+            recipient_input_frame,
+            text="🔄",
+            width=3,
+            command=self._rotate_recipient_id
+        )
+        self.recipient_rotate_btn.pack(side=tk.LEFT)
 
-        self.backend_url_var = tk.StringVar()
-        self.backend_url_entry = ttk.Entry(backend_input_frame, textvariable=self.backend_url_var, width=35)
-        self.backend_url_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
-
-        # Help text
+        # Help text for Recipient ID
         help_text = ttk.Label(
-            backend_frame,
-            text="Leave empty to use default backend",
+            recipient_frame,
+            text="Auto-generated unique ID. Use 🔄 to generate a new one.",
             font=("", 8),
             foreground="gray"
         )
@@ -157,10 +170,9 @@ class SettingsWindow:
         recipient_id = self.config_manager.get_recipient_id()
         if recipient_id:
             self.recipient_id_var.set(recipient_id)
-
-        backend_url = self.config_manager.get_backend_url()
-        if backend_url:
-            self.backend_url_var.set(backend_url)
+        else:
+            # Generate a new recipient ID if none exists
+            self._generate_new_recipient_id()
 
     def _toggle_api_key_visibility(self) -> None:
         """Toggle API key visibility."""
@@ -171,6 +183,54 @@ class SettingsWindow:
         else:
             self.api_key_entry.config(show="*")
             self.show_hide_btn.config(text="👁")
+
+    def _toggle_recipient_id_visibility(self) -> None:
+        """Toggle Recipient ID visibility."""
+        self.recipient_id_visible = not self.recipient_id_visible
+        current_value = self.recipient_id_var.get()
+
+        # Temporarily change state to normal to modify the entry
+        self.recipient_id_entry.config(state='normal')
+
+        if self.recipient_id_visible:
+            # Show the full recipient ID
+            self.recipient_id_entry.config(show="")
+            self.recipient_show_hide_btn.config(text="🙈")
+        else:
+            # Mask the recipient ID
+            self.recipient_id_entry.config(show="*")
+            self.recipient_show_hide_btn.config(text="👁")
+
+        # Set it back to readonly
+        self.recipient_id_entry.config(state='readonly')
+
+    def _generate_new_recipient_id(self) -> None:
+        """Generate a new recipient ID."""
+        import secrets
+        import string
+        alphabet = string.ascii_letters + string.digits
+        new_id = "".join(secrets.choice(alphabet) for _ in range(32))
+        self.recipient_id_var.set(new_id)
+
+    def _rotate_recipient_id(self) -> None:
+        """Generate a new recipient ID (rotate)."""
+        result = messagebox.askyesno(
+            "Rotate Recipient ID",
+            "Are you sure you want to generate a new Recipient ID?\n\n"
+            "This will change your printer's identity and may require "
+            "updating the ID in your web dashboard.\n\n"
+            "Continue?",
+            parent=self.dialog
+        )
+
+        if result:
+            self._generate_new_recipient_id()
+            messagebox.showinfo(
+                "New ID Generated",
+                "A new Recipient ID has been generated.\n\n"
+                "Remember to save and update your web dashboard with the new ID!",
+                parent=self.dialog
+            )
 
     def _validate_api_key(self, *args) -> None:
         """Validate API key format as user types."""
@@ -191,14 +251,13 @@ class SettingsWindow:
         """Test connection to the backend with current settings."""
         api_key = self.api_key_var.get().strip()
         recipient_id = self.recipient_id_var.get().strip()
-        backend_url = self.backend_url_var.get().strip()
 
         if not api_key:
             messagebox.showerror("Error", "Please enter an API key")
             return
 
         if not recipient_id:
-            messagebox.showerror("Error", "Please enter a Recipient ID")
+            messagebox.showerror("Error", "Recipient ID is missing")
             return
 
         # Validate API key format
@@ -207,12 +266,8 @@ class SettingsWindow:
             messagebox.showerror("Invalid API Key", error_message)
             return
 
-        # Determine backend URL
-        if backend_url:
-            test_url = backend_url.rstrip("/")
-        else:
-            # Use default backend
-            test_url = "https://printpro3d-api-931368217793.europe-west1.run.app"
+        # Use hardcoded backend URL
+        test_url = "https://printpro3d-api-931368217793.europe-west1.run.app"
 
         # Build status endpoint
         status_endpoint = f"{test_url}/api/recipients/{recipient_id}/status/update"
@@ -276,7 +331,6 @@ class SettingsWindow:
         """Save settings to config."""
         api_key = self.api_key_var.get().strip()
         recipient_id = self.recipient_id_var.get().strip()
-        backend_url = self.backend_url_var.get().strip()
 
         # Validate required fields
         if not api_key:
@@ -296,9 +350,6 @@ class SettingsWindow:
         # Save to config
         self.config_manager.set_api_key(api_key)
         self.config_manager.set_recipient_id(recipient_id)
-
-        if backend_url:
-            self.config_manager.set_backend_url(backend_url)
 
         # Save to disk
         if self.config_manager.save():
