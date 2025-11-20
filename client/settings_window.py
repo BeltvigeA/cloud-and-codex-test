@@ -339,7 +339,7 @@ class SettingsWindow:
                 "printerSerial": "TEST_PRINTER",
                 "printerIpAddress": "0.0.0.0",
                 "status": {
-                    "status": "Testing",
+                    "status": "idle",
                     "online": False,
                     "mqttReady": False
                 }
