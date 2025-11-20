@@ -320,7 +320,7 @@ class SettingsWindow:
         test_url = "https://printpro3d-api-931368217793.europe-west1.run.app"
 
         # Build status endpoint
-        status_endpoint = f"{test_url}/api/recipients/{recipient_id}/status/update"
+        status_endpoint = f"{test_url}/printer-status"
 
         self.status_label.config(text="Testing connection...", foreground="blue")
         self.test_btn.config(state=tk.DISABLED)
@@ -336,13 +336,9 @@ class SettingsWindow:
             # Send a minimal test payload
             test_payload = {
                 "recipientId": recipient_id,
-                "printerSerial": "TEST_PRINTER",
+                "printerSerial": "TEST_CONNECTION",
                 "printerIpAddress": "0.0.0.0",
-                "status": {
-                    "status": "idle",
-                    "online": False,
-                    "mqttReady": False
-                }
+                "status": "idle"
             }
 
             log.info(f"Testing connection to {status_endpoint}")

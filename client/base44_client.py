@@ -101,9 +101,9 @@ def _resolveControlBaseUrl() -> str:
 
 def postUpdateStatus(payload: Dict[str, object]) -> Dict[str, object]:
     """
-    POST to recipient-based status update endpoint.
+    POST to printer status update endpoint.
 
-    Nytt endpoint: POST /api/recipients/{recipientId}/status/update
+    Endpoint: POST /printer-status
 
     Payload format:
     {
@@ -150,8 +150,8 @@ def postUpdateStatus(payload: Dict[str, object]) -> Dict[str, object]:
     preparedPayload["recipientId"] = recipientId
     preparedPayload.setdefault("lastUpdateTimestamp", _isoNow())
 
-    # Bygg dynamisk URL med recipientId (bruker hardkodet backend URL)
-    statusUrl = f"{PRINTPRO3D_BASE}/api/recipients/{recipientId}/status/update"
+    # Bygg dynamisk URL (bruker hardkodet backend URL)
+    statusUrl = f"{PRINTPRO3D_BASE}/printer-status"
 
     # Bruk control headers (ikke functions headers)
     headers = _buildControlHeaders()
