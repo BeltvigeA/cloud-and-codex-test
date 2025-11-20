@@ -221,7 +221,6 @@ class ListenerGuiApp:
         """Load settings from config manager and set environment variables."""
         api_key = self.config_manager.get_api_key()
         recipient_id = self.config_manager.get_recipient_id()
-        backend_url = self.config_manager.get_backend_url()
 
         if api_key:
             os.environ["PRINTER_BACKEND_API_KEY"] = api_key
@@ -231,10 +230,6 @@ class ListenerGuiApp:
         if recipient_id:
             os.environ["BASE44_RECIPIENT_ID"] = recipient_id
             logging.info(f"Loaded recipient ID from config: {recipient_id}")
-
-        if backend_url:
-            os.environ["BASE44_API_BASE"] = backend_url
-            logging.info(f"Loaded backend URL from config: {backend_url}")
 
     def _buildMenuBar(self) -> None:
         """Build the menu bar with File menu."""
@@ -258,7 +253,6 @@ class ListenerGuiApp:
         # Update environment variables from config if needed
         api_key = self.config_manager.get_api_key()
         recipient_id = self.config_manager.get_recipient_id()
-        backend_url = self.config_manager.get_backend_url()
 
         if api_key:
             os.environ["PRINTER_BACKEND_API_KEY"] = api_key
@@ -266,9 +260,6 @@ class ListenerGuiApp:
 
         if recipient_id:
             os.environ["BASE44_RECIPIENT_ID"] = recipient_id
-
-        if backend_url:
-            os.environ["BASE44_API_BASE"] = backend_url
 
         self.log("Settings updated successfully")
 
