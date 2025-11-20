@@ -793,7 +793,7 @@ def postStatus(status: Dict[str, Any], printerConfig: Dict[str, Any]) -> None:
     payload = {
         "recipientId": recipientId,
         "printerIpAddress": printerConfig.get("ipAddress"),  # CRITICAL: Required for matching
-        "serialNumber": printerConfig.get("serialNumber"),
+        "printerSerial": printerConfig.get("serialNumber"),
         "status": status.get("status") or status.get("state"),
         "nozzleTemp": status.get("nozzle_temper") or status.get("nozzleTemp"),
         "bedTemp": status.get("bed_temper") or status.get("bedTemp"),
