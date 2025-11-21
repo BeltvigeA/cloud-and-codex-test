@@ -369,13 +369,6 @@ class ListenerGuiApp:
             state=tk.DISABLED,
         )
         self.editPrinterButton.pack(side=tk.LEFT, padx=(8, 0))
-        self.deletePrinterButton = ttk.Button(
-            actionFrame,
-            text="Delete Selected",
-            command=self._openDeletePrinterDialog,
-            state=tk.DISABLED,
-        )
-        self.deletePrinterButton.pack(side=tk.LEFT, padx=(8, 0))
         self.captureReferenceButton = ttk.Button(
             actionFrame,
             text="Capture Bed Reference",
@@ -1014,44 +1007,6 @@ class ListenerGuiApp:
             initialValues=self.printers[selectedIndex],
             onSave=lambda updated: self._handleUpdatePrinter(selectedIndex, updated),
         )
-
-    def _openDeletePrinterDialog(self) -> None:
-        selectedIndex = self._getSelectedPrinterIndex()
-        if selectedIndex is None:
-            return
-
-        printer = self.printers[selectedIndex]
-        printerName = printer.get("nickname", "Unknown Printer")
-
-        result = messagebox.askyesno(
-            "Delete Printer",
-            f"Are you sure you want to delete '{printerName}'?\n\nThis action cannot be undone.",
-            icon="warning"
-        )
-
-        if result:
-            self._handleDeletePrinter(selectedIndex)
-
-    def _handleDeletePrinter(self, index: int) -> None:
-        printer = self.printers[index]
-        serialNumber = printer.get("serialNumber")
-
-        # Remove from the list
-        del self.printers[index]
-
-        # Save updated list to JSON
-        self._savePrinters()
-
-        # Delete from database if serial number exists
-        if serialNumber and hasattr(self, "db"):
-            try:
-                self.db.deletePrinter(serialNumber)
-            except Exception as error:
-                logging.exception("Failed to delete printer from database: %s", error)
-
-        # Refresh UI
-        self._refreshPrinterList()
-        self._scheduleStatusRefresh(0)
 
     def openManualStatusDialog(self) -> None:
         selectedIndex = self._getSelectedPrinterIndex()
@@ -1742,8 +1697,6 @@ class ListenerGuiApp:
     def _onPrinterSelection(self, event: object) -> None:  # noqa: ARG002 - required by Tk callback
         state = tk.NORMAL if self._getSelectedPrinterIndex() is not None else tk.DISABLED
         self.editPrinterButton.config(state=state)
-        if hasattr(self, "deletePrinterButton"):
-            self.deletePrinterButton.config(state=state)
         if hasattr(self, "captureReferenceButton"):
             self.captureReferenceButton.config(state=state)
         if hasattr(self, "runBrakeDemoButton"):
