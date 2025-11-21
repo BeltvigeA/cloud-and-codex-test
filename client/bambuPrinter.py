@@ -790,13 +790,6 @@ def postStatus(status: Dict[str, Any], printerConfig: Dict[str, Any]) -> None:
     organizationId = printerConfig.get("organizationId") or os.getenv("BASE44_ORGANIZATION_ID", "").strip()
 
     # Build payload with all required fields for PostgreSQL backend
-    # Get progress value (will be sent as both progressPercent and jobProgress)
-    progressValue = (
-        status.get("mc_percent")
-        or status.get("progress")
-        or status.get("progressPercent")
-    )
-
     payload = {
         "recipientId": recipientId,
         "printerIpAddress": printerConfig.get("ipAddress"),  # CRITICAL: Required for matching
@@ -804,8 +797,9 @@ def postStatus(status: Dict[str, Any], printerConfig: Dict[str, Any]) -> None:
         "status": status.get("status") or status.get("state"),
         "nozzleTemp": status.get("nozzle_temper") or status.get("nozzleTemp"),
         "bedTemp": status.get("bed_temper") or status.get("bedTemp"),
-        "progressPercent": progressValue,  # For backwards compatibility
-        "jobProgress": progressValue,  # For frontend display (maps to job_progress DB column)
+        "progressPercent": status.get("mc_percent")
+        or status.get("progress")
+        or status.get("progressPercent"),
         "remainingTimeSeconds": status.get("mc_remaining_time")
         or status.get("remainingTimeSeconds"),
         "gcodeState": status.get("gcode_state") or status.get("gcodeState"),
