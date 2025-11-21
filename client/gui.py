@@ -311,8 +311,6 @@ class ListenerGuiApp:
         self.startButton.pack(side=tk.LEFT, padx=6)
         self.stopButton = ttk.Button(buttonFrame, text="Stop", command=self.stopListening, state=tk.DISABLED)
         self.stopButton.pack(side=tk.LEFT, padx=6)
-        self.closeButton = ttk.Button(buttonFrame, text="Lukk", command=self.closeApplication)
-        self.closeButton.pack(side=tk.LEFT, padx=6)
 
         currentRow += 1
         ttk.Label(parent, text="Event Log:").grid(row=currentRow, column=0, sticky=tk.W, **paddingOptions)
@@ -573,8 +571,8 @@ class ListenerGuiApp:
         connectionCandidate = self._parseOptionalString(printerDetails.get("connectionMethod")) or ""
         normalizedConnection = connectionCandidate.lower()
         wasLanConnection = normalizedConnection == "lan"
-        if normalizedConnection == "legacy":
-            normalizedConnection = bambuConnect
+        if normalizedConnection == "legacy" or normalizedConnection == bambuConnect.lower():
+            normalizedConnection = mqttTransport
         if wasLanConnection:
             normalizedConnection = mqttTransport
 
@@ -595,15 +593,11 @@ class ListenerGuiApp:
 
             if not isSupportedModel:
                 normalizedConnection = mqttTransport
-            elif normalizedConnection not in {mqttTransport, bambuConnect}:
-                normalizedConnection = bambuConnect
+            elif normalizedConnection not in {mqttTransport, defaultTransport}:
+                normalizedConnection = mqttTransport
 
             printerDetails["bambuModel"] = canonicalModel if isSupportedModel else ""
-            resolvedConnectionMethod = (
-                bambuConnect
-                if normalizedConnection == bambuConnect and isSupportedModel
-                else mqttTransport
-            )
+            resolvedConnectionMethod = mqttTransport
             if wasLanConnection:
                 resolvedConnectionMethod = "lan"
             printerDetails["connectionMethod"] = resolvedConnectionMethod
@@ -623,10 +617,7 @@ class ListenerGuiApp:
             printerDetails.get("manualStatusDefaults")
         )
 
-        if printerDetails.get("connectionMethod") == bambuConnect:
-            printerDetails.setdefault("transport", "bambu_connect")
-            printerDetails.setdefault("useCloud", True)
-        elif printerDetails.get("connectionMethod") == "lan":
+        if printerDetails.get("connectionMethod") == "lan":
             printerDetails.setdefault("transport", "lan")
             printerDetails.setdefault("useCloud", False)
 
@@ -1500,13 +1491,8 @@ class ListenerGuiApp:
                 bambuOptionsMap = {model.lower(): model for model in bambuOptions}
 
             def updateAccessCodeState() -> None:
-                resolvedConnection = connectionMethodVar.get().strip().lower()
-                if resolvedConnection == str(bambuConnect).lower():
-                    if accessCodeVar.get():
-                        accessCodeVar.set("")
-                    accessCodeEntry.configure(state=tk.DISABLED)
-                else:
-                    accessCodeEntry.configure(state=tk.NORMAL)
+                # Access code field is always enabled now
+                accessCodeEntry.configure(state=tk.NORMAL)
 
             currentModel = bambuModelVar.get().strip()
             canonicalModel = bambuOptionsMap.get(currentModel.lower(), currentModel)
@@ -1537,10 +1523,7 @@ class ListenerGuiApp:
             isSupportedModel = bool(currentModel and currentModel.lower() in supportedModels)
 
             normalizedConnection = connectionMethodVar.get().strip().lower()
-            if normalizedConnection == "legacy":
-                connectionMethodVar.set(bambuConnect)
-                normalizedConnection = bambuConnect
-            if normalizedConnection == "lan":
+            if normalizedConnection == "legacy" or normalizedConnection == "lan":
                 connectionMethodVar.set(mqttTransport)
                 normalizedConnection = mqttTransport
 
@@ -1553,17 +1536,17 @@ class ListenerGuiApp:
                 return
 
             connectionMethodCombo.configure(state="readonly")
-            availableTransports = (bambuConnect, mqttTransport)
+            availableTransports = (mqttTransport,)
             connectionMethodCombo.config(values=availableTransports)
             if normalizedConnection not in {transport.lower() for transport in availableTransports}:
-                connectionMethodVar.set(bambuConnect)
+                connectionMethodVar.set(mqttTransport)
             updateAccessCodeState()
 
         brandVar.trace_add("write", updateConnectionControls)
         bambuModelVar.trace_add("write", updateConnectionControls)
         connectionMethodVar.trace_add("write", lambda *_: updateConnectionControls())
         initialTransports = tuple(
-            getattr(self, "connectionMethodOptions", [defaultTransport, mqttTransport, bambuConnect])
+            getattr(self, "connectionMethodOptions", [defaultTransport, mqttTransport])
         )
         connectionMethodCombo.config(values=initialTransports)
         updateConnectionControls()
@@ -1666,11 +1649,7 @@ class ListenerGuiApp:
         brand = brandVar.get().strip()
         bambuModel = bambuModelVar.get().strip()
         connectionMethod = connectionMethodVar.get().strip().lower()
-        accessCode = (
-            ""
-            if connectionMethod == getattr(self, "bambuConnectMethod", "bambu_connect")
-            else accessCodeVar.get().strip()
-        )
+        accessCode = accessCodeVar.get().strip()
 
         if not nickname or not ipAddress:
             messagebox.showerror(
@@ -1691,14 +1670,9 @@ class ListenerGuiApp:
             "connectionMethod": connectionMethod,
         }
 
-        bambuConnect = getattr(self, "bambuConnectMethod", "bambu_connect")
         mqttTransport = getattr(self, "mqttConnectionMethod", "mqtt")
 
-        if connectionMethod == bambuConnect:
-            printerDetails["connectionMethod"] = "bambu_connect"
-            printerDetails["transport"] = "bambu_connect"
-            printerDetails["useCloud"] = True
-        elif connectionMethod in {mqttTransport, "lan"}:
+        if connectionMethod in {mqttTransport, "lan"}:
             printerDetails["connectionMethod"] = "lan"
             printerDetails["transport"] = "lan"
             printerDetails["useCloud"] = False
