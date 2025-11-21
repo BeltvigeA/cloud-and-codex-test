@@ -165,7 +165,6 @@ class ListenerGuiApp:
         self.connectionMethodOptions = [
             self.defaultConnectionMethod,
             self.mqttConnectionMethod,
-            self.bambuConnectMethod,
         ]
 
         self.logQueue: "Queue[str]" = Queue()
@@ -372,20 +371,6 @@ class ListenerGuiApp:
             state=tk.DISABLED,
         )
         self.editPrinterButton.pack(side=tk.LEFT, padx=(8, 0))
-        self.sendTestStatusButton = ttk.Button(
-            actionFrame,
-            text="Send Test Status",
-            command=self.openManualStatusDialog,
-            state=tk.DISABLED,
-        )
-        self.sendTestStatusButton.pack(side=tk.LEFT, padx=8)
-        self.connectPrintersButton = ttk.Button(
-            actionFrame,
-            text="Connect Printers",
-            command=self.refreshPrintersNow,
-            state=tk.NORMAL,
-        )
-        self.connectPrintersButton.pack(side=tk.LEFT, padx=8)
         self.captureReferenceButton = ttk.Button(
             actionFrame,
             text="Capture Bed Reference",
@@ -1738,8 +1723,6 @@ class ListenerGuiApp:
     def _onPrinterSelection(self, event: object) -> None:  # noqa: ARG002 - required by Tk callback
         state = tk.NORMAL if self._getSelectedPrinterIndex() is not None else tk.DISABLED
         self.editPrinterButton.config(state=state)
-        if hasattr(self, "sendTestStatusButton"):
-            self.sendTestStatusButton.config(state=state)
         if hasattr(self, "captureReferenceButton"):
             self.captureReferenceButton.config(state=state)
         if hasattr(self, "runBrakeDemoButton"):
@@ -1837,8 +1820,6 @@ class ListenerGuiApp:
         if self.statusRefreshThread and self.statusRefreshThread.is_alive():
             self.pendingImmediateStatusRefresh = True
             return
-        if hasattr(self, "connectPrintersButton"):
-            self.connectPrintersButton.config(state=tk.DISABLED)
         self._scheduleStatusRefresh(0)
 
     def _getSelectedPrinterIndex(self) -> Optional[int]:
@@ -2259,8 +2240,6 @@ class ListenerGuiApp:
                         self._refreshPrinterList()
                 elif messageType == "complete":
                     self.statusRefreshThread = None
-                    if hasattr(self, "connectPrintersButton"):
-                        self.connectPrintersButton.config(state=tk.NORMAL)
                     delay = 0 if self.pendingImmediateStatusRefresh else self.statusRefreshIntervalMs
                     self._scheduleStatusRefresh(delay)
         except Empty:
