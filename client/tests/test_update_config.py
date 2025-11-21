@@ -1,13 +1,8 @@
-import sys
 import unittest
 import json
 import tempfile
 from pathlib import Path
-
-# Add parent directory to path to allow imports
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
-from commands.update_config import PrinterConfigUpdater, handle_update_printer_config
+from client.commands.update_config import PrinterConfigUpdater, handle_update_printer_config
 
 class TestPrinterConfigUpdater(unittest.TestCase):
 
@@ -52,18 +47,9 @@ class TestPrinterConfigUpdater(unittest.TestCase):
         success, changes, error = updater.apply_changes(
             '01P00A381200999',  # New serial
             {
-                'fullConfig': {
-                    'serialNumber': '01P00A381200999',
-                    'nickname': 'New Printer',
-                    'brand': 'Bambu Lab',
-                    'ipAddress': '192.168.1.200',
-                    'accessCode': 'NEW_CODE',
-                    'transport': 'lan',
-                    'useCloud': False,
-                    'useAms': True,
-                    'bedLeveling': True,
-                    'layerInspect': False
-                }
+                'ip_address': '192.168.1.200',
+                'name': 'New Printer',
+                'access_code': 'NEW_CODE'
             }
         )
 
