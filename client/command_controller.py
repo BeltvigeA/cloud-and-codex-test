@@ -33,7 +33,6 @@ from .base44_client import (
     postReportPrinterImage,
 )
 from .client import buildBaseUrl, defaultBaseUrl, getPrinterControlEndpointUrl
-from .commands.update_config import handle_update_printer_config
 
 log = logging.getLogger(__name__)
 
@@ -2489,22 +2488,6 @@ class CommandWorker:
                 commandName = "load_filament" if normalizedType == "load_filament" else "unload_filament"
                 sendControlPayload({"command": commandName, "param": {"slot": slotValue}})
                 message = ("Load" if commandName == "load_filament" else "Unload") + f" filament slot {slotValue}"
-        elif normalizedType == "update_printer_config":
-            # Handle printer configuration updates
-            config_path = Path.home() / '.printmaster' / 'printers.json'
-            response = handle_update_printer_config(command, config_path)
-
-            if response['status'] == 'completed':
-                message = response.get('message', 'Configuration updated')
-                log.info(f"Updated printer config for {self.serial}: {message}")
-            elif response['status'] == 'failed':
-                error_msg = response.get('error', 'Unknown error')
-                log.error(f"Failed to update printer config for {self.serial}: {error_msg}")
-                raise RuntimeError(f"Config update failed: {error_msg}")
-            else:
-                error_msg = response.get('error', 'Unknown error')
-                log.error(f"Error updating printer config for {self.serial}: {error_msg}")
-                raise ValueError(f"Config update error: {error_msg}")
         else:
             raise ValueError(f"Unsupported commandType: {rawCommandType}")
 
