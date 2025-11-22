@@ -1935,6 +1935,12 @@ class ListenerGuiApp:
         jobProgressValue = self._parseOptionalFloat(jobProgressCandidate)
         if jobProgressValue is not None and jobProgressValue >= 0:
             payload["jobProgress"] = float(jobProgressValue)
+            # Also include progress/progressPercent for compatibility
+            payload["progress"] = float(jobProgressValue)
+            payload["progressPercent"] = float(jobProgressValue)
+        
+        # Log for debugging
+        logging.debug(f"Sending status with jobProgress={jobProgressValue} for {printerIpAddress}")
 
         nozzleTempValue = self._parseOptionalFloat(telemetry.get("nozzleTemp"))
         if nozzleTempValue is not None:
