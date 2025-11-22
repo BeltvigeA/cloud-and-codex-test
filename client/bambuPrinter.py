@@ -999,6 +999,7 @@ class BambuPrintOptions:
     accessCode: str
     brand: str = "Bambu Lab"
     nickname: Optional[str] = None
+    printerModel: Optional[str] = None
     useCloud: bool = False
     cloudUrl: Optional[str] = None
     cloudTimeout: int = 180
@@ -1135,6 +1136,19 @@ def resolveUseAmsAuto(
 
     if localPath and localPath.suffix.lower() == ".gcode":
         return False
+
+    # Check printer model - P1P, A1, and A1 Mini don't have AMS
+    # First check options.printerModel, then fall back to jobMetadata
+    printerModel = options.printerModel
+    if not printerModel and jobMetadata:
+        printerModel = _findMetadataValue(jobMetadata, {"printermodel", "printer_model", "bambumodel", "bambu_model"})
+
+    if printerModel:
+        normalizedModel = str(printerModel).strip().upper().replace(" ", "")
+        modelsWithoutAms = {"P1P", "A1", "A1MINI"}
+        if normalizedModel in modelsWithoutAms:
+            logger.info("[AMS] Printer model %s does not support AMS - disabling AMS", printerModel)
+            return False
 
     if jobMetadata:
         quickPrint = _findMetadataValue(jobMetadata, {"isquickprint"})

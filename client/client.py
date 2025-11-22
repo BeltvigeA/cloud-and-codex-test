@@ -561,6 +561,10 @@ def normalizePrinterDetails(details: Dict[str, Any]) -> Dict[str, Any]:
             directoryValue = normalizeTextValue(rawValue)
             if directoryValue is not None:
                 normalized["timeLapseDirectory"] = directoryValue
+        elif key in {"printermodel", "bambumodel", "model"}:
+            modelValue = normalizeTextValue(rawValue)
+            if modelValue is not None:
+                normalized["printerModel"] = modelValue
     return normalized
 
 
@@ -1417,6 +1421,7 @@ def dispatchBambuPrintIfPossible(
         accessCode=resolvedAccessCode,
         brand=brand or "Bambu Lab",
         nickname=resolvedDetails.get("nickname") or resolvedDetails.get("printerName"),
+        printerModel=resolvedDetails.get("printerModel"),
         useCloud=resolveBool("useCloud", False),
         cloudUrl=resolvedDetails.get("cloudUrl"),
         cloudTimeout=resolveInt("cloudTimeout", 180) or 180,
