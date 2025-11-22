@@ -78,6 +78,17 @@ def _is_active_state(stateName: Optional[str]) -> bool:
     )
 
 
+def _is_printing_state(stateName: Optional[str]) -> bool:
+    """Check if printer is actively printing (not just heating/preparing)."""
+    if not stateName:
+        return False
+    normalized = str(stateName).upper()
+    # Check for states that indicate actual printing, not just warmup
+    return any(
+        token in normalized for token in ("PRINT", "RUN", "RUNNING")
+    )
+
+
 def _safe_get_state(printer: Any) -> Optional[Dict[str, Any]]:
     getStateMethod = getattr(printer, "get_state", None)
     if not callable(getStateMethod):
@@ -1707,7 +1718,10 @@ def startPrintViaApi(
             if not completedLike and percentageFloat is not None and percentageFloat >= 100.0:
                 completedLike = True
             pctOk = percentageFloat is not None and 0.0 < percentageFloat < 100.0
-            activeOk = _is_active_state(stateIndicator) and not completedLike
+            # Only consider printer ready when it's actually printing (not just heating)
+            # This prevents premature disconnect during warmup phase
+            printingState = _is_printing_state(stateIndicator)
+            activeOk = printingState and not completedLike
             # Also accept if printer has transitioned from FINISH to IDLE/ready state
             # This handles the case where printer is ready but not yet actively printing
             stateNormalized = _normalizeStateName(stateIndicator)
@@ -1724,10 +1738,13 @@ def startPrintViaApi(
             )
             if START_DEBUG:
                 logger.info(
-                    "[start] poll state=%s percent=%s completedLike=%s idleOrReady=%s exitedFinish=%s finishObserved=%s",
+                    "[start] poll state=%s percent=%s completedLike=%s printingState=%s activeOk=%s pctOk=%s idleOrReady=%s exitedFinish=%s finishObserved=%s",
                     stateIndicator,
                     lastPercentage,
                     completedLike,
+                    printingState,
+                    activeOk,
+                    pctOk,
                     idleOrReady,
                     exitedFinish,
                     observedFinishState,
