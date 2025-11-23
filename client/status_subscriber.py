@@ -965,7 +965,9 @@ class BambuStatusSubscriber:
 
     def _coerceFloat(self, value: Any) -> Optional[float]:
         candidateValue = self._unwrapNumericValue(value)
-        if isinstance(candidateValue, bool):
+        # Check for bool BEFORE checking for int/float since bool is subclass of int
+        # But we need to explicitly check type, not isinstance, to handle 0 correctly
+        if type(candidateValue) is bool:
             return None
         if isinstance(candidateValue, (int, float)):
             return float(candidateValue)
@@ -981,7 +983,8 @@ class BambuStatusSubscriber:
 
     def _coerceInt(self, value: Any) -> Optional[int]:
         candidateValue = self._unwrapNumericValue(value)
-        if isinstance(candidateValue, bool):
+        # Same fix as _coerceFloat - use type() instead of isinstance()
+        if type(candidateValue) is bool:
             return None
         if isinstance(candidateValue, int):
             return candidateValue
