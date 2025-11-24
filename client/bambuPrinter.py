@@ -28,6 +28,13 @@ from urllib.parse import urljoin
 
 from ftplib import FTP_TLS, error_perm
 
+# Import config manager for reading config.json
+try:
+    from .config_manager import get_config_manager
+    _config_manager_available = True
+except ImportError:
+    _config_manager_available = False
+
 import requests
 
 
@@ -780,12 +787,41 @@ def postStatus(status: Dict[str, Any], printerConfig: Dict[str, Any]) -> None:
     the web frontend displays real-time printer status correctly.
     """
 
-    # Get configuration from printer config - but override URL for PostgreSQL backend
-    configuredUrl = printerConfig.get("statusBaseUrl")
-    apiKey = printerConfig.get("statusApiKey")
-    recipientId = printerConfig.get("statusRecipientId")
+    # Get API key - try config manager first, then printer config, then environment
+    apiKey = None
+    if _config_manager_available:
+        try:
+            config = get_config_manager()
+            apiKey = config.get_api_key()
+        except Exception:
+            pass
 
     if not apiKey:
+        apiKey = printerConfig.get("statusApiKey")
+
+    if not apiKey:
+        apiKey = os.getenv("BASE44_API_KEY", "").strip() or None
+
+    if not apiKey:
+        return
+
+    # Get recipient ID - try config manager first, then printer config, then environment
+    recipientId = None
+    if _config_manager_available:
+        try:
+            config = get_config_manager()
+            recipientId = config.get_recipient_id()
+        except Exception:
+            pass
+
+    if not recipientId:
+        recipientId = printerConfig.get("statusRecipientId")
+
+    if not recipientId:
+        recipientId = os.getenv("BASE44_RECIPIENT_ID", "").strip() or None
+
+    if not recipientId:
+        logger.warning("postStatus: missing recipientId; skipping status update")
         return
 
     # CRITICAL: Always use PostgreSQL backend for status updates, not the configured URL
