@@ -33,15 +33,15 @@ class SettingsWindow:
         # Create dialog window
         self.dialog = tk.Toplevel(parent)
         self.dialog.title("Settings")
-        self.dialog.geometry("500x400")
+        self.dialog.geometry("500x480")
         self.dialog.transient(parent)
         self.dialog.grab_set()
 
         # Center the dialog
         self.dialog.update_idletasks()
         x = (self.dialog.winfo_screenwidth() // 2) - (500 // 2)
-        y = (self.dialog.winfo_screenheight() // 2) - (400 // 2)
-        self.dialog.geometry(f"500x400+{x}+{y}")
+        y = (self.dialog.winfo_screenheight() // 2) - (480 // 2)
+        self.dialog.geometry(f"500x480+{x}+{y}")
 
         # API key visibility state
         self.api_key_visible = False
@@ -148,6 +148,32 @@ class SettingsWindow:
         )
         help_text.pack(fill=tk.X, pady=(5, 0))
 
+        # Organization ID section (optional)
+        org_id_frame = ttk.LabelFrame(main_frame, text="Organization ID (Optional)", padding="10")
+        org_id_frame.pack(fill=tk.X, pady=(0, 10))
+
+        org_id_input_frame = ttk.Frame(org_id_frame)
+        org_id_input_frame.pack(fill=tk.X)
+
+        ttk.Label(org_id_input_frame, text="Organization ID:").pack(side=tk.LEFT, padx=(0, 5))
+
+        self.organization_id_var = tk.StringVar()
+        self.organization_id_entry = ttk.Entry(
+            org_id_input_frame,
+            textvariable=self.organization_id_var,
+            width=30
+        )
+        self.organization_id_entry.pack(side=tk.LEFT, padx=(0, 5), fill=tk.X, expand=True)
+
+        # Help text for Organization ID
+        org_help_text = ttk.Label(
+            org_id_frame,
+            text="Optional organization identifier for heartbeat tracking.",
+            font=("", 8),
+            foreground="gray"
+        )
+        org_help_text.pack(fill=tk.X, pady=(5, 0))
+
         # Buttons
         button_frame = ttk.Frame(main_frame)
         button_frame.pack(fill=tk.X, pady=(10, 0))
@@ -192,6 +218,10 @@ class SettingsWindow:
         else:
             # Generate a new recipient ID if none exists
             self._generate_new_recipient_id()
+
+        organization_id = self.config_manager.get_organization_id()
+        if organization_id:
+            self.organization_id_var.set(organization_id)
 
     def _toggle_api_key_visibility(self) -> None:
         """Toggle API key visibility."""
@@ -416,6 +446,7 @@ class SettingsWindow:
         """Save settings to config."""
         api_key = self.api_key_var.get().strip()
         recipient_id = self.recipient_id_var.get().strip()
+        organization_id = self.organization_id_var.get().strip()
 
         # Validate required fields
         if not api_key:
@@ -435,6 +466,7 @@ class SettingsWindow:
         # Save to config
         self.config_manager.set_api_key(api_key)
         self.config_manager.set_recipient_id(recipient_id)
+        self.config_manager.set_organization_id(organization_id)
 
         # Save to disk
         if self.config_manager.save():

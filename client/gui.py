@@ -2798,8 +2798,11 @@ class ListenerGuiApp:
             if not api_key and hasattr(self, "statusApiKeyVar"):
                 api_key = self.statusApiKeyVar.get().strip()
 
-            # Get organization ID from environment (GUI support can be added later)
-            organization_id = os.getenv("BASE44_ORGANIZATION_ID", "").strip()
+            # Get organization ID from config or environment
+            organization_id = (
+                self.config_manager.get_organization_id()
+                or os.getenv("BASE44_ORGANIZATION_ID", "").strip()
+            )
 
             if not api_key:
                 logging.warning("No API key found - heartbeat disabled (set BASE44_API_KEY env var)")
