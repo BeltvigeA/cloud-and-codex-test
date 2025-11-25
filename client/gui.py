@@ -195,7 +195,6 @@ class ListenerGuiApp:
         self.lastLiveStatusAlerts: Dict[str, str] = {}
         self.commandWorkers: Dict[str, CommandWorker] = {}
         self.heartbeatWorker: Optional[HeartbeatWorker] = None
-        self.heartbeatStatusLabel: Optional[tk.Label] = None
 
         # Initialize config manager
         self.config_manager = get_config_manager()
@@ -314,10 +313,6 @@ class ListenerGuiApp:
         self.startButton.pack(side=tk.LEFT, padx=6)
         self.stopButton = ttk.Button(buttonFrame, text="Stop", command=self.stopListening, state=tk.DISABLED)
         self.stopButton.pack(side=tk.LEFT, padx=6)
-
-        currentRow += 1
-        self.heartbeatStatusLabel = ttk.Label(parent, text="Heartbeat: Inactive")
-        self.heartbeatStatusLabel.grid(row=currentRow, column=0, columnspan=2, sticky=tk.W, **paddingOptions)
 
         currentRow += 1
         ttk.Label(parent, text="Event Log:").grid(row=currentRow, column=0, sticky=tk.W, **paddingOptions)
@@ -2382,28 +2377,6 @@ class ListenerGuiApp:
         except Exception:
             logging.exception("Unable to schedule status warning dialog")
 
-    def _onHeartbeatStatusChange(self, is_active: bool, last_timestamp: Optional[str]) -> None:
-        """Callback for heartbeat status changes."""
-        try:
-            self.root.after(0, lambda: self._updateHeartbeatStatus(is_active, last_timestamp))
-        except Exception:
-            logging.exception("Unable to schedule heartbeat status update")
-
-    def _updateHeartbeatStatus(self, is_active: bool, last_timestamp: Optional[str]) -> None:
-        """Update the heartbeat status label in the GUI."""
-        if not self.heartbeatStatusLabel:
-            return
-
-        status_text = "Heartbeat: "
-        if is_active:
-            status_text += "Active"
-            if last_timestamp:
-                status_text += f" (Last: {last_timestamp})"
-        else:
-            status_text += "Inactive"
-
-        self.heartbeatStatusLabel.config(text=status_text)
-
     def _applyLiveStatusUpdate(self, status: Dict[str, Any], printerConfig: Dict[str, Any]) -> None:
         serial = str(printerConfig.get("serialNumber") or status.get("printerSerial") or "").strip()
         if not serial:
@@ -2536,33 +2509,13 @@ class ListenerGuiApp:
                 logging.exception("Failed to start live status subscribers")
 
         # Start heartbeat worker
-        try:
-            jwt_token = os.getenv("PRINTRELAY_JWT_TOKEN", "").strip()
-            self.heartbeatWorker = HeartbeatWorker(
-                base_url=baseUrl,
-                recipient_id=recipientId,
-                jwt_token=jwt_token if jwt_token else None,
-                interval=20,
-                on_status_change=self._onHeartbeatStatusChange,
-            )
-            self.heartbeatWorker.start()
-            self._appendLogLine("Heartbeat worker started.")
-        except Exception as error:
-            logging.exception("Failed to start heartbeat worker: %s", error)
-            self._appendLogLine(f"Warning: Heartbeat worker failed to start: {error}")
+        self._startHeartbeatWorker()
 
     def stopListening(self) -> None:
-        self._stopStatusSubscribers()
-
         # Stop heartbeat worker
-        if self.heartbeatWorker:
-            try:
-                self.heartbeatWorker.stop()
-                self._appendLogLine("Heartbeat worker stopped.")
-            except Exception as error:
-                logging.exception("Failed to stop heartbeat worker: %s", error)
-            finally:
-                self.heartbeatWorker = None
+        self._stopHeartbeatWorker()
+
+        self._stopStatusSubscribers()
 
         if self.stopEvent:
             self.stopEvent.set()
@@ -2829,6 +2782,53 @@ class ListenerGuiApp:
     def closeApplication(self) -> None:
         """Lukk programmet og stopp listening hvis aktiv."""
         self._handleWindowClose()
+
+    def _startHeartbeatWorker(self) -> None:
+        """Start the heartbeat worker to signal client is active."""
+        try:
+            # Get configuration
+            base_url = self.baseUrlVar.get().strip()
+            recipient_id = (
+                self.config_manager.get_recipient_id()
+                or os.getenv("BASE44_RECIPIENT_ID", "").strip()
+            )
+            jwt_token = os.getenv("PRINTRELAY_JWT_TOKEN", "").strip()
+
+            if not jwt_token:
+                log.warning("No JWT token found - heartbeat disabled (set PRINTRELAY_JWT_TOKEN env var)")
+                return
+
+            if not base_url or not recipient_id:
+                log.warning("Missing base URL or recipient ID - heartbeat disabled")
+                return
+
+            # Stop existing worker if any
+            if self.heartbeatWorker and self.heartbeatWorker.is_running():
+                self.heartbeatWorker.stop()
+
+            # Create and start new worker
+            self.heartbeatWorker = HeartbeatWorker(
+                base_url=base_url,
+                recipient_id=recipient_id,
+                jwt_token=jwt_token,
+                interval_seconds=20.0,
+                client_version="1.0.0",
+            )
+            self.heartbeatWorker.start()
+            log.info("Heartbeat worker started")
+
+        except Exception as error:  # pragma: no cover
+            log.error("Failed to start heartbeat worker: %s", error)
+
+    def _stopHeartbeatWorker(self) -> None:
+        """Stop the heartbeat worker."""
+        try:
+            if self.heartbeatWorker:
+                self.heartbeatWorker.stop()
+                self.heartbeatWorker = None
+                log.info("Heartbeat worker stopped")
+        except Exception as error:  # pragma: no cover
+            log.error("Failed to stop heartbeat worker: %s", error)
 
     def _handleWindowClose(self) -> None:
         try:

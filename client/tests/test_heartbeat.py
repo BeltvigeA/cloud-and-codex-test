@@ -18,92 +18,76 @@ class TestHeartbeatWorker(unittest.TestCase):
             base_url="https://example.com",
             recipient_id="test123",
             jwt_token="token123",
-            interval=20,
+            interval_seconds=20.0,
+            client_version="1.0.0",
         )
 
         self.assertEqual(worker.base_url, "https://example.com")
         self.assertEqual(worker.recipient_id, "test123")
         self.assertEqual(worker.jwt_token, "token123")
-        self.assertEqual(worker.interval, 20)
-        self.assertFalse(worker.running)
-        self.assertIsNone(worker.thread)
-        self.assertIsNone(worker.last_success_time)
+        self.assertEqual(worker.interval_seconds, 20.0)
+        self.assertEqual(worker.client_version, "1.0.0")
+        self.assertFalse(worker.is_running())
+        self.assertIsNone(worker._thread)
+        self.assertIsNone(worker._last_success)
 
     def test_init_strips_trailing_slash(self) -> None:
         """Test that base URL trailing slash is removed."""
         worker = HeartbeatWorker(
             base_url="https://example.com/",
             recipient_id="test123",
+            jwt_token="token123",
         )
         self.assertEqual(worker.base_url, "https://example.com")
 
-    def test_init_with_env_jwt_token(self) -> None:
-        """Test JWT token is read from environment if not provided."""
-        with patch.dict("os.environ", {"PRINTRELAY_JWT_TOKEN": "env_token"}):
-            worker = HeartbeatWorker(
-                base_url="https://example.com",
-                recipient_id="test123",
-            )
-            self.assertEqual(worker.jwt_token, "env_token")
+    def test_init_minimum_interval(self) -> None:
+        """Test that interval has a minimum value of 10 seconds."""
+        worker = HeartbeatWorker(
+            base_url="https://example.com",
+            recipient_id="test123",
+            jwt_token="token123",
+            interval_seconds=5.0,  # Below minimum
+        )
+        self.assertEqual(worker.interval_seconds, 10.0)  # Should be clamped to minimum
 
     def test_start_stop(self) -> None:
         """Test starting and stopping the worker."""
         worker = HeartbeatWorker(
             base_url="https://example.com",
             recipient_id="test123",
-            interval=0.1,  # Short interval for testing
+            jwt_token="token123",
+            interval_seconds=10.0,
         )
 
         # Mock the _send_heartbeat method to avoid network calls
-        with patch.object(worker, "_send_heartbeat", return_value=True):
+        with patch.object(worker, "_send_heartbeat"):
             worker.start()
-            self.assertTrue(worker.running)
-            self.assertIsNotNone(worker.thread)
+            self.assertTrue(worker.is_running())
+            self.assertIsNotNone(worker._thread)
 
             # Wait a bit to ensure thread started
-            time.sleep(0.05)
+            time.sleep(0.1)
             self.assertTrue(worker.is_running())
 
             worker.stop()
-            self.assertFalse(worker.running)
-
-    def test_start_without_base_url(self) -> None:
-        """Test that start fails gracefully without base URL."""
-        worker = HeartbeatWorker(
-            base_url="",
-            recipient_id="test123",
-        )
-
-        worker.start()
-        self.assertFalse(worker.running)
-        self.assertIsNone(worker.thread)
-
-    def test_start_without_recipient_id(self) -> None:
-        """Test that start fails gracefully without recipient ID."""
-        worker = HeartbeatWorker(
-            base_url="https://example.com",
-            recipient_id="",
-        )
-
-        worker.start()
-        self.assertFalse(worker.running)
-        self.assertIsNone(worker.thread)
+            self.assertFalse(worker.is_running())
 
     def test_start_already_running(self) -> None:
         """Test that starting an already running worker is safe."""
         worker = HeartbeatWorker(
             base_url="https://example.com",
             recipient_id="test123",
-            interval=0.1,
+            jwt_token="token123",
+            interval_seconds=10.0,
         )
 
-        with patch.object(worker, "_send_heartbeat", return_value=True):
+        with patch.object(worker, "_send_heartbeat"):
             worker.start()
-            first_thread = worker.thread
+            first_thread = worker._thread
 
             # Try to start again
             worker.start()
-            second_thread = worker.thread
+            second_thread = worker._thread
 
             # Thread should be the same
             self.assertIs(first_thread, second_thread)
@@ -115,6 +99,7 @@ class TestHeartbeatWorker(unittest.TestCase):
         """Test successful heartbeat sending."""
         mock_response = Mock()
         mock_response.status_code = 200
+        mock_response.json.return_value = {"lastHeartbeat": "2025-11-25T12:00:00Z"}
         mock_post.return_value = mock_response
 
         worker = HeartbeatWorker(
@@ -123,20 +108,21 @@ class TestHeartbeatWorker(unittest.TestCase):
             jwt_token="token123",
         )
 
-        result = worker._send_heartbeat()
+        worker._send_heartbeat()
 
-        self.assertTrue(result)
-        self.assertIsNotNone(worker.last_success_time)
+        # Should succeed
+        self.assertIsNotNone(worker._last_success)
+        self.assertEqual(worker._consecutive_failures, 0)
 
         # Verify the request
         mock_post.assert_called_once_with(
             "https://example.com/api/heartbeat",
-            json={"recipientId": "test123"},
+            json={"recipientId": "test123", "clientVersion": "1.0.0"},
             headers={
                 "Content-Type": "application/json",
                 "Authorization": "Bearer token123",
             },
-            timeout=10.0,
+            timeout=10,
         )
 
     @patch("client.heartbeat.requests.post")
@@ -145,16 +131,19 @@ class TestHeartbeatWorker(unittest.TestCase):
         mock_response = Mock()
         mock_response.status_code = 500
         mock_response.text = "Internal Server Error"
+        mock_response.raise_for_status.side_effect = Exception("HTTP 500")
         mock_post.return_value = mock_response
 
         worker = HeartbeatWorker(
             base_url="https://example.com",
             recipient_id="test123",
+            jwt_token="token123",
         )
 
-        result = worker._send_heartbeat()
+        worker._send_heartbeat()
 
-        self.assertFalse(result)
+        # Should fail and increment failure counter
+        self.assertEqual(worker._consecutive_failures, 1)
 
     @patch("client.heartbeat.requests.post")
     def test_send_heartbeat_network_error(self, mock_post: Mock) -> None:
@@ -166,11 +155,13 @@ class TestHeartbeatWorker(unittest.TestCase):
         worker = HeartbeatWorker(
             base_url="https://example.com",
             recipient_id="test123",
+            jwt_token="token123",
         )
 
-        result = worker._send_heartbeat()
+        worker._send_heartbeat()
 
-        self.assertFalse(result)
+        # Should fail and increment failure counter
+        self.assertEqual(worker._consecutive_failures, 1)
 
     @patch("client.heartbeat.requests.post")
     def test_send_heartbeat_timeout(self, mock_post: Mock) -> None:
@@ -182,51 +173,58 @@ class TestHeartbeatWorker(unittest.TestCase):
         worker = HeartbeatWorker(
             base_url="https://example.com",
             recipient_id="test123",
+            jwt_token="token123",
         )
 
-        result = worker._send_heartbeat()
+        worker._send_heartbeat()
 
-        self.assertFalse(result)
+        # Should fail and increment failure counter
+        self.assertEqual(worker._consecutive_failures, 1)
 
     def test_exponential_backoff(self) -> None:
         """Test that exponential backoff is applied on failures."""
         worker = HeartbeatWorker(
             base_url="https://example.com",
             recipient_id="test123",
+            jwt_token="token123",
+            interval_seconds=20.0,
         )
 
-        # Initial backoff should be min_backoff
-        self.assertEqual(worker.current_backoff, worker.min_backoff)
+        # Initial interval should be the configured interval
+        self.assertEqual(worker._get_current_interval(), 20.0)
 
         # Simulate failures
-        with patch.object(worker, "_send_heartbeat", return_value=False):
-            worker.start()
-            time.sleep(0.1)  # Let the worker run a bit
+        worker._consecutive_failures = 1
+        self.assertEqual(worker._get_current_interval(), 40.0)  # 20 * 2^1
 
-            # Current backoff should increase
-            worker.stop()
+        worker._consecutive_failures = 2
+        self.assertEqual(worker._get_current_interval(), 60.0)  # 20 * 2^2 = 80, clamped to 60
 
-    def test_callback_on_status_change(self) -> None:
-        """Test that status change callback is called."""
-        callback = MagicMock()
+        worker._consecutive_failures = 10
+        self.assertEqual(worker._get_current_interval(), 60.0)  # Should cap at 60
+
+    @patch("client.heartbeat.requests.post")
+    def test_reset_backoff_on_success(self, mock_post: Mock) -> None:
+        """Test that backoff resets on successful request."""
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"lastHeartbeat": "2025-11-25T12:00:00Z"}
+        mock_post.return_value = mock_response
+
         worker = HeartbeatWorker(
             base_url="https://example.com",
             recipient_id="test123",
-            interval=0.1,
-            on_status_change=callback,
+            jwt_token="token123",
         )
 
-        with patch.object(worker, "_send_heartbeat", return_value=True):
-            worker.start()
-            time.sleep(0.05)
+        # Set some failures
+        worker._consecutive_failures = 3
 
-            # Callback should be called on start
-            callback.assert_called()
+        # Send successful heartbeat
+        worker._send_heartbeat()
 
-            worker.stop()
-
-            # Callback should be called on stop
-            self.assertGreater(callback.call_count, 1)
+        # Failures should be reset
+        self.assertEqual(worker._consecutive_failures, 0)
 
 
 if __name__ == "__main__":
