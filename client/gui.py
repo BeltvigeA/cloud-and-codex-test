@@ -2792,15 +2792,26 @@ class ListenerGuiApp:
                 self.config_manager.get_recipient_id()
                 or os.getenv("BASE44_RECIPIENT_ID", "").strip()
             )
-            jwt_token = os.getenv("PRINTRELAY_JWT_TOKEN", "").strip()
 
-            if not jwt_token:
-                logging.warning("No JWT token found - heartbeat disabled (set PRINTRELAY_JWT_TOKEN env var)")
+            # Get API key from environment or settings
+            api_key = os.getenv("BASE44_API_KEY", "").strip()
+            if not api_key and hasattr(self, "statusApiKeyVar"):
+                api_key = self.statusApiKeyVar.get().strip()
+
+            # Get organization ID from environment (GUI support can be added later)
+            organization_id = os.getenv("BASE44_ORGANIZATION_ID", "").strip()
+
+            if not api_key:
+                logging.warning("No API key found - heartbeat disabled (set BASE44_API_KEY env var)")
                 return
 
             if not base_url or not recipient_id:
                 logging.warning("Missing base URL or recipient ID - heartbeat disabled")
                 return
+
+            # Organization ID is optional for now
+            if not organization_id:
+                logging.info("No organization ID set - heartbeat will send empty organizationId")
 
             # Stop existing worker if any
             if self.heartbeatWorker and self.heartbeatWorker.is_running():
@@ -2810,7 +2821,8 @@ class ListenerGuiApp:
             self.heartbeatWorker = HeartbeatWorker(
                 base_url=base_url,
                 recipient_id=recipient_id,
-                jwt_token=jwt_token,
+                organization_id=organization_id,
+                api_key=api_key,
                 interval_seconds=20.0,
                 client_version="1.0.0",
             )
