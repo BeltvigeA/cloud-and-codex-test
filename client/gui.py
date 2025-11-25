@@ -2795,11 +2795,11 @@ class ListenerGuiApp:
             jwt_token = os.getenv("PRINTRELAY_JWT_TOKEN", "").strip()
 
             if not jwt_token:
-                log.warning("No JWT token found - heartbeat disabled (set PRINTRELAY_JWT_TOKEN env var)")
+                logging.warning("No JWT token found - heartbeat disabled (set PRINTRELAY_JWT_TOKEN env var)")
                 return
 
             if not base_url or not recipient_id:
-                log.warning("Missing base URL or recipient ID - heartbeat disabled")
+                logging.warning("Missing base URL or recipient ID - heartbeat disabled")
                 return
 
             # Stop existing worker if any
@@ -2815,10 +2815,10 @@ class ListenerGuiApp:
                 client_version="1.0.0",
             )
             self.heartbeatWorker.start()
-            log.info("Heartbeat worker started")
+            logging.info("Heartbeat worker started")
 
         except Exception as error:  # pragma: no cover
-            log.error("Failed to start heartbeat worker: %s", error)
+            logging.error("Failed to start heartbeat worker: %s", error)
 
     def _stopHeartbeatWorker(self) -> None:
         """Stop the heartbeat worker."""
@@ -2826,9 +2826,9 @@ class ListenerGuiApp:
             if self.heartbeatWorker:
                 self.heartbeatWorker.stop()
                 self.heartbeatWorker = None
-                log.info("Heartbeat worker stopped")
+                logging.info("Heartbeat worker stopped")
         except Exception as error:  # pragma: no cover
-            log.error("Failed to stop heartbeat worker: %s", error)
+            logging.error("Failed to stop heartbeat worker: %s", error)
 
     def _handleWindowClose(self) -> None:
         try:
