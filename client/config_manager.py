@@ -118,6 +118,27 @@ class ConfigManager:
         """
         self._config["recipient_id"] = recipient_id.strip()
 
+    def get_organization_id(self) -> Optional[str]:
+        """
+        Get the organization ID from configuration.
+
+        Returns:
+            Organization ID if set, None otherwise
+        """
+        organization_id = self._config.get("organization_id")
+        if isinstance(organization_id, str) and organization_id.strip():
+            return organization_id.strip()
+        return None
+
+    def set_organization_id(self, organization_id: str) -> None:
+        """
+        Set the organization ID in configuration.
+
+        Args:
+            organization_id: The organization ID to store
+        """
+        self._config["organization_id"] = organization_id.strip()
+
     def get_backend_url(self) -> Optional[str]:
         """
         Get the backend URL from configuration.
