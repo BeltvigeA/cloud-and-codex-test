@@ -105,6 +105,19 @@ class HeartbeatWorker:
 
         payload = {"recipientId": self.recipient_id, "clientVersion": self.client_version}
 
+        # Log detailed request information
+        masked_token = self._mask_jwt_token(self.jwt_token)
+        log.info(
+            "Sending heartbeat request:\n"
+            "  URL: %s\n"
+            "  Method: POST\n"
+            "  Headers: {Authorization: Bearer %s, Content-Type: application/json}\n"
+            "  Payload: %s",
+            endpoint,
+            masked_token,
+            payload,
+        )
+
         try:
             response = requests.post(endpoint, json=payload, headers=headers, timeout=10)
             response.raise_for_status()
@@ -114,26 +127,41 @@ class HeartbeatWorker:
             self._consecutive_failures = 0
 
             data = response.json()
-            log.debug(
-                "Heartbeat sent successfully (recipient: %s, last: %s)",
+            log.info(
+                "Heartbeat sent successfully (status: %d, recipient: %s, last: %s)",
+                response.status_code,
                 self.recipient_id,
                 data.get("lastHeartbeat", "unknown"),
             )
 
         except requests.Timeout:
             self._consecutive_failures += 1
-            log.warning("Heartbeat request timed out (failures: %d)", self._consecutive_failures)
+            log.warning(
+                "Heartbeat request timed out (URL: %s, failures: %d)",
+                endpoint,
+                self._consecutive_failures,
+            )
 
         except requests.RequestException as error:
             self._consecutive_failures += 1
             log.warning(
-                "Heartbeat request failed: %s (failures: %d)", error, self._consecutive_failures
+                "Heartbeat request failed (URL: %s): %s (failures: %d)",
+                endpoint,
+                error,
+                self._consecutive_failures,
             )
 
         except Exception as error:  # noqa: BLE001 - catch all to prevent thread crash
             self._consecutive_failures += 1
             log.error(
-                "Unexpected error sending heartbeat: %s (failures: %d)",
+                "Unexpected error sending heartbeat (URL: %s): %s (failures: %d)",
+                endpoint,
                 error,
                 self._consecutive_failures,
             )
+
+    def _mask_jwt_token(self, token: str) -> str:
+        """Mask JWT token for logging, showing only first and last few characters."""
+        if not token or len(token) <= 10:
+            return "***"
+        return f"{token[:5]}...{token[-5:]}"
