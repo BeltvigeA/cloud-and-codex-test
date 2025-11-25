@@ -99,7 +99,10 @@ class HeartbeatWorker:
 
     def _send_heartbeat(self) -> None:
         """Send a single heartbeat request to the backend."""
-        endpoint = f"{self.base_url}/api/heartbeat"
+        # Always use the correct PrintPro3D API backend for heartbeat
+        # Not the legacy printer-backend
+        correct_backend = "https://printpro3d-api-931368217793.europe-west1.run.app"
+        endpoint = f"{correct_backend}/api/heartbeat"
 
         headers = {
             "X-API-Key": self.api_key,
