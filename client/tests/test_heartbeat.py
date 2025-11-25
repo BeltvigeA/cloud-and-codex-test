@@ -226,6 +226,26 @@ class TestHeartbeatWorker(unittest.TestCase):
         # Failures should be reset
         self.assertEqual(worker._consecutive_failures, 0)
 
+    def test_mask_jwt_token(self) -> None:
+        """Test JWT token masking for logging."""
+        worker = HeartbeatWorker(
+            base_url="https://example.com",
+            recipient_id="test123",
+            jwt_token="this_is_a_very_long_jwt_token_12345",
+        )
+
+        # Test normal token masking
+        masked = worker._mask_jwt_token("this_is_a_very_long_jwt_token_12345")
+        self.assertEqual(masked, "this_...12345")
+
+        # Test short token
+        masked_short = worker._mask_jwt_token("short")
+        self.assertEqual(masked_short, "***")
+
+        # Test empty token
+        masked_empty = worker._mask_jwt_token("")
+        self.assertEqual(masked_empty, "***")
+
 
 if __name__ == "__main__":
     unittest.main()
