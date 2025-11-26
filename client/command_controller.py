@@ -329,12 +329,14 @@ def captureCameraSnapshot(printer: Any, serial: str) -> Path:
 def _ensurePrinterConnected(
     printer: Any,
     *,
+    serial: str = "",
     timeout: float = 15.0,
 ) -> None:
     """
     Best-effort: start MQTT, connect(), and wait until camera/mqtt is usable.
     Safe to call multiple times.
     """
+    printer_id = serial or "unknown printer"
 
     connectMethod = getattr(printer, "connect", None)
     if callable(connectMethod):
@@ -373,7 +375,7 @@ def _ensurePrinterConnected(
             time.sleep(0.25)
 
         if callable(mqttReadyMethod) and not readyConfirmed:
-            log.error("[motion] printer MQTT not ready after 10 seconds")
+            log.error("[motion] printer %s MQTT not ready after 10 seconds", printer_id)
             if lastError is not None:
                 raise RuntimeError(
                     f"Printer MQTT connection not ready: {lastError}"
@@ -1333,7 +1335,7 @@ class CommandWorker:
                 stopLoop()
                 log.info("[bedref] stoppet periodisk kameraloop for %s", serial)
             except Exception as error:
-                log.warning("[bedref] kunne ikke stoppe kameraloop: %s", error)
+                log.warning("[bedref] printer %s kunne ikke stoppe kameraloop: %s", serial, error)
 
         capturedPaths: List[Path] = []
 
@@ -1350,7 +1352,7 @@ class CommandWorker:
                 except Exception as error:
                     log.warning("[bedref] kunne ikke starte MQTT for %s: %s", serial, error)
             else:
-                log.warning("[bedref] printer har ikke mqtt_start() metode")
+                log.warning("[bedref] printer %s har ikke mqtt_start() metode", serial)
 
             # Deretter connect()
             connectMethod = getattr(printer, "connect", None)
@@ -1362,7 +1364,7 @@ class CommandWorker:
                     log.error("[bedref] kunne ikke koble til printer %s: %s", serial, error)
                     raise RuntimeError(f"Kunne ikke koble til printer: {error}") from error
             else:
-                log.warning("[bedref] printer har ikke connect() metode")
+                log.warning("[bedref] printer %s har ikke connect() metode", serial)
 
             # Vent på at MQTT-tilkobling etableres
             log.info("[bedref] venter 5 sekunder på at MQTT-tilkobling etableres")
@@ -1380,9 +1382,9 @@ class CommandWorker:
                         pass
                     time.sleep(1.0)
                 else:
-                    log.warning("[bedref] kunne ikke bekrefte MQTT-tilkobling - fortsetter likevel")
+                    log.warning("[bedref] printer %s kunne ikke bekrefte MQTT-tilkobling - fortsetter likevel", serial)
             else:
-                log.warning("[bedref] printer har ikke mqtt_client_ready() - antar tilkobling er OK")
+                log.warning("[bedref] printer %s har ikke mqtt_client_ready() - antar tilkobling er OK", serial)
 
             # 2. Home printer
             log.info("[bedref] starter homing for %s", serial)
@@ -1399,7 +1401,7 @@ class CommandWorker:
                     log.error("[bedref] homing feilet for %s: %s", serial, error)
                     raise RuntimeError(f"Homing feilet: {error}") from error
             else:
-                log.error("[bedref] printer har ikke home_printer() metode")
+                log.error("[bedref] printer %s har ikke home_printer() metode", serial)
                 raise RuntimeError("Printer mangler home_printer() metode")
 
             # Vent på at homing fullføres - homing kan ta lang tid!
@@ -1440,7 +1442,7 @@ class CommandWorker:
 
                 # Hvis vi aldri så homing, eller timeout, gi en advarsel men fortsett
                 if not homingDetected:
-                    log.warning("[bedref] kunne ikke bekrefte homing via state, venter 45 sekunder ekstra")
+                    log.warning("[bedref] printer %s kunne ikke bekrefte homing via state, venter 45 sekunder ekstra", serial)
                     time.sleep(45.0)
                 else:
                     # Vent litt ekstra etter at homing er bekreftet ferdig
@@ -1448,7 +1450,7 @@ class CommandWorker:
                     time.sleep(3.0)
             else:
                 # Fallback hvis get_state ikke finnes
-                log.warning("[bedref] get_state() ikke tilgjengelig, bruker fast ventetid på 45 sekunder")
+                log.warning("[bedref] printer %s get_state() ikke tilgjengelig, bruker fast ventetid på 45 sekunder", serial)
                 time.sleep(45.0)
 
             # 3. Flytt print head bakover (midten av X, helt bak på Y)
@@ -1466,7 +1468,7 @@ class CommandWorker:
                                serial, error)
                     # Fortsett likevel - ikke kritisk
             else:
-                log.warning("[bedref] printer har ikke gcode() metode - hopper over head parking")
+                log.warning("[bedref] printer %s har ikke gcode() metode - hopper over head parking", serial)
 
             # Vent på at bevegelse fullføres - økt til 4 sekunder
             log.info("[bedref] venter 4 sekunder på at print head bevegelse fullføres")
@@ -1499,7 +1501,7 @@ class CommandWorker:
                 if callable(mqttReadyMethod):
                     try:
                         if not mqttReadyMethod():
-                            log.warning("[bedref] MQTT ikke klar, prøver å reconnect...")
+                            log.warning("[bedref] printer %s MQTT ikke klar, prøver å reconnect...", serial)
                             # Prøv å reconnect
                             mqttStartMethod = getattr(printer, "mqtt_start", None)
                             if callable(mqttStartMethod):
@@ -1543,7 +1545,7 @@ class CommandWorker:
                         log.error("[bedref] move_z_axis(%d) kastet exception: %s", zPosition, error)
                         # Ikke raise - fortsett med neste bilde
                 else:
-                    log.error("[bedref] printer har ikke move_z_axis() metode")
+                    log.error("[bedref] printer %s har ikke move_z_axis() metode", serial)
                     raise RuntimeError("Printer mangler move_z_axis() metode")
 
                 # Vent lengre på at bevegelse fullføres - økt til 5 sekunder
@@ -2420,7 +2422,7 @@ class CommandWorker:
                     if isinstance(udata, dict) and "enable_timelapse" in udata:
                         log.info("[timelapse] FUNNET enable_timelapse i unencryptedData: %s", udata.get("enable_timelapse"))
                 else:
-                    log.warning("[timelapse] metadata inneholder IKKE 'unencryptedData'")
+                    log.warning("[timelapse] printer %s metadata inneholder IKKE 'unencryptedData'", self.serial)
             log.info("[timelapse] ===== SLUTT TIMELAPSE DEBUG =====")
 
             options = bambuPrinter.BambuPrintOptions(

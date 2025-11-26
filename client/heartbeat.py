@@ -76,7 +76,7 @@ class HeartbeatWorker:
             try:
                 self._send_heartbeat()
             except Exception as error:  # noqa: BLE001 - prevent thread crash
-                log.error("Unexpected error in heartbeat worker: %s", error)
+                log.error("Unexpected error in heartbeat worker for %s: %s", self.recipient_id, error)
 
             # Sleep in small intervals to allow quick shutdown
             sleep_slices = max(1, int(self._get_current_interval() / 0.5))
