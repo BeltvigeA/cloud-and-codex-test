@@ -20,8 +20,7 @@ class HeartbeatWorker:
         self,
         base_url: str,
         recipient_id: str,
-        organization_id: str,
-        api_key: str,
+        auth_token: str,
         interval_seconds: float = 20.0,
         client_version: str = "1.0.0",
     ) -> None:
@@ -31,15 +30,13 @@ class HeartbeatWorker:
         Args:
             base_url: The base URL of the backend server
             recipient_id: The recipient ID to send in heartbeat requests
-            organization_id: The organization ID to send in heartbeat requests
-            api_key: API key for authentication
+            auth_token: Bearer token for authentication
             interval_seconds: Interval in seconds between heartbeat requests (default: 20.0, min: 10.0)
             client_version: Version string of the client (default: "1.0.0")
         """
         self.base_url = base_url.rstrip("/")
         self.recipient_id = recipient_id.strip()
-        self.organization_id = organization_id.strip()
-        self.api_key = api_key.strip()
+        self.auth_token = auth_token.strip()
         self.interval_seconds = max(10.0, float(interval_seconds))
         self.client_version = client_version
 
@@ -102,26 +99,25 @@ class HeartbeatWorker:
         endpoint = f"{self.base_url}/api/heartbeat"
 
         headers = {
-            "X-API-Key": self.api_key,
+            "Authorization": f"Bearer {self.auth_token}",
             "Content-Type": "application/json",
         }
 
         payload = {
             "recipientId": self.recipient_id,
-            "organizationId": self.organization_id,
             "clientVersion": self.client_version,
         }
 
         # Log detailed request information
-        masked_api_key = self._mask_api_key(self.api_key)
+        masked_token = self._mask_token(self.auth_token)
         log.info(
             "Sending heartbeat request:\n"
             "  URL: %s\n"
             "  Method: POST\n"
-            "  Headers: {X-API-Key: %s, Content-Type: application/json}\n"
+            "  Headers: {Authorization: Bearer %s, Content-Type: application/json}\n"
             "  Payload: %s",
             endpoint,
-            masked_api_key,
+            masked_token,
             payload,
         )
 
@@ -167,8 +163,8 @@ class HeartbeatWorker:
                 self._consecutive_failures,
             )
 
-    def _mask_api_key(self, api_key: str) -> str:
-        """Mask API key for logging, showing only first and last few characters."""
-        if not api_key or len(api_key) <= 10:
+    def _mask_token(self, token: str) -> str:
+        """Mask auth token for logging, showing only first and last few characters."""
+        if not token or len(token) <= 10:
             return "***"
-        return f"{api_key[:5]}...{api_key[-5:]}"
+        return f"{token[:5]}...{token[-5:]}"
