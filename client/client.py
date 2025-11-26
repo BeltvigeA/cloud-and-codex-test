@@ -21,9 +21,11 @@ from .persistence import storePrintSummary
 from .bambuPrinter import BambuPrintOptions, deleteRemoteFile, postStatus, sendBambuPrintJob
 
 
-# Use the correct PrintPro3D API backend
-# The old printer-backend is deprecated
-defaultBaseUrl = "https://printpro3d-api-931368217793.europe-west1.run.app"
+# NOTE: This URL is still used for /upload endpoint (print jobs to Firestore)
+# Status updates now use PostgreSQL backend via getPrinterStatusEndpointUrl()
+# Old Firestore: https://printer-backend-934564650450.europe-west1.run.app
+# New PostgreSQL: https://printpro3d-api-931368217793.europe-west1.run.app
+defaultBaseUrl = "https://printer-backend-934564650450.europe-west1.run.app"
 defaultFilesDirectory = Path.home() / ".printmaster" / "files"
 
 

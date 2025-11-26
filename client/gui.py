@@ -25,9 +25,7 @@ from tkinter import filedialog, messagebox, ttk
 import requests
 
 
-# Use the correct PrintPro3D API backend
-# The old printer-backend is deprecated
-hardcodedBaseUrl = "https://printpro3d-api-931368217793.europe-west1.run.app"
+hardcodedBaseUrl = "https://printer-backend-934564650450.europe-west1.run.app"
 hardcodedApiKey = (
     "V9JDvmqG9SB40JpmNu1HwM8ZbvplTrf7ddjudAe6yvjg7hbENEgA429N6xuio4CWQ7nv30fk0c2V8WiOemNWuP2PCKa9dbp7Aoww5lfQPdQu1FGuNKgUZ4wmA23sFCQ7lpxRq9cgZdIWMmwY2EpeYCR13UMgUzDqE8Su6GDPXuXHuPcMKxZnrI9vKNFjtxtCymw1Q8Wr"
 )

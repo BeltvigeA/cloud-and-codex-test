@@ -88,7 +88,7 @@ def test_control_requests_use_control_api_key(monkeypatch: pytest.MonkeyPatch) -
     base44_client.postCommandResult("cmd-1", status="completed", message="ok")
 
     assert get_calls and get_calls[0][1].get("X-API-Key") == "control-key"
-    assert get_calls[0][0] == "https://printpro3d-api-931368217793.europe-west1.run.app/control"
+    assert get_calls[0][0] == "https://printer-backend-934564650450.europe-west1.run.app/control"
     assert get_calls[0][2] == {"recipientId": "recipient-123"}
     assert len(post_calls) == 2
     assert all(headers.get("X-API-Key") == "control-key" for _url, headers, _payload in post_calls)
