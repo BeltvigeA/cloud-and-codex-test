@@ -17,14 +17,14 @@ class TestHeartbeatWorker(unittest.TestCase):
         worker = HeartbeatWorker(
             base_url="https://example.com",
             recipient_id="test123",
-            auth_token="test_token_123",
+            api_key="test_api_key_123",
             interval_seconds=20.0,
             client_version="1.0.0",
         )
 
         self.assertEqual(worker.base_url, "https://example.com")
         self.assertEqual(worker.recipient_id, "test123")
-        self.assertEqual(worker.auth_token, "test_token_123")
+        self.assertEqual(worker.api_key, "test_api_key_123")
         self.assertEqual(worker.interval_seconds, 20.0)
         self.assertEqual(worker.client_version, "1.0.0")
         self.assertFalse(worker.is_running())
@@ -36,7 +36,7 @@ class TestHeartbeatWorker(unittest.TestCase):
         worker = HeartbeatWorker(
             base_url="https://example.com/",
             recipient_id="test123",
-            auth_token="test_token_123",
+            api_key="test_api_key_123",
         )
         self.assertEqual(worker.base_url, "https://example.com")
 
@@ -45,7 +45,7 @@ class TestHeartbeatWorker(unittest.TestCase):
         worker = HeartbeatWorker(
             base_url="https://example.com",
             recipient_id="test123",
-            auth_token="test_token_123",
+            api_key="test_api_key_123",
             interval_seconds=5.0,  # Below minimum
         )
         self.assertEqual(worker.interval_seconds, 10.0)  # Should be clamped to minimum
@@ -55,7 +55,7 @@ class TestHeartbeatWorker(unittest.TestCase):
         worker = HeartbeatWorker(
             base_url="https://example.com",
             recipient_id="test123",
-            auth_token="test_token_123",
+            api_key="test_api_key_123",
             interval_seconds=10.0,
         )
 
@@ -77,7 +77,7 @@ class TestHeartbeatWorker(unittest.TestCase):
         worker = HeartbeatWorker(
             base_url="https://example.com",
             recipient_id="test123",
-            auth_token="test_token_123",
+            api_key="test_api_key_123",
             interval_seconds=10.0,
         )
 
@@ -105,7 +105,7 @@ class TestHeartbeatWorker(unittest.TestCase):
         worker = HeartbeatWorker(
             base_url="https://example.com",
             recipient_id="test123",
-            auth_token="test_token_123",
+            api_key="test_api_key_123",
         )
 
         worker._send_heartbeat()
@@ -123,7 +123,7 @@ class TestHeartbeatWorker(unittest.TestCase):
             },
             headers={
                 "Content-Type": "application/json",
-                "Authorization": "Bearer test_token_123",
+                "X-API-Key": "test_api_key_123",
             },
             timeout=10,
         )
@@ -140,7 +140,7 @@ class TestHeartbeatWorker(unittest.TestCase):
         worker = HeartbeatWorker(
             base_url="https://example.com",
             recipient_id="test123",
-            auth_token="test_token_123",
+            api_key="test_api_key_123",
         )
 
         worker._send_heartbeat()
@@ -158,7 +158,7 @@ class TestHeartbeatWorker(unittest.TestCase):
         worker = HeartbeatWorker(
             base_url="https://example.com",
             recipient_id="test123",
-            auth_token="test_token_123",
+            api_key="test_api_key_123",
         )
 
         worker._send_heartbeat()
@@ -176,7 +176,7 @@ class TestHeartbeatWorker(unittest.TestCase):
         worker = HeartbeatWorker(
             base_url="https://example.com",
             recipient_id="test123",
-            auth_token="test_token_123",
+            api_key="test_api_key_123",
         )
 
         worker._send_heartbeat()
@@ -189,7 +189,7 @@ class TestHeartbeatWorker(unittest.TestCase):
         worker = HeartbeatWorker(
             base_url="https://example.com",
             recipient_id="test123",
-            auth_token="test_token_123",
+            api_key="test_api_key_123",
             interval_seconds=20.0,
         )
 
@@ -217,7 +217,7 @@ class TestHeartbeatWorker(unittest.TestCase):
         worker = HeartbeatWorker(
             base_url="https://example.com",
             recipient_id="test123",
-            auth_token="test_token_123",
+            api_key="test_api_key_123",
         )
 
         # Set some failures
@@ -229,24 +229,24 @@ class TestHeartbeatWorker(unittest.TestCase):
         # Failures should be reset
         self.assertEqual(worker._consecutive_failures, 0)
 
-    def test_mask_token(self) -> None:
-        """Test auth token masking for logging."""
+    def test_mask_api_key(self) -> None:
+        """Test API key masking for logging."""
         worker = HeartbeatWorker(
             base_url="https://example.com",
             recipient_id="test123",
-            auth_token="this_is_a_very_long_auth_token_12345",
+            api_key="this_is_a_very_long_api_key_12345",
         )
 
-        # Test normal token masking
-        masked = worker._mask_token("this_is_a_very_long_auth_token_12345")
+        # Test normal API key masking
+        masked = worker._mask_api_key("this_is_a_very_long_api_key_12345")
         self.assertEqual(masked, "this_...12345")
 
-        # Test short token
-        masked_short = worker._mask_token("short")
+        # Test short API key
+        masked_short = worker._mask_api_key("short")
         self.assertEqual(masked_short, "***")
 
-        # Test empty token
-        masked_empty = worker._mask_token("")
+        # Test empty API key
+        masked_empty = worker._mask_api_key("")
         self.assertEqual(masked_empty, "***")
 
 
