@@ -422,11 +422,12 @@ def _connect_and_wait(printer, retries: int = 3, connect_timeout_s: float = 15.0
         time.sleep(retry_delay_s)
     raise RuntimeError("Could not establish MQTT session with the printer")
 
-def _home_printer_exact(printer) -> bool:
+def _home_printer_exact(printer, serial: str = "") -> bool:
     """Eksakt Bambu-SDK-kall, samme flyt som i enkeltskripta: home_printer() -> bool."""
+    printer_id = serial or "unknown"
     home_fn = getattr(printer, "home_printer", None)
     if not callable(home_fn):
-        log.warning("home_printer() not available on printer object")
+        log.warning("home_printer() not available on printer %s", printer_id)
         return False
     try:
         ok = bool(home_fn())
@@ -540,7 +541,7 @@ def captureZAxisReferenceSequence(
 
     # Home først med EKSPLISITT API: home_printer() → bool, så Z=0 fallback via move_z_axis(0)
     if home_first:
-        if not _home_printer_exact(printer):
+        if not _home_printer_exact(printer, serial):
             raise RuntimeError("Unable to home printer via API method home_printer()")
         # liten settle uansett
         time.sleep(3.0)

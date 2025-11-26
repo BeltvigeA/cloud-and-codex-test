@@ -78,13 +78,14 @@ def _wait_for_motion(apiPrinter: Any, *, target: bool, timeout: float, poll: flo
     return False
 
 
-def _await_printer_ready(printer: Any, *, timeout: float = 20.0, poll: float = 0.25) -> bool:
+def _await_printer_ready(printer: Any, serial: str = "", *, timeout: float = 20.0, poll: float = 0.25) -> bool:
     """
     Vent til vi kan lese en gyldig state fra bambulabs_api. Uten dette får vi
     'Printer Values Not Available Yet' og klarer ikke å oppdage pauser.
     """
     deadline = time.monotonic() + max(0.0, timeout)
     last_error = None
+    printer_id = serial or "unknown"
     while time.monotonic() < deadline:
         try:
             state = printer.get_state()
@@ -94,9 +95,9 @@ def _await_printer_ready(printer: Any, *, timeout: float = 20.0, poll: float = 0
             last_error = ex
         time.sleep(poll)
     if last_error:
-        log.warning("[bedref] printer state not ready within %.1fs: %s", timeout, last_error)
+        log.warning("[bedref] printer %s state not ready within %.1fs: %s", printer_id, timeout, last_error)
     else:
-        log.warning("[bedref] printer state not ready within %.1fs", timeout)
+        log.warning("[bedref] printer %s state not ready within %.1fs", printer_id, timeout)
     return False
 
 def capture_during_pauses(
@@ -117,7 +118,7 @@ def capture_during_pauses(
     """
     results: List[Path] = []
     # Først: sikre at state faktisk er lesbar
-    _await_printer_ready(apiPrinter, timeout=20.0, poll=poll)
+    _await_printer_ready(apiPrinter, serial, timeout=20.0, poll=poll)
     _wait_for_motion(apiPrinter, target=True, timeout=60.0, poll=poll)  # best-effort
     deadline = time.monotonic() + max(timeout, 0.0)
     last_fallback = 0.0
@@ -142,7 +143,7 @@ def capture_during_pauses(
             saved = storeBedReferenceFrame(serial, len(results) + 1, shot)
             results.append(saved)
             last_fallback = now
-            log.warning("[bedref] fallback snapshot taken (state unavailable)")
+            log.warning("[bedref] printer %s fallback snapshot taken (state unavailable)", serial)
             continue
         time.sleep(poll)
     return results
@@ -195,7 +196,7 @@ def run_bed_reference_capture(
         pass
     try:
         # Sørg for at vi er tilkoblet og at state er klar før pause-deteksjon
-        _await_printer_ready(printer, timeout=20.0, poll=0.25)
+        _await_printer_ready(printer, serial, timeout=20.0, poll=0.25)
         return capture_during_pauses(printer, serial, captureFunc, frames)
     finally:
         for meth in ("disconnect", "mqtt_stop"):

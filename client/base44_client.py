@@ -153,7 +153,8 @@ def postUpdateStatus(payload: Dict[str, object]) -> Dict[str, object]:
             recipientId = os.getenv("BASE44_RECIPIENT_ID", "").strip()
 
     if not recipientId:
-        log.warning("postUpdateStatus: missing recipientId; skipping.")
+        printer_serial = payload.get("printerSerial", "unknown")
+        log.warning("postUpdateStatus: missing recipientId for printer %s; skipping.", printer_serial)
         return {}
 
     # Sett recipientId i payload
@@ -175,10 +176,12 @@ def postUpdateStatus(payload: Dict[str, object]) -> Dict[str, object]:
             timeout=10,
         )
         response.raise_for_status()
-        log.info(f"Status update successful for {recipientId}")
+        printer_serial = preparedPayload.get("printerSerial", recipientId)
+        log.info(f"Status update successful for printer {printer_serial} (recipient: {recipientId})")
         return response.json() if response.content else {}
     except requests.RequestException as error:
-        log.error(f"Failed to update status for {recipientId}: {error}")
+        printer_serial = preparedPayload.get("printerSerial", recipientId)
+        log.error(f"Failed to update status for printer {printer_serial} (recipient: {recipientId}): {error}")
         return {}
 
 
