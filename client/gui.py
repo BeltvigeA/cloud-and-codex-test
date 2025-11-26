@@ -27,7 +27,7 @@ import requests
 
 hardcodedBaseUrl = "https://printer-backend-934564650450.europe-west1.run.app"
 hardcodedApiKey = (
-    "V9JDvmqG9SB40JpmNu1HwM8ZbvplTrf7ddjudAe6yvjg7hbENEgA429N6xuio4CWQ7nv30fk0c2V8WiOemNWuP2PCKa9dbp7Aoww5lfQPdQu1FGuNKgUZ4wmA23sFCQ7lpxRq9cgZdIWMmwY2EpeYCR13UMgUzDqE8Su6GDPXuXHuPcMKxZnrI9vKNFjtxtCymw1Q8Wr"
+    "pk_V9JDvmqG9SB40JpmNu1HwM8ZbvplTrf7ddjudAe6yvjg7hbENEgA429N6xuio4CWQ7nv30fk0c2V8WiOemNWuP2PCKa9dbp7Aoww5lfQPdQu1FGuNKgUZ4wmA23sFCQ7lpxRq9cgZdIWMmwY2EpeYCR13UMgUzDqE8Su6GDPXuXHuPcMKxZnrI9vKNFjtxtCymw1Q8Wr"
 )
 hardcodedOutputDirectory = str(Path.home() / ".printmaster" / "files")
 hardcodedJsonLogFile = str(Path.home() / ".printmaster" / "listener-log.json")
@@ -2795,13 +2795,13 @@ class ListenerGuiApp:
                 or os.getenv("BASE44_RECIPIENT_ID", "").strip()
             )
 
-            # Get auth token from environment or settings
-            auth_token = os.getenv("BASE44_API_KEY", "").strip()
-            if not auth_token and hasattr(self, "statusApiKeyVar"):
-                auth_token = self.statusApiKeyVar.get().strip()
+            # Get API key from environment or settings
+            api_key = os.getenv("BASE44_API_KEY", "").strip()
+            if not api_key and hasattr(self, "statusApiKeyVar"):
+                api_key = self.statusApiKeyVar.get().strip()
 
-            if not auth_token:
-                logging.warning("No auth token found - heartbeat disabled (set BASE44_API_KEY env var)")
+            if not api_key:
+                logging.warning("No API key found - heartbeat disabled (set BASE44_API_KEY env var)")
                 return
 
             if not recipient_id:
@@ -2816,7 +2816,7 @@ class ListenerGuiApp:
             self.heartbeatWorker = HeartbeatWorker(
                 base_url=base_url,
                 recipient_id=recipient_id,
-                auth_token=auth_token,
+                api_key=api_key,
                 interval_seconds=20.0,
                 client_version="1.0.0",
             )
