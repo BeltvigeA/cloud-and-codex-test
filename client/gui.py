@@ -2786,8 +2786,10 @@ class ListenerGuiApp:
     def _startHeartbeatWorker(self) -> None:
         """Start the heartbeat worker to signal client is active."""
         try:
+            # Hardcoded backend URL for heartbeat - this is the only correct URL
+            base_url = "https://printpro3d-api-931368217793.europe-west1.run.app"
+
             # Get configuration
-            base_url = self.baseUrlVar.get().strip()
             recipient_id = (
                 self.config_manager.get_recipient_id()
                 or os.getenv("BASE44_RECIPIENT_ID", "").strip()
@@ -2808,8 +2810,8 @@ class ListenerGuiApp:
                 logging.warning("No API key found - heartbeat disabled (set BASE44_API_KEY env var)")
                 return
 
-            if not base_url or not recipient_id:
-                logging.warning("Missing base URL or recipient ID - heartbeat disabled")
+            if not recipient_id:
+                logging.warning("Missing recipient ID - heartbeat disabled")
                 return
 
             # Organization ID is optional for now
