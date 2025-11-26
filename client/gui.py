@@ -2795,28 +2795,18 @@ class ListenerGuiApp:
                 or os.getenv("BASE44_RECIPIENT_ID", "").strip()
             )
 
-            # Get API key from environment or settings
-            api_key = os.getenv("BASE44_API_KEY", "").strip()
-            if not api_key and hasattr(self, "statusApiKeyVar"):
-                api_key = self.statusApiKeyVar.get().strip()
+            # Get auth token from environment or settings
+            auth_token = os.getenv("BASE44_API_KEY", "").strip()
+            if not auth_token and hasattr(self, "statusApiKeyVar"):
+                auth_token = self.statusApiKeyVar.get().strip()
 
-            # Get organization ID from config or environment
-            organization_id = (
-                self.config_manager.get_organization_id()
-                or os.getenv("BASE44_ORGANIZATION_ID", "").strip()
-            )
-
-            if not api_key:
-                logging.warning("No API key found - heartbeat disabled (set BASE44_API_KEY env var)")
+            if not auth_token:
+                logging.warning("No auth token found - heartbeat disabled (set BASE44_API_KEY env var)")
                 return
 
             if not recipient_id:
                 logging.warning("Missing recipient ID - heartbeat disabled")
                 return
-
-            # Organization ID is optional for now
-            if not organization_id:
-                logging.info("No organization ID set - heartbeat will send empty organizationId")
 
             # Stop existing worker if any
             if self.heartbeatWorker and self.heartbeatWorker.is_running():
@@ -2826,8 +2816,7 @@ class ListenerGuiApp:
             self.heartbeatWorker = HeartbeatWorker(
                 base_url=base_url,
                 recipient_id=recipient_id,
-                organization_id=organization_id,
-                api_key=api_key,
+                auth_token=auth_token,
                 interval_seconds=20.0,
                 client_version="1.0.0",
             )
