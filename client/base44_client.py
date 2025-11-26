@@ -17,11 +17,21 @@ try:
 except ImportError:
     _config_manager_available = False
 
+def _resolveFunctionsBaseUrl() -> str:
+    """Resolve Base44 functions base URL from environment or use default."""
+    baseCandidate = os.getenv("BASE44_FUNCTIONS_BASE", "").strip()
+    if not baseCandidate:
+        baseCandidate = "https://printpro3d-api-931368217793.europe-west1.run.app/api/apps/68b61486e7c52405eb683cc6/functions"
+    if not baseCandidate.startswith("http://") and not baseCandidate.startswith("https://"):
+        baseCandidate = f"https://{baseCandidate}"
+    return baseCandidate.rstrip("/")
+
+
 # Hardkodet PrintPro3D backend URL for status updates
 PRINTPRO3D_BASE = "https://printpro3d-api-931368217793.europe-west1.run.app"
 
-# Legacy Base44 base (beholder for andre funksjoner)
-BASE44_FUNCTIONS_BASE = "https://print-flow-pro-eb683cc6.base44.app/api/apps/68b61486e7c52405eb683cc6/functions"
+# Base44 functions base - now configurable via environment variable
+BASE44_FUNCTIONS_BASE = _resolveFunctionsBaseUrl()
 
 # Legacy endpoints (kun for error og image reporting)
 REPORT_ERROR_URL = f"{BASE44_FUNCTIONS_BASE}/reportPrinterError"
