@@ -26,9 +26,6 @@ import requests
 
 
 hardcodedBaseUrl = "https://printer-backend-934564650450.europe-west1.run.app"
-hardcodedApiKey = (
-    "pk_V9JDvmqG9SB40JpmNu1HwM8ZbvplTrf7ddjudAe6yvjg7hbENEgA429N6xuio4CWQ7nv30fk0c2V8WiOemNWuP2PCKa9dbp7Aoww5lfQPdQu1FGuNKgUZ4wmA23sFCQ7lpxRq9cgZdIWMmwY2EpeYCR13UMgUzDqE8Su6GDPXuXHuPcMKxZnrI9vKNFjtxtCymw1Q8Wr"
-)
 hardcodedOutputDirectory = str(Path.home() / ".printmaster" / "files")
 hardcodedJsonLogFile = str(Path.home() / ".printmaster" / "listener-log.json")
 hardcodedPollIntervalSeconds = 30
@@ -180,8 +177,8 @@ class ListenerGuiApp:
         self.statusRefreshIntervalMs = 60_000
         self.pendingImmediateStatusRefresh = False
 
-        self.listenerStatusApiKey = hardcodedApiKey
-        self.listenerControlApiKey = hardcodedApiKey
+        self.listenerStatusApiKey = ""
+        self.listenerControlApiKey = ""
         self._managedEnvKeys: set[str] = set()
 
         self.activePrinterDialog: Optional[Dict[str, Any]] = None
@@ -223,6 +220,8 @@ class ListenerGuiApp:
         recipient_id = self.config_manager.get_recipient_id()
 
         if api_key:
+            self.listenerStatusApiKey = api_key
+            self.listenerControlApiKey = api_key
             os.environ["PRINTER_BACKEND_API_KEY"] = api_key
             os.environ["BASE44_API_KEY"] = api_key
             logging.info(f"Loaded API key from config: {self.config_manager.get_masked_api_key()}")
@@ -255,6 +254,8 @@ class ListenerGuiApp:
         recipient_id = self.config_manager.get_recipient_id()
 
         if api_key:
+            self.listenerStatusApiKey = api_key
+            self.listenerControlApiKey = api_key
             os.environ["PRINTER_BACKEND_API_KEY"] = api_key
             os.environ["BASE44_API_KEY"] = api_key
 
@@ -290,8 +291,9 @@ class ListenerGuiApp:
 
     def _buildListenerTab(self, parent: ttk.Frame, paddingOptions: Dict[str, int]) -> None:
         self.baseUrlVar = tk.StringVar(value=hardcodedBaseUrl)
-        self.statusApiKeyVar = tk.StringVar(value=hardcodedApiKey)
-        self.controlApiKeyVar = tk.StringVar(value=hardcodedApiKey)
+        api_key = self.config_manager.get_api_key() or ""
+        self.statusApiKeyVar = tk.StringVar(value=api_key)
+        self.controlApiKeyVar = tk.StringVar(value=api_key)
         self.outputDirVar = tk.StringVar(value=hardcodedOutputDirectory)
         self.logFileVar = tk.StringVar(value=hardcodedJsonLogFile)
         self.pollIntervalVar = tk.IntVar(value=hardcodedPollIntervalSeconds)
