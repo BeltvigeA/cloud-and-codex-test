@@ -18,6 +18,15 @@ import requests
 from .bambuPrinter import extractStateText, looksLikeAmsFilamentConflict, safeDisconnectPrinter
 from .base44_client import postReportError, postUpdateStatus
 
+# Import event reporting modules
+try:
+    from .event_reporter import EventReporter
+    from .hms_handler import parse_hms_error, capture_camera_frame_from_printer
+    _event_reporting_available = True
+except ImportError:
+    _event_reporting_available = False
+    EventReporter = None
+
 # Reduce noise from third-party SDK logger
 logging.getLogger("bambulabs_api").setLevel(logging.WARNING)
 
@@ -52,6 +61,8 @@ class BambuStatusSubscriber:
         pollInterval: float = 1.0,
         heartbeatInterval: float = 5.0,
         reconnectDelay: float = 3.0,
+        baseUrl: Optional[str] = None,
+        apiKey: Optional[str] = None,
     ) -> None:
         self.onUpdate = onUpdate
         self.onError = onError
@@ -70,6 +81,35 @@ class BambuStatusSubscriber:
         self.errorCountLock = threading.Lock()
         self.logEvery = 50
         self.defaultRecipientId = os.getenv("BASE44_RECIPIENT_ID", "").strip()
+
+        # Initialize event reporter if credentials available
+        self.event_reporter: Optional[EventReporter] = None
+        self.base_url = baseUrl or os.getenv("BASE44_API_URL", "").strip()
+        self.api_key = apiKey or os.getenv("BASE44_API_KEY", "").strip() or os.getenv("BASE44_FUNCTIONS_API_KEY", "").strip()
+
+        if _event_reporting_available and self.base_url and self.api_key and self.defaultRecipientId:
+            try:
+                self.event_reporter = EventReporter(
+                    base_url=self.base_url,
+                    api_key=self.api_key,
+                    recipient_id=self.defaultRecipientId
+                )
+                self.log.info("Event reporting initialized")
+            except Exception as e:
+                self.log.warning(f"Failed to initialize event reporter: {e}")
+        elif not _event_reporting_available:
+            self.log.debug("Event reporting modules not available")
+        else:
+            self.log.debug("Event reporting not configured (missing baseUrl, apiKey, or recipientId)")
+
+        # Track reported HMS errors to avoid duplicates
+        self.reported_hms_errors: Dict[str, Set[str]] = {}
+        self.hms_errors_lock = threading.Lock()
+
+        # Track last status update time per printer for periodic reporting
+        self.last_status_report_time: Dict[str, float] = {}
+        self.status_report_lock = threading.Lock()
+        self.status_report_interval = 300.0  # 5 minutes
 
     def startAll(self, printers: Iterable[Dict[str, Any]]) -> None:
         """Start worker threads for each printer configuration."""
@@ -185,6 +225,26 @@ class BambuStatusSubscriber:
                     statusPayload["printerIp"] = ipAddress
                     statusPayload["nickname"] = nickname
                     statusPayload["status"] = statusPayload.get("status") or "update"
+
+                    # Handle HMS error detection and reporting
+                    if self.event_reporter:
+                        hmsCode = statusPayload.get("hmsCode")
+                        if hmsCode:
+                            try:
+                                self._handle_hms_error(hmsCode, serial, ipAddress, printerInstance)
+                            except Exception as e:
+                                self.log.debug(f"HMS error handling failed: {e}")
+
+                        # Periodic status updates (every 5 minutes by default)
+                        current_time = time.monotonic()
+                        with self.status_report_lock:
+                            last_report_time = self.last_status_report_time.get(serial, 0)
+                            if current_time - last_report_time >= self.status_report_interval:
+                                try:
+                                    self._report_status_update(statusPayload, serial, ipAddress)
+                                    self.last_status_report_time[serial] = current_time
+                                except Exception as e:
+                                    self.log.debug(f"Status update reporting failed: {e}")
 
                     base44Package = self._buildBase44Payloads(statusPayload, printerConfig, resolvedApiKey)
                     if base44Package is not None:
@@ -1028,6 +1088,123 @@ class BambuStatusSubscriber:
         if isinstance(value, (list, tuple, set)):
             return " ".join(self._stringifyFragment(item) for item in value)
         return str(value)
+
+    def _handle_hms_error(
+        self,
+        hms_code: str,
+        printer_serial: str,
+        printer_ip: str,
+        printer_instance: Optional[Any] = None
+    ) -> None:
+        """
+        Handle HMS error detection and reporting
+
+        Args:
+            hms_code: HMS error code
+            printer_serial: Printer serial number
+            printer_ip: Printer IP address
+            printer_instance: Optional connected printer instance for camera capture
+        """
+        if not self.event_reporter:
+            return
+
+        # Check if already reported
+        with self.hms_errors_lock:
+            if printer_serial not in self.reported_hms_errors:
+                self.reported_hms_errors[printer_serial] = set()
+            if hms_code in self.reported_hms_errors[printer_serial]:
+                return
+            self.reported_hms_errors[printer_serial].add(hms_code)
+
+        self.log.warning(f"HMS Error detected on {printer_serial} ({printer_ip}): {hms_code}")
+
+        # Parse error
+        error_data = parse_hms_error(hms_code)
+
+        self.log.error(
+            f"HMS Error {hms_code} on {printer_serial}: "
+            f"{error_data['description']} (severity: {error_data['severity']})"
+        )
+
+        # Capture camera snapshot (non-blocking, best effort)
+        image_data = None
+        if printer_instance:
+            try:
+                image_data = capture_camera_frame_from_printer(printer_instance)
+                if image_data:
+                    self.log.info(f"Captured error snapshot for HMS {hms_code}")
+                else:
+                    self.log.debug(f"No image captured for HMS {hms_code}")
+            except Exception as e:
+                self.log.debug(f"Could not capture error snapshot: {e}")
+
+        # Report event to backend
+        try:
+            event_id = self.event_reporter.report_hms_error(
+                printer_serial=printer_serial,
+                printer_ip=printer_ip,
+                hms_code=hms_code,
+                error_data=error_data,
+                image_data=image_data
+            )
+
+            if event_id:
+                self.log.info(f"HMS error reported to backend: event_id={event_id}")
+            else:
+                self.log.warning("Failed to report HMS error to backend")
+
+        except Exception as e:
+            self.log.error(f"Error reporting HMS error to backend: {e}", exc_info=True)
+
+    def _report_status_update(
+        self,
+        status_data: Dict[str, Any],
+        printer_serial: str,
+        printer_ip: str
+    ) -> None:
+        """
+        Report periodic status update to backend
+
+        Args:
+            status_data: Raw status data from printer
+            printer_serial: Printer serial number
+            printer_ip: Printer IP address
+        """
+        if not self.event_reporter:
+            return
+
+        try:
+            # Extract relevant status fields from normalized snapshot
+            extracted_status = {
+                "progress": status_data.get("progressPercent"),
+                "bedTemp": status_data.get("bedTemp"),
+                "nozzleTemp": status_data.get("nozzleTemp"),
+                "remainingTimeSeconds": status_data.get("remainingTimeSeconds"),
+                "gcodeState": status_data.get("gcodeState"),
+                "currentLayer": status_data.get("currentLayer"),
+                "totalLayers": status_data.get("totalLayers"),
+                "state": status_data.get("state"),
+                "fanSpeedPercent": status_data.get("fanSpeedPercent"),
+                "printSpeed": status_data.get("printSpeed"),
+                "filamentUsed": status_data.get("filamentUsed"),
+                "currentJobId": status_data.get("currentJobId"),
+            }
+
+            # Remove None values
+            extracted_status = {k: v for k, v in extracted_status.items() if v is not None}
+
+            # Only report if we have meaningful status data
+            if extracted_status:
+                self.event_reporter.report_event(
+                    event_type="status_update",
+                    printer_serial=printer_serial,
+                    printer_ip=printer_ip,
+                    event_status="info",
+                    status_data=extracted_status
+                )
+
+        except Exception as e:
+            self.log.debug(f"Error reporting status update: {e}")
 
     def _sanitizeErrorMessage(self, message: str, accessCode: str) -> str:
         if accessCode and accessCode in message:
