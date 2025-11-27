@@ -35,6 +35,14 @@ try:
 except ImportError:
     _config_manager_available = False
 
+# Import event reporter for event reporting
+try:
+    from .event_reporter import EventReporter
+    _event_reporter_available = True
+except ImportError:
+    _event_reporter_available = False
+    EventReporter = None
+
 import requests
 
 
@@ -2108,6 +2116,34 @@ def applySkippedObjectsToArchive(archivePath: Path, skipTargets: Sequence[Dict[s
             archive.writestr(name, data)
 
 
+def _create_event_reporter_if_available() -> Optional[Any]:
+    """
+    Create an EventReporter instance if credentials are available.
+
+    Returns:
+        EventReporter instance or None if not available/configured
+    """
+    if not _event_reporter_available or EventReporter is None:
+        return None
+
+    base_url = os.getenv("BASE44_API_URL", "").strip()
+    api_key = os.getenv("BASE44_API_KEY", "").strip() or os.getenv("BASE44_FUNCTIONS_API_KEY", "").strip()
+    recipient_id = os.getenv("BASE44_RECIPIENT_ID", "").strip()
+
+    if not base_url or not api_key or not recipient_id:
+        return None
+
+    try:
+        return EventReporter(
+            base_url=base_url,
+            api_key=api_key,
+            recipient_id=recipient_id
+        )
+    except Exception as e:
+        logger.debug(f"Failed to create event reporter: {e}")
+        return None
+
+
 def sendBambuPrintJob(
     *,
     filePath: Path,
@@ -2117,6 +2153,14 @@ def sendBambuPrintJob(
     jobMetadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Upload a file and start a Bambu print job."""
+
+    # Initialize event reporter if available
+    event_reporter = _create_event_reporter_if_available()
+
+    # Extract print job ID from metadata if available
+    print_job_id = None
+    if jobMetadata:
+        print_job_id = jobMetadata.get("printJobId") or jobMetadata.get("print_job_id") or jobMetadata.get("jobId")
 
     logger.info(
         "[PRINT_JOB] Dispatch Started",
@@ -2446,8 +2490,37 @@ def sendBambuPrintJob(
                         }
                     )
                 )
+
+            # Report job started event
+            if event_reporter and print_job_id:
+                try:
+                    event_reporter.report_job_started(
+                        printer_serial=options.serialNumber,
+                        printer_ip=options.ipAddress,
+                        print_job_id=print_job_id,
+                        file_name=filePath.name,
+                        estimated_time=None,  # Could extract from metadata if available
+                        plates_requested=1
+                    )
+                except Exception as e:
+                    logger.debug(f"Failed to report job_started event: {e}")
+
         except Exception as error:
             logger.warning("API start failed for %s: %s", options.serialNumber, error, exc_info=True)
+
+            # Report job failed event
+            if event_reporter and print_job_id:
+                try:
+                    event_reporter.report_job_failed(
+                        printer_serial=options.serialNumber,
+                        printer_ip=options.ipAddress,
+                        print_job_id=print_job_id,
+                        file_name=filePath.name,
+                        error_message=str(error)
+                    )
+                except Exception as e:
+                    logger.debug(f"Failed to report job_failed event: {e}")
+
             if statusCallback:
                 statusCallback(_with_plate_options({"status": "apiStartFailed", "error": str(error)}))
             raise RuntimeError(
