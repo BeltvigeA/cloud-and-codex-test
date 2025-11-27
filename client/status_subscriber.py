@@ -27,6 +27,13 @@ except ImportError:
     _event_reporting_available = False
     EventReporter = None
 
+# Import config manager
+try:
+    from .config_manager import get_config_manager
+    _config_manager_available = True
+except ImportError:
+    _config_manager_available = False
+
 # Reduce noise from third-party SDK logger
 logging.getLogger("bambulabs_api").setLevel(logging.WARNING)
 
@@ -80,12 +87,28 @@ class BambuStatusSubscriber:
         self.errorCountBySerial: Dict[str, int] = {}
         self.errorCountLock = threading.Lock()
         self.logEvery = 50
-        self.defaultRecipientId = os.getenv("BASE44_RECIPIENT_ID", "").strip()
+
+        # Get configuration from config manager (prefer) or environment variables (fallback)
+        config_base_url = None
+        config_api_key = None
+        config_recipient_id = None
+
+        if _config_manager_available:
+            try:
+                config = get_config_manager()
+                config_base_url = config.get_backend_url()
+                config_api_key = config.get_api_key()
+                config_recipient_id = config.get_recipient_id()
+            except Exception as e:
+                self.log.debug(f"Could not load config from config manager: {e}")
+
+        # Use config values (preferred) or parameters (fallback) or env (last resort)
+        self.base_url = config_base_url or baseUrl or os.getenv("BASE44_API_URL", "").strip()
+        self.api_key = config_api_key or apiKey or os.getenv("BASE44_API_KEY", "").strip() or os.getenv("BASE44_FUNCTIONS_API_KEY", "").strip()
+        self.defaultRecipientId = config_recipient_id or os.getenv("BASE44_RECIPIENT_ID", "").strip()
 
         # Initialize event reporter if credentials available
         self.event_reporter: Optional[EventReporter] = None
-        self.base_url = baseUrl or os.getenv("BASE44_API_URL", "").strip()
-        self.api_key = apiKey or os.getenv("BASE44_API_KEY", "").strip() or os.getenv("BASE44_FUNCTIONS_API_KEY", "").strip()
 
         if _event_reporting_available and self.base_url and self.api_key and self.defaultRecipientId:
             try:
@@ -94,13 +117,22 @@ class BambuStatusSubscriber:
                     api_key=self.api_key,
                     recipient_id=self.defaultRecipientId
                 )
-                self.log.info("Event reporting initialized")
+                self.log.info("Event reporting initialized (credentials from config file)")
             except Exception as e:
                 self.log.warning(f"Failed to initialize event reporter: {e}")
         elif not _event_reporting_available:
             self.log.debug("Event reporting modules not available")
+        elif not _config_manager_available:
+            self.log.debug("Event reporting not configured (config manager not available)")
         else:
-            self.log.debug("Event reporting not configured (missing baseUrl, apiKey, or recipientId)")
+            missing = []
+            if not self.base_url:
+                missing.append("backend_url")
+            if not self.api_key:
+                missing.append("api_key")
+            if not self.defaultRecipientId:
+                missing.append("recipient_id")
+            self.log.debug(f"Event reporting not configured (missing from config: {', '.join(missing)})")
 
         # Track reported HMS errors to avoid duplicates
         self.reported_hms_errors: Dict[str, Set[str]] = {}
