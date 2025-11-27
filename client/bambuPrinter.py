@@ -2118,7 +2118,12 @@ def applySkippedObjectsToArchive(archivePath: Path, skipTargets: Sequence[Dict[s
 
 def _create_event_reporter_if_available() -> Optional[Any]:
     """
-    Create an EventReporter instance if credentials are available.
+    Create an EventReporter instance if credentials are available from config file.
+
+    Credentials are read from ~/.printmaster/config.json:
+    - backend_url: Backend API URL
+    - api_key: API authentication key
+    - recipient_id: Unique recipient identifier
 
     Returns:
         EventReporter instance or None if not available/configured
@@ -2126,14 +2131,41 @@ def _create_event_reporter_if_available() -> Optional[Any]:
     if not _event_reporter_available or EventReporter is None:
         return None
 
-    base_url = os.getenv("BASE44_API_URL", "").strip()
-    api_key = os.getenv("BASE44_API_KEY", "").strip() or os.getenv("BASE44_FUNCTIONS_API_KEY", "").strip()
-    recipient_id = os.getenv("BASE44_RECIPIENT_ID", "").strip()
+    # Get configuration from config manager (preferred)
+    base_url = None
+    api_key = None
+    recipient_id = None
+
+    if _config_manager_available:
+        try:
+            config = get_config_manager()
+            base_url = config.get_backend_url()
+            api_key = config.get_api_key()
+            recipient_id = config.get_recipient_id()
+        except Exception as e:
+            logger.debug(f"Could not load config from config manager: {e}")
+
+    # Fallback to environment variables (not recommended, use config file instead)
+    if not base_url:
+        base_url = os.getenv("BASE44_API_URL", "").strip()
+    if not api_key:
+        api_key = os.getenv("BASE44_API_KEY", "").strip() or os.getenv("BASE44_FUNCTIONS_API_KEY", "").strip()
+    if not recipient_id:
+        recipient_id = os.getenv("BASE44_RECIPIENT_ID", "").strip()
 
     if not base_url or not api_key or not recipient_id:
+        missing = []
+        if not base_url:
+            missing.append("backend_url")
+        if not api_key:
+            missing.append("api_key")
+        if not recipient_id:
+            missing.append("recipient_id")
+        logger.debug(f"Event reporting not configured (missing: {', '.join(missing)})")
         return None
 
     try:
+        logger.debug("Creating event reporter with credentials from config file")
         return EventReporter(
             base_url=base_url,
             api_key=api_key,
