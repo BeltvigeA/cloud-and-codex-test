@@ -1617,6 +1617,21 @@ def startPrintViaApi(
             _extract_mc_percent(preflightState),
             _extract_gcode_state(preflightState),
         )
+    # NEW: Always try to clear FINISH state before attempting to start
+    if preflightState is not None:
+        preflightStateText = _extract_gcode_state(preflightState) or extractStateText(preflightState)
+        if _normalizeStateName(preflightStateText) in finishStateNames:
+            logger.info("[start] Printer is in FINISH state before start - clearing...")
+            try:
+                stopMethod = getattr(printer, "stop_print", None)
+                if callable(stopMethod):
+                    stopMethod()
+                    logger.info("[start] Sent stop_print to clear FINISH state proactively")
+                    time.sleep(3.0)  # Give printer more time to process
+                    preflightState = _safe_get_state(printer)  # Refresh state after clearing
+            except Exception as error:
+                logger.warning("[start] Failed to proactively clear FINISH state: %s", error)
+
     if _state_is_completed_like(preflightState):
         # Printer is in FINISH state - try to force it out of FINISH state first
         logger.info("[start] Printer in FINISH state, attempting to reset/clear state...")
@@ -1627,7 +1642,7 @@ def startPrintViaApi(
                 try:
                     stopMethod()
                     logger.info("[start] Sent stop_print to clear FINISH state")
-                    time.sleep(1.0)  # Give printer time to process
+                    time.sleep(3.0)  # Give printer more time to process
                 except Exception as error:
                     logger.debug("[start] stop_print failed (may already be stopped): %s", error)
         except Exception as error:
@@ -1820,17 +1835,27 @@ def startPrintViaApi(
 
         # Check if printer is in FINISH state (from ackResult, not preflight)
         currentState = ackResult.get("state")
+        currentGcodeState = ackResult.get("gcodeState")
         isInFinishState = (
             currentState == "FINISH" or
+            currentGcodeState == "FINISH" or
             _state_is_completed_like(preflightState) or
             _state_is_completed_like(ackResult.get("statePayload"))
         )
 
         # Debug logging to understand why FINISH detection might not trigger
         logger.info(
-            "[start] FINISH state check: currentState=%s, preflightState=%s, isInFinishState=%s, acknowledged=%s",
-            currentState, preflightState, isInFinishState, acknowledged
+            "[start] State check: currentState=%s, currentGcodeState=%s, preflightState=%s, isInFinishState=%s, acknowledged=%s",
+            currentState, currentGcodeState, preflightState, isInFinishState, acknowledged
         )
+
+        # NEW: Check for HMS error code 07ff-2000-0002-0004 specifically
+        statePayload = ackResult.get("statePayload")
+        if statePayload and isinstance(statePayload, dict):
+            hmsMessages = statePayload.get("messages", [])
+            if any("07ff-2000-0002-0004" in str(msg).lower() for msg in hmsMessages):
+                logger.warning("[start] Detected HMS code 07ff-2000-0002-0004 - file sent but not started")
+                isInFinishState = True  # Treat this like a FINISH state that needs clearing
 
         # If printer is in FINISH state, we need to clear it first
         finishStateHandled = False
@@ -1841,7 +1866,7 @@ def startPrintViaApi(
                 if callable(stopMethod):
                     stopMethod()
                     logger.info("[start] Sent stop_print to clear FINISH state")
-                    time.sleep(2.0)  # Give printer time to process
+                    time.sleep(3.0)  # Give printer more time to process
                     # Try starting again
                     _invokeStart()
                     ackResult = _pollForAcknowledgement(ack_timeout_sec)
