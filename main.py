@@ -2947,6 +2947,238 @@ def reportPrinterImage():
     }, 200)
 
 
+@app.route('/api/printer-events/upload-image', methods=['POST'])
+def uploadPrinterImage():
+    """
+    Handle printer image uploads with multipart/form-data.
+
+    Expected form fields:
+    - image: file (required)
+    - recipientId: string (required)
+    - printerSerial: string (required)
+    - printerIpAddress: string (optional)
+    - imageType: string (optional, default: "webcam")
+    """
+    logging.info('Received printer image upload request')
+
+    # Validate API key
+    apiKeyError = ensureValidApiKey()
+    if apiKeyError:
+        return apiKeyError
+
+    # Get clients
+    clients, clientError = _loadClientsOrError()
+    if clientError:
+        return clientError
+
+    storageClient = clients.storageClient
+    firestoreClient = clients.firestoreClient
+    gcsBucketName = clients.gcsBucketName
+
+    # Validate multipart/form-data
+    if not request.files or 'image' not in request.files:
+        logging.warning('No image file provided in upload request')
+        return makeErrorResponse(400, 'ValidationError', 'Image file is required')
+
+    imageFile = request.files['image']
+    if not imageFile or not imageFile.filename:
+        logging.warning('Empty image file provided')
+        return makeErrorResponse(400, 'ValidationError', 'Image file cannot be empty')
+
+    # Get form data
+    recipientId = request.form.get('recipientId', '').strip()
+    printerSerial = request.form.get('printerSerial', '').strip()
+    printerIpAddress = request.form.get('printerIpAddress', '').strip()
+    imageType = request.form.get('imageType', 'webcam').strip()
+
+    # Validate required fields
+    if not recipientId:
+        logging.warning('Missing recipientId in printer image upload')
+        return makeErrorResponse(400, 'ValidationError', 'recipientId is required')
+
+    if not printerSerial:
+        logging.warning('Missing printerSerial in printer image upload')
+        return makeErrorResponse(400, 'ValidationError', 'printerSerial is required')
+
+    # Validate image file size (max 10MB)
+    imageFile.seek(0, os.SEEK_END)
+    fileSize = imageFile.tell()
+    imageFile.seek(0)
+
+    maxFileSize = 10 * 1024 * 1024  # 10MB
+    if fileSize > maxFileSize:
+        logging.warning('Image file too large: %d bytes (max: %d)', fileSize, maxFileSize)
+        return makeErrorResponse(400, 'ValidationError', f'Image file too large (max {maxFileSize / 1024 / 1024}MB)')
+
+    # Generate filename and GCS path
+    timestamp = datetime.now(timezone.utc)
+    timestampStr = timestamp.strftime('%Y%m%d-%H%M%S')
+    imageId = str(uuid.uuid4())
+
+    # Determine file extension from original filename
+    originalFilename = secure_filename(imageFile.filename)
+    _, fileExtension = os.path.splitext(originalFilename)
+    if not fileExtension:
+        fileExtension = '.jpg'  # Default to .jpg if no extension
+
+    filename = f'printer-snapshot-{timestampStr}-{imageId}{fileExtension}'
+    gcsPath = f'{recipientId}/printer_image/{printerSerial}/{filename}'
+
+    # Upload to Google Cloud Storage
+    try:
+        bucket = storageClient.bucket(gcsBucketName)
+        blob = bucket.blob(gcsPath)
+
+        # Set content type
+        contentType = imageFile.content_type or 'image/jpeg'
+        blob.upload_from_file(imageFile, content_type=contentType)
+
+        logging.info('Uploaded printer image to gs://%s/%s', gcsBucketName, gcsPath)
+    except Exception as error:
+        logging.exception('Failed to upload printer image to GCS')
+        return makeErrorResponse(500, 'ServerError', 'Failed to upload image to storage', str(error))
+
+    # Generate signed URL for the uploaded image
+    signedUrl = None
+    try:
+        credentials = getattr(storageClient, '_credentials', None)
+        if credentials is not None:
+            signBytesMethod = getattr(credentials, 'sign_bytes', None)
+            if callable(signBytesMethod):
+                signedUrl = blob.generate_signed_url(
+                    version='v4',
+                    expiration=timedelta(hours=24),  # 24-hour expiry for images
+                    method='GET',
+                )
+            else:
+                if Request is None:
+                    raise ImportError('google.auth Request is required for IAM signing')
+                requestAdapter = Request()
+                scopedCredentials = credentials
+                withScopesMethod = getattr(credentials, 'with_scopes_if_required', None)
+                if callable(withScopesMethod):
+                    scopedCredentials = withScopesMethod(
+                        ['https://www.googleapis.com/auth/cloud-platform']
+                    )
+                    if scopedCredentials is None:
+                        scopedCredentials = credentials
+                credentials = scopedCredentials
+                credentials.refresh(requestAdapter)
+                accessToken = getattr(credentials, 'token', None)
+                if not accessToken:
+                    raise AttributeError('Credentials missing access token required for IAM signing')
+                serviceAccountEmail = getattr(credentials, 'service_account_email', None)
+                if not serviceAccountEmail:
+                    raise AttributeError('Credentials missing service_account_email required for IAM signing')
+                signedUrl = blob.generate_signed_url(
+                    version='v4',
+                    expiration=timedelta(hours=24),
+                    method='GET',
+                    service_account_email=serviceAccountEmail,
+                    access_token=accessToken,
+                )
+
+        if signedUrl is None:
+            signedUrl = blob.generate_signed_url(
+                version='v4',
+                expiration=timedelta(hours=24),
+                method='GET',
+            )
+
+        logging.info('Generated signed URL for printer image gs://%s/%s', gcsBucketName, gcsPath)
+    except Exception as error:
+        logging.warning('Failed to generate signed URL for printer image: %s', error)
+        # Continue without signed URL - not critical
+
+    # Store metadata in Firestore
+    imageMetadata = {
+        'imageId': imageId,
+        'recipientId': recipientId,
+        'printerSerial': printerSerial,
+        'imageType': imageType,
+        'filename': filename,
+        'originalFilename': originalFilename,
+        'gcsPath': gcsPath,
+        'gcsBucket': gcsBucketName,
+        'fileSize': fileSize,
+        'contentType': contentType,
+        'timestamp': firestore.SERVER_TIMESTAMP,
+        'uploadTimestamp': timestamp,
+        'type': 'printer_image',
+    }
+
+    if printerIpAddress:
+        imageMetadata['printerIpAddress'] = printerIpAddress
+
+    try:
+        documentReference = firestoreClient.collection(firestoreCollectionPrinterStatus).add(imageMetadata)
+        documentId = getattr(documentReference, 'id', None)
+        logging.info('Stored printer image metadata for %s (document: %s)', printerSerial, documentId)
+    except Exception as error:
+        logging.exception('Failed to store printer image metadata')
+        return makeErrorResponse(500, 'ServerError', 'Failed to store image metadata', str(error))
+
+    # Build response
+    response = {
+        'success': True,
+        'artifactId': imageId,
+        'message': 'Image uploaded successfully',
+        'gcsPath': gcsPath,
+    }
+
+    if signedUrl:
+        response['imageUrl'] = signedUrl
+
+    return makeJsonResponse(response, 200)
+
+
+@app.route('/api/printer-events/error', methods=['POST'])
+def reportPrinterEventError():
+    """Handle printer error reports via new API endpoint."""
+    logging.info('Received printer error report via /api/printer-events/error')
+
+    apiKeyError = ensureValidApiKey()
+    if apiKeyError:
+        return apiKeyError
+
+    payload, payloadError = getJsonPayload()
+    if payloadError:
+        return payloadError
+
+    clients, clientError = _loadClientsOrError()
+    if clientError:
+        return clientError
+
+    firestoreClient = clients.firestoreClient
+
+    # Validate recipientId
+    recipientId = payload.get('recipientId')
+    if not recipientId or not isinstance(recipientId, str) or not recipientId.strip():
+        logging.warning('Invalid or missing recipientId in error report')
+        return makeErrorResponse(400, 'ValidationError', 'recipientId must be a non-empty string')
+
+    # Prepare error data
+    errorData = dict(payload)
+    errorData['timestamp'] = firestore.SERVER_TIMESTAMP
+    errorData['recipientId'] = recipientId.strip()
+    errorData['type'] = 'error'
+
+    # Store in Firestore
+    try:
+        documentReference = firestoreClient.collection(firestoreCollectionPrinterStatus).add(errorData)
+        logging.info('Stored error report for recipient %s', recipientId)
+    except Exception as error:
+        logging.exception('Failed to store printer error report')
+        return makeErrorResponse(500, 'ServerError', 'Failed to store error report', str(error))
+
+    return makeJsonResponse({
+        'ok': True,
+        'success': True,
+        'message': 'Error reported successfully',
+        'errorId': getattr(documentReference, 'id', None)
+    }, 200)
+
+
 @app.route('/', methods=['GET'])
 def healthCheck():
     return jsonify({'status': 'ok', 'message': 'Cloud server is running!'}), 200

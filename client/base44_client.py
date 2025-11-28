@@ -30,12 +30,12 @@ def _resolveFunctionsBaseUrl() -> str:
 # Hardkodet PrintPro3D backend URL for status updates
 PRINTPRO3D_BASE = "https://printpro3d-api-931368217793.europe-west1.run.app"
 
-# Base44 functions base - now configurable via environment variable
+# Base44 functions base - now configurable via environment variable (legacy)
 BASE44_FUNCTIONS_BASE = _resolveFunctionsBaseUrl()
 
-# Legacy endpoints (kun for error og image reporting)
-REPORT_ERROR_URL = f"{BASE44_FUNCTIONS_BASE}/reportPrinterError"
-REPORT_IMAGE_URL = f"{BASE44_FUNCTIONS_BASE}/reportPrinterImage"
+# PrintPro3D backend API endpoints
+REPORT_ERROR_URL = f"{PRINTPRO3D_BASE}/api/printer-events/error"
+REPORT_IMAGE_URL = f"{PRINTPRO3D_BASE}/api/printer-events/upload-image"
 
 # Note: UPDATE_STATUS_URL er nå dynamisk og bygges i postUpdateStatus()
 
@@ -60,7 +60,8 @@ def _resolveApiKey(*envKeys: str) -> str:
 
 
 def _buildFunctionsHeaders() -> Dict[str, str]:
-    apiKey = _resolveApiKey("BASE44_FUNCTIONS_API_KEY", "BASE44_API_KEY")
+    """Build headers for PrintPro3D backend API (formerly Base44 functions)"""
+    apiKey = _resolveApiKey("PRINTER_BACKEND_API_KEY", "BASE44_FUNCTIONS_API_KEY", "BASE44_API_KEY")
     return {"Content-Type": "application/json", "X-API-Key": apiKey}
 
 
@@ -202,19 +203,76 @@ def postReportError(payload: Dict[str, object]) -> Dict[str, object]:
 
 
 def postReportPrinterImage(payload: Dict[str, object]) -> Dict[str, object]:
-    """POST to reportPrinterImage. payload MUST match the required schema."""
+    """
+    POST to upload printer image endpoint.
+
+    Expected payload format:
+    {
+        "recipientId": "RID123",  # Optional - will be auto-filled if missing
+        "printerSerial": "01P00A381200434",
+        "printerIpAddress": "192.168.1.100",  # Optional
+        "imageType": "webcam",  # Optional - default is "webcam"
+        "imageData": "data:image/jpeg;base64,/9j/4AAQ..."  # Base64 data URI
+    }
+
+    Converts to multipart/form-data upload for new backend.
+    """
+    import base64
+    from io import BytesIO
 
     preparedPayload = dict(payload)
     if not _ensureRecipient(preparedPayload):
         return {}
-    response = requests.post(
-        REPORT_IMAGE_URL,
-        json=preparedPayload,
-        headers=_buildFunctionsHeaders(),
-        timeout=10,
-    )
-    response.raise_for_status()
-    return response.json() if response.content else {}
+
+    # Extract and decode image data
+    imageDataUri = preparedPayload.get("imageData", "")
+    if not imageDataUri:
+        log.warning("postReportPrinterImage: missing imageData")
+        return {}
+
+    # Strip data URI prefix if present (e.g., "data:image/jpeg;base64,...")
+    if imageDataUri.startswith("data:"):
+        imageDataUri = imageDataUri.split(",", 1)[1] if "," in imageDataUri else imageDataUri
+
+    try:
+        # Decode base64 image data
+        imageBytes = base64.b64decode(imageDataUri)
+    except Exception as e:
+        log.error(f"Failed to decode image data: {e}")
+        return {}
+
+    # Prepare multipart form data
+    files = {"image": ("snapshot.jpg", BytesIO(imageBytes), "image/jpeg")}
+    data = {
+        "recipientId": preparedPayload.get("recipientId"),
+        "printerSerial": preparedPayload.get("printerSerial", ""),
+        "imageType": preparedPayload.get("imageType", "webcam")
+    }
+
+    # Include printerIpAddress if provided
+    if "printerIpAddress" in preparedPayload and preparedPayload["printerIpAddress"]:
+        data["printerIpAddress"] = preparedPayload["printerIpAddress"]
+
+    # Build headers (without Content-Type - requests will set it for multipart)
+    apiKey = _resolveApiKey("PRINTER_BACKEND_API_KEY", "BASE44_FUNCTIONS_API_KEY", "BASE44_API_KEY")
+    headers = {"X-API-Key": apiKey}
+
+    try:
+        response = requests.post(
+            REPORT_IMAGE_URL,
+            files=files,
+            data=data,
+            headers=headers,
+            timeout=30,  # Longer timeout for image upload
+        )
+        response.raise_for_status()
+        printer_serial = data.get("printerSerial", "unknown")
+        log.info(f"Image uploaded successfully for printer {printer_serial}")
+        return response.json() if response.content else {}
+    except requests.RequestException as error:
+        printer_serial = data.get("printerSerial", "unknown")
+        log.error(f"Failed to upload image for printer {printer_serial}: {error}")
+        return {}
 
 
 def listPendingCommandsForRecipient(recipientId: str, limit: Optional[int] = None) -> List[Dict[str, Any]]:
