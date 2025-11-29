@@ -183,6 +183,17 @@ class ListenerGuiApp:
 
         self.activePrinterDialog: Optional[Dict[str, Any]] = None
 
+        # Initialize config manager FIRST (before statusSubscriber needs it)
+        self.config_manager = get_config_manager()
+
+        # Ensure backend URL is set in config (required for event reporting)
+        if not self.config_manager.get_backend_url():
+            backend_url = "https://printpro3d-api-931368217793.europe-west1.run.app"
+            self.config_manager.set_backend_url(backend_url)
+            self.config_manager.save()
+            logging.info(f"Saved backend URL to config: {backend_url}")
+
+        # Now create statusSubscriber (it will read backend_url from config)
         self.liveStatusEnabledVar = tk.BooleanVar(value=True)
         self.statusSubscriber = BambuStatusSubscriber(
             onUpdate=self._onPrinterStatusUpdate,
@@ -192,9 +203,6 @@ class ListenerGuiApp:
         self.lastLiveStatusAlerts: Dict[str, str] = {}
         self.commandWorkers: Dict[str, CommandWorker] = {}
         self.heartbeatWorker: Optional[HeartbeatWorker] = None
-
-        # Initialize config manager
-        self.config_manager = get_config_manager()
 
         # Load settings from config if available
         self._loadSettingsFromConfig()
