@@ -3132,6 +3132,145 @@ def uploadPrinterImage():
     return makeJsonResponse(response, 200)
 
 
+@app.route('/api/printer-images/latest', methods=['GET'])
+def getLatestPrinterImage():
+    """
+    Retrieve the latest camera image for a specific printer.
+
+    Query parameters:
+    - printerSerial: string (required) - The printer's serial number
+    - imageType: string (optional, default: "webcam") - The type of image to retrieve
+
+    Returns the latest image metadata with a signed URL.
+    """
+    logging.info('Received request for latest printer image')
+
+    # Validate API key
+    apiKeyError = ensureValidApiKey()
+    if apiKeyError:
+        return apiKeyError
+
+    # Get clients
+    clients, clientError = _loadClientsOrError()
+    if clientError:
+        return clientError
+
+    storageClient = clients.storageClient
+    firestoreClient = clients.firestoreClient
+    gcsBucketName = clients.gcsBucketName
+
+    # Get query parameters
+    printerSerial = request.args.get('printerSerial', '').strip()
+    imageType = request.args.get('imageType', 'webcam').strip()
+
+    # Validate required parameters
+    if not printerSerial:
+        logging.warning('Missing printerSerial in latest image request')
+        return makeErrorResponse(400, 'ValidationError', 'printerSerial query parameter is required')
+
+    # Query Firestore for the latest image
+    try:
+        query = firestoreClient.collection(firestoreCollectionPrinterStatus) \
+            .where('type', '==', 'printer_image') \
+            .where('printerSerial', '==', printerSerial) \
+            .where('imageType', '==', imageType) \
+            .order_by('timestamp', direction=firestore.Query.DESCENDING) \
+            .limit(1)
+
+        results = query.get()
+
+        if not results:
+            logging.info('No images found for printer %s with imageType %s', printerSerial, imageType)
+            return makeErrorResponse(404, 'NotFound', f'No images found for printer {printerSerial}')
+
+        # Get the latest image document
+        latestImageDoc = results[0]
+        imageData = latestImageDoc.to_dict()
+
+        # Generate a fresh signed URL for the image
+        gcsPath = imageData.get('gcsPath')
+        if not gcsPath:
+            logging.warning('Image document missing gcsPath: %s', latestImageDoc.id)
+            return makeErrorResponse(500, 'ServerError', 'Image metadata is incomplete')
+
+        signedUrl = None
+        try:
+            bucket = storageClient.bucket(gcsBucketName)
+            blob = bucket.blob(gcsPath)
+
+            credentials = getattr(storageClient, '_credentials', None)
+            if credentials is not None:
+                signBytesMethod = getattr(credentials, 'sign_bytes', None)
+                if callable(signBytesMethod):
+                    signedUrl = blob.generate_signed_url(
+                        version='v4',
+                        expiration=timedelta(hours=1),  # 1-hour expiry for retrieval
+                        method='GET',
+                    )
+                else:
+                    if Request is None:
+                        raise ImportError('google.auth Request is required for IAM signing')
+                    requestAdapter = Request()
+                    scopedCredentials = credentials
+                    withScopesMethod = getattr(credentials, 'with_scopes_if_required', None)
+                    if callable(withScopesMethod):
+                        scopedCredentials = withScopesMethod(
+                            ['https://www.googleapis.com/auth/cloud-platform']
+                        )
+                        if scopedCredentials is None:
+                            scopedCredentials = credentials
+                    credentials = scopedCredentials
+                    credentials.refresh(requestAdapter)
+                    accessToken = getattr(credentials, 'token', None)
+                    if not accessToken:
+                        raise AttributeError('Credentials missing access token required for IAM signing')
+                    serviceAccountEmail = getattr(credentials, 'service_account_email', None)
+                    if not serviceAccountEmail:
+                        raise AttributeError('Credentials missing service_account_email required for IAM signing')
+                    signedUrl = blob.generate_signed_url(
+                        version='v4',
+                        expiration=timedelta(hours=1),
+                        method='GET',
+                        service_account_email=serviceAccountEmail,
+                        access_token=accessToken,
+                    )
+
+            if signedUrl is None:
+                signedUrl = blob.generate_signed_url(
+                    version='v4',
+                    expiration=timedelta(hours=1),
+                    method='GET',
+                )
+
+            logging.info('Generated signed URL for latest image: %s', gcsPath)
+        except Exception as error:
+            logging.exception('Failed to generate signed URL for latest image')
+            return makeErrorResponse(500, 'ServerError', 'Failed to generate image URL', str(error))
+
+        # Build response
+        response = {
+            'success': True,
+            'id': latestImageDoc.id,
+            'fileName': imageData.get('filename'),
+            'fileSize': imageData.get('fileSize'),
+            'imageUrl': signedUrl,
+            'metadata': {
+                'printerSerial': imageData.get('printerSerial'),
+                'printerIpAddress': imageData.get('printerIpAddress'),
+                'imageType': imageData.get('imageType'),
+                'capturedAt': imageData.get('uploadTimestamp'),
+            },
+            'capturedAt': imageData.get('uploadTimestamp'),
+        }
+
+        logging.info('Retrieved latest image for printer %s', printerSerial)
+        return makeJsonResponse(response, 200)
+
+    except Exception as error:
+        logging.exception('Failed to query for latest printer image')
+        return makeErrorResponse(500, 'ServerError', 'Failed to retrieve latest image', str(error))
+
+
 @app.route('/api/printer-events/error', methods=['POST'])
 def reportPrinterEventError():
     """Handle printer error reports via new API endpoint."""

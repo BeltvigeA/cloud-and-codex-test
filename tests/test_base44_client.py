@@ -37,30 +37,52 @@ def test_functions_requests_use_dedicated_api_key(monkeypatch: pytest.MonkeyPatc
 
     recorded_headers: List[Dict[str, str]] = []
     recorded_requests: List[Tuple[str, Dict[str, Any]]] = []
+    recorded_multipart_requests: List[Tuple[str, Dict[str, str], Dict[str, str]]] = []
 
-    def fake_post(url: str, json: Dict[str, Any] | None = None, headers: Dict[str, str] | None = None, timeout: float = 0.0) -> _DummyResponse:
+    def fake_post(url: str, json: Dict[str, Any] | None = None, headers: Dict[str, str] | None = None, files: Any = None, data: Dict[str, str] | None = None, timeout: float = 0.0) -> _DummyResponse:
         if headers is not None:
             recorded_headers.append(dict(headers))
-        recorded_requests.append((url, dict(json or {})))
+
+        # Handle multipart/form-data requests (for image upload)
+        if files is not None and data is not None:
+            recorded_multipart_requests.append((url, dict(data or {}), dict(headers or {})))
+        else:
+            # Handle JSON requests
+            recorded_requests.append((url, dict(json or {})))
+
         return _DummyResponse({})
 
     monkeypatch.setattr(base44_client.requests, "post", fake_post)
 
     base44_client.postUpdateStatus({"status": "ready"})
     base44_client.postReportError({"errorMessage": "boom"})
+    # Use valid base64 data (minimal JPEG header)
     base44_client.postReportPrinterImage(
         {
             "printerIpAddress": "192.168.1.100",
             "imageType": "webcam",
-            "imageData": "data:image/jpeg;base64,xxx",
+            "imageData": "data:image/jpeg;base64,/9j/4AAQSkZJRg==",
         }
     )
 
+    # Verify all three calls were made
     assert len(recorded_headers) == 3
-    assert all(headers.get("X-API-Key") == "functions-key" for headers in recorded_headers)
-    assert any(url.endswith("/reportPrinterImage") for url, _payload in recorded_requests)
-    image_payload = next(payload for url, payload in recorded_requests if url.endswith("/reportPrinterImage"))
-    assert image_payload["recipientId"] == "recipient-xyz"
+
+    # postUpdateStatus uses control headers (BASE44_API_KEY → "legacy-key")
+    # postReportError uses functions headers (BASE44_FUNCTIONS_API_KEY → "functions-key")
+    # postReportPrinterImage uses functions headers (BASE44_FUNCTIONS_API_KEY → "functions-key")
+    assert recorded_headers[0].get("X-API-Key") == "legacy-key"  # postUpdateStatus (control)
+    assert recorded_headers[1].get("X-API-Key") == "functions-key"  # postReportError (functions)
+    assert recorded_headers[2].get("X-API-Key") == "functions-key"  # postReportPrinterImage (functions)
+
+    # Verify image upload uses multipart/form-data to the new endpoint
+    assert len(recorded_multipart_requests) == 1
+    upload_url, upload_data, upload_headers = recorded_multipart_requests[0]
+    assert upload_url.endswith("/api/printer-events/upload-image")
+    assert upload_data["recipientId"] == "recipient-xyz"
+    assert upload_data["printerIpAddress"] == "192.168.1.100"
+    assert upload_data["imageType"] == "webcam"
+    assert upload_headers.get("X-API-Key") == "functions-key"
 
 
 def test_control_requests_use_control_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -88,7 +110,7 @@ def test_control_requests_use_control_api_key(monkeypatch: pytest.MonkeyPatch) -
     base44_client.postCommandResult("cmd-1", status="completed", message="ok")
 
     assert get_calls and get_calls[0][1].get("X-API-Key") == "control-key"
-    assert get_calls[0][0] == "https://printer-backend-934564650450.europe-west1.run.app/control"
+    assert get_calls[0][0] == "https://printpro3d-api-931368217793.europe-west1.run.app/control"
     assert get_calls[0][2] == {"recipientId": "recipient-123"}
     assert len(post_calls) == 2
     assert all(headers.get("X-API-Key") == "control-key" for _url, headers, _payload in post_calls)
