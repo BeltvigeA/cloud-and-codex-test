@@ -144,6 +144,12 @@ class BambuStatusSubscriber:
         self.previous_states: Dict[str, Optional[str]] = {}
         self.previous_states_lock = threading.Lock()
 
+        # Camera capture tracking
+        self.last_camera_capture: Dict[str, float] = {}  # {printer_serial: timestamp}
+        self.camera_capture_lock = threading.Lock()
+        self.camera_capture_interval_active = 30.0   # 30 seconds during print
+        self.camera_capture_interval_idle = 300.0    # 5 minutes when idle
+
     def startAll(self, printers: Iterable[Dict[str, Any]]) -> None:
         """Start worker threads for each printer configuration."""
 
@@ -390,6 +396,43 @@ class BambuStatusSubscriber:
 
                             except Exception as e:
                                 self.log.debug(f"Pause detection failed: {e}")
+
+                    # ============================================
+                    # CAMERA IMAGE CAPTURE AND UPLOAD
+                    # ============================================
+                    # Check if we should capture camera image now
+                    should_capture = self._should_capture_camera_image(serial, statusPayload)
+
+                    if should_capture and _event_reporting_available:
+                        try:
+                            self.log.info(f"📸 Capturing camera image for {serial}...")
+
+                            # Capture image using existing function
+                            image_data = capture_camera_frame_from_printer(printerInstance)
+
+                            if image_data:
+                                self.log.info(f"   ✅ Image captured: {len(image_data)} bytes")
+
+                                # Encode to base64
+                                import base64
+                                from datetime import datetime
+                                camera_image_base64 = base64.b64encode(image_data).decode('utf-8')
+                                camera_timestamp = datetime.utcnow().isoformat() + 'Z'
+
+                                self.log.info(f"   📦 Image encoded: {len(camera_image_base64)} chars")
+
+                                # Add camera data to status payload
+                                statusPayload['cameraImage'] = camera_image_base64
+                                statusPayload['cameraImageTimestamp'] = camera_timestamp
+                                statusPayload['cameraImageSize'] = len(image_data)
+
+                                self.log.info(f"   📷 Camera image ready for upload")
+                            else:
+                                self.log.debug(f"⚠️  No camera image captured")
+
+                        except Exception as e:
+                            self.log.warning(f"⚠️  Camera capture failed: {e}")
+                            # Don't fail status update if camera fails
 
                     base44Package = self._buildBase44Payloads(statusPayload, printerConfig, resolvedApiKey)
                     if base44Package is not None:
@@ -857,6 +900,7 @@ class BambuStatusSubscriber:
         apiKey: Optional[str],
     ) -> Optional[Tuple[Dict[str, Any], Dict[str, Any], Optional[Dict[str, Any]], Optional[Dict[str, Any]]]]:
         ipAddress = str(printerConfig.get("ipAddress") or "").strip()
+        serialNumber = str(printerConfig.get("serialNumber") or snapshot.get("printerSerial") or "").strip()
         recipientId = self._resolveRecipientId(printerConfig)
         resolvedApiKey = apiKey or self._resolveBase44ApiKey(printerConfig)
         if not ipAddress or not recipientId or not resolvedApiKey:
@@ -901,15 +945,35 @@ class BambuStatusSubscriber:
         if firmwareVersion:
             optionalFields["firmwareVersion"] = firmwareVersion
 
+        # Add camera image data if available
+        cameraImage = snapshot.get("cameraImage")
+        if cameraImage:
+            optionalFields["cameraImage"] = cameraImage
+            self.log.debug("   📷 Including camera image in status update payload")
+
+        cameraImageTimestamp = snapshot.get("cameraImageTimestamp")
+        if cameraImageTimestamp:
+            optionalFields["cameraImageTimestamp"] = cameraImageTimestamp
+
+        cameraImageSize = snapshot.get("cameraImageSize")
+        if cameraImageSize:
+            optionalFields["cameraImageSize"] = cameraImageSize
+
         updatePayload: Dict[str, Any] = {
             "recipientId": recipientId,
+            "printerSerial": serialNumber,
             "printerIpAddress": ipAddress,
             "status": status,
         }
         if combinedErrorMessage:
             updatePayload["errorMessage"] = combinedErrorMessage
         updatePayload.update(optionalFields)
-        updateComparable = {key: value for key, value in updatePayload.items() if key != "lastUpdateTimestamp"}
+        # Exclude camera image and timestamp from comparison (don't trigger updates just because image changed)
+        updateComparable = {
+            key: value
+            for key, value in updatePayload.items()
+            if key not in ("lastUpdateTimestamp", "cameraImage", "cameraImageTimestamp", "cameraImageSize")
+        }
 
         errorPayload: Optional[Dict[str, Any]] = None
         errorComparable: Optional[Dict[str, Any]] = None
@@ -1552,6 +1616,50 @@ class BambuStatusSubscriber:
         except Exception as e:
             self.log.error(f"❌ Failed to get access code: {e}")
             return None
+
+    def _should_capture_camera_image(self, printer_serial: str, status_data: Dict[str, Any]) -> bool:
+        """
+        Determine if we should capture camera image now
+
+        Capture strategy:
+        - Every 30 seconds during active print
+        - Every 5 minutes when idle
+        - Always on first status update for new printer
+
+        Args:
+            printer_serial: Printer serial number
+            status_data: Current status data from printer (normalized snapshot)
+
+        Returns:
+            True if should capture, False otherwise
+        """
+        current_time = time.monotonic()
+
+        with self.camera_capture_lock:
+            last_capture = self.last_camera_capture.get(printer_serial, 0)
+
+            # Get printer state
+            gcode_state = status_data.get('gcodeState', 'IDLE') or 'IDLE'
+            gcode_state_upper = str(gcode_state).upper()
+
+            # Determine capture interval based on state
+            if gcode_state_upper in ['RUNNING', 'PRINTING', 'PREPARE', 'PREHEATING']:
+                capture_interval = self.camera_capture_interval_active  # 30 seconds
+            else:
+                capture_interval = self.camera_capture_interval_idle  # 5 minutes
+
+            # Check if enough time has passed
+            time_since_last = current_time - last_capture
+
+            if time_since_last >= capture_interval:
+                self.log.debug(
+                    f"📸 Should capture camera (state={gcode_state}, "
+                    f"interval={capture_interval:.0f}s, last={time_since_last:.0f}s ago)"
+                )
+                self.last_camera_capture[printer_serial] = current_time
+                return True
+
+        return False
 
     def _report_generic_pause_error(
         self,

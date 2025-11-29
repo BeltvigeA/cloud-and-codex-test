@@ -169,17 +169,38 @@ def postUpdateStatus(payload: Dict[str, object]) -> Dict[str, object]:
     headers = _buildControlHeaders()
 
     try:
-        log.debug(f"Sending status update to {statusUrl}")
+        # Use longer timeout if camera image is included (large payload)
+        has_camera_image = 'cameraImage' in preparedPayload
+        timeout = 30 if has_camera_image else 10
+
+        if has_camera_image:
+            log.debug(f"Sending status update with camera image to {statusUrl}")
+        else:
+            log.debug(f"Sending status update to {statusUrl}")
+
         response = requests.post(
             statusUrl,
             json=preparedPayload,
             headers=headers,
-            timeout=10,
+            timeout=timeout,
         )
         response.raise_for_status()
         printer_serial = preparedPayload.get("printerSerial", recipientId)
+
+        result = response.json() if response.content else {}
+
+        # Log camera image upload success
+        if has_camera_image and result:
+            if result.get('imageUploaded'):
+                log.info(f"✅ Camera image uploaded successfully for printer {printer_serial}")
+                image_url = result.get('imageUrl', '')
+                if image_url:
+                    log.info(f"   🔗 Image URL: {image_url[:80]}...")
+            else:
+                log.warning(f"⚠️  Camera image not uploaded (backend did not confirm)")
+
         log.info(f"Status update successful for printer {printer_serial} (recipient: {recipientId})")
-        return response.json() if response.content else {}
+        return result
     except requests.RequestException as error:
         printer_serial = preparedPayload.get("printerSerial", recipientId)
         log.error(f"Failed to update status for printer {printer_serial} (recipient: {recipientId}): {error}")
