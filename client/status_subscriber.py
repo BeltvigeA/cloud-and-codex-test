@@ -406,7 +406,8 @@ class BambuStatusSubscriber:
                     if should_capture and _event_reporting_available:
                         try:
                             # Capture image to file with extensive logging
-                            image_file_path = self._capture_camera_image_to_file(serial, ipAddress)
+                            # Pass access code directly from worker context (more efficient than config lookup)
+                            image_file_path = self._capture_camera_image_to_file(serial, ipAddress, accessCode)
 
                             if image_file_path:
                                 # Read the saved image file
@@ -1604,17 +1605,50 @@ class BambuStatusSubscriber:
                 return None
 
             config = get_config_manager()
-            printers = config.get_printers()
 
-            # Find printer by serial
-            for printer in printers:
-                if printer.get('serialNumber') == printer_serial:
-                    access_code = printer.get('accessCode')
-                    if access_code:
-                        self.log.debug(f"✅ Found access code for {printer_serial}")
-                        return access_code
+            # Method 1: Use config.get() - the correct API
+            printers = config.get('printers', [])
+            if isinstance(printers, list):
+                for printer in printers:
+                    if isinstance(printer, dict) and printer.get('serialNumber') == printer_serial:
+                        access_code = printer.get('accessCode')
+                        if access_code:
+                            self.log.debug(f"✅ Found access code for {printer_serial} (config.get)")
+                            return access_code
+
+            # Method 2: Try to_dict() as fallback
+            try:
+                config_data = config.to_dict()
+                if isinstance(config_data, dict):
+                    printers = config_data.get('printers', [])
+                    if isinstance(printers, list):
+                        for printer in printers:
+                            if isinstance(printer, dict) and printer.get('serialNumber') == printer_serial:
+                                access_code = printer.get('accessCode')
+                                if access_code:
+                                    self.log.debug(f"✅ Found access code for {printer_serial} (to_dict)")
+                                    return access_code
+            except Exception as e:
+                self.log.debug(f"to_dict() fallback failed: {e}")
+
+            # Method 3: Try direct _config access as last resort
+            try:
+                if hasattr(config, '_config') and isinstance(config._config, dict):
+                    printers = config._config.get('printers', [])
+                    if isinstance(printers, list):
+                        for printer in printers:
+                            if isinstance(printer, dict) and printer.get('serialNumber') == printer_serial:
+                                access_code = printer.get('accessCode')
+                                if access_code:
+                                    self.log.debug(f"✅ Found access code for {printer_serial} (_config)")
+                                    return access_code
+            except Exception as e:
+                self.log.debug(f"_config fallback failed: {e}")
 
             self.log.warning(f"⚠️  No access code found for printer {printer_serial}")
+            self.log.debug(f"   Config type: {type(config)}")
+            self.log.debug(f"   Available methods: {[m for m in dir(config) if not m.startswith('_')]}")
+
             return None
 
         except Exception as e:
@@ -1708,8 +1742,22 @@ class BambuStatusSubscriber:
             import traceback
             self.log.error(traceback.format_exc())
 
-    def _capture_camera_image_to_file(self, printer_serial: str, printer_ip: str) -> Optional[str]:
-        """Capture camera image from printer and save to local file"""
+    def _capture_camera_image_to_file(
+        self,
+        printer_serial: str,
+        printer_ip: str,
+        access_code: Optional[str] = None
+    ) -> Optional[str]:
+        """Capture camera image from printer and save to local file
+
+        Args:
+            printer_serial: Printer serial number
+            printer_ip: Printer IP address
+            access_code: Optional printer access code (if not provided, will look up from config)
+
+        Returns:
+            Path to saved image file, or None if capture failed
+        """
 
         import os
         from datetime import datetime
@@ -1745,7 +1793,12 @@ class BambuStatusSubscriber:
 
             # Get printer access code
             self.log.info(f"   🔑 Getting access code for {printer_serial}...")
-            access_code = self._get_printer_access_code(printer_serial)
+
+            if access_code:
+                self.log.info(f"   ✅ Access code provided directly ({len(access_code)} chars)")
+            else:
+                self.log.info(f"   📋 Looking up access code from config...")
+                access_code = self._get_printer_access_code(printer_serial)
 
             if not access_code:
                 self.log.error(f"   ❌ No access code found for {printer_serial}")
