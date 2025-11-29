@@ -405,12 +405,14 @@ class BambuStatusSubscriber:
 
                     if should_capture and _event_reporting_available:
                         try:
-                            self.log.info(f"📸 Capturing camera image for {serial}...")
+                            # Capture image to file with extensive logging
+                            image_file_path = self._capture_camera_image_to_file(serial, ipAddress)
 
-                            # Capture image using existing function
-                            image_data = capture_camera_frame_from_printer(printerInstance)
+                            if image_file_path:
+                                # Read the saved image file
+                                with open(image_file_path, 'rb') as f:
+                                    image_data = f.read()
 
-                            if image_data:
                                 self.log.info(f"   ✅ Image captured: {len(image_data)} bytes")
 
                                 # Encode to base64
@@ -428,10 +430,12 @@ class BambuStatusSubscriber:
 
                                 self.log.info(f"   📷 Camera image ready for upload")
                             else:
-                                self.log.debug(f"⚠️  No camera image captured")
+                                self.log.debug(f"⚠️  No camera image captured (see detailed logs above)")
 
                         except Exception as e:
                             self.log.warning(f"⚠️  Camera capture failed: {e}")
+                            import traceback
+                            self.log.warning(f"   Traceback:\n{traceback.format_exc()}")
                             # Don't fail status update if camera fails
 
                     base44Package = self._buildBase44Payloads(statusPayload, printerConfig, resolvedApiKey)
@@ -1703,6 +1707,148 @@ class BambuStatusSubscriber:
             self.log.error(f"❌ Failed to report generic pause error: {e}")
             import traceback
             self.log.error(traceback.format_exc())
+
+    def _capture_camera_image_to_file(self, printer_serial: str, printer_ip: str) -> Optional[str]:
+        """Capture camera image from printer and save to local file"""
+
+        import os
+        from datetime import datetime
+
+        try:
+            self.log.info("=" * 80)
+            self.log.info("📸 CAMERA CAPTURE STARTED")
+            self.log.info(f"   Printer Serial: {printer_serial}")
+            self.log.info(f"   Printer IP: {printer_ip}")
+
+            # Generate output path
+            timestamp = datetime.utcnow().strftime('%Y-%m-%dT%H-%M-%S')
+            date_str = datetime.utcnow().strftime('%Y-%m-%d')
+
+            output_dir = os.path.join(
+                os.path.expanduser('~'),
+                '.printmaster',
+                'camera',
+                date_str,
+                printer_serial
+            )
+
+            self.log.info(f"   Output dir: {output_dir}")
+            os.makedirs(output_dir, exist_ok=True)
+            self.log.info(f"   ✅ Output directory created/verified")
+
+            output_path = os.path.join(
+                output_dir,
+                f"{printer_serial}-{timestamp}.jpg"
+            )
+
+            self.log.info(f"   Target file: {output_path}")
+
+            # Get printer access code
+            self.log.info(f"   🔑 Getting access code for {printer_serial}...")
+            access_code = self._get_printer_access_code(printer_serial)
+
+            if not access_code:
+                self.log.error(f"   ❌ No access code found for {printer_serial}")
+                self.log.error(f"   Cannot capture camera image without access code")
+                self.log.info("=" * 80)
+                return None
+
+            self.log.info(f"   ✅ Access code found ({len(access_code)} chars)")
+
+            # Import Bambu API
+            self.log.info(f"   📦 Importing bambulabs_api...")
+            try:
+                from bambulabs_api import Printer
+                self.log.info(f"   ✅ bambulabs_api imported successfully")
+            except ImportError as e:
+                self.log.error(f"   ❌ Failed to import bambulabs_api: {e}")
+                self.log.info("=" * 80)
+                return None
+
+            # Initialize printer connection
+            self.log.info(f"   🔌 Connecting to printer at {printer_ip}...")
+            try:
+                printer = Printer(
+                    ip_address=printer_ip,
+                    access_code=access_code,
+                    serial_number=printer_serial
+                )
+                self.log.info(f"   ✅ Printer connection initialized")
+            except Exception as e:
+                self.log.error(f"   ❌ Failed to initialize printer connection: {e}")
+                self.log.info("=" * 80)
+                return None
+
+            # Try to get camera image
+            self.log.info(f"   📷 Requesting camera image from printer...")
+            image_data = None
+
+            # Try multiple methods
+            methods_tried = []
+
+            # Method 1: get_camera_image()
+            if hasattr(printer, 'get_camera_image'):
+                methods_tried.append('get_camera_image()')
+                try:
+                    self.log.info(f"   Trying: printer.get_camera_image()...")
+                    image_data = printer.get_camera_image()
+                    if image_data:
+                        self.log.info(f"   ✅ Success with get_camera_image()")
+                except Exception as e:
+                    self.log.warning(f"   ⚠️  get_camera_image() failed: {e}")
+
+            # Method 2: get_latest_jpg()
+            if not image_data and hasattr(printer, 'get_latest_jpg'):
+                methods_tried.append('get_latest_jpg()')
+                try:
+                    self.log.info(f"   Trying: printer.get_latest_jpg()...")
+                    image_data = printer.get_latest_jpg()
+                    if image_data:
+                        self.log.info(f"   ✅ Success with get_latest_jpg()")
+                except Exception as e:
+                    self.log.warning(f"   ⚠️  get_latest_jpg() failed: {e}")
+
+            # Method 3: camera.get_image()
+            if not image_data and hasattr(printer, 'camera'):
+                if hasattr(printer.camera, 'get_image'):
+                    methods_tried.append('camera.get_image()')
+                    try:
+                        self.log.info(f"   Trying: printer.camera.get_image()...")
+                        image_data = printer.camera.get_image()
+                        if image_data:
+                            self.log.info(f"   ✅ Success with camera.get_image()")
+                    except Exception as e:
+                        self.log.warning(f"   ⚠️  camera.get_image() failed: {e}")
+
+            if not image_data:
+                self.log.error(f"   ❌ No image data received from printer")
+                self.log.error(f"   Methods tried: {methods_tried}")
+                self.log.error(f"   Available methods: {[m for m in dir(printer) if 'camera' in m.lower() or 'image' in m.lower() or 'jpg' in m.lower()]}")
+                self.log.info("=" * 80)
+                return None
+
+            # Save to file
+            self.log.info(f"   💾 Saving image to file...")
+            with open(output_path, 'wb') as f:
+                f.write(image_data)
+
+            file_size = len(image_data)
+            file_size_kb = file_size / 1024
+
+            self.log.info(f"   ✅ Camera image saved successfully!")
+            self.log.info(f"   File: {output_path}")
+            self.log.info(f"   Size: {file_size_kb:.2f} KB ({file_size} bytes)")
+            self.log.info("=" * 80)
+
+            return output_path
+
+        except Exception as e:
+            self.log.error(f"❌ CAMERA CAPTURE FAILED")
+            self.log.error(f"   Error: {e}")
+            import traceback
+            self.log.error(f"   Traceback:\n{traceback.format_exc()}")
+            self.log.info("=" * 80)
+            return None
 
     def _sanitizeErrorMessage(self, message: str, accessCode: str) -> str:
         if accessCode and accessCode in message:
