@@ -140,6 +140,10 @@ class BambuStatusSubscriber:
         self.status_report_lock = threading.Lock()
         self.status_report_interval = 300.0  # 5 minutes
 
+        # Track previous printer states for pause detection
+        self.previous_states: Dict[str, Optional[str]] = {}
+        self.previous_states_lock = threading.Lock()
+
     def startAll(self, printers: Iterable[Dict[str, Any]]) -> None:
         """Start worker threads for each printer configuration."""
 
@@ -354,6 +358,38 @@ class BambuStatusSubscriber:
                                     self.last_status_report_time[serial] = current_time
                                 except Exception as e:
                                     self.log.debug(f"Status update reporting failed: {e}")
+
+                        # ============================================
+                        # UNEXPECTED PAUSE DETECTION FOR HMS ERRORS
+                        # ============================================
+                        if self.event_reporter:
+                            try:
+                                gcode_state = statusPayload.get('gcodeState')
+
+                                # Get previous state (thread-safe)
+                                with self.previous_states_lock:
+                                    previous_state = self.previous_states.get(serial)
+
+                                # Detect unexpected pause (state transition to PAUSE)
+                                if gcode_state == 'PAUSE':
+                                    self.log.info(f"🔍 Printer {serial} is PAUSED")
+
+                                    # Check if this is a NEW pause (state changed from non-paused to paused)
+                                    if previous_state and previous_state != 'PAUSE':
+                                        self.log.warning("⚠️  UNEXPECTED PAUSE DETECTED!")
+                                        self.log.warning(f"   Printer: {serial}")
+                                        self.log.warning(f"   Previous state: {previous_state}")
+                                        self.log.warning(f"   Current state: PAUSE")
+
+                                        # Check if pause was user-initiated or error-caused
+                                        self._check_pause_reason(serial, ipAddress, printerInstance, statusPayload)
+
+                                # Update previous state (thread-safe)
+                                with self.previous_states_lock:
+                                    self.previous_states[serial] = gcode_state
+
+                            except Exception as e:
+                                self.log.debug(f"Pause detection failed: {e}")
 
                     base44Package = self._buildBase44Payloads(statusPayload, printerConfig, resolvedApiKey)
                     if base44Package is not None:
@@ -1350,6 +1386,215 @@ class BambuStatusSubscriber:
 
         except Exception as e:
             self.log.debug(f"Error reporting status update: {e}")
+
+    def _check_pause_reason(
+        self,
+        printer_serial: str,
+        printer_ip: str,
+        printer_instance: Optional[Any],
+        status_data: Dict[str, Any]
+    ) -> None:
+        """
+        Check if pause was caused by HMS error or user action
+
+        Uses Bambu API print_error_code() to detect errors
+
+        Args:
+            printer_serial: Printer serial number
+            printer_ip: Printer IP address
+            printer_instance: Connected printer instance
+            status_data: Current status payload
+        """
+        self.log.info("=" * 80)
+        self.log.info("🔍 CHECKING PAUSE REASON")
+        self.log.info(f"   Printer: {printer_serial}")
+        self.log.info(f"   IP: {printer_ip}")
+
+        try:
+            # Check if we have a printer instance
+            if not printer_instance:
+                self.log.warning("⚠️  No printer instance available, cannot check error code")
+                return
+
+            # Check error code via API
+            self.log.info("🔍 Calling printer.print_error_code()...")
+            error_code_method = getattr(printer_instance, "print_error_code", None)
+
+            if not callable(error_code_method):
+                self.log.warning("⚠️  print_error_code() method not available on printer instance")
+                return
+
+            error_code = error_code_method()
+            self.log.info(f"📊 Error code: {error_code}")
+
+            if error_code and error_code > 0:
+                # Error detected!
+                self.log.error("❌ HMS ERROR DETECTED via error code!")
+                self.log.error(f"   Printer: {printer_serial}")
+                self.log.error(f"   Error code: {error_code}")
+
+                # Try to get HMS error codes from status data
+                hms_errors = self._extract_hms_from_status(status_data)
+
+                if hms_errors:
+                    self.log.error(f"   HMS errors found: {hms_errors}")
+
+                    # Report each HMS error
+                    for hms_code in hms_errors:
+                        self._handle_hms_error(hms_code, printer_serial, printer_ip, printer_instance)
+                else:
+                    # Error code present but no specific HMS codes
+                    # Report generic error
+                    self.log.warning("⚠️  Error code present but no specific HMS codes found")
+                    self._report_generic_pause_error(printer_serial, printer_ip, error_code)
+            else:
+                # No error - this was a user-initiated pause
+                self.log.info("✅ Pause was USER-INITIATED (error_code = 0)")
+                self.log.info("   No HMS error to report")
+
+        except Exception as e:
+            self.log.error(f"❌ Failed to check pause reason: {e}")
+            import traceback
+            self.log.error(traceback.format_exc())
+
+        self.log.info("=" * 80)
+
+    def _extract_hms_from_status(self, status_data: Dict[str, Any]) -> List[str]:
+        """
+        Extract HMS error codes from status data
+
+        Args:
+            status_data: Current status payload
+
+        Returns:
+            List of HMS error codes
+        """
+        hms_errors = []
+
+        try:
+            # Check normalized hmsCode field
+            hms_code = status_data.get("hmsCode")
+            if hms_code:
+                hms_errors.append(hms_code)
+
+            # Check raw state payload for HMS in various field names
+            raw_state = status_data.get("rawStatePayload")
+            if isinstance(raw_state, dict):
+                possible_hms_fields = [
+                    'hms',
+                    'hms_list',
+                    'hmsErrors',
+                    'errors',
+                    'alarm',
+                    'mc_hms',
+                    'print_error',
+                    'hms_code',
+                ]
+
+                for field in possible_hms_fields:
+                    if field in raw_state:
+                        value = raw_state.get(field)
+
+                        # Handle HMS as list
+                        if isinstance(value, list) and len(value) > 0:
+                            for item in value:
+                                if isinstance(item, str) and item:
+                                    hms_errors.append(item)
+                                elif isinstance(item, dict):
+                                    code = (
+                                        item.get('code') or
+                                        item.get('hms_code') or
+                                        item.get('error_code') or
+                                        str(item)
+                                    )
+                                    if code:
+                                        hms_errors.append(str(code))
+
+                        # Handle HMS as string
+                        elif isinstance(value, str) and value:
+                            hms_errors.append(value)
+
+        except Exception as e:
+            self.log.warning(f"⚠️  Could not extract HMS errors from status: {e}")
+
+        # Remove duplicates
+        return list(set(hms_errors))
+
+    def _get_printer_access_code(self, printer_serial: str) -> Optional[str]:
+        """
+        Get access code for printer from config
+
+        Args:
+            printer_serial: Printer serial number
+
+        Returns:
+            Access code string or None
+        """
+        try:
+            if not _config_manager_available:
+                self.log.warning("⚠️  Config manager not available")
+                return None
+
+            config = get_config_manager()
+            printers = config.get_printers()
+
+            # Find printer by serial
+            for printer in printers:
+                if printer.get('serialNumber') == printer_serial:
+                    access_code = printer.get('accessCode')
+                    if access_code:
+                        self.log.debug(f"✅ Found access code for {printer_serial}")
+                        return access_code
+
+            self.log.warning(f"⚠️  No access code found for printer {printer_serial}")
+            return None
+
+        except Exception as e:
+            self.log.error(f"❌ Failed to get access code: {e}")
+            return None
+
+    def _report_generic_pause_error(
+        self,
+        printer_serial: str,
+        printer_ip: str,
+        error_code: int
+    ) -> None:
+        """
+        Report a generic pause error when error_code > 0 but no specific HMS codes
+
+        Args:
+            printer_serial: Printer serial number
+            printer_ip: Printer IP address
+            error_code: Error code from printer
+        """
+        self.log.warning("📤 Reporting generic pause error to backend...")
+
+        if not self.event_reporter:
+            self.log.error("❌ EventReporter not initialized, cannot report error")
+            return
+
+        try:
+            event_id = self.event_reporter.report_event(
+                event_type="printer_error",
+                printer_serial=printer_serial,
+                printer_ip=printer_ip,
+                event_status="warning",
+                error_data={
+                    "errorCode": error_code,
+                    "description": f"Printer paused unexpectedly with error code {error_code}"
+                },
+                message=f"Unexpected pause detected (error code: {error_code})"
+            )
+
+            if event_id:
+                self.log.info(f"✅ Generic pause error reported: {event_id}")
+            else:
+                self.log.warning("⚠️  Failed to report generic pause error")
+
+        except Exception as e:
+            self.log.error(f"❌ Failed to report generic pause error: {e}")
+            import traceback
+            self.log.error(traceback.format_exc())
 
     def _sanitizeErrorMessage(self, message: str, accessCode: str) -> str:
         if accessCode and accessCode in message:
