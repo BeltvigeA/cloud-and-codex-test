@@ -255,14 +255,94 @@ class BambuStatusSubscriber:
                     statusPayload["nickname"] = nickname
                     statusPayload["status"] = statusPayload.get("status") or "update"
 
-                    # Handle HMS error detection and reporting
+                    # ============================================
+                    # ENHANCED HMS ERROR DETECTION AND REPORTING
+                    # ============================================
                     if self.event_reporter:
-                        hmsCode = statusPayload.get("hmsCode")
-                        if hmsCode:
-                            try:
-                                self._handle_hms_error(hmsCode, serial, ipAddress, printerInstance)
-                            except Exception as e:
-                                self.log.debug(f"HMS error handling failed: {e}")
+                        # Get raw state payload for deep HMS inspection
+                        rawState = statusPayload.get("rawStatePayload")
+
+                        # Collect all HMS errors from different possible locations
+                        hms_errors = []
+
+                        # 1. Check normalized hmsCode (existing method)
+                        normalizedHmsCode = statusPayload.get("hmsCode")
+                        if normalizedHmsCode:
+                            hms_errors.append(normalizedHmsCode)
+                            self.log.info(f"🔍 Found HMS in normalized field: {normalizedHmsCode}")
+
+                        # 2. Check raw state payload for HMS in various field names
+                        if isinstance(rawState, dict):
+                            possible_hms_fields = [
+                                'hms',           # Standard field
+                                'hms_list',      # Alternative
+                                'hmsErrors',     # CamelCase variant
+                                'errors',        # Generic
+                                'alarm',         # Older firmware
+                                'mc_hms',        # Machine HMS
+                                'print_error',   # Print error
+                                'hms_code',      # Direct code field
+                            ]
+
+                            for field in possible_hms_fields:
+                                if field in rawState:
+                                    value = rawState.get(field)
+                                    self.log.info(f"🔍 Found HMS field '{field}': {value}")
+
+                                    # Handle HMS as list
+                                    if isinstance(value, list) and len(value) > 0:
+                                        for item in value:
+                                            # Item can be string or dict
+                                            if isinstance(item, str) and item:
+                                                hms_errors.append(item)
+                                            elif isinstance(item, dict):
+                                                # Try to extract code from dict
+                                                code = (
+                                                    item.get('code') or
+                                                    item.get('hms_code') or
+                                                    item.get('error_code') or
+                                                    item.get('id') or
+                                                    str(item)
+                                                )
+                                                if code:
+                                                    hms_errors.append(str(code))
+
+                                    # Handle HMS as string
+                                    elif isinstance(value, str) and value:
+                                        hms_errors.append(value)
+
+                                    # Handle HMS as dict
+                                    elif isinstance(value, dict):
+                                        # Try nested errors
+                                        if 'errors' in value:
+                                            nested = value['errors']
+                                            if isinstance(nested, list):
+                                                hms_errors.extend([str(e) for e in nested if e])
+                                        elif 'list' in value:
+                                            nested = value['list']
+                                            if isinstance(nested, list):
+                                                hms_errors.extend([str(e) for e in nested if e])
+
+                        # ============================================
+                        # LOG HMS ERROR DETECTION RESULTS
+                        # ============================================
+                        if hms_errors:
+                            self.log.warning("⚠️  ⚠️  ⚠️  HMS ERRORS DETECTED! ⚠️  ⚠️  ⚠️")
+                            self.log.warning(f"   Printer: {serial}")
+                            self.log.warning(f"   Error Count: {len(hms_errors)}")
+                            self.log.warning(f"   HMS Codes: {hms_errors}")
+                            self.log.warning("=" * 80)
+
+                            # Process each unique HMS error
+                            unique_errors = list(set(hms_errors))  # Remove duplicates
+                            for hms_code in unique_errors:
+                                try:
+                                    self.log.info(f"🚨 Processing HMS error: {hms_code}")
+                                    self._handle_hms_error(hms_code, serial, ipAddress, printerInstance)
+                                except Exception as e:
+                                    self.log.error(f"❌ HMS error handling failed for {hms_code}: {e}")
+                        else:
+                            self.log.debug(f"✅ No HMS errors detected for {serial}")
 
                         # Periodic status updates (every 5 minutes by default)
                         current_time = time.monotonic()
@@ -464,6 +544,28 @@ class BambuStatusSubscriber:
             statePayload = printer.get_state()
         except Exception as error:  # pragma: no cover - depends on SDK behaviour
             self.log.debug("get_state failed", exc_info=error)
+
+        # ============================================
+        # RAW STATUS DATA LOGGING FOR HMS DEBUG
+        # ============================================
+        if isinstance(statePayload, dict):
+            serial = printerConfig.get("serialNumber", "unknown")
+            ip = printerConfig.get("ipAddress", "unknown")
+
+            self.log.info("=" * 80)
+            self.log.info("📦 RAW STATUS DATA RECEIVED")
+            self.log.info(f"   Printer: {serial}")
+            self.log.info(f"   IP: {ip}")
+            self.log.info("   Full payload:")
+
+            # Log entire status payload structure
+            import json
+            try:
+                self.log.info(json.dumps(statePayload, indent=2, default=str))
+            except Exception:
+                self.log.info(str(statePayload))
+
+            self.log.info("=" * 80)
 
         if self.statusDebugEnabled and isinstance(statePayload, dict):
             self.log.info("[status] keys(state)=%s", sorted(list(statePayload.keys()))[:40])
