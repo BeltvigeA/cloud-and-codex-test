@@ -30,6 +30,15 @@ class EventReporter:
         self.report_url = f"{self.base_url}/api/printer-events/report"
         self.upload_url_template = f"{self.base_url}/api/printer-events/{{event_id}}/upload-image"
 
+        # VERBOSE LOGGING
+        log.info("=" * 80)
+        log.info("🚀 EventReporter INITIALIZED")
+        log.info(f"   Base URL: {self.base_url}")
+        log.info(f"   Report URL: {self.report_url}")
+        log.info(f"   API Key: {'✅ Present (' + str(len(api_key)) + ' chars)' if api_key else '❌ MISSING'}")
+        log.info(f"   Recipient ID: {'✅ ' + recipient_id if recipient_id else '❌ MISSING'}")
+        log.info("=" * 80)
+
     def report_event(
         self,
         event_type: str,
@@ -79,23 +88,80 @@ class EventReporter:
             "Content-Type": "application/json"
         }
 
+        # VERBOSE LOGGING - Before sending
+        log.info("─" * 80)
+        log.info(f"📤 SENDING EVENT to backend")
+        log.info(f"   Event Type: {event_type}")
+        log.info(f"   Event Status: {event_status}")
+        log.info(f"   Printer Serial: {printer_serial}")
+        log.info(f"   Printer IP: {printer_ip}")
+        log.info(f"   Print Job ID: {print_job_id or 'None'}")
+        log.info(f"   Message: {message or 'None'}")
+        log.info(f"   Has Error Data: {'✅ Yes' if error_data else '❌ No'}")
+        log.info(f"   Has Status Data: {'✅ Yes' if status_data else '❌ No'}")
+        log.info(f"   Target URL: {self.report_url}")
+        log.info(f"   API Key: {'✅ Present' if self.api_key else '❌ MISSING'}")
+        log.info(f"   Recipient ID: {self.recipient_id}")
+        log.info("─" * 80)
+
         try:
+            log.info(f"🌐 Making HTTP POST request...")
             response = requests.post(
                 self.report_url,
                 json=payload,
                 headers=headers,
                 timeout=15
             )
+
+            log.info(f"📥 Got response: HTTP {response.status_code}")
+
+            if response.status_code >= 400:
+                error_text = response.text[:500]  # First 500 chars
+                log.error(f"❌ Backend returned error {response.status_code}")
+                log.error(f"   Response: {error_text}")
+
             response.raise_for_status()
             data = response.json()
             event_id = data.get("eventId")
-            log.info(f"Event reported: {event_type} [{event_status}] → {event_id}")
+
+            log.info("✅ EVENT SENT SUCCESSFULLY")
+            log.info(f"   Event ID: {event_id}")
+            log.info(f"   Event Type: {event_type}")
+            log.info(f"   Created At: {data.get('created_at', 'N/A')}")
+            log.info("─" * 80)
+
             return event_id
-        except requests.exceptions.RequestException as error:
-            log.error(f"Failed to report event {event_type}: {error}")
+
+        except requests.exceptions.Timeout as error:
+            log.error("❌ REQUEST TIMEOUT")
+            log.error(f"   Event Type: {event_type}")
+            log.error(f"   Target: {self.report_url}")
+            log.error(f"   Error: {error}")
             return None
+
+        except requests.exceptions.ConnectionError as error:
+            log.error("❌ CONNECTION ERROR")
+            log.error(f"   Event Type: {event_type}")
+            log.error(f"   Target: {self.report_url}")
+            log.error(f"   Error: {error}")
+            log.error(f"   ⚠️  Check that backend is running and accessible")
+            return None
+
+        except requests.exceptions.HTTPError as error:
+            log.error("❌ HTTP ERROR")
+            log.error(f"   Event Type: {event_type}")
+            log.error(f"   Status Code: {response.status_code}")
+            log.error(f"   Response: {response.text[:500]}")
+            log.error(f"   Error: {error}")
+            return None
+
         except Exception as error:
-            log.error(f"Unexpected error reporting event {event_type}: {error}", exc_info=True)
+            log.error("❌ UNEXPECTED ERROR")
+            log.error(f"   Event Type: {event_type}")
+            log.error(f"   Error Type: {type(error).__name__}")
+            log.error(f"   Error: {error}")
+            import traceback
+            log.error(f"   Traceback:\n{traceback.format_exc()}")
             return None
 
     def upload_event_image(

@@ -2194,6 +2194,20 @@ def sendBambuPrintJob(
     if jobMetadata:
         print_job_id = jobMetadata.get("printJobId") or jobMetadata.get("print_job_id") or jobMetadata.get("jobId")
 
+    logger.info("=" * 80)
+    logger.info("🖨️  STARTING PRINT JOB")
+    logger.info(f"   Printer Serial: {options.serialNumber}")
+    logger.info(f"   Printer IP: {options.ipAddress}")
+    logger.info(f"   File: {filePath.name}")
+    logger.info(f"   Print Job ID: {print_job_id or 'None'}")
+
+    # Check event reporter initialization
+    if event_reporter:
+        logger.info("✅ EventReporter initialized for job lifecycle tracking")
+    else:
+        logger.warning("⚠️  EventReporter NOT initialized (job events will not be reported)")
+        logger.warning("   Check that baseUrl, apiKey, recipientId are configured")
+
     logger.info(
         "[PRINT_JOB] Dispatch Started",
         extra={
@@ -2526,7 +2540,8 @@ def sendBambuPrintJob(
             # Report job started event
             if event_reporter and print_job_id:
                 try:
-                    event_reporter.report_job_started(
+                    logger.info("📤 Reporting job_started event...")
+                    event_id = event_reporter.report_job_started(
                         printer_serial=options.serialNumber,
                         printer_ip=options.ipAddress,
                         print_job_id=print_job_id,
@@ -2534,24 +2549,37 @@ def sendBambuPrintJob(
                         estimated_time=None,  # Could extract from metadata if available
                         plates_requested=1
                     )
+                    if event_id:
+                        logger.info(f"✅ job_started event reported: {event_id}")
+                    else:
+                        logger.warning("⚠️  job_started event failed (no event_id)")
                 except Exception as e:
-                    logger.debug(f"Failed to report job_started event: {e}")
+                    logger.error(f"❌ Failed to report job_started: {e}")
 
         except Exception as error:
+            logger.error("❌ PRINT JOB FAILED")
+            logger.error(f"   Error: {error}")
             logger.warning("API start failed for %s: %s", options.serialNumber, error, exc_info=True)
 
             # Report job failed event
             if event_reporter and print_job_id:
                 try:
-                    event_reporter.report_job_failed(
+                    logger.info("📤 Reporting job_failed event...")
+                    event_id = event_reporter.report_job_failed(
                         printer_serial=options.serialNumber,
                         printer_ip=options.ipAddress,
                         print_job_id=print_job_id,
                         file_name=filePath.name,
                         error_message=str(error)
                     )
+                    if event_id:
+                        logger.info(f"✅ job_failed event reported: {event_id}")
+                    else:
+                        logger.warning("⚠️  job_failed event failed (no event_id)")
                 except Exception as e:
-                    logger.debug(f"Failed to report job_failed event: {e}")
+                    logger.error(f"❌ Failed to report job_failed: {e}")
+
+            logger.info("=" * 80)
 
             if statusCallback:
                 statusCallback(_with_plate_options({"status": "apiStartFailed", "error": str(error)}))
@@ -2573,6 +2601,12 @@ def sendBambuPrintJob(
             "api": apiResult,
             "startMethod": startMethodResult,
         }
+
+        logger.info("🎉 PRINT JOB STARTED SUCCESSFULLY")
+        logger.info(f"   Serial: {options.serialNumber}")
+        logger.info(f"   File: {uploadedName}")
+        logger.info(f"   Start Method: {startMethodResult}")
+        logger.info("=" * 80)
 
         logger.info(
             "[PRINT_JOB] Dispatch Complete",
