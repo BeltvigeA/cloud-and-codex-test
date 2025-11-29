@@ -112,12 +112,13 @@ class BambuStatusSubscriber:
 
         if _event_reporting_available and self.base_url and self.api_key and self.defaultRecipientId:
             try:
+                self.log.info("🔧 Initializing EventReporter in status_subscriber...")
                 self.event_reporter = EventReporter(
                     base_url=self.base_url,
                     api_key=self.api_key,
                     recipient_id=self.defaultRecipientId
                 )
-                self.log.info("Event reporting initialized (credentials from config file)")
+                self.log.info("✅ EventReporter initialized successfully")
             except Exception as e:
                 self.log.warning(f"Failed to initialize event reporter: {e}")
         elif not _event_reporting_available:
@@ -125,14 +126,10 @@ class BambuStatusSubscriber:
         elif not _config_manager_available:
             self.log.debug("Event reporting not configured (config manager not available)")
         else:
-            missing = []
-            if not self.base_url:
-                missing.append("backend_url")
-            if not self.api_key:
-                missing.append("api_key")
-            if not self.defaultRecipientId:
-                missing.append("recipient_id")
-            self.log.debug(f"Event reporting not configured (missing from config: {', '.join(missing)})")
+            self.log.warning("⚠️  EventReporter NOT initialized (missing credentials)")
+            self.log.warning(f"   base_url: {'✅' if self.base_url else '❌'}")
+            self.log.warning(f"   api_key: {'✅' if self.api_key else '❌'}")
+            self.log.warning(f"   recipient_id: {'✅' if self.defaultRecipientId else '❌'}")
 
         # Track reported HMS errors to avoid duplicates
         self.reported_hms_errors: Dict[str, Set[str]] = {}
@@ -1138,6 +1135,9 @@ class BambuStatusSubscriber:
             printer_instance: Optional connected printer instance for camera capture
         """
         if not self.event_reporter:
+            self.log.error("❌ EventReporter NOT INITIALIZED!")
+            self.log.error("   HMS error will NOT be reported to backend")
+            self.log.error("   Check that base_url, api_key, recipient_id are set")
             return
 
         # Check if already reported
@@ -1145,33 +1145,40 @@ class BambuStatusSubscriber:
             if printer_serial not in self.reported_hms_errors:
                 self.reported_hms_errors[printer_serial] = set()
             if hms_code in self.reported_hms_errors[printer_serial]:
+                self.log.debug(f"ℹ️  HMS error {hms_code} already reported (skipping)")
                 return
             self.reported_hms_errors[printer_serial].add(hms_code)
 
-        self.log.warning(f"HMS Error detected on {printer_serial} ({printer_ip}): {hms_code}")
+        self.log.info("=" * 80)
+        self.log.info("🚨 HANDLING HMS ERROR")
+        self.log.info(f"   HMS Code: {hms_code}")
+        self.log.info(f"   Printer: {printer_serial}")
+        self.log.info(f"   IP: {printer_ip}")
 
         # Parse error
         error_data = parse_hms_error(hms_code)
 
-        self.log.error(
-            f"HMS Error {hms_code} on {printer_serial}: "
-            f"{error_data['description']} (severity: {error_data['severity']})"
-        )
+        self.log.info(f"   Module: {error_data.get('module', 'unknown')}")
+        self.log.info(f"   Severity: {error_data.get('severity', 'unknown')}")
+        description = error_data.get('description', 'N/A')
+        self.log.info(f"   Description: {description[:100]}...")
 
         # Capture camera snapshot (non-blocking, best effort)
         image_data = None
         if printer_instance:
             try:
+                self.log.info("📸 Attempting to capture error snapshot...")
                 image_data = capture_camera_frame_from_printer(printer_instance)
                 if image_data:
-                    self.log.info(f"Captured error snapshot for HMS {hms_code}")
+                    self.log.info(f"✅ Captured error snapshot ({len(image_data)} bytes)")
                 else:
-                    self.log.debug(f"No image captured for HMS {hms_code}")
+                    self.log.warning("⚠️  No image captured")
             except Exception as e:
-                self.log.debug(f"Could not capture error snapshot: {e}")
+                self.log.warning(f"⚠️  Could not capture error snapshot: {e}")
 
         # Report event to backend
         try:
+            self.log.info("📤 Reporting HMS error to backend...")
             event_id = self.event_reporter.report_hms_error(
                 printer_serial=printer_serial,
                 printer_ip=printer_ip,
@@ -1181,12 +1188,16 @@ class BambuStatusSubscriber:
             )
 
             if event_id:
-                self.log.info(f"HMS error reported to backend: event_id={event_id}")
+                self.log.info(f"✅ HMS error reported successfully: event_id={event_id}")
             else:
-                self.log.warning("Failed to report HMS error to backend")
+                self.log.error("❌ Failed to report HMS error (no event_id returned)")
 
         except Exception as e:
-            self.log.error(f"Error reporting HMS error to backend: {e}", exc_info=True)
+            self.log.error(f"❌ ERROR reporting HMS error to backend: {e}")
+            import traceback
+            self.log.error(traceback.format_exc())
+
+        self.log.info("=" * 80)
 
     def _report_status_update(
         self,
