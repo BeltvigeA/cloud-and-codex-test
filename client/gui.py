@@ -204,6 +204,10 @@ class ListenerGuiApp:
         self.commandWorkers: Dict[str, CommandWorker] = {}
         self.heartbeatWorker: Optional[HeartbeatWorker] = None
 
+        # Auto-refresh worker for keeping printer data fresh
+        self.autoRefreshThread: Optional[threading.Thread] = None
+        self.autoRefreshEnabled = True
+
         # Load settings from config if available
         self._loadSettingsFromConfig()
 
@@ -215,6 +219,9 @@ class ListenerGuiApp:
         self.root.after(200, self._processPrinterStatusUpdates)
         self._scheduleStatusRefresh(0)
         self._registerPrintersConfigListener()
+
+        # Start auto-refresh worker for keeping printer data fresh
+        self._startAutoRefreshWorker()
 
         # Check if first-time setup is needed
         self.root.after(500, self._checkFirstTimeSetup)
@@ -1945,6 +1952,116 @@ class ListenerGuiApp:
 
         return telemetry
 
+    def _startAutoRefreshWorker(self) -> None:
+        """Start background thread that refreshes printer data every 5 minutes"""
+        def autoRefreshWorker():
+            while self.autoRefreshEnabled:
+                try:
+                    time.sleep(300)  # 5 minutes = 300 seconds
+                    if not self.autoRefreshEnabled:
+                        break
+
+                    logging.info("Auto-refresh: Updating all printer telemetry (5 min interval)")
+                    self._refreshAllPrinterData()
+                except Exception as error:
+                    logging.exception("Error in auto-refresh worker: %s", error)
+
+        self.autoRefreshThread = threading.Thread(target=autoRefreshWorker, daemon=True)
+        self.autoRefreshThread.start()
+        logging.info("Auto-refresh worker started (5 minute interval)")
+
+    def _refreshAllPrinterData(self) -> None:
+        """Refresh telemetry data for all printers"""
+        updates: list[tuple[int, Dict[str, Any]]] = []
+
+        for index, printer in enumerate(self.printers):
+            if not isinstance(printer, dict):
+                continue
+
+            try:
+                telemetry = self._collectPrinterTelemetry(printer)
+                if telemetry:
+                    updates.append((index, telemetry))
+            except Exception as error:
+                logging.debug(
+                    "Failed to refresh data for printer %s: %s",
+                    printer.get("nickname") or printer.get("ipAddress"),
+                    error
+                )
+
+        # Apply updates
+        if updates:
+            for index, telemetry in updates:
+                printer = self.printers[index]
+                for key, value in telemetry.items():
+                    if value is not None:
+                        printer[key] = value
+
+            self._savePrinters()
+            self._refreshPrinterList()
+            logging.info("Auto-refresh: Updated %d printers", len(updates))
+
+    def _showPrinterDetails(self, printerIndex: int) -> None:
+        """Show printer details dialog with fresh data"""
+        if printerIndex < 0 or printerIndex >= len(self.printers):
+            return
+
+        printer = self.printers[printerIndex]
+
+        # Force refresh data before showing details
+        ipAddress = str(printer.get("ipAddress", "")).strip()
+        serialNumber = str(printer.get("serialNumber", "")).strip()
+        accessCode = str(printer.get("accessCode", "")).strip()
+
+        if ipAddress and serialNumber and accessCode:
+            try:
+                logging.info("Fetching fresh data for %s before showing details...",
+                           printer.get("nickname") or ipAddress)
+
+                freshTelemetry = self._fetchBambuTelemetry(
+                    ipAddress, serialNumber, accessCode, timeoutSeconds=6.0
+                )
+
+                if freshTelemetry:
+                    # Update printer with fresh data
+                    for key, value in freshTelemetry.items():
+                        if value is not None:
+                            printer[key] = value
+
+                    self.printers[printerIndex] = printer
+                    self._savePrinters()
+                    logging.info("Successfully fetched fresh data for %s",
+                               printer.get("nickname") or ipAddress)
+            except Exception as error:
+                logging.warning("Could not fetch fresh data for printer details: %s", error)
+
+        # Show details dialog
+        detailsJson = json.dumps(printer, indent=2, ensure_ascii=False)
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title(f"Printer Details - {printer.get('nickname') or 'Unknown'}")
+        dialog.geometry("600x700")
+        dialog.transient(self.root)
+
+        # Add scrollable text widget
+        frame = ttk.Frame(dialog, padding=10)
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        textWidget = tk.Text(frame, wrap=tk.WORD, width=70, height=35)
+        scrollbar = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=textWidget.yview)
+        textWidget.configure(yscrollcommand=scrollbar.set)
+
+        textWidget.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        textWidget.insert("1.0", detailsJson)
+        textWidget.configure(state=tk.DISABLED)
+
+        # Add close button
+        buttonFrame = ttk.Frame(dialog)
+        buttonFrame.pack(pady=10)
+        ttk.Button(buttonFrame, text="Close", command=dialog.destroy).pack()
+
     def _sendAutomaticPrinterStatus(
         self,
         printerIndex: int,
@@ -2161,14 +2278,28 @@ class ListenerGuiApp:
                 except Exception:
                     subtaskNamePayload = None
 
-            # Hent total layer num
+            # Hent total layer num - prøv flere kilder
             totalLayerPayload: Any = None
+
+            # Metode 1: Fra total_layer_num()
             totalLayerGetter = getattr(printer, "total_layer_num", None)
             if callable(totalLayerGetter):
                 try:
-                    totalLayerPayload = totalLayerGetter()
+                    result = totalLayerGetter()
+                    if result and result > 0:
+                        totalLayerPayload = result
                 except Exception:
-                    totalLayerPayload = None
+                    pass
+
+            # Metode 2: Fra state-payload hvis metode 1 feilet
+            if totalLayerPayload is None or totalLayerPayload == 0:
+                try:
+                    if isinstance(statePayload, dict):
+                        totalLayers = statePayload.get("total_layer_num") or statePayload.get("layer_num")
+                        if totalLayers and int(totalLayers) > 0:
+                            totalLayerPayload = int(totalLayers)
+                except Exception:
+                    pass
 
             # Hent WiFi signal
             wifiSignalPayload: Any = None
@@ -2179,23 +2310,59 @@ class ListenerGuiApp:
                 except Exception:
                     wifiSignalPayload = None
 
-            # Hent file name
+            # Hent file name - prøv flere kilder
             fileNamePayload: Any = None
+
+            # Metode 1: Fra get_file_name()
             fileNameGetter = getattr(printer, "get_file_name", None)
             if callable(fileNameGetter):
                 try:
-                    fileNamePayload = fileNameGetter()
+                    result = fileNameGetter()
+                    if result and str(result).strip():
+                        fileNamePayload = str(result).strip()
                 except Exception:
-                    fileNamePayload = None
+                    pass
 
-            # Hent light state
+            # Metode 2: Fra state-payload hvis metode 1 feilet
+            if not fileNamePayload:
+                try:
+                    if isinstance(statePayload, dict):
+                        fileName = (statePayload.get("gcode_file") or
+                                   statePayload.get("subtask_name") or
+                                   statePayload.get("print_file"))
+                        if fileName and str(fileName).strip():
+                            fileNamePayload = str(fileName).strip()
+                except Exception:
+                    pass
+
+            # Hent light state - prøv flere kilder
             lightStatePayload: Any = None
+
+            # Metode 1: Fra get_light_state()
             lightStateGetter = getattr(printer, "get_light_state", None)
             if callable(lightStateGetter):
                 try:
-                    lightStatePayload = lightStateGetter()
+                    result = lightStateGetter()
+                    if result:
+                        lightStatePayload = str(result)
                 except Exception:
-                    lightStatePayload = None
+                    pass
+
+            # Metode 2: Fra state-payload hvis metode 1 feilet
+            if not lightStatePayload or lightStatePayload == "unknown":
+                try:
+                    if isinstance(statePayload, dict):
+                        lightState = statePayload.get("lights_report") or statePayload.get("chamber_light")
+                        if lightState:
+                            # Konverter til on/off
+                            if isinstance(lightState, bool):
+                                lightStatePayload = "on" if lightState else "off"
+                            elif isinstance(lightState, (int, float)):
+                                lightStatePayload = "on" if int(lightState) > 0 else "off"
+                            else:
+                                lightStatePayload = str(lightState)
+                except Exception:
+                    pass
 
             def searchValue(payload: Any, keys: set[str]) -> Any:
                 if payload is None:
@@ -2262,6 +2429,14 @@ class ListenerGuiApp:
 
         status = self._mapBambuState(state, percent)
 
+        # Get new fields with improved null handling
+        printSpeed = self._parseOptionalInt(payload.get("print_speed"))
+        subtaskName = self._parseOptionalString(payload.get("subtask_name"))
+        totalLayerNum = self._parseOptionalInt(payload.get("total_layer_num"))
+        wifiSignal = self._parseOptionalString(payload.get("wifi_signal"))
+        fileName = self._parseOptionalString(payload.get("file_name"))
+        lightState = self._parseOptionalString(payload.get("light_state"))
+
         return {
             "status": status,
             "progressPercent": percent,
@@ -2269,12 +2444,12 @@ class ListenerGuiApp:
             "nozzleTemp": nozzleTemp,
             "bedTemp": bedTemp,
             "gcodeState": state,
-            "printSpeed": self._parseOptionalInt(payload.get("print_speed")),
-            "subtaskName": self._parseOptionalString(payload.get("subtask_name")),
-            "totalLayerNum": self._parseOptionalInt(payload.get("total_layer_num")),
-            "wifiSignal": self._parseOptionalString(payload.get("wifi_signal")),
-            "fileName": self._parseOptionalString(payload.get("file_name")),
-            "lightState": self._parseOptionalString(payload.get("light_state")),
+            "printSpeed": printSpeed if printSpeed is not None else None,
+            "subtaskName": subtaskName if subtaskName else None,
+            "totalLayerNum": totalLayerNum if totalLayerNum is not None and totalLayerNum > 0 else None,
+            "wifiSignal": wifiSignal if wifiSignal else None,
+            "fileName": fileName if fileName else None,
+            "lightState": lightState if lightState else None,
         }
 
     def _mapBambuState(self, state: Optional[str], percent: Optional[float]) -> str:
@@ -2652,6 +2827,11 @@ class ListenerGuiApp:
         self._stopHeartbeatWorker()
 
         self._stopStatusSubscribers()
+
+        # Stop auto-refresh worker
+        self.autoRefreshEnabled = False
+        if self.autoRefreshThread and self.autoRefreshThread.is_alive():
+            self.autoRefreshThread.join(timeout=2.0)
 
         if self.stopEvent:
             self.stopEvent.set()
