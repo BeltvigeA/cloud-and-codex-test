@@ -1599,6 +1599,7 @@ class BambuStatusSubscriber:
         Returns:
             Access code string or None
         """
+
         try:
             if not _config_manager_available:
                 self.log.warning("⚠️  Config manager not available")
@@ -1606,17 +1607,53 @@ class BambuStatusSubscriber:
 
             config = get_config_manager()
 
-            # Method 1: Use config.get() - the correct API
-            printers = config.get('printers', [])
-            if isinstance(printers, list):
-                for printer in printers:
-                    if isinstance(printer, dict) and printer.get('serialNumber') == printer_serial:
+            # ConfigManager stores printers in a different structure
+            # Try multiple possible locations:
+
+            # Method 1: Check if printers are stored directly
+            if hasattr(config, 'printers') and isinstance(config.printers, list):
+                for printer in config.printers:
+                    if printer.get('serialNumber') == printer_serial:
                         access_code = printer.get('accessCode')
                         if access_code:
-                            self.log.debug(f"✅ Found access code for {printer_serial} (config.get)")
+                            self.log.debug(f"✅ Found access code for {printer_serial} (Method 1)")
                             return access_code
 
-            # Method 2: Try to_dict() as fallback
+            # Method 2: Check config data structure
+            if hasattr(config, 'data') and isinstance(config.data, dict):
+                printers = config.data.get('printers', [])
+                for printer in printers:
+                    if printer.get('serialNumber') == printer_serial:
+                        access_code = printer.get('accessCode')
+                        if access_code:
+                            self.log.debug(f"✅ Found access code for {printer_serial} (Method 2)")
+                            return access_code
+
+            # Method 3: Try to get from config file directly
+            config_data = config.get_all()
+            if isinstance(config_data, dict):
+                printers = config_data.get('printers', [])
+                for printer in printers:
+                    if printer.get('serialNumber') == printer_serial:
+                        access_code = printer.get('accessCode')
+                        if access_code:
+                            self.log.debug(f"✅ Found access code for {printer_serial} (Method 3)")
+                            return access_code
+
+            # Method 4: Use config.get() API
+            try:
+                printers = config.get('printers', [])
+                if isinstance(printers, list):
+                    for printer in printers:
+                        if isinstance(printer, dict) and printer.get('serialNumber') == printer_serial:
+                            access_code = printer.get('accessCode')
+                            if access_code:
+                                self.log.debug(f"✅ Found access code for {printer_serial} (Method 4)")
+                                return access_code
+            except Exception as e:
+                self.log.debug(f"config.get() failed: {e}")
+
+            # Method 5: Try to_dict() as fallback
             try:
                 config_data = config.to_dict()
                 if isinstance(config_data, dict):
@@ -1626,12 +1663,12 @@ class BambuStatusSubscriber:
                             if isinstance(printer, dict) and printer.get('serialNumber') == printer_serial:
                                 access_code = printer.get('accessCode')
                                 if access_code:
-                                    self.log.debug(f"✅ Found access code for {printer_serial} (to_dict)")
+                                    self.log.debug(f"✅ Found access code for {printer_serial} (Method 5)")
                                     return access_code
             except Exception as e:
                 self.log.debug(f"to_dict() fallback failed: {e}")
 
-            # Method 3: Try direct _config access as last resort
+            # Method 6: Try direct _config access as last resort
             try:
                 if hasattr(config, '_config') and isinstance(config._config, dict):
                     printers = config._config.get('printers', [])
@@ -1640,19 +1677,21 @@ class BambuStatusSubscriber:
                             if isinstance(printer, dict) and printer.get('serialNumber') == printer_serial:
                                 access_code = printer.get('accessCode')
                                 if access_code:
-                                    self.log.debug(f"✅ Found access code for {printer_serial} (_config)")
+                                    self.log.debug(f"✅ Found access code for {printer_serial} (Method 6)")
                                     return access_code
             except Exception as e:
                 self.log.debug(f"_config fallback failed: {e}")
 
-            self.log.warning(f"⚠️  No access code found for printer {printer_serial}")
-            self.log.debug(f"   Config type: {type(config)}")
-            self.log.debug(f"   Available methods: {[m for m in dir(config) if not m.startswith('_')]}")
+            self.log.warning(f"⚠️  No access code found for printer {printer_serial} in config")
+            self.log.debug(f"   Config structure: {type(config)}")
+            self.log.debug(f"   Available attributes: {dir(config)}")
 
             return None
 
         except Exception as e:
-            self.log.error(f"❌ Failed to get access code: {e}")
+            self.log.error(f"❌ Failed to get printer access code: {e}")
+            import traceback
+            self.log.debug(traceback.format_exc())
             return None
 
     def _should_capture_camera_image(self, printer_serial: str, status_data: Dict[str, Any]) -> bool:
