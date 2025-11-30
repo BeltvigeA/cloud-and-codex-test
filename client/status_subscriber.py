@@ -1862,8 +1862,7 @@ class BambuStatusSubscriber:
             try:
                 printer = Printer(
                     ip_address=printer_ip,
-                    access_code=access_code,
-                    serial_number=printer_serial
+                    access_code=access_code
                 )
                 self.log.info(f"   ✅ Printer connection initialized")
             except Exception as e:
