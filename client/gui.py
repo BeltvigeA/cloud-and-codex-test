@@ -483,6 +483,12 @@ class ListenerGuiApp:
                                     "progressPercent": self._parseOptionalFloat(entry.get("progressPercent")),
                                     "remainingTimeSeconds": self._parseOptionalInt(entry.get("remainingTimeSeconds")),
                                     "gcodeState": self._parseOptionalString(entry.get("gcodeState")),
+                                    "printSpeed": self._parseOptionalInt(entry.get("printSpeed")),
+                                    "subtaskName": self._parseOptionalString(entry.get("subtaskName")),
+                                    "totalLayerNum": self._parseOptionalInt(entry.get("totalLayerNum")),
+                                    "wifiSignal": self._parseOptionalString(entry.get("wifiSignal")),
+                                    "fileName": self._parseOptionalString(entry.get("fileName")),
+                                    "lightState": self._parseOptionalString(entry.get("lightState")),
                                     "manualStatusDefaults": entry.get("manualStatusDefaults"),
                                 }
                             )
@@ -2137,6 +2143,60 @@ class ListenerGuiApp:
                 except Exception:
                     gcodePayload = None
 
+            # Hent print speed
+            printSpeedPayload: Any = None
+            printSpeedGetter = getattr(printer, "get_print_speed", None)
+            if callable(printSpeedGetter):
+                try:
+                    printSpeedPayload = printSpeedGetter()
+                except Exception:
+                    printSpeedPayload = None
+
+            # Hent subtask name
+            subtaskNamePayload: Any = None
+            subtaskNameGetter = getattr(printer, "subtask_name", None)
+            if callable(subtaskNameGetter):
+                try:
+                    subtaskNamePayload = subtaskNameGetter()
+                except Exception:
+                    subtaskNamePayload = None
+
+            # Hent total layer num
+            totalLayerPayload: Any = None
+            totalLayerGetter = getattr(printer, "total_layer_num", None)
+            if callable(totalLayerGetter):
+                try:
+                    totalLayerPayload = totalLayerGetter()
+                except Exception:
+                    totalLayerPayload = None
+
+            # Hent WiFi signal
+            wifiSignalPayload: Any = None
+            wifiSignalGetter = getattr(printer, "wifi_signal", None)
+            if callable(wifiSignalGetter):
+                try:
+                    wifiSignalPayload = wifiSignalGetter()
+                except Exception:
+                    wifiSignalPayload = None
+
+            # Hent file name
+            fileNamePayload: Any = None
+            fileNameGetter = getattr(printer, "get_file_name", None)
+            if callable(fileNameGetter):
+                try:
+                    fileNamePayload = fileNameGetter()
+                except Exception:
+                    fileNamePayload = None
+
+            # Hent light state
+            lightStatePayload: Any = None
+            lightStateGetter = getattr(printer, "get_light_state", None)
+            if callable(lightStateGetter):
+                try:
+                    lightStatePayload = lightStateGetter()
+                except Exception:
+                    lightStatePayload = None
+
             def searchValue(payload: Any, keys: set[str]) -> Any:
                 if payload is None:
                     return None
@@ -2180,6 +2240,12 @@ class ListenerGuiApp:
                 "gcode_state": pickState(),
                 "nozzle_temper": pickNozzle(),
                 "bed_temper": pickBed(),
+                "print_speed": printSpeedPayload,
+                "subtask_name": subtaskNamePayload,
+                "total_layer_num": totalLayerPayload,
+                "wifi_signal": wifiSignalPayload,
+                "file_name": fileNamePayload,
+                "light_state": lightStatePayload,
             }
 
             return self._interpretBambuStatus(statusPayload)
@@ -2203,6 +2269,12 @@ class ListenerGuiApp:
             "nozzleTemp": nozzleTemp,
             "bedTemp": bedTemp,
             "gcodeState": state,
+            "printSpeed": self._parseOptionalInt(payload.get("print_speed")),
+            "subtaskName": self._parseOptionalString(payload.get("subtask_name")),
+            "totalLayerNum": self._parseOptionalInt(payload.get("total_layer_num")),
+            "wifiSignal": self._parseOptionalString(payload.get("wifi_signal")),
+            "fileName": self._parseOptionalString(payload.get("file_name")),
+            "lightState": self._parseOptionalString(payload.get("light_state")),
         }
 
     def _mapBambuState(self, state: Optional[str], percent: Optional[float]) -> str:
@@ -2456,6 +2528,18 @@ class ListenerGuiApp:
                 printer["nozzleTemp"] = status.get("nozzleTemp")
             if status.get("bedTemp") is not None:
                 printer["bedTemp"] = status.get("bedTemp")
+            if status.get("printSpeed") is not None:
+                printer["printSpeed"] = status.get("printSpeed")
+            if status.get("subtaskName") is not None:
+                printer["subtaskName"] = status.get("subtaskName")
+            if status.get("totalLayerNum") is not None:
+                printer["totalLayerNum"] = status.get("totalLayerNum")
+            if status.get("wifiSignal") is not None:
+                printer["wifiSignal"] = status.get("wifiSignal")
+            if status.get("fileName") is not None:
+                printer["fileName"] = status.get("fileName")
+            if status.get("lightState") is not None:
+                printer["lightState"] = status.get("lightState")
             updated = True
             break
 
