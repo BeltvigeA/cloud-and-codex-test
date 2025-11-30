@@ -1871,15 +1871,50 @@ class BambuStatusSubscriber:
                 self.log.info("=" * 80)
                 return None
 
+            # ============================================
+            # START CAMERA STREAM
+            # ============================================
+            self.log.info(f"   📹 Starting camera stream...")
+            try:
+                # Check if camera is already running
+                if hasattr(printer, 'camera_client_alive') and printer.camera_client_alive():
+                    self.log.info(f"   ✅ Camera stream already active")
+                else:
+                    # Start camera stream
+                    if hasattr(printer, 'camera_start'):
+                        printer.camera_start()
+                        self.log.info(f"   ✅ Camera stream started")
+
+                        # Wait a moment for stream to initialize
+                        import time
+                        time.sleep(1)
+                        self.log.info(f"   ⏱️  Waited 1s for camera initialization")
+                    else:
+                        self.log.warning(f"   ⚠️  No camera_start method available")
+            except Exception as e:
+                self.log.warning(f"   ⚠️  Failed to start camera stream: {e}")
+                # Continue anyway - camera might already be running
+
             # Try to get camera image
             self.log.info(f"   📷 Requesting camera image from printer...")
             image_data = None
 
-            # Try multiple methods
+            # Try different methods in order
             methods_tried = []
 
-            # Method 1: get_camera_image()
-            if hasattr(printer, 'get_camera_image'):
+            # Method 1: get_camera_frame (recommended for active streams)
+            if hasattr(printer, 'get_camera_frame'):
+                methods_tried.append('get_camera_frame()')
+                try:
+                    self.log.info(f"   Trying: printer.get_camera_frame()...")
+                    image_data = printer.get_camera_frame()
+                    if image_data:
+                        self.log.info(f"   ✅ Success with get_camera_frame()")
+                except Exception as e:
+                    self.log.warning(f"   ⚠️  get_camera_frame() failed: {e}")
+
+            # Method 2: get_camera_image()
+            if not image_data and hasattr(printer, 'get_camera_image'):
                 methods_tried.append('get_camera_image()')
                 try:
                     self.log.info(f"   Trying: printer.get_camera_image()...")
@@ -1889,7 +1924,18 @@ class BambuStatusSubscriber:
                 except Exception as e:
                     self.log.warning(f"   ⚠️  get_camera_image() failed: {e}")
 
-            # Method 2: get_latest_jpg()
+            # Method 3: get_camera_frame_ (alternative)
+            if not image_data and hasattr(printer, 'get_camera_frame_'):
+                methods_tried.append('get_camera_frame_()')
+                try:
+                    self.log.info(f"   Trying: printer.get_camera_frame_()...")
+                    image_data = printer.get_camera_frame_()
+                    if image_data:
+                        self.log.info(f"   ✅ Success with get_camera_frame_()")
+                except Exception as e:
+                    self.log.warning(f"   ⚠️  get_camera_frame_() failed: {e}")
+
+            # Method 4: get_latest_jpg()
             if not image_data and hasattr(printer, 'get_latest_jpg'):
                 methods_tried.append('get_latest_jpg()')
                 try:
@@ -1900,7 +1946,7 @@ class BambuStatusSubscriber:
                 except Exception as e:
                     self.log.warning(f"   ⚠️  get_latest_jpg() failed: {e}")
 
-            # Method 3: camera.get_image()
+            # Method 5: camera.get_image()
             if not image_data and hasattr(printer, 'camera'):
                 if hasattr(printer.camera, 'get_image'):
                     methods_tried.append('camera.get_image()')
@@ -1915,7 +1961,15 @@ class BambuStatusSubscriber:
             if not image_data:
                 self.log.error(f"   ❌ No image data received from printer")
                 self.log.error(f"   Methods tried: {methods_tried}")
-                self.log.error(f"   Available methods: {[m for m in dir(printer) if 'camera' in m.lower() or 'image' in m.lower() or 'jpg' in m.lower()]}")
+
+                # Try to stop camera stream to clean up
+                if hasattr(printer, 'camera_stop'):
+                    try:
+                        printer.camera_stop()
+                        self.log.info(f"   🛑 Camera stream stopped")
+                    except:
+                        pass
+
                 self.log.info("=" * 80)
                 return None
 
@@ -1930,6 +1984,15 @@ class BambuStatusSubscriber:
             self.log.info(f"   ✅ Camera image saved successfully!")
             self.log.info(f"   File: {output_path}")
             self.log.info(f"   Size: {file_size_kb:.2f} KB ({file_size} bytes)")
+
+            # Stop camera stream to save bandwidth
+            if hasattr(printer, 'camera_stop'):
+                try:
+                    printer.camera_stop()
+                    self.log.info(f"   🛑 Camera stream stopped")
+                except Exception as e:
+                    self.log.debug(f"   Note: camera_stop failed: {e}")
+
             self.log.info("=" * 80)
 
             return output_path
