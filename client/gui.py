@@ -204,6 +204,12 @@ class ListenerGuiApp:
         self.commandWorkers: Dict[str, CommandWorker] = {}
         self.heartbeatWorker: Optional[HeartbeatWorker] = None
 
+        # Printer Info cache and polling
+        self.printerInfoCache: Dict[str, Dict[str, Any]] = {}  # serial -> {timestamp, data}
+        self.printerInfoPollingThread: Optional[threading.Thread] = None
+        self.printerInfoPollingInterval = 300  # 5 minutes in seconds
+        self.printerInfoStopEvent: Optional[threading.Event] = None
+
         # Load settings from config if available
         self._loadSettingsFromConfig()
 
@@ -296,6 +302,10 @@ class ListenerGuiApp:
         printersFrame = ttk.Frame(notebook)
         notebook.add(printersFrame, text="3D Printers")
         self._buildPrintersTab(printersFrame)
+
+        printerInfoFrame = ttk.Frame(notebook)
+        notebook.add(printerInfoFrame, text="Printer Info")
+        self._buildPrinterInfoTab(printerInfoFrame)
 
     def _buildListenerTab(self, parent: ttk.Frame, paddingOptions: Dict[str, int]) -> None:
         self.baseUrlVar = tk.StringVar(value=hardcodedBaseUrl)
@@ -450,6 +460,77 @@ class ListenerGuiApp:
         self.printerTree.bind("<<TreeviewSelect>>", self._onPrinterSelection)
 
         self._refreshPrinterList()
+
+    def _buildPrinterInfoTab(self, parent: ttk.Frame) -> None:
+        """Build the Printer Info tab showing cached detailed printer information."""
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(1, weight=1)
+
+        # Header frame with info and controls
+        headerFrame = ttk.Frame(parent)
+        headerFrame.grid(row=0, column=0, sticky=tk.EW, padx=8, pady=8)
+
+        infoLabel = ttk.Label(
+            headerFrame,
+            text="Detaljert printerinformasjon oppdateres automatisk hver 5. minutt",
+            font=("TkDefaultFont", 9)
+        )
+        infoLabel.pack(side=tk.LEFT, padx=6)
+
+        # Control buttons
+        ttk.Button(
+            headerFrame,
+            text="Oppdater alle nå",
+            command=self._refreshAllPrinterInfo
+        ).pack(side=tk.RIGHT, padx=6)
+
+        ttk.Button(
+            headerFrame,
+            text="Start automatisk oppdatering",
+            command=self._startPrinterInfoPolling
+        ).pack(side=tk.RIGHT, padx=6)
+
+        # Main content frame with two panes
+        contentFrame = ttk.Frame(parent)
+        contentFrame.grid(row=1, column=0, sticky=tk.NSEW, padx=8, pady=(0, 8))
+        contentFrame.columnconfigure(0, weight=1)
+        contentFrame.columnconfigure(1, weight=2)
+        contentFrame.rowconfigure(0, weight=1)
+
+        # Left pane: Printer list
+        leftFrame = ttk.LabelFrame(contentFrame, text="Printere")
+        leftFrame.grid(row=0, column=0, sticky=tk.NSEW, padx=(0, 4))
+        leftFrame.columnconfigure(0, weight=1)
+        leftFrame.rowconfigure(0, weight=1)
+
+        # Printer listbox
+        self.printerInfoListbox = tk.Listbox(leftFrame, selectmode=tk.SINGLE)
+        self.printerInfoListbox.grid(row=0, column=0, sticky=tk.NSEW, padx=4, pady=4)
+        self.printerInfoListbox.bind("<<ListboxSelect>>", self._onPrinterInfoSelection)
+
+        listScrollbar = ttk.Scrollbar(leftFrame, orient=tk.VERTICAL, command=self.printerInfoListbox.yview)
+        self.printerInfoListbox.configure(yscrollcommand=listScrollbar.set)
+        listScrollbar.grid(row=0, column=1, sticky=tk.NS, pady=4)
+
+        # Right pane: Printer details
+        rightFrame = ttk.LabelFrame(contentFrame, text="Detaljer")
+        rightFrame.grid(row=0, column=1, sticky=tk.NSEW, padx=(4, 0))
+        rightFrame.columnconfigure(0, weight=1)
+        rightFrame.rowconfigure(0, weight=1)
+
+        # Text widget for details
+        self.printerInfoText = tk.Text(rightFrame, wrap=tk.WORD, state=tk.DISABLED)
+        self.printerInfoText.grid(row=0, column=0, sticky=tk.NSEW, padx=4, pady=4)
+
+        detailsScrollbar = ttk.Scrollbar(rightFrame, orient=tk.VERTICAL, command=self.printerInfoText.yview)
+        self.printerInfoText.configure(yscrollcommand=detailsScrollbar.set)
+        detailsScrollbar.grid(row=0, column=1, sticky=tk.NS, pady=4)
+
+        # Populate printer list
+        self._refreshPrinterInfoList()
+
+        # Start polling automatically
+        self.root.after(1000, self._startPrinterInfoPolling)
 
     def _registerPrintersConfigListener(self) -> None:
         try:
@@ -3094,8 +3175,221 @@ class ListenerGuiApp:
         except Exception as error:  # pragma: no cover
             logging.error("Failed to stop heartbeat worker: %s", error)
 
+    def _refreshPrinterInfoList(self) -> None:
+        """Populate the printer info listbox with all printers that have Bambu configuration."""
+        if not hasattr(self, 'printerInfoListbox'):
+            return
+
+        self.printerInfoListbox.delete(0, tk.END)
+
+        for printer in self.printers:
+            ipAddress = str(printer.get("ipAddress") or "").strip()
+            serialNumber = str(printer.get("serialNumber") or "").strip()
+            accessCode = str(printer.get("accessCode") or "").strip()
+
+            # Only show printers with complete Bambu configuration
+            if ipAddress and serialNumber and accessCode:
+                nickname = printer.get("nickname", serialNumber)
+                # Show if data exists in cache
+                hasCachedData = serialNumber in self.printerInfoCache
+                cacheIndicator = "✓" if hasCachedData else "○"
+                self.printerInfoListbox.insert(tk.END, f"{cacheIndicator} {nickname} ({serialNumber})")
+
+    def _onPrinterInfoSelection(self, event: object) -> None:
+        """Handle printer selection in the Printer Info tab."""
+        if not hasattr(self, 'printerInfoListbox') or not hasattr(self, 'printerInfoText'):
+            return
+
+        selection = self.printerInfoListbox.curselection()
+        if not selection:
+            return
+
+        index = selection[0]
+
+        # Find the corresponding printer from printers list
+        bambuPrinters = [
+            p for p in self.printers
+            if str(p.get("ipAddress") or "").strip()
+            and str(p.get("serialNumber") or "").strip()
+            and str(p.get("accessCode") or "").strip()
+        ]
+
+        if index >= len(bambuPrinters):
+            return
+
+        printer = bambuPrinters[index]
+        serialNumber = str(printer.get("serialNumber") or "").strip()
+
+        # Display cached data if available
+        if serialNumber in self.printerInfoCache:
+            cachedEntry = self.printerInfoCache[serialNumber]
+            timestamp = cachedEntry.get("timestamp", "Ukjent")
+            data = cachedEntry.get("data", {})
+
+            self._displayPrinterInfoData(printer, data, timestamp)
+        else:
+            # No cached data, offer to fetch
+            self.printerInfoText.config(state=tk.NORMAL)
+            self.printerInfoText.delete("1.0", tk.END)
+            self.printerInfoText.insert("1.0", f"Ingen cached data for {printer.get('nickname', serialNumber)}.\n\n")
+            self.printerInfoText.insert(tk.END, "Klikk 'Oppdater alle nå' for å hente data.")
+            self.printerInfoText.config(state=tk.DISABLED)
+
+    def _displayPrinterInfoData(self, printer: Dict[str, Any], data: Dict[str, Any], timestamp: str) -> None:
+        """Display printer info data in the text widget."""
+        if not hasattr(self, 'printerInfoText'):
+            return
+
+        self.printerInfoText.config(state=tk.NORMAL)
+        self.printerInfoText.delete("1.0", tk.END)
+
+        nickname = printer.get("nickname", "Ukjent")
+        serialNumber = printer.get("serialNumber", "Ukjent")
+
+        self.printerInfoText.insert("1.0", f"=== {nickname} ({serialNumber}) ===\n")
+        self.printerInfoText.insert(tk.END, f"Sist oppdatert: {timestamp}\n\n")
+
+        if "error" in data:
+            self.printerInfoText.insert(tk.END, f"FEIL: {data['error']}\n")
+        else:
+            # Format the data nicely
+            formatted = self._formatPrinterInfoData(data)
+            self.printerInfoText.insert(tk.END, formatted)
+
+        self.printerInfoText.config(state=tk.DISABLED)
+
+    def _formatPrinterInfoData(self, data: Dict[str, Any]) -> str:
+        """Format printer info data as readable text."""
+        lines = []
+
+        mqtt_status = data.get("mqtt_status", {})
+        lines.append("=== MQTT STATUS ===")
+        lines.append(f"Connected: {mqtt_status.get('connected')}")
+        lines.append(f"Ready: {mqtt_status.get('ready')}")
+
+        lines.append("\n=== PRINT INFORMASJON ===")
+        print_info = data.get("print_info", {})
+        for key, value in print_info.items():
+            lines.append(f"{key}: {value}")
+
+        lines.append("\n=== FREMDRIFT ===")
+        progress = data.get("progress", {})
+        for key, value in progress.items():
+            lines.append(f"{key}: {value}")
+
+        lines.append("\n=== TEMPERATURER ===")
+        temps = data.get("temperatures", {})
+        for key, value in temps.items():
+            lines.append(f"{key}: {value}")
+
+        lines.append("\n=== DIVERSE ===")
+        misc = data.get("misc", {})
+        for key, value in misc.items():
+            lines.append(f"{key}: {value}")
+
+        if "mqtt_client" in data:
+            lines.append("\n=== MQTT CLIENT ===")
+            mqtt_client = data.get("mqtt_client", {})
+            for key, value in mqtt_client.items():
+                lines.append(f"{key}: {value}")
+
+        return "\n".join(lines)
+
+    def _refreshAllPrinterInfo(self) -> None:
+        """Manually refresh printer info for all printers now."""
+        def task() -> None:
+            for printer in self.printers:
+                ipAddress = str(printer.get("ipAddress") or "").strip()
+                serialNumber = str(printer.get("serialNumber") or "").strip()
+                accessCode = str(printer.get("accessCode") or "").strip()
+
+                if not (ipAddress and serialNumber and accessCode):
+                    continue
+
+                nickname = printer.get("nickname", serialNumber)
+                self.log(f"Henter info for {nickname}...")
+
+                try:
+                    data = self._fetchBambuExtendedStatus(ipAddress, serialNumber, accessCode)
+                    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+                    self.printerInfoCache[serialNumber] = {
+                        "timestamp": timestamp,
+                        "data": data
+                    }
+
+                    self.log(f"✓ Info hentet for {nickname}")
+                except Exception as e:
+                    self.log(f"✗ Feil ved henting for {nickname}: {e}")
+
+            # Update the list to show cache indicators
+            self.root.after(0, self._refreshPrinterInfoList)
+            self.log("Printer info oppdatering fullført!")
+
+        threading.Thread(target=task, daemon=True).start()
+
+    def _startPrinterInfoPolling(self) -> None:
+        """Start automatic polling of printer info every 5 minutes."""
+        if self.printerInfoPollingThread and self.printerInfoPollingThread.is_alive():
+            self.log("Printer info polling kjører allerede")
+            return
+
+        self.printerInfoStopEvent = threading.Event()
+        self.printerInfoPollingThread = threading.Thread(
+            target=self._pollPrinterInfoLoop,
+            daemon=True,
+            name="PrinterInfoPoller"
+        )
+        self.printerInfoPollingThread.start()
+        self.log(f"Automatisk printer info oppdatering startet (hver {self.printerInfoPollingInterval // 60} minutt)")
+
+    def _pollPrinterInfoLoop(self) -> None:
+        """Background loop that polls printer info every interval."""
+        while not (self.printerInfoStopEvent and self.printerInfoStopEvent.is_set()):
+            # Fetch data for all printers
+            for printer in self.printers:
+                if self.printerInfoStopEvent and self.printerInfoStopEvent.is_set():
+                    break
+
+                ipAddress = str(printer.get("ipAddress") or "").strip()
+                serialNumber = str(printer.get("serialNumber") or "").strip()
+                accessCode = str(printer.get("accessCode") or "").strip()
+
+                if not (ipAddress and serialNumber and accessCode):
+                    continue
+
+                try:
+                    data = self._fetchBambuExtendedStatus(ipAddress, serialNumber, accessCode)
+                    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+                    self.printerInfoCache[serialNumber] = {
+                        "timestamp": timestamp,
+                        "data": data
+                    }
+
+                    logging.info(f"Printer info updated for {serialNumber}")
+                except Exception as e:
+                    logging.error(f"Failed to fetch printer info for {serialNumber}: {e}")
+
+            # Update the list UI to show cache indicators
+            if hasattr(self, 'root'):
+                self.root.after(0, self._refreshPrinterInfoList)
+
+            # Wait for interval or until stop event
+            if self.printerInfoStopEvent:
+                self.printerInfoStopEvent.wait(self.printerInfoPollingInterval)
+
+    def _stopPrinterInfoPolling(self) -> None:
+        """Stop the automatic printer info polling."""
+        if self.printerInfoStopEvent:
+            self.printerInfoStopEvent.set()
+        if self.printerInfoPollingThread:
+            self.printerInfoPollingThread.join(timeout=2.0)
+        self.log("Automatisk printer info oppdatering stoppet")
+
     def _handleWindowClose(self) -> None:
         try:
+            self._stopPrinterInfoPolling()
             self.stopListening()
         finally:
             try:
