@@ -30,6 +30,9 @@ hardcodedOutputDirectory = str(Path.home() / ".printmaster" / "files")
 hardcodedJsonLogFile = str(Path.home() / ".printmaster" / "listener-log.json")
 hardcodedPollIntervalSeconds = 30
 
+# DEBUG: Set to True to enable test printer (easy to remove for production)
+ENABLE_TEST_PRINTER = True  # Set to False to disable
+
 
 def _generateRecipientId(length: int = 32) -> str:
     alphabet = string.ascii_letters + string.digits
@@ -472,7 +475,7 @@ class ListenerGuiApp:
 
         infoLabel = ttk.Label(
             headerFrame,
-            text="Detaljert printerinformasjon oppdateres automatisk hver 5. minutt",
+            text="Detaljert printerinformasjon oppdateres automatisk hver 5. minutt (starter når 'Start Listening' kjøres)",
             font=("TkDefaultFont", 9)
         )
         infoLabel.pack(side=tk.LEFT, padx=6)
@@ -482,12 +485,6 @@ class ListenerGuiApp:
             headerFrame,
             text="Oppdater alle nå",
             command=self._refreshAllPrinterInfo
-        ).pack(side=tk.RIGHT, padx=6)
-
-        ttk.Button(
-            headerFrame,
-            text="Start automatisk oppdatering",
-            command=self._startPrinterInfoPolling
         ).pack(side=tk.RIGHT, padx=6)
 
         # Main content frame with two panes
@@ -528,9 +525,6 @@ class ListenerGuiApp:
 
         # Populate printer list
         self._refreshPrinterInfoList()
-
-        # Start polling automatically
-        self.root.after(1000, self._startPrinterInfoPolling)
 
     def _registerPrintersConfigListener(self) -> None:
         try:
@@ -574,9 +568,51 @@ class ListenerGuiApp:
                                 }
                             )
                         )
+                    # DEBUG: Add test printer if enabled
+                    if ENABLE_TEST_PRINTER:
+                        testPrinter = self._applyTelemetryDefaults({
+                            "nickname": "test",
+                            "ipAddress": "192.168.86.86",
+                            "accessCode": "12345678",
+                            "serialNumber": "TEST00000000001",
+                            "brand": "Bambu Lab",
+                            "bambuModel": "X1 Carbon",
+                            "connectionMethod": "mqtt",
+                            "transport": None,
+                            "useCloud": False,
+                            "status": "Idle",
+                            "nozzleTemp": 25.5,
+                            "bedTemp": 30.2,
+                            "progressPercent": 0,
+                            "remainingTimeSeconds": 0,
+                            "gcodeState": "IDLE",
+                            "manualStatusDefaults": None,
+                        })
+                        sanitizedPrinters.append(testPrinter)
                     return sanitizedPrinters
             except (OSError, json.JSONDecodeError) as error:
                 logging.warning("Unable to load printers from %s: %s", self.printerStoragePath, error)
+
+        # DEBUG: Return test printer as only printer if enabled and no printers loaded
+        if ENABLE_TEST_PRINTER:
+            return [self._applyTelemetryDefaults({
+                "nickname": "test",
+                "ipAddress": "192.168.86.86",
+                "accessCode": "12345678",
+                "serialNumber": "TEST00000000001",
+                "brand": "Bambu Lab",
+                "bambuModel": "X1 Carbon",
+                "connectionMethod": "mqtt",
+                "transport": None,
+                "useCloud": False,
+                "status": "Idle",
+                "nozzleTemp": 25.5,
+                "bedTemp": 30.2,
+                "progressPercent": 0,
+                "remainingTimeSeconds": 0,
+                "gcodeState": "IDLE",
+                "manualStatusDefaults": None,
+            })]
         return []
 
     def _extractNumericCandidate(self, value: Any) -> Any:
@@ -2850,9 +2886,15 @@ class ListenerGuiApp:
         # Start heartbeat worker
         self._startHeartbeatWorker()
 
+        # Start printer info polling
+        self._startPrinterInfoPolling()
+
     def stopListening(self) -> None:
         # Stop heartbeat worker
         self._stopHeartbeatWorker()
+
+        # Stop printer info polling
+        self._stopPrinterInfoPolling()
 
         self._stopStatusSubscribers()
 
