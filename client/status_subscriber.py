@@ -1599,7 +1599,6 @@ class BambuStatusSubscriber:
         Returns:
             Access code string or None
         """
-
         try:
             if not _config_manager_available:
                 self.log.warning("⚠️  Config manager not available")
@@ -1607,53 +1606,17 @@ class BambuStatusSubscriber:
 
             config = get_config_manager()
 
-            # ConfigManager stores printers in a different structure
-            # Try multiple possible locations:
-
-            # Method 1: Check if printers are stored directly
-            if hasattr(config, 'printers') and isinstance(config.printers, list):
-                for printer in config.printers:
-                    if printer.get('serialNumber') == printer_serial:
-                        access_code = printer.get('accessCode')
-                        if access_code:
-                            self.log.debug(f"✅ Found access code for {printer_serial} (Method 1)")
-                            return access_code
-
-            # Method 2: Check config data structure
-            if hasattr(config, 'data') and isinstance(config.data, dict):
-                printers = config.data.get('printers', [])
+            # Method 1: Use config.get() - the correct API
+            printers = config.get('printers', [])
+            if isinstance(printers, list):
                 for printer in printers:
-                    if printer.get('serialNumber') == printer_serial:
+                    if isinstance(printer, dict) and printer.get('serialNumber') == printer_serial:
                         access_code = printer.get('accessCode')
                         if access_code:
-                            self.log.debug(f"✅ Found access code for {printer_serial} (Method 2)")
+                            self.log.debug(f"✅ Found access code for {printer_serial} (config.get)")
                             return access_code
 
-            # Method 3: Try to get from config file directly
-            config_data = config.get_all()
-            if isinstance(config_data, dict):
-                printers = config_data.get('printers', [])
-                for printer in printers:
-                    if printer.get('serialNumber') == printer_serial:
-                        access_code = printer.get('accessCode')
-                        if access_code:
-                            self.log.debug(f"✅ Found access code for {printer_serial} (Method 3)")
-                            return access_code
-
-            # Method 4: Use config.get() API
-            try:
-                printers = config.get('printers', [])
-                if isinstance(printers, list):
-                    for printer in printers:
-                        if isinstance(printer, dict) and printer.get('serialNumber') == printer_serial:
-                            access_code = printer.get('accessCode')
-                            if access_code:
-                                self.log.debug(f"✅ Found access code for {printer_serial} (Method 4)")
-                                return access_code
-            except Exception as e:
-                self.log.debug(f"config.get() failed: {e}")
-
-            # Method 5: Try to_dict() as fallback
+            # Method 2: Try to_dict() as fallback
             try:
                 config_data = config.to_dict()
                 if isinstance(config_data, dict):
@@ -1663,12 +1626,12 @@ class BambuStatusSubscriber:
                             if isinstance(printer, dict) and printer.get('serialNumber') == printer_serial:
                                 access_code = printer.get('accessCode')
                                 if access_code:
-                                    self.log.debug(f"✅ Found access code for {printer_serial} (Method 5)")
+                                    self.log.debug(f"✅ Found access code for {printer_serial} (to_dict)")
                                     return access_code
             except Exception as e:
                 self.log.debug(f"to_dict() fallback failed: {e}")
 
-            # Method 6: Try direct _config access as last resort
+            # Method 3: Try direct _config access as last resort
             try:
                 if hasattr(config, '_config') and isinstance(config._config, dict):
                     printers = config._config.get('printers', [])
@@ -1677,21 +1640,19 @@ class BambuStatusSubscriber:
                             if isinstance(printer, dict) and printer.get('serialNumber') == printer_serial:
                                 access_code = printer.get('accessCode')
                                 if access_code:
-                                    self.log.debug(f"✅ Found access code for {printer_serial} (Method 6)")
+                                    self.log.debug(f"✅ Found access code for {printer_serial} (_config)")
                                     return access_code
             except Exception as e:
                 self.log.debug(f"_config fallback failed: {e}")
 
-            self.log.warning(f"⚠️  No access code found for printer {printer_serial} in config")
-            self.log.debug(f"   Config structure: {type(config)}")
-            self.log.debug(f"   Available attributes: {dir(config)}")
+            self.log.warning(f"⚠️  No access code found for printer {printer_serial}")
+            self.log.debug(f"   Config type: {type(config)}")
+            self.log.debug(f"   Available methods: {[m for m in dir(config) if not m.startswith('_')]}")
 
             return None
 
         except Exception as e:
-            self.log.error(f"❌ Failed to get printer access code: {e}")
-            import traceback
-            self.log.debug(traceback.format_exc())
+            self.log.error(f"❌ Failed to get access code: {e}")
             return None
 
     def _should_capture_camera_image(self, printer_serial: str, status_data: Dict[str, Any]) -> bool:
@@ -1847,135 +1808,75 @@ class BambuStatusSubscriber:
 
             self.log.info(f"   ✅ Access code found ({len(access_code)} chars)")
 
-            # ============================================
-            # TRY HTTP CAMERA SNAPSHOT (FASTER AND MORE RELIABLE)
-            # ============================================
-            self.log.info(f"   📷 Requesting camera snapshot via HTTP...")
-
-            image_data = None
-            camera_url = f"http://{printer_ip}/camera/snapshot"
-
-            self.log.info(f"   🌐 GET {camera_url}")
-
+            # Import Bambu API
+            self.log.info(f"   📦 Importing bambulabs_api...")
             try:
-                response = requests.get(
-                    camera_url,
-                    auth=('bblp', access_code),  # Basic auth with access code
-                    timeout=5
+                from bambulabs_api import Printer
+                self.log.info(f"   ✅ bambulabs_api imported successfully")
+            except ImportError as e:
+                self.log.error(f"   ❌ Failed to import bambulabs_api: {e}")
+                self.log.info("=" * 80)
+                return None
+
+            # Initialize printer connection
+            self.log.info(f"   🔌 Connecting to printer at {printer_ip}...")
+            try:
+                printer = Printer(
+                    ip_address=printer_ip,
+                    access_code=access_code,
+                    serial_number=printer_serial
                 )
-
-                if response.status_code == 200:
-                    image_data = response.content
-                    self.log.info(f"   ✅ Camera snapshot received via HTTP ({len(image_data)} bytes)")
-                else:
-                    self.log.warning(f"   ⚠️  HTTP request failed: {response.status_code}")
-                    image_data = None
-
-            except requests.exceptions.Timeout:
-                self.log.warning(f"   ⚠️  HTTP request timed out")
-                image_data = None
-            except requests.exceptions.ConnectionError:
-                self.log.warning(f"   ⚠️  Connection error - printer may be offline")
-                image_data = None
+                self.log.info(f"   ✅ Printer connection initialized")
             except Exception as e:
-                self.log.warning(f"   ⚠️  HTTP request failed: {e}")
-                image_data = None
+                self.log.error(f"   ❌ Failed to initialize printer connection: {e}")
+                self.log.info("=" * 80)
+                return None
 
-            # ============================================
-            # FALLBACK TO MJPEG STREAM IF HTTP FAILED
-            # ============================================
-            if not image_data:
-                self.log.info(f"   📹 Falling back to MJPEG stream...")
+            # Try to get camera image
+            self.log.info(f"   📷 Requesting camera image from printer...")
+            image_data = None
 
-                # Import Bambu API
-                self.log.info(f"   📦 Importing bambulabs_api...")
+            # Try multiple methods
+            methods_tried = []
+
+            # Method 1: get_camera_image()
+            if hasattr(printer, 'get_camera_image'):
+                methods_tried.append('get_camera_image()')
                 try:
-                    from bambulabs_api import Printer
-                    self.log.info(f"   ✅ bambulabs_api imported successfully")
-                except ImportError as e:
-                    self.log.error(f"   ❌ Failed to import bambulabs_api: {e}")
-                    self.log.info("=" * 80)
-                    return None
-
-                # Initialize printer connection
-                self.log.info(f"   🔌 Connecting to printer at {printer_ip}...")
-                try:
-                    printer = Printer(
-                        ip_address=printer_ip,
-                        access_code=access_code,
-                        serial=printer_serial
-                    )
-                    self.log.info(f"   ✅ Printer connection initialized")
+                    self.log.info(f"   Trying: printer.get_camera_image()...")
+                    image_data = printer.get_camera_image()
+                    if image_data:
+                        self.log.info(f"   ✅ Success with get_camera_image()")
                 except Exception as e:
-                    self.log.error(f"   ❌ Failed to initialize printer connection: {e}")
-                    self.log.info("=" * 80)
-                    return None
+                    self.log.warning(f"   ⚠️  get_camera_image() failed: {e}")
 
-                # Start camera stream
-                self.log.info(f"   📹 Starting camera stream...")
+            # Method 2: get_latest_jpg()
+            if not image_data and hasattr(printer, 'get_latest_jpg'):
+                methods_tried.append('get_latest_jpg()')
                 try:
-                    if hasattr(printer, 'camera_start'):
-                        printer.camera_start()
-                        self.log.info(f"   ✅ Camera stream started")
-
-                        # Wait longer for stream to initialize
-                        import time
-                        time.sleep(3)  # Increased from 1s to 3s
-                        self.log.info(f"   ⏱️  Waited 3s for camera initialization")
+                    self.log.info(f"   Trying: printer.get_latest_jpg()...")
+                    image_data = printer.get_latest_jpg()
+                    if image_data:
+                        self.log.info(f"   ✅ Success with get_latest_jpg()")
                 except Exception as e:
-                    self.log.warning(f"   ⚠️  Failed to start camera stream: {e}")
+                    self.log.warning(f"   ⚠️  get_latest_jpg() failed: {e}")
 
-                # Try to get camera frame
-                self.log.info(f"   📷 Requesting camera frame from MJPEG stream...")
-                methods_tried = []
-
-                # Method 1: get_camera_frame (recommended for active streams)
-                if hasattr(printer, 'get_camera_frame'):
-                    methods_tried.append('get_camera_frame()')
+            # Method 3: camera.get_image()
+            if not image_data and hasattr(printer, 'camera'):
+                if hasattr(printer.camera, 'get_image'):
+                    methods_tried.append('camera.get_image()')
                     try:
-                        self.log.info(f"   Trying: printer.get_camera_frame()...")
-                        image_data = printer.get_camera_frame()
+                        self.log.info(f"   Trying: printer.camera.get_image()...")
+                        image_data = printer.camera.get_image()
                         if image_data:
-                            self.log.info(f"   ✅ Success with get_camera_frame()")
+                            self.log.info(f"   ✅ Success with camera.get_image()")
                     except Exception as e:
-                        self.log.warning(f"   ⚠️  get_camera_frame() failed: {e}")
+                        self.log.warning(f"   ⚠️  camera.get_image() failed: {e}")
 
-                # Method 2: get_camera_image()
-                if not image_data and hasattr(printer, 'get_camera_image'):
-                    methods_tried.append('get_camera_image()')
-                    try:
-                        self.log.info(f"   Trying: printer.get_camera_image()...")
-                        image_data = printer.get_camera_image()
-                        if image_data:
-                            self.log.info(f"   ✅ Success with get_camera_image()")
-                    except Exception as e:
-                        self.log.warning(f"   ⚠️  get_camera_image() failed: {e}")
-
-                # Method 3: get_latest_jpg()
-                if not image_data and hasattr(printer, 'get_latest_jpg'):
-                    methods_tried.append('get_latest_jpg()')
-                    try:
-                        self.log.info(f"   Trying: printer.get_latest_jpg()...")
-                        image_data = printer.get_latest_jpg()
-                        if image_data:
-                            self.log.info(f"   ✅ Success with get_latest_jpg()")
-                    except Exception as e:
-                        self.log.warning(f"   ⚠️  get_latest_jpg() failed: {e}")
-
-                # Stop camera stream to save bandwidth
-                if hasattr(printer, 'camera_stop'):
-                    try:
-                        printer.camera_stop()
-                        self.log.info(f"   🛑 Camera stream stopped")
-                    except Exception as e:
-                        self.log.debug(f"   Note: camera_stop failed: {e}")
-
-            # ============================================
-            # CHECK IF WE GOT IMAGE DATA
-            # ============================================
             if not image_data:
                 self.log.error(f"   ❌ No image data received from printer")
-                self.log.error(f"   Tried: HTTP snapshot, MJPEG stream")
+                self.log.error(f"   Methods tried: {methods_tried}")
+                self.log.error(f"   Available methods: {[m for m in dir(printer) if 'camera' in m.lower() or 'image' in m.lower() or 'jpg' in m.lower()]}")
                 self.log.info("=" * 80)
                 return None
 

@@ -204,10 +204,6 @@ class ListenerGuiApp:
         self.commandWorkers: Dict[str, CommandWorker] = {}
         self.heartbeatWorker: Optional[HeartbeatWorker] = None
 
-        # Auto-refresh worker for keeping printer data fresh
-        self.autoRefreshThread: Optional[threading.Thread] = None
-        self.autoRefreshEnabled = True
-
         # Load settings from config if available
         self._loadSettingsFromConfig()
 
@@ -219,9 +215,6 @@ class ListenerGuiApp:
         self.root.after(200, self._processPrinterStatusUpdates)
         self._scheduleStatusRefresh(0)
         self._registerPrintersConfigListener()
-
-        # Start auto-refresh worker for keeping printer data fresh
-        self._startAutoRefreshWorker()
 
         # Check if first-time setup is needed
         self.root.after(500, self._checkFirstTimeSetup)
@@ -388,13 +381,6 @@ class ListenerGuiApp:
             state=tk.DISABLED,
         )
         self.editPrinterButton.pack(side=tk.LEFT, padx=(8, 0))
-        self.showDetailsButton = ttk.Button(
-            actionFrame,
-            text="Show Details",
-            command=self._showSelectedPrinterDetails,
-            state=tk.DISABLED,
-        )
-        self.showDetailsButton.pack(side=tk.LEFT, padx=8)
         self.captureReferenceButton = ttk.Button(
             actionFrame,
             text="Capture Bed Reference",
@@ -455,7 +441,6 @@ class ListenerGuiApp:
         self.printerTree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.printerTree.bind("<<TreeviewSelect>>", self._onPrinterSelection)
-        self.printerTree.bind("<Double-Button-1>", self._onPrinterDoubleClick)
 
         self._refreshPrinterList()
 
@@ -497,12 +482,6 @@ class ListenerGuiApp:
                                     "progressPercent": self._parseOptionalFloat(entry.get("progressPercent")),
                                     "remainingTimeSeconds": self._parseOptionalInt(entry.get("remainingTimeSeconds")),
                                     "gcodeState": self._parseOptionalString(entry.get("gcodeState")),
-                                    "printSpeed": self._parseOptionalInt(entry.get("printSpeed")),
-                                    "subtaskName": self._parseOptionalString(entry.get("subtaskName")),
-                                    "totalLayerNum": self._parseOptionalInt(entry.get("totalLayerNum")),
-                                    "wifiSignal": self._parseOptionalString(entry.get("wifiSignal")),
-                                    "fileName": self._parseOptionalString(entry.get("fileName")),
-                                    "lightState": self._parseOptionalString(entry.get("lightState")),
                                     "manualStatusDefaults": entry.get("manualStatusDefaults"),
                                 }
                             )
@@ -1730,59 +1709,10 @@ class ListenerGuiApp:
     def _onPrinterSelection(self, event: object) -> None:  # noqa: ARG002 - required by Tk callback
         state = tk.NORMAL if self._getSelectedPrinterIndex() is not None else tk.DISABLED
         self.editPrinterButton.config(state=state)
-        if hasattr(self, "showDetailsButton"):
-            self.showDetailsButton.config(state=state)
         if hasattr(self, "captureReferenceButton"):
             self.captureReferenceButton.config(state=state)
         if hasattr(self, "runBrakeDemoButton"):
             self.runBrakeDemoButton.config(state=state)
-
-    def _showSelectedPrinterDetails(self) -> None:
-        """Show details dialog for the selected printer with fresh data."""
-        printerIndex = self._getSelectedPrinterIndex()
-        if printerIndex is not None:
-            self._showPrinterDetails(printerIndex)
-
-    def _onPrinterDoubleClick(self, event: object) -> None:  # noqa: ARG002 - required by Tk callback
-        """Handle double-click on printer to show details dialog."""
-        printerIndex = self._getSelectedPrinterIndex()
-        if printerIndex is not None and 0 <= printerIndex < len(self.printers):
-            self._showPrinterDetailsDialog(self.printers[printerIndex])
-
-    def _showPrinterDetailsDialog(self, printerData: Dict[str, Any]) -> None:
-        """Display all printer information in JSON format (read-only)."""
-        dialog = tk.Toplevel(self.root)
-        dialog.title(f"Printer Details - {printerData.get('nickname', 'Unknown')}")
-        dialog.transient(self.root)
-        dialog.grab_set()
-
-        # Set dialog size
-        dialog.geometry("600x500")
-
-        # Create frame for text widget and scrollbar
-        textFrame = ttk.Frame(dialog)
-        textFrame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-
-        # Create text widget with scrollbar
-        textWidget = tk.Text(textFrame, wrap=tk.WORD, font=("Courier", 10))
-        scrollbar = ttk.Scrollbar(textFrame, orient=tk.VERTICAL, command=textWidget.yview)
-        textWidget.configure(yscrollcommand=scrollbar.set)
-
-        textWidget.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-
-        # Format printer data as JSON
-        jsonText = json.dumps(printerData, indent=2, ensure_ascii=False, sort_keys=True)
-        textWidget.insert("1.0", jsonText)
-
-        # Make text widget read-only
-        textWidget.configure(state=tk.DISABLED)
-
-        # Add close button
-        buttonFrame = ttk.Frame(dialog)
-        buttonFrame.pack(fill=tk.X, padx=10, pady=(0, 10))
-        closeButton = ttk.Button(buttonFrame, text="Close", command=dialog.destroy)
-        closeButton.pack(side=tk.RIGHT)
 
     def _captureSelectedBedReference(self) -> None:
         """
@@ -1966,151 +1896,6 @@ class ListenerGuiApp:
                 logging.debug("Unable to fetch Bambu telemetry from %s: %s", ipAddress, error)
 
         return telemetry
-
-    def _startAutoRefreshWorker(self) -> None:
-        """Start background thread that refreshes printer data every 5 minutes"""
-        def autoRefreshWorker():
-            while self.autoRefreshEnabled:
-                try:
-                    time.sleep(300)  # 5 minutes = 300 seconds
-                    if not self.autoRefreshEnabled:
-                        break
-
-                    logging.info("Auto-refresh: Updating all printer telemetry (5 min interval)")
-                    self._refreshAllPrinterData()
-                except Exception as error:
-                    logging.exception("Error in auto-refresh worker: %s", error)
-
-        self.autoRefreshThread = threading.Thread(target=autoRefreshWorker, daemon=True)
-        self.autoRefreshThread.start()
-        logging.info("Auto-refresh worker started (5 minute interval)")
-
-    def _refreshAllPrinterData(self) -> None:
-        """Refresh telemetry data for all printers"""
-        updates: list[tuple[int, Dict[str, Any]]] = []
-
-        for index, printer in enumerate(self.printers):
-            if not isinstance(printer, dict):
-                continue
-
-            try:
-                telemetry = self._collectPrinterTelemetry(printer)
-                if telemetry:
-                    updates.append((index, telemetry))
-            except Exception as error:
-                logging.debug(
-                    "Failed to refresh data for printer %s: %s",
-                    printer.get("nickname") or printer.get("ipAddress"),
-                    error
-                )
-
-        # Apply updates
-        if updates:
-            for index, telemetry in updates:
-                printer = self.printers[index]
-                for key, value in telemetry.items():
-                    if value is not None:
-                        printer[key] = value
-
-            self._savePrinters()
-            self._refreshPrinterList()
-            logging.info("Auto-refresh: Updated %d printers", len(updates))
-
-    def _showPrinterDetails(self, printerIndex: int) -> None:
-        """Show printer details dialog with fresh data"""
-        if printerIndex < 0 or printerIndex >= len(self.printers):
-            return
-
-        printer = self.printers[printerIndex]
-
-        # Force refresh data before showing details
-        ipAddress = str(printer.get("ipAddress", "")).strip()
-        serialNumber = str(printer.get("serialNumber", "")).strip()
-        accessCode = str(printer.get("accessCode", "")).strip()
-
-        if ipAddress and serialNumber and accessCode:
-            try:
-                logging.info("Fetching fresh data for %s before showing details...",
-                           printer.get("nickname") or ipAddress)
-
-                freshTelemetry = self._fetchBambuTelemetry(
-                    ipAddress, serialNumber, accessCode, timeoutSeconds=6.0
-                )
-
-                if freshTelemetry:
-                    # Update printer with fresh data
-                    for key, value in freshTelemetry.items():
-                        if value is not None:
-                            printer[key] = value
-
-                    self.printers[printerIndex] = printer
-                    self._savePrinters()
-                    logging.info("Successfully fetched fresh data for %s",
-                               printer.get("nickname") or ipAddress)
-            except Exception as error:
-                logging.warning("Could not fetch fresh data for printer details: %s", error)
-
-        # Show details dialog
-        detailsJson = json.dumps(printer, indent=2, ensure_ascii=False)
-
-        dialog = tk.Toplevel(self.root)
-        dialog.title(f"Printer Details - {printer.get('nickname') or 'Unknown'}")
-        dialog.geometry("600x700")
-        dialog.transient(self.root)
-
-        # Add scrollable text widget
-        frame = ttk.Frame(dialog, padding=10)
-        frame.pack(fill=tk.BOTH, expand=True)
-
-        textWidget = tk.Text(frame, wrap=tk.WORD, width=70, height=35)
-        scrollbar = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=textWidget.yview)
-        textWidget.configure(yscrollcommand=scrollbar.set)
-
-        textWidget.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-
-        textWidget.insert("1.0", detailsJson)
-        textWidget.configure(state=tk.DISABLED)
-
-        # Add refresh and close buttons
-        buttonFrame = ttk.Frame(dialog)
-        buttonFrame.pack(pady=10)
-
-        def refreshData():
-            """Refresh printer data and update the dialog"""
-            nickname = printer.get("nickname") or "Unknown"
-            logging.info("Refreshing data for %s...", nickname)
-
-            try:
-                # Fetch fresh telemetry
-                freshTelemetry = self._fetchBambuTelemetry(
-                    ipAddress, serialNumber, accessCode, timeoutSeconds=6.0
-                )
-
-                if freshTelemetry:
-                    # Update printer with fresh data
-                    for key, value in freshTelemetry.items():
-                        if value is not None:
-                            printer[key] = value
-
-                    self.printers[printerIndex] = printer
-                    self._savePrinters()
-
-                    # Update text widget
-                    textWidget.configure(state=tk.NORMAL)
-                    textWidget.delete("1.0", tk.END)
-                    updatedJson = json.dumps(printer, indent=2, ensure_ascii=False)
-                    textWidget.insert("1.0", updatedJson)
-                    textWidget.configure(state=tk.DISABLED)
-
-                    logging.info("Successfully refreshed data for %s", nickname)
-                else:
-                    logging.warning("No fresh data received for %s", nickname)
-            except Exception as error:
-                logging.error("Refresh failed for %s: %s", nickname, error)
-
-        ttk.Button(buttonFrame, text="Refresh Data", command=refreshData).pack(side=tk.LEFT, padx=5)
-        ttk.Button(buttonFrame, text="Close", command=dialog.destroy).pack(side=tk.LEFT, padx=5)
 
     def _sendAutomaticPrinterStatus(
         self,
@@ -2310,110 +2095,6 @@ class ListenerGuiApp:
                 except Exception:
                     gcodePayload = None
 
-            # Hent print speed
-            printSpeedPayload: Any = None
-            printSpeedGetter = getattr(printer, "get_print_speed", None)
-            if callable(printSpeedGetter):
-                try:
-                    printSpeedPayload = printSpeedGetter()
-                except Exception:
-                    printSpeedPayload = None
-
-            # Hent subtask name
-            subtaskNamePayload: Any = None
-            subtaskNameGetter = getattr(printer, "subtask_name", None)
-            if callable(subtaskNameGetter):
-                try:
-                    subtaskNamePayload = subtaskNameGetter()
-                except Exception:
-                    subtaskNamePayload = None
-
-            # Hent total layer num - prøv flere kilder
-            totalLayerPayload: Any = None
-
-            # Metode 1: Fra total_layer_num()
-            totalLayerGetter = getattr(printer, "total_layer_num", None)
-            if callable(totalLayerGetter):
-                try:
-                    result = totalLayerGetter()
-                    if result and result > 0:
-                        totalLayerPayload = result
-                except Exception:
-                    pass
-
-            # Metode 2: Fra state-payload hvis metode 1 feilet
-            if totalLayerPayload is None or totalLayerPayload == 0:
-                try:
-                    if isinstance(statePayload, dict):
-                        totalLayers = statePayload.get("total_layer_num") or statePayload.get("layer_num")
-                        if totalLayers and int(totalLayers) > 0:
-                            totalLayerPayload = int(totalLayers)
-                except Exception:
-                    pass
-
-            # Hent WiFi signal
-            wifiSignalPayload: Any = None
-            wifiSignalGetter = getattr(printer, "wifi_signal", None)
-            if callable(wifiSignalGetter):
-                try:
-                    wifiSignalPayload = wifiSignalGetter()
-                except Exception:
-                    wifiSignalPayload = None
-
-            # Hent file name - prøv flere kilder
-            fileNamePayload: Any = None
-
-            # Metode 1: Fra get_file_name()
-            fileNameGetter = getattr(printer, "get_file_name", None)
-            if callable(fileNameGetter):
-                try:
-                    result = fileNameGetter()
-                    if result and str(result).strip():
-                        fileNamePayload = str(result).strip()
-                except Exception:
-                    pass
-
-            # Metode 2: Fra state-payload hvis metode 1 feilet
-            if not fileNamePayload:
-                try:
-                    if isinstance(statePayload, dict):
-                        fileName = (statePayload.get("gcode_file") or
-                                   statePayload.get("subtask_name") or
-                                   statePayload.get("print_file"))
-                        if fileName and str(fileName).strip():
-                            fileNamePayload = str(fileName).strip()
-                except Exception:
-                    pass
-
-            # Hent light state - prøv flere kilder
-            lightStatePayload: Any = None
-
-            # Metode 1: Fra get_light_state()
-            lightStateGetter = getattr(printer, "get_light_state", None)
-            if callable(lightStateGetter):
-                try:
-                    result = lightStateGetter()
-                    if result:
-                        lightStatePayload = str(result)
-                except Exception:
-                    pass
-
-            # Metode 2: Fra state-payload hvis metode 1 feilet
-            if not lightStatePayload or lightStatePayload == "unknown":
-                try:
-                    if isinstance(statePayload, dict):
-                        lightState = statePayload.get("lights_report") or statePayload.get("chamber_light")
-                        if lightState:
-                            # Konverter til on/off
-                            if isinstance(lightState, bool):
-                                lightStatePayload = "on" if lightState else "off"
-                            elif isinstance(lightState, (int, float)):
-                                lightStatePayload = "on" if int(lightState) > 0 else "off"
-                            else:
-                                lightStatePayload = str(lightState)
-                except Exception:
-                    pass
-
             def searchValue(payload: Any, keys: set[str]) -> Any:
                 if payload is None:
                     return None
@@ -2457,12 +2138,6 @@ class ListenerGuiApp:
                 "gcode_state": pickState(),
                 "nozzle_temper": pickNozzle(),
                 "bed_temper": pickBed(),
-                "print_speed": printSpeedPayload,
-                "subtask_name": subtaskNamePayload,
-                "total_layer_num": totalLayerPayload,
-                "wifi_signal": wifiSignalPayload,
-                "file_name": fileNamePayload,
-                "light_state": lightStatePayload,
             }
 
             return self._interpretBambuStatus(statusPayload)
@@ -2479,14 +2154,6 @@ class ListenerGuiApp:
 
         status = self._mapBambuState(state, percent)
 
-        # Get new fields with improved null handling
-        printSpeed = self._parseOptionalInt(payload.get("print_speed"))
-        subtaskName = self._parseOptionalString(payload.get("subtask_name"))
-        totalLayerNum = self._parseOptionalInt(payload.get("total_layer_num"))
-        wifiSignal = self._parseOptionalString(payload.get("wifi_signal"))
-        fileName = self._parseOptionalString(payload.get("file_name"))
-        lightState = self._parseOptionalString(payload.get("light_state"))
-
         return {
             "status": status,
             "progressPercent": percent,
@@ -2494,12 +2161,6 @@ class ListenerGuiApp:
             "nozzleTemp": nozzleTemp,
             "bedTemp": bedTemp,
             "gcodeState": state,
-            "printSpeed": printSpeed if printSpeed is not None else None,
-            "subtaskName": subtaskName if subtaskName else None,
-            "totalLayerNum": totalLayerNum if totalLayerNum is not None and totalLayerNum > 0 else None,
-            "wifiSignal": wifiSignal if wifiSignal else None,
-            "fileName": fileName if fileName else None,
-            "lightState": lightState if lightState else None,
         }
 
     def _mapBambuState(self, state: Optional[str], percent: Optional[float]) -> str:
@@ -2753,18 +2414,6 @@ class ListenerGuiApp:
                 printer["nozzleTemp"] = status.get("nozzleTemp")
             if status.get("bedTemp") is not None:
                 printer["bedTemp"] = status.get("bedTemp")
-            if status.get("printSpeed") is not None:
-                printer["printSpeed"] = status.get("printSpeed")
-            if status.get("subtaskName") is not None:
-                printer["subtaskName"] = status.get("subtaskName")
-            if status.get("totalLayerNum") is not None:
-                printer["totalLayerNum"] = status.get("totalLayerNum")
-            if status.get("wifiSignal") is not None:
-                printer["wifiSignal"] = status.get("wifiSignal")
-            if status.get("fileName") is not None:
-                printer["fileName"] = status.get("fileName")
-            if status.get("lightState") is not None:
-                printer["lightState"] = status.get("lightState")
             updated = True
             break
 
@@ -2877,11 +2526,6 @@ class ListenerGuiApp:
         self._stopHeartbeatWorker()
 
         self._stopStatusSubscribers()
-
-        # Stop auto-refresh worker
-        self.autoRefreshEnabled = False
-        if self.autoRefreshThread and self.autoRefreshThread.is_alive():
-            self.autoRefreshThread.join(timeout=2.0)
 
         if self.stopEvent:
             self.stopEvent.set()
