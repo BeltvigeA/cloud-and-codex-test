@@ -1847,129 +1847,135 @@ class BambuStatusSubscriber:
 
             self.log.info(f"   ✅ Access code found ({len(access_code)} chars)")
 
-            # Import Bambu API
-            self.log.info(f"   📦 Importing bambulabs_api...")
-            try:
-                from bambulabs_api import Printer
-                self.log.info(f"   ✅ bambulabs_api imported successfully")
-            except ImportError as e:
-                self.log.error(f"   ❌ Failed to import bambulabs_api: {e}")
-                self.log.info("=" * 80)
-                return None
+            # ============================================
+            # TRY HTTP CAMERA SNAPSHOT (FASTER AND MORE RELIABLE)
+            # ============================================
+            self.log.info(f"   📷 Requesting camera snapshot via HTTP...")
 
-            # Initialize printer connection
-            self.log.info(f"   🔌 Connecting to printer at {printer_ip}...")
+            image_data = None
+            camera_url = f"http://{printer_ip}/camera/snapshot"
+
+            self.log.info(f"   🌐 GET {camera_url}")
+
             try:
-                printer = Printer(
-                    ip_address=printer_ip,
-                    access_code=access_code,
-                    serial=printer_serial
+                response = requests.get(
+                    camera_url,
+                    auth=('bblp', access_code),  # Basic auth with access code
+                    timeout=5
                 )
-                self.log.info(f"   ✅ Printer connection initialized")
+
+                if response.status_code == 200:
+                    image_data = response.content
+                    self.log.info(f"   ✅ Camera snapshot received via HTTP ({len(image_data)} bytes)")
+                else:
+                    self.log.warning(f"   ⚠️  HTTP request failed: {response.status_code}")
+                    image_data = None
+
+            except requests.exceptions.Timeout:
+                self.log.warning(f"   ⚠️  HTTP request timed out")
+                image_data = None
+            except requests.exceptions.ConnectionError:
+                self.log.warning(f"   ⚠️  Connection error - printer may be offline")
+                image_data = None
             except Exception as e:
-                self.log.error(f"   ❌ Failed to initialize printer connection: {e}")
-                self.log.info("=" * 80)
-                return None
+                self.log.warning(f"   ⚠️  HTTP request failed: {e}")
+                image_data = None
 
             # ============================================
-            # START CAMERA STREAM
+            # FALLBACK TO MJPEG STREAM IF HTTP FAILED
             # ============================================
-            self.log.info(f"   📹 Starting camera stream...")
-            try:
-                # Check if camera is already running
-                if hasattr(printer, 'camera_client_alive') and printer.camera_client_alive():
-                    self.log.info(f"   ✅ Camera stream already active")
-                else:
-                    # Start camera stream
+            if not image_data:
+                self.log.info(f"   📹 Falling back to MJPEG stream...")
+
+                # Import Bambu API
+                self.log.info(f"   📦 Importing bambulabs_api...")
+                try:
+                    from bambulabs_api import Printer
+                    self.log.info(f"   ✅ bambulabs_api imported successfully")
+                except ImportError as e:
+                    self.log.error(f"   ❌ Failed to import bambulabs_api: {e}")
+                    self.log.info("=" * 80)
+                    return None
+
+                # Initialize printer connection
+                self.log.info(f"   🔌 Connecting to printer at {printer_ip}...")
+                try:
+                    printer = Printer(
+                        ip_address=printer_ip,
+                        access_code=access_code,
+                        serial=printer_serial
+                    )
+                    self.log.info(f"   ✅ Printer connection initialized")
+                except Exception as e:
+                    self.log.error(f"   ❌ Failed to initialize printer connection: {e}")
+                    self.log.info("=" * 80)
+                    return None
+
+                # Start camera stream
+                self.log.info(f"   📹 Starting camera stream...")
+                try:
                     if hasattr(printer, 'camera_start'):
                         printer.camera_start()
                         self.log.info(f"   ✅ Camera stream started")
 
-                        # Wait a moment for stream to initialize
+                        # Wait longer for stream to initialize
                         import time
-                        time.sleep(1)
-                        self.log.info(f"   ⏱️  Waited 1s for camera initialization")
-                    else:
-                        self.log.warning(f"   ⚠️  No camera_start method available")
-            except Exception as e:
-                self.log.warning(f"   ⚠️  Failed to start camera stream: {e}")
-                # Continue anyway - camera might already be running
-
-            # Try to get camera image
-            self.log.info(f"   📷 Requesting camera image from printer...")
-            image_data = None
-
-            # Try different methods in order
-            methods_tried = []
-
-            # Method 1: get_camera_frame (recommended for active streams)
-            if hasattr(printer, 'get_camera_frame'):
-                methods_tried.append('get_camera_frame()')
-                try:
-                    self.log.info(f"   Trying: printer.get_camera_frame()...")
-                    image_data = printer.get_camera_frame()
-                    if image_data:
-                        self.log.info(f"   ✅ Success with get_camera_frame()")
+                        time.sleep(3)  # Increased from 1s to 3s
+                        self.log.info(f"   ⏱️  Waited 3s for camera initialization")
                 except Exception as e:
-                    self.log.warning(f"   ⚠️  get_camera_frame() failed: {e}")
+                    self.log.warning(f"   ⚠️  Failed to start camera stream: {e}")
 
-            # Method 2: get_camera_image()
-            if not image_data and hasattr(printer, 'get_camera_image'):
-                methods_tried.append('get_camera_image()')
-                try:
-                    self.log.info(f"   Trying: printer.get_camera_image()...")
-                    image_data = printer.get_camera_image()
-                    if image_data:
-                        self.log.info(f"   ✅ Success with get_camera_image()")
-                except Exception as e:
-                    self.log.warning(f"   ⚠️  get_camera_image() failed: {e}")
+                # Try to get camera frame
+                self.log.info(f"   📷 Requesting camera frame from MJPEG stream...")
+                methods_tried = []
 
-            # Method 3: get_camera_frame_ (alternative)
-            if not image_data and hasattr(printer, 'get_camera_frame_'):
-                methods_tried.append('get_camera_frame_()')
-                try:
-                    self.log.info(f"   Trying: printer.get_camera_frame_()...")
-                    image_data = printer.get_camera_frame_()
-                    if image_data:
-                        self.log.info(f"   ✅ Success with get_camera_frame_()")
-                except Exception as e:
-                    self.log.warning(f"   ⚠️  get_camera_frame_() failed: {e}")
-
-            # Method 4: get_latest_jpg()
-            if not image_data and hasattr(printer, 'get_latest_jpg'):
-                methods_tried.append('get_latest_jpg()')
-                try:
-                    self.log.info(f"   Trying: printer.get_latest_jpg()...")
-                    image_data = printer.get_latest_jpg()
-                    if image_data:
-                        self.log.info(f"   ✅ Success with get_latest_jpg()")
-                except Exception as e:
-                    self.log.warning(f"   ⚠️  get_latest_jpg() failed: {e}")
-
-            # Method 5: camera.get_image()
-            if not image_data and hasattr(printer, 'camera'):
-                if hasattr(printer.camera, 'get_image'):
-                    methods_tried.append('camera.get_image()')
+                # Method 1: get_camera_frame (recommended for active streams)
+                if hasattr(printer, 'get_camera_frame'):
+                    methods_tried.append('get_camera_frame()')
                     try:
-                        self.log.info(f"   Trying: printer.camera.get_image()...")
-                        image_data = printer.camera.get_image()
+                        self.log.info(f"   Trying: printer.get_camera_frame()...")
+                        image_data = printer.get_camera_frame()
                         if image_data:
-                            self.log.info(f"   ✅ Success with camera.get_image()")
+                            self.log.info(f"   ✅ Success with get_camera_frame()")
                     except Exception as e:
-                        self.log.warning(f"   ⚠️  camera.get_image() failed: {e}")
+                        self.log.warning(f"   ⚠️  get_camera_frame() failed: {e}")
 
-            if not image_data:
-                self.log.error(f"   ❌ No image data received from printer")
-                self.log.error(f"   Methods tried: {methods_tried}")
+                # Method 2: get_camera_image()
+                if not image_data and hasattr(printer, 'get_camera_image'):
+                    methods_tried.append('get_camera_image()')
+                    try:
+                        self.log.info(f"   Trying: printer.get_camera_image()...")
+                        image_data = printer.get_camera_image()
+                        if image_data:
+                            self.log.info(f"   ✅ Success with get_camera_image()")
+                    except Exception as e:
+                        self.log.warning(f"   ⚠️  get_camera_image() failed: {e}")
 
-                # Try to stop camera stream to clean up
+                # Method 3: get_latest_jpg()
+                if not image_data and hasattr(printer, 'get_latest_jpg'):
+                    methods_tried.append('get_latest_jpg()')
+                    try:
+                        self.log.info(f"   Trying: printer.get_latest_jpg()...")
+                        image_data = printer.get_latest_jpg()
+                        if image_data:
+                            self.log.info(f"   ✅ Success with get_latest_jpg()")
+                    except Exception as e:
+                        self.log.warning(f"   ⚠️  get_latest_jpg() failed: {e}")
+
+                # Stop camera stream to save bandwidth
                 if hasattr(printer, 'camera_stop'):
                     try:
                         printer.camera_stop()
                         self.log.info(f"   🛑 Camera stream stopped")
-                    except:
-                        pass
+                    except Exception as e:
+                        self.log.debug(f"   Note: camera_stop failed: {e}")
 
+            # ============================================
+            # CHECK IF WE GOT IMAGE DATA
+            # ============================================
+            if not image_data:
+                self.log.error(f"   ❌ No image data received from printer")
+                self.log.error(f"   Tried: HTTP snapshot, MJPEG stream")
                 self.log.info("=" * 80)
                 return None
 
@@ -1984,15 +1990,6 @@ class BambuStatusSubscriber:
             self.log.info(f"   ✅ Camera image saved successfully!")
             self.log.info(f"   File: {output_path}")
             self.log.info(f"   Size: {file_size_kb:.2f} KB ({file_size} bytes)")
-
-            # Stop camera stream to save bandwidth
-            if hasattr(printer, 'camera_stop'):
-                try:
-                    printer.camera_stop()
-                    self.log.info(f"   🛑 Camera stream stopped")
-                except Exception as e:
-                    self.log.debug(f"   Note: camera_stop failed: {e}")
-
             self.log.info("=" * 80)
 
             return output_path
