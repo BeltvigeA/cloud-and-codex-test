@@ -441,6 +441,7 @@ class ListenerGuiApp:
         self.printerTree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.printerTree.bind("<<TreeviewSelect>>", self._onPrinterSelection)
+        self.printerTree.bind("<Double-Button-1>", self._onPrinterDoubleClick)
 
         self._refreshPrinterList()
 
@@ -1713,6 +1714,47 @@ class ListenerGuiApp:
             self.captureReferenceButton.config(state=state)
         if hasattr(self, "runBrakeDemoButton"):
             self.runBrakeDemoButton.config(state=state)
+
+    def _onPrinterDoubleClick(self, event: object) -> None:  # noqa: ARG002 - required by Tk callback
+        """Handle double-click on printer to show details dialog."""
+        printerIndex = self._getSelectedPrinterIndex()
+        if printerIndex is not None and 0 <= printerIndex < len(self.printers):
+            self._showPrinterDetailsDialog(self.printers[printerIndex])
+
+    def _showPrinterDetailsDialog(self, printerData: Dict[str, Any]) -> None:
+        """Display all printer information in JSON format (read-only)."""
+        dialog = tk.Toplevel(self.root)
+        dialog.title(f"Printer Details - {printerData.get('nickname', 'Unknown')}")
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        # Set dialog size
+        dialog.geometry("600x500")
+
+        # Create frame for text widget and scrollbar
+        textFrame = ttk.Frame(dialog)
+        textFrame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        # Create text widget with scrollbar
+        textWidget = tk.Text(textFrame, wrap=tk.WORD, font=("Courier", 10))
+        scrollbar = ttk.Scrollbar(textFrame, orient=tk.VERTICAL, command=textWidget.yview)
+        textWidget.configure(yscrollcommand=scrollbar.set)
+
+        textWidget.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # Format printer data as JSON
+        jsonText = json.dumps(printerData, indent=2, ensure_ascii=False, sort_keys=True)
+        textWidget.insert("1.0", jsonText)
+
+        # Make text widget read-only
+        textWidget.configure(state=tk.DISABLED)
+
+        # Add close button
+        buttonFrame = ttk.Frame(dialog)
+        buttonFrame.pack(fill=tk.X, padx=10, pady=(0, 10))
+        closeButton = ttk.Button(buttonFrame, text="Close", command=dialog.destroy)
+        closeButton.pack(side=tk.RIGHT)
 
     def _captureSelectedBedReference(self) -> None:
         """
