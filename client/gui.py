@@ -395,6 +395,13 @@ class ListenerGuiApp:
             state=tk.DISABLED,
         )
         self.runBrakeDemoButton.pack(side=tk.LEFT, padx=8)
+        self.showDetailsButton = ttk.Button(
+            actionFrame,
+            text="Show Details",
+            command=self._showPrinterDetails,
+            state=tk.DISABLED,
+        )
+        self.showDetailsButton.pack(side=tk.LEFT, padx=8)
         actionFrame.columnconfigure(0, weight=1)
 
         treeFrame = ttk.Frame(parent)
@@ -1713,6 +1720,131 @@ class ListenerGuiApp:
             self.captureReferenceButton.config(state=state)
         if hasattr(self, "runBrakeDemoButton"):
             self.runBrakeDemoButton.config(state=state)
+        if hasattr(self, "showDetailsButton"):
+            self.showDetailsButton.config(state=state)
+
+    def _showPrinterDetails(self) -> None:
+        """
+        Viser detaljert printerinformasjon i et popup-vindu.
+        Bruker ny metode som venter på at MQTT er klar før data hentes.
+        """
+        # Hent valgt printer
+        index = self._getSelectedPrinterIndex()
+        if index is None:
+            messagebox.showinfo("Printer Details", "Velg en printer først.")
+            return
+
+        printer = self.printers[index]
+        ipAddress = str(printer.get("ipAddress") or "").strip()
+        serialNumber = str(printer.get("serialNumber") or "").strip()
+        accessCode = str(printer.get("accessCode") or "").strip()
+
+        if not ipAddress or not serialNumber or not accessCode:
+            messagebox.showerror(
+                "Printer Details",
+                "Printer mangler nødvendig informasjon (IP, serial, eller access code)."
+            )
+            return
+
+        # Opprett dialog-vindu
+        dialog = tk.Toplevel(self.root)
+        dialog.title(f"Printer Details - {printer.get('nickname', serialNumber)}")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.geometry("700x600")
+
+        # Status label
+        statusLabel = ttk.Label(dialog, text="Henter printerinformasjon...", font=("TkDefaultFont", 10))
+        statusLabel.pack(pady=10)
+
+        # Tekstområde for å vise resultatene
+        textFrame = ttk.Frame(dialog)
+        textFrame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        scrollbar = ttk.Scrollbar(textFrame)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        textWidget = tk.Text(textFrame, wrap=tk.WORD, yscrollcommand=scrollbar.set, state=tk.DISABLED)
+        textWidget.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.config(command=textWidget.yview)
+
+        # Refresh-knapp
+        refreshButton = ttk.Button(dialog, text="Oppdater data", state=tk.DISABLED)
+        refreshButton.pack(pady=5)
+
+        # Close-knapp
+        closeButton = ttk.Button(dialog, text="Lukk", command=dialog.destroy)
+        closeButton.pack(pady=5)
+
+        def formatDetails(data: Dict[str, Any]) -> str:
+            """Formater data til lesbar tekst"""
+            if "error" in data:
+                return f"FEIL: {data['error']}"
+
+            lines = []
+            lines.append("=== MQTT STATUS ===")
+            mqtt_status = data.get("mqtt_status", {})
+            lines.append(f"Connected: {mqtt_status.get('connected')}")
+            lines.append(f"Ready: {mqtt_status.get('ready')}")
+
+            lines.append("\n=== PRINT INFORMASJON ===")
+            print_info = data.get("print_info", {})
+            for key, value in print_info.items():
+                lines.append(f"{key}: {value}")
+
+            lines.append("\n=== FREMDRIFT ===")
+            progress = data.get("progress", {})
+            for key, value in progress.items():
+                lines.append(f"{key}: {value}")
+
+            lines.append("\n=== TEMPERATURER ===")
+            temps = data.get("temperatures", {})
+            for key, value in temps.items():
+                lines.append(f"{key}: {value}")
+
+            lines.append("\n=== DIVERSE ===")
+            misc = data.get("misc", {})
+            for key, value in misc.items():
+                lines.append(f"{key}: {value}")
+
+            if "mqtt_client" in data:
+                lines.append("\n=== MQTT CLIENT ===")
+                mqtt_client = data.get("mqtt_client", {})
+                for key, value in mqtt_client.items():
+                    lines.append(f"{key}: {value}")
+
+            return "\n".join(lines)
+
+        def updateTextWidget(text: str) -> None:
+            """Oppdater tekstwidgeten med ny tekst"""
+            textWidget.config(state=tk.NORMAL)
+            textWidget.delete("1.0", tk.END)
+            textWidget.insert("1.0", text)
+            textWidget.config(state=tk.DISABLED)
+
+        def fetchData() -> None:
+            """Henter data i bakgrunnen"""
+            try:
+                statusLabel.config(text="Henter data... (dette kan ta opptil 10 sekunder)")
+                data = self._fetchBambuExtendedStatus(ipAddress, serialNumber, accessCode)
+                formattedText = formatDetails(data)
+                updateTextWidget(formattedText)
+                statusLabel.config(text="Data hentet!")
+                refreshButton.config(state=tk.NORMAL)
+            except Exception as e:
+                updateTextWidget(f"Feil ved henting av data: {e}")
+                statusLabel.config(text="Feil!")
+                refreshButton.config(state=tk.NORMAL)
+
+        def onRefresh() -> None:
+            """Refresh-knapp callback"""
+            refreshButton.config(state=tk.DISABLED)
+            threading.Thread(target=fetchData, daemon=True).start()
+
+        refreshButton.config(command=onRefresh)
+
+        # Start data-henting i bakgrunnen
+        threading.Thread(target=fetchData, daemon=True).start()
 
     def _captureSelectedBedReference(self) -> None:
         """
@@ -2141,6 +2273,122 @@ class ListenerGuiApp:
             }
 
             return self._interpretBambuStatus(statusPayload)
+        finally:
+            with contextlib.suppress(Exception):
+                printer.disconnect()
+
+    def _fetchBambuExtendedStatus(
+        self,
+        ipAddress: str,
+        serialNumber: str,
+        accessCode: str,
+        tries: int = 10,
+        sleepInterval: float = 1.0,
+    ) -> Dict[str, Any]:
+        """
+        Hent utvidet status fra BambuLab-printer via bambulabs_api.
+        Venter eksplisitt på at MQTT-klienten er connected og ready.
+        """
+        try:
+            import bambulabs_api as bl  # type: ignore[import]
+        except Exception:
+            return {"error": "bambulabs_api er ikke installert"}
+
+        try:
+            printer = bl.Printer(ipAddress, accessCode, serialNumber)
+        except Exception as e:
+            return {"error": f"Kunne ikke opprette printer-objekt: {e}"}
+
+        try:
+            printer.connect()
+        except Exception as e:
+            return {"error": f"Kunne ikke koble til printer: {e}"}
+
+        try:
+            # Vent eksplisitt til MQTT er connected & ready
+            connected = False
+            ready = False
+
+            for i in range(tries):
+                try:
+                    connected = printer.mqtt_client_connected()
+                    ready = printer.mqtt_client_ready()
+                except Exception as e:
+                    return {"error": f"mqtt_client_*() kastet exception: {e}"}
+
+                if connected and ready:
+                    break
+                time.sleep(sleepInterval)
+
+            if not connected:
+                return {
+                    "error": "MQTT-klienten er IKKE tilkoblet. Sjekk IP, access-code, LAN-mode på printeren og at port 8883 ikke er blokkert."
+                }
+
+            if not ready:
+                return {
+                    "error": "MQTT-klienten er tilkoblet, men ikke 'ready'. Prøv å øke tries eller sleep."
+                }
+
+            # Gi et lite ekstra pust etter ready
+            time.sleep(0.5)
+
+            # Hjelpefunksjon for sikker kall
+            def safe_call(func):
+                try:
+                    return func()
+                except Exception as e:
+                    return f"<feil: {e}>"
+
+            # Hent felt fra printeren
+            result = {
+                "mqtt_status": {"connected": connected, "ready": ready},
+                "print_info": {
+                    "print_type": safe_call(printer.print_type),
+                    "current_state": safe_call(printer.get_current_state),
+                    "file_name": safe_call(printer.get_file_name),
+                    "gcode_state": safe_call(printer.get_state),
+                    "gcode_file": safe_call(printer.gcode_file),
+                    "print_error_code": safe_call(printer.print_error_code),
+                },
+                "progress": {
+                    "percentage": safe_call(printer.get_percentage),
+                    "time_remaining": safe_call(printer.get_time),
+                    "current_layer": safe_call(printer.current_layer_num),
+                    "total_layers": safe_call(printer.total_layer_num),
+                },
+                "temperatures": {
+                    "nozzle": safe_call(printer.get_nozzle_temperature),
+                    "bed": safe_call(printer.get_bed_temperature),
+                    "chamber": safe_call(printer.get_chamber_temperature),
+                },
+                "misc": {
+                    "print_speed": safe_call(printer.get_print_speed),
+                    "light_state": safe_call(printer.get_light_state),
+                    "skipped_objects": safe_call(printer.get_skipped_objects),
+                },
+            }
+
+            # Hent MQTT-klient felter
+            mqtt_client = None
+            for attr_name in ("_mqtt_client", "mqtt_client", "_Printer__mqtt_client"):
+                if hasattr(printer, attr_name):
+                    mqtt_client = getattr(printer, attr_name)
+                    break
+
+            if mqtt_client:
+                result["mqtt_client"] = {
+                    "current_layer_num": safe_call(mqtt_client.current_layer_num),
+                    "access_code": safe_call(mqtt_client.get_access_code),
+                    "chamber_fan_speed": safe_call(mqtt_client.get_chamber_fan_speed),
+                    "sequence_id": safe_call(mqtt_client.get_sequence_id),
+                    "nozzle_diameter": safe_call(mqtt_client.nozzle_diameter),
+                    "nozzle_type": safe_call(mqtt_client.nozzle_type),
+                    "print_error_code": safe_call(mqtt_client.print_error_code),
+                }
+
+            return result
+
         finally:
             with contextlib.suppress(Exception):
                 printer.disconnect()
