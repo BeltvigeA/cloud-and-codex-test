@@ -388,6 +388,13 @@ class ListenerGuiApp:
             state=tk.DISABLED,
         )
         self.editPrinterButton.pack(side=tk.LEFT, padx=(8, 0))
+        self.showDetailsButton = ttk.Button(
+            actionFrame,
+            text="Show Details",
+            command=self._showSelectedPrinterDetails,
+            state=tk.DISABLED,
+        )
+        self.showDetailsButton.pack(side=tk.LEFT, padx=8)
         self.captureReferenceButton = ttk.Button(
             actionFrame,
             text="Capture Bed Reference",
@@ -1723,10 +1730,18 @@ class ListenerGuiApp:
     def _onPrinterSelection(self, event: object) -> None:  # noqa: ARG002 - required by Tk callback
         state = tk.NORMAL if self._getSelectedPrinterIndex() is not None else tk.DISABLED
         self.editPrinterButton.config(state=state)
+        if hasattr(self, "showDetailsButton"):
+            self.showDetailsButton.config(state=state)
         if hasattr(self, "captureReferenceButton"):
             self.captureReferenceButton.config(state=state)
         if hasattr(self, "runBrakeDemoButton"):
             self.runBrakeDemoButton.config(state=state)
+
+    def _showSelectedPrinterDetails(self) -> None:
+        """Show details dialog for the selected printer with fresh data."""
+        printerIndex = self._getSelectedPrinterIndex()
+        if printerIndex is not None:
+            self._showPrinterDetails(printerIndex)
 
     def _onPrinterDoubleClick(self, event: object) -> None:  # noqa: ARG002 - required by Tk callback
         """Handle double-click on printer to show details dialog."""
@@ -2057,10 +2072,45 @@ class ListenerGuiApp:
         textWidget.insert("1.0", detailsJson)
         textWidget.configure(state=tk.DISABLED)
 
-        # Add close button
+        # Add refresh and close buttons
         buttonFrame = ttk.Frame(dialog)
         buttonFrame.pack(pady=10)
-        ttk.Button(buttonFrame, text="Close", command=dialog.destroy).pack()
+
+        def refreshData():
+            """Refresh printer data and update the dialog"""
+            nickname = printer.get("nickname") or "Unknown"
+            logging.info("Refreshing data for %s...", nickname)
+
+            try:
+                # Fetch fresh telemetry
+                freshTelemetry = self._fetchBambuTelemetry(
+                    ipAddress, serialNumber, accessCode, timeoutSeconds=6.0
+                )
+
+                if freshTelemetry:
+                    # Update printer with fresh data
+                    for key, value in freshTelemetry.items():
+                        if value is not None:
+                            printer[key] = value
+
+                    self.printers[printerIndex] = printer
+                    self._savePrinters()
+
+                    # Update text widget
+                    textWidget.configure(state=tk.NORMAL)
+                    textWidget.delete("1.0", tk.END)
+                    updatedJson = json.dumps(printer, indent=2, ensure_ascii=False)
+                    textWidget.insert("1.0", updatedJson)
+                    textWidget.configure(state=tk.DISABLED)
+
+                    logging.info("Successfully refreshed data for %s", nickname)
+                else:
+                    logging.warning("No fresh data received for %s", nickname)
+            except Exception as error:
+                logging.error("Refresh failed for %s: %s", nickname, error)
+
+        ttk.Button(buttonFrame, text="Refresh Data", command=refreshData).pack(side=tk.LEFT, padx=5)
+        ttk.Button(buttonFrame, text="Close", command=dialog.destroy).pack(side=tk.LEFT, padx=5)
 
     def _sendAutomaticPrinterStatus(
         self,
