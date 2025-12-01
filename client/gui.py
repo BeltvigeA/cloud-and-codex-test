@@ -436,8 +436,8 @@ class ListenerGuiApp:
             "brand",
             "bambuModel",
             "connectionMethod",
+            "ping",
             "status",
-            "progress",
         )
         self.printerTree = ttk.Treeview(treeFrame, columns=columns, show="headings", selectmode="browse")
         self.printerTree.heading("nickname", text="Nickname")
@@ -447,8 +447,8 @@ class ListenerGuiApp:
         self.printerTree.heading("brand", text="Brand")
         self.printerTree.heading("bambuModel", text="Model")
         self.printerTree.heading("connectionMethod", text="Connection")
-        self.printerTree.heading("status", text="Status")
-        self.printerTree.heading("progress", text="Progress")
+        self.printerTree.heading("ping", text="Ping")
+        self.printerTree.heading("status", text="MQTT Status")
         self.printerTree.column("nickname", width=120)
         self.printerTree.column("ipAddress", width=110)
         self.printerTree.column("accessCode", width=110)
@@ -456,8 +456,8 @@ class ListenerGuiApp:
         self.printerTree.column("brand", width=100)
         self.printerTree.column("bambuModel", width=110)
         self.printerTree.column("connectionMethod", width=120)
-        self.printerTree.column("status", width=100)
-        self.printerTree.column("progress", width=140)
+        self.printerTree.column("ping", width=80)
+        self.printerTree.column("status", width=120)
 
         scrollbar = ttk.Scrollbar(treeFrame, orient=tk.VERTICAL, command=self.printerTree.yview)
         self.printerTree.configure(yscrollcommand=scrollbar.set)
@@ -1001,16 +1001,33 @@ class ListenerGuiApp:
             ipAddress = printer.get("ipAddress", "")
             if searchTerm and searchTerm not in nickname.lower() and searchTerm not in ipAddress.lower():
                 continue
-            progressDisplay = self._formatProgress(
-                self._parseOptionalFloat(printer.get("progressPercent")),
-                self._parseOptionalInt(printer.get("remainingTimeSeconds")),
-                self._parseOptionalString(printer.get("gcodeState")),
-            )
             connectionDisplay = str(
                 printer.get("transport")
                 or printer.get("connectionMethod")
                 or defaultTransport
             )
+
+            # Get ping status - check immediately if not already set or if it's Unknown
+            pingStatus = printer.get("pingStatus", "Unknown")
+            if pingStatus == "Unknown" and ipAddress:
+                # Do a quick ping check now
+                pingStatus = self._checkPingStatus(ipAddress)
+                printer["pingStatus"] = pingStatus
+            
+            # Get MQTT status from extendedStatus data (from printer details)
+            mqttStatus = "Unknown"
+            extendedStatus = printer.get("extendedStatus")
+            if extendedStatus and isinstance(extendedStatus, dict):
+                mqtt_status = extendedStatus.get("mqtt_status", {})
+                if isinstance(mqtt_status, dict):
+                    connected = mqtt_status.get("connected", False)
+                    if connected:
+                        mqttStatus = "OK"
+                    else:
+                        mqttStatus = "Not connected"
+            else:
+                # Fallback to cached value from telemetry
+                mqttStatus = printer.get("mqttStatus", "Unknown")
 
             self.printerTree.insert(
                 "",
@@ -1024,8 +1041,8 @@ class ListenerGuiApp:
                     printer.get("brand", ""),
                     printer.get("bambuModel", ""),
                     connectionDisplay,
-                    printer.get("status", "Unknown"),
-                    progressDisplay,
+                    pingStatus,
+                    mqttStatus,
                 ),
             )
         self._onPrinterSelection(None)
@@ -2052,6 +2069,12 @@ class ListenerGuiApp:
                 if index is not None and 0 <= index < len(self.printers):
                     self.printers[index]["extendedStatus"] = data
                     self.printers[index]["extendedStatusTimestamp"] = time.time()
+                    # Update MQTT status from extendedStatus
+                    if isinstance(data, dict) and "error" not in data:
+                        mqtt_status = data.get("mqtt_status", {})
+                        if isinstance(mqtt_status, dict):
+                            connected = mqtt_status.get("connected", False)
+                            self.printers[index]["mqttStatus"] = "OK" if connected else "Not connected"
                     # Also update cache
                     serialNumber = str(self.printers[index].get("serialNumber") or "").strip()
                     if serialNumber:
@@ -2239,8 +2262,38 @@ class ListenerGuiApp:
     def _collectPrinterTelemetry(self, printer: Dict[str, Any]) -> Dict[str, Any]:
         ipAddress = str(printer.get("ipAddress", "")).strip()
         availabilityStatus = self._probePrinterAvailability(ipAddress) if ipAddress else "Offline"
+        
+        # Check ping status - quick check
+        pingStatus = self._checkPingStatus(ipAddress) if ipAddress else "N/A"
+        
+        # Check MQTT status from cached extendedStatus data instead of connecting
+        mqttStatus = "N/A"
+        extendedStatus = printer.get("extendedStatus")
+        if extendedStatus and isinstance(extendedStatus, dict):
+            # Check if we have MQTT status in cached data
+            mqtt_status = extendedStatus.get("mqtt_status", {})
+            if isinstance(mqtt_status, dict):
+                connected = mqtt_status.get("connected", False)
+                if connected:
+                    mqttStatus = "OK"
+                else:
+                    mqttStatus = "Not connected"
+        elif serialNumber and serialNumber in self.printerInfoCache:
+            # Try to get from cache
+            cachedData = self.printerInfoCache[serialNumber].get("data", {})
+            if isinstance(cachedData, dict) and "error" not in cachedData:
+                mqtt_status = cachedData.get("mqtt_status", {})
+                if isinstance(mqtt_status, dict):
+                    connected = mqtt_status.get("connected", False)
+                    if connected:
+                        mqttStatus = "OK"
+                    else:
+                        mqttStatus = "Not connected"
+        
         telemetry: Dict[str, Any] = {
             "status": availabilityStatus,
+            "pingStatus": pingStatus,
+            "mqttStatus": mqttStatus,
             "nozzleTemp": None,
             "bedTemp": None,
             "progressPercent": None,
@@ -2712,6 +2765,126 @@ class ListenerGuiApp:
             except (OSError, ValueError):
                 continue
         return "Offline"
+
+    def _checkPingStatus(self, ipAddress: str, timeoutSeconds: float = 1.0) -> str:
+        """Check if IP address is reachable (ping) - uses actual ping command."""
+        if not ipAddress:
+            return "N/A"
+        
+        # Try using subprocess ping command first (more reliable on Windows)
+        import subprocess
+        import platform
+        
+        try:
+            # Use ping command appropriate for the OS
+            if platform.system().lower() == "windows":
+                # Windows ping: -n 1 = send 1 packet, -w = timeout in milliseconds
+                result = subprocess.run(
+                    ["ping", "-n", "1", "-w", str(int(timeoutSeconds * 1000)), ipAddress],
+                    capture_output=True,
+                    timeout=timeoutSeconds + 1,
+                    text=True
+                )
+            else:
+                # Linux/Mac ping: -c 1 = send 1 packet, -W = timeout in seconds
+                result = subprocess.run(
+                    ["ping", "-c", "1", "-W", str(int(timeoutSeconds)), ipAddress],
+                    capture_output=True,
+                    timeout=timeoutSeconds + 1,
+                    text=True
+                )
+            
+            if result.returncode == 0:
+                return "OK"
+            else:
+                return "Feilet"
+        except (subprocess.TimeoutExpired, FileNotFoundError, Exception):
+            # Fallback to socket connection if ping command fails
+            try:
+                result = socket.create_connection((ipAddress, 8883), timeout=timeoutSeconds)
+                result.close()
+                return "OK"
+            except (OSError, ValueError, socket.timeout, socket.gaierror):
+                return "Feilet"
+            except Exception:
+                return "Feilet"
+
+    def _checkMqttStatus(self, ipAddress: str, serialNumber: str, accessCode: str, timeoutSeconds: float = 3.0) -> str:
+        """Check if MQTT connection to printer is successful."""
+        if not ipAddress or not serialNumber or not accessCode:
+            return "N/A"
+        
+        try:
+            import bambulabs_api as bl  # type: ignore[import]
+        except Exception:
+            return "N/A"
+        
+        printer = None
+        try:
+            printer = bl.Printer(ipAddress, accessCode, serialNumber)
+            
+            # Try to connect with timeout
+            try:
+                printer.connect()
+            except Exception:
+                # Try mqtt_start as alternative
+                mqttStart = getattr(printer, "mqtt_start", None)
+                if callable(mqttStart):
+                    try:
+                        mqttStart()
+                    except Exception:
+                        return "Feilet"
+                else:
+                    return "Feilet"
+            
+            # Wait a bit for connection to establish (reduced wait time)
+            time.sleep(0.3)
+            
+            # Check if MQTT is connected and ready with timeout
+            deadline = time.monotonic() + timeoutSeconds
+            connected = False
+            ready = False
+            
+            while time.monotonic() < deadline:
+                try:
+                    # Try to get connection status
+                    if hasattr(printer, "mqtt_client_connected"):
+                        connected = printer.mqtt_client_connected()
+                    if hasattr(printer, "mqtt_client_ready"):
+                        ready = printer.mqtt_client_ready()
+                    
+                    if connected and ready:
+                        return "OK"
+                    elif connected:
+                        # Give it a bit more time to become ready
+                        time.sleep(0.2)
+                        if hasattr(printer, "mqtt_client_ready"):
+                            ready = printer.mqtt_client_ready()
+                        if ready:
+                            return "OK"
+                        return "Tilkoblet (ikke klar)"
+                except Exception:
+                    pass
+                
+                time.sleep(0.1)
+            
+            # If we couldn't check status, try to get state as a test
+            try:
+                state = printer.get_state()
+                if state is not None:
+                    return "OK"
+            except Exception:
+                pass
+            
+            return "Feilet"
+        except Exception:
+            return "Feilet"
+        finally:
+            if printer:
+                try:
+                    printer.disconnect()
+                except Exception:
+                    pass
 
     def _processPrinterStatusUpdates(self) -> None:
         try:
@@ -3652,6 +3825,12 @@ class ListenerGuiApp:
                         if str(p.get("serialNumber") or "").strip() == serialNumber:
                             self.printers[idx]["extendedStatus"] = data
                             self.printers[idx]["extendedStatusTimestamp"] = timestamp
+                            # Update MQTT status from extendedStatus
+                            if isinstance(data, dict) and "error" not in data:
+                                mqtt_status = data.get("mqtt_status", {})
+                                if isinstance(mqtt_status, dict):
+                                    connected = mqtt_status.get("connected", False)
+                                    self.printers[idx]["mqttStatus"] = "OK" if connected else "Not connected"
                             break
 
                     self.log(f"✓ Info hentet for {nickname}")
@@ -3756,6 +3935,12 @@ class ListenerGuiApp:
                         if str(p.get("serialNumber") or "").strip() == serialNumber:
                             self.printers[idx]["extendedStatus"] = data
                             self.printers[idx]["extendedStatusTimestamp"] = timestamp
+                            # Update MQTT status from extendedStatus
+                            if isinstance(data, dict) and "error" not in data:
+                                mqtt_status = data.get("mqtt_status", {})
+                                if isinstance(mqtt_status, dict):
+                                    connected = mqtt_status.get("connected", False)
+                                    self.printers[idx]["mqttStatus"] = "OK" if connected else "Not connected"
                             break
 
                     logging.info(f"Printer info updated for {serialNumber}")
