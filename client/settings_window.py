@@ -33,15 +33,15 @@ class SettingsWindow:
         # Create dialog window
         self.dialog = tk.Toplevel(parent)
         self.dialog.title("Settings")
-        self.dialog.geometry("500x480")
+        self.dialog.geometry("500x550")
         self.dialog.transient(parent)
         self.dialog.grab_set()
 
         # Center the dialog
         self.dialog.update_idletasks()
         x = (self.dialog.winfo_screenwidth() // 2) - (500 // 2)
-        y = (self.dialog.winfo_screenheight() // 2) - (480 // 2)
-        self.dialog.geometry(f"500x480+{x}+{y}")
+        y = (self.dialog.winfo_screenheight() // 2) - (550 // 2)
+        self.dialog.geometry(f"500x550+{x}+{y}")
 
         # API key visibility state
         self.api_key_visible = False
@@ -174,6 +174,40 @@ class SettingsWindow:
         )
         org_help_text.pack(fill=tk.X, pady=(5, 0))
 
+        # Printer Info Update Interval section
+        interval_frame = ttk.LabelFrame(main_frame, text="Printer Info Update Interval", padding="10")
+        interval_frame.pack(fill=tk.X, pady=(0, 10))
+
+        interval_input_frame = ttk.Frame(interval_frame)
+        interval_input_frame.pack(fill=tk.X)
+
+        ttk.Label(interval_input_frame, text="Update Interval:").pack(side=tk.LEFT, padx=(0, 10))
+
+        # Slider for update interval (minimum 3 minutes, maximum 60 minutes)
+        self.update_interval_var = tk.IntVar()
+        interval_slider = ttk.Scale(
+            interval_input_frame,
+            from_=3,
+            to=60,
+            orient=tk.HORIZONTAL,
+            length=200,
+            variable=self.update_interval_var,
+            command=self._on_interval_slider_changed
+        )
+        interval_slider.pack(side=tk.LEFT, padx=(0, 10))
+
+        self.interval_label = ttk.Label(interval_input_frame, text="5 min")
+        self.interval_label.pack(side=tk.LEFT)
+
+        # Help text for Update Interval
+        interval_help_text = ttk.Label(
+            interval_frame,
+            text="How often to automatically fetch detailed printer information (minimum 3 minutes).",
+            font=("", 8),
+            foreground="gray"
+        )
+        interval_help_text.pack(fill=tk.X, pady=(5, 0))
+
         # Buttons
         button_frame = ttk.Frame(main_frame)
         button_frame.pack(fill=tk.X, pady=(10, 0))
@@ -206,6 +240,14 @@ class SettingsWindow:
         self.status_label = ttk.Label(main_frame, text="", foreground="blue")
         self.status_label.pack(fill=tk.X, pady=(10, 0))
 
+    def _on_interval_slider_changed(self, value: str) -> None:
+        """Handle slider value change for update interval."""
+        try:
+            minutes = int(float(value))
+            self.interval_label.config(text=f"{minutes} min")
+        except (ValueError, TypeError):
+            pass
+
     def _load_current_settings(self) -> None:
         """Load current settings from config manager."""
         api_key = self.config_manager.get_api_key()
@@ -222,6 +264,11 @@ class SettingsWindow:
         organization_id = self.config_manager.get_organization_id()
         if organization_id:
             self.organization_id_var.set(organization_id)
+
+        # Load printer info update interval
+        interval_minutes = self.config_manager.get_printer_info_update_interval_minutes()
+        self.update_interval_var.set(interval_minutes)
+        self.interval_label.config(text=f"{interval_minutes} min")
 
     def _toggle_api_key_visibility(self) -> None:
         """Toggle API key visibility."""
@@ -467,6 +514,10 @@ class SettingsWindow:
         self.config_manager.set_api_key(api_key)
         self.config_manager.set_recipient_id(recipient_id)
         self.config_manager.set_organization_id(organization_id)
+        
+        # Save printer info update interval
+        interval_minutes = self.update_interval_var.get()
+        self.config_manager.set_printer_info_update_interval_minutes(interval_minutes)
 
         # Save to disk
         if self.config_manager.save():

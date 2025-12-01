@@ -234,6 +234,29 @@ class ConfigManager:
         # Show first 3 and last 3 characters
         return f"{api_key[:3]}...{api_key[-3:]}"
 
+    def get_printer_info_update_interval_minutes(self) -> int:
+        """
+        Get the printer info update interval in minutes.
+
+        Returns:
+            Update interval in minutes (default: 5)
+        """
+        interval = self._config.get("printer_info_update_interval_minutes")
+        if isinstance(interval, int) and interval >= 3:
+            return interval
+        return 5  # Default 5 minutes
+
+    def set_printer_info_update_interval_minutes(self, minutes: int) -> None:
+        """
+        Set the printer info update interval in minutes.
+
+        Args:
+            minutes: Update interval in minutes (minimum 3)
+        """
+        if minutes < 3:
+            minutes = 3
+        self._config["printer_info_update_interval_minutes"] = minutes
+
     def clear(self) -> None:
         """Clear all configuration."""
         self._config = {}

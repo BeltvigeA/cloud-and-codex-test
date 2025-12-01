@@ -207,8 +207,12 @@ class ListenerGuiApp:
         # Printer Info cache and polling
         self.printerInfoCache: Dict[str, Dict[str, Any]] = {}  # serial -> {timestamp, data}
         self.printerInfoPollingThread: Optional[threading.Thread] = None
-        self.printerInfoPollingInterval = 300  # 5 minutes in seconds
+        # Load interval from config (default 5 minutes = 300 seconds)
+        interval_minutes = self.config_manager.get_printer_info_update_interval_minutes()
+        self.printerInfoPollingInterval = interval_minutes * 60
         self.printerInfoStopEvent: Optional[threading.Event] = None
+        self.printerInfoUpdateAttempts: Dict[str, int] = {}  # serial -> attempt count
+        self.printerInfoIsUpdating: bool = False
 
         # Load settings from config if available
         self._loadSettingsFromConfig()
@@ -275,6 +279,10 @@ class ListenerGuiApp:
 
         if recipient_id:
             os.environ["BASE44_RECIPIENT_ID"] = recipient_id
+
+        # Update printer info polling interval from config
+        interval_minutes = self.config_manager.get_printer_info_update_interval_minutes()
+        self.printerInfoPollingInterval = interval_minutes * 60
 
         self.log("Settings updated successfully")
 
@@ -425,8 +433,6 @@ class ListenerGuiApp:
             "bambuModel",
             "connectionMethod",
             "status",
-            "nozzleTemp",
-            "bedTemp",
             "progress",
         )
         self.printerTree = ttk.Treeview(treeFrame, columns=columns, show="headings", selectmode="browse")
@@ -438,8 +444,6 @@ class ListenerGuiApp:
         self.printerTree.heading("bambuModel", text="Model")
         self.printerTree.heading("connectionMethod", text="Connection")
         self.printerTree.heading("status", text="Status")
-        self.printerTree.heading("nozzleTemp", text="Nozzle Temp")
-        self.printerTree.heading("bedTemp", text="Bed Temp")
         self.printerTree.heading("progress", text="Progress")
         self.printerTree.column("nickname", width=120)
         self.printerTree.column("ipAddress", width=110)
@@ -449,8 +453,6 @@ class ListenerGuiApp:
         self.printerTree.column("bambuModel", width=110)
         self.printerTree.column("connectionMethod", width=120)
         self.printerTree.column("status", width=100)
-        self.printerTree.column("nozzleTemp", width=110)
-        self.printerTree.column("bedTemp", width=100)
         self.printerTree.column("progress", width=140)
 
         scrollbar = ttk.Scrollbar(treeFrame, orient=tk.VERTICAL, command=self.printerTree.yview)
@@ -469,26 +471,44 @@ class ListenerGuiApp:
         # Header frame with info and controls
         headerFrame = ttk.Frame(parent)
         headerFrame.grid(row=0, column=0, sticky=tk.EW, padx=8, pady=8)
+        headerFrame.columnconfigure(0, weight=1)
 
+        # Info label about update interval (from settings)
+        interval_minutes = self.config_manager.get_printer_info_update_interval_minutes()
         infoLabel = ttk.Label(
             headerFrame,
-            text="Detaljert printerinformasjon oppdateres automatisk hver 5. minutt",
+            text=f"Detaljert printerinformasjon oppdateres automatisk hver {interval_minutes} minutt (kan endres i Settings)",
             font=("TkDefaultFont", 9)
         )
-        infoLabel.pack(side=tk.LEFT, padx=6)
+        infoLabel.grid(row=0, column=0, sticky=tk.W, padx=6)
+
+        # Status indicator frame
+        statusFrame = ttk.Frame(headerFrame)
+        statusFrame.grid(row=0, column=1, sticky=tk.E, padx=6)
+        
+        self.printerInfoStatusLabel = ttk.Label(
+            statusFrame,
+            text="",
+            font=("TkDefaultFont", 9),
+            foreground="gray"
+        )
+        self.printerInfoStatusLabel.pack(side=tk.LEFT)
 
         # Control buttons
+        buttonFrame = ttk.Frame(headerFrame)
+        buttonFrame.grid(row=0, column=2, sticky=tk.E, padx=6)
+        
         ttk.Button(
-            headerFrame,
+            buttonFrame,
             text="Oppdater alle nå",
             command=self._refreshAllPrinterInfo
-        ).pack(side=tk.RIGHT, padx=6)
+        ).pack(side=tk.LEFT, padx=6)
 
         ttk.Button(
-            headerFrame,
+            buttonFrame,
             text="Start automatisk oppdatering",
             command=self._startPrinterInfoPolling
-        ).pack(side=tk.RIGHT, padx=6)
+        ).pack(side=tk.LEFT, padx=6)
 
         # Main content frame with two panes
         contentFrame = ttk.Frame(parent)
@@ -857,8 +877,6 @@ class ListenerGuiApp:
             ipAddress = printer.get("ipAddress", "")
             if searchTerm and searchTerm not in nickname.lower() and searchTerm not in ipAddress.lower():
                 continue
-            nozzleTempDisplay = self._formatTemperature(self._parseOptionalFloat(printer.get("nozzleTemp")))
-            bedTempDisplay = self._formatTemperature(self._parseOptionalFloat(printer.get("bedTemp")))
             progressDisplay = self._formatProgress(
                 self._parseOptionalFloat(printer.get("progressPercent")),
                 self._parseOptionalInt(printer.get("remainingTimeSeconds")),
@@ -883,8 +901,6 @@ class ListenerGuiApp:
                     printer.get("bambuModel", ""),
                     connectionDisplay,
                     printer.get("status", "Unknown"),
-                    nozzleTempDisplay,
-                    bedTempDisplay,
                     progressDisplay,
                 ),
             )
@@ -2468,6 +2484,34 @@ class ListenerGuiApp:
                     "print_error_code": safe_call(mqtt_client.print_error_code),
                 }
 
+            # Hent mqtt_dump, vt_tray og wifi_signal
+            try:
+                mqtt_dump_data = printer.mqtt_dump()
+                if mqtt_dump_data:
+                    result["mqtt_dump"] = mqtt_dump_data
+            except Exception as e:
+                result["mqtt_dump"] = f"<feil: {e}>"
+
+            try:
+                vt_tray_data = printer.vt_tray()
+                if vt_tray_data:
+                    # Convert FilamentTray object to dict if it has attributes
+                    if hasattr(vt_tray_data, '__dict__'):
+                        result["vt_tray"] = vt_tray_data.__dict__
+                    elif hasattr(vt_tray_data, '__iter__') and not isinstance(vt_tray_data, (str, bytes)):
+                        result["vt_tray"] = dict(vt_tray_data)
+                    else:
+                        result["vt_tray"] = str(vt_tray_data)
+            except Exception as e:
+                result["vt_tray"] = f"<feil: {e}>"
+
+            try:
+                wifi_signal_data = printer.wifi_signal()
+                if wifi_signal_data is not None:
+                    result["wifi_signal"] = wifi_signal_data
+            except Exception as e:
+                result["wifi_signal"] = f"<feil: {e}>"
+
             return result
 
         finally:
@@ -3293,11 +3337,147 @@ class ListenerGuiApp:
             for key, value in mqtt_client.items():
                 lines.append(f"{key}: {value}")
 
+        # WiFi Signal
+        if "wifi_signal" in data:
+            lines.append("\n=== WIFI SIGNAL ===")
+            wifi_signal = data.get("wifi_signal")
+            lines.append(f"Signal: {wifi_signal}")
+
+        # VT Tray (Filament Tray)
+        if "vt_tray" in data:
+            lines.append("\n=== VT TRAY (FILAMENT TRAY) ===")
+            vt_tray = data.get("vt_tray")
+            if isinstance(vt_tray, dict):
+                # Sort keys for better readability
+                sorted_keys = sorted(vt_tray.keys())
+                for key in sorted_keys:
+                    value = vt_tray[key]
+                    lines.append(f"{key}: {value}")
+            else:
+                lines.append(str(vt_tray))
+
+        # MQTT Dump - organize and sort
+        if "mqtt_dump" in data:
+            lines.append("\n=== MQTT DUMP ===")
+            mqtt_dump = data.get("mqtt_dump")
+            if isinstance(mqtt_dump, dict):
+                # Helper function to format nested structures
+                def format_value(value, indent_level=0):
+                    """Recursively format nested dicts and lists."""
+                    indent = "  " * indent_level
+                    if isinstance(value, dict):
+                        result = []
+                        for k, v in sorted(value.items()):
+                            if isinstance(v, (dict, list)):
+                                result.append(f"{indent}{k}:")
+                                result.extend(format_value(v, indent_level + 1))
+                            else:
+                                result.append(f"{indent}{k}: {v}")
+                        return result
+                    elif isinstance(value, list):
+                        if not value:
+                            return [f"{indent}[]"]
+                        result = [f"{indent}["]
+                        for item in value:
+                            if isinstance(item, (dict, list)):
+                                result.extend(format_value(item, indent_level + 1))
+                            else:
+                                result.append(f"{indent}  {item}")
+                        result.append(f"{indent}]")
+                        return result
+                    else:
+                        return [f"{indent}{value}"]
+
+                # Organize by main sections: print, upgrade, info
+                if "print" in mqtt_dump:
+                    lines.append("\n--- Print Section ---")
+                    print_section = mqtt_dump["print"]
+                    if isinstance(print_section, dict):
+                        # Prioritize important fields first
+                        priority_keys = [
+                            "gcode_state", "gcode_file", "print_type", "mc_percent", 
+                            "mc_remaining_time", "layer_num", "total_layer_num",
+                            "nozzle_temper", "nozzle_target_temper", "bed_temper", 
+                            "bed_target_temper", "chamber_temper", "wifi_signal",
+                            "print_error", "mc_print_stage", "spd_mag", "spd_lvl"
+                        ]
+                        remaining_keys = [k for k in sorted(print_section.keys()) if k not in priority_keys]
+                        
+                        # Add priority keys first
+                        for key in priority_keys:
+                            if key in print_section:
+                                value = print_section[key]
+                                if isinstance(value, (dict, list)):
+                                    lines.append(f"{key}:")
+                                    lines.extend(format_value(value, 1))
+                                else:
+                                    lines.append(f"{key}: {value}")
+                        
+                        # Then add remaining keys grouped by category
+                        nested_sections = {}
+                        simple_keys = []
+                        for key in remaining_keys:
+                            value = print_section[key]
+                            if isinstance(value, dict):
+                                nested_sections[key] = value
+                            else:
+                                simple_keys.append((key, value))
+                        
+                        # Add simple keys
+                        for key, value in sorted(simple_keys):
+                            lines.append(f"{key}: {value}")
+                        
+                        # Add nested sections
+                        for key in sorted(nested_sections.keys()):
+                            value = nested_sections[key]
+                            lines.append(f"\n{key}:")
+                            lines.extend(format_value(value, 1))
+
+                if "upgrade" in mqtt_dump:
+                    lines.append("\n--- Upgrade Section ---")
+                    upgrade_section = mqtt_dump["upgrade"]
+                    if isinstance(upgrade_section, dict):
+                        for key, value in sorted(upgrade_section.items()):
+                            if isinstance(value, (dict, list)):
+                                lines.append(f"{key}:")
+                                lines.extend(format_value(value, 1))
+                            else:
+                                lines.append(f"{key}: {value}")
+
+                if "info" in mqtt_dump:
+                    lines.append("\n--- Info Section ---")
+                    info_section = mqtt_dump["info"]
+                    if isinstance(info_section, dict):
+                        for key, value in sorted(info_section.items()):
+                            if isinstance(value, (dict, list)):
+                                lines.append(f"{key}:")
+                                lines.extend(format_value(value, 1))
+                            else:
+                                lines.append(f"{key}: {value}")
+
+                # Any other top-level keys
+                other_keys = [k for k in mqtt_dump.keys() if k not in ("print", "upgrade", "info")]
+                if other_keys:
+                    lines.append("\n--- Other Sections ---")
+                    for key in sorted(other_keys):
+                        value = mqtt_dump[key]
+                        if isinstance(value, (dict, list)):
+                            lines.append(f"{key}:")
+                            lines.extend(format_value(value, 1))
+                        else:
+                            lines.append(f"{key}: {value}")
+            else:
+                lines.append(str(mqtt_dump))
+
         return "\n".join(lines)
 
     def _refreshAllPrinterInfo(self) -> None:
         """Manually refresh printer info for all printers now."""
         def task() -> None:
+            self.printerInfoIsUpdating = True
+            self.printerInfoUpdateAttempts = {}
+            self._updatePrinterInfoStatus("Oppdaterer alle printere...", "blue")
+            
             for printer in self.printers:
                 ipAddress = str(printer.get("ipAddress") or "").strip()
                 serialNumber = str(printer.get("serialNumber") or "").strip()
@@ -3308,6 +3488,16 @@ class ListenerGuiApp:
 
                 nickname = printer.get("nickname", serialNumber)
                 self.log(f"Henter info for {nickname}...")
+                
+                # Track attempts
+                if serialNumber not in self.printerInfoUpdateAttempts:
+                    self.printerInfoUpdateAttempts[serialNumber] = 0
+                self.printerInfoUpdateAttempts[serialNumber] += 1
+                attempt_count = self.printerInfoUpdateAttempts[serialNumber]
+                self._updatePrinterInfoStatus(
+                    f"Oppdaterer {nickname}... (forsøk {attempt_count})",
+                    "blue"
+                )
 
                 try:
                     data = self._fetchBambuExtendedStatus(ipAddress, serialNumber, accessCode)
@@ -3319,20 +3509,46 @@ class ListenerGuiApp:
                     }
 
                     self.log(f"✓ Info hentet for {nickname}")
+                    self.printerInfoUpdateAttempts[serialNumber] = 0  # Reset on success
                 except Exception as e:
                     self.log(f"✗ Feil ved henting for {nickname}: {e}")
 
             # Update the list to show cache indicators
             self.root.after(0, self._refreshPrinterInfoList)
             self.log("Printer info oppdatering fullført!")
+            
+            # Update status
+            self.printerInfoIsUpdating = False
+            total_attempts = sum(self.printerInfoUpdateAttempts.values())
+            if total_attempts > 0:
+                failed_printers = [k for k, v in self.printerInfoUpdateAttempts.items() if v > 0]
+                if failed_printers:
+                    self._updatePrinterInfoStatus(
+                        f"Oppdatering fullført. {len(failed_printers)} printer(e) feilet (totalt {total_attempts} forsøk)",
+                        "orange"
+                    )
+                else:
+                    self._updatePrinterInfoStatus("Oppdatering fullført", "green")
+            else:
+                self._updatePrinterInfoStatus("Oppdatering fullført", "green")
 
         threading.Thread(target=task, daemon=True).start()
 
+
+    def _updatePrinterInfoStatus(self, message: str, color: str = "gray") -> None:
+        """Update the status label in Printer Info tab."""
+        if hasattr(self, 'printerInfoStatusLabel'):
+            self.root.after(0, lambda: self.printerInfoStatusLabel.config(text=message, foreground=color))
+
     def _startPrinterInfoPolling(self) -> None:
-        """Start automatic polling of printer info every 5 minutes."""
+        """Start automatic polling of printer info."""
         if self.printerInfoPollingThread and self.printerInfoPollingThread.is_alive():
             self.log("Printer info polling kjører allerede")
             return
+
+        # Get interval from config
+        interval_minutes = self.config_manager.get_printer_info_update_interval_minutes()
+        self.printerInfoPollingInterval = interval_minutes * 60
 
         self.printerInfoStopEvent = threading.Event()
         self.printerInfoPollingThread = threading.Thread(
@@ -3341,11 +3557,19 @@ class ListenerGuiApp:
             name="PrinterInfoPoller"
         )
         self.printerInfoPollingThread.start()
-        self.log(f"Automatisk printer info oppdatering startet (hver {self.printerInfoPollingInterval // 60} minutt)")
+        self.log(f"Automatisk printer info oppdatering startet (hver {interval_minutes} minutt)")
+        self._updatePrinterInfoStatus(f"Oppdatering aktiv (hver {interval_minutes} min)", "green")
 
     def _pollPrinterInfoLoop(self) -> None:
         """Background loop that polls printer info every interval."""
         while not (self.printerInfoStopEvent and self.printerInfoStopEvent.is_set()):
+            # Update status to show we're starting an update cycle
+            self.printerInfoIsUpdating = True
+            self._updatePrinterInfoStatus("Oppdaterer printere...", "blue")
+            
+            # Reset attempt counts for this cycle
+            self.printerInfoUpdateAttempts = {}
+            
             # Fetch data for all printers
             for printer in self.printers:
                 if self.printerInfoStopEvent and self.printerInfoStopEvent.is_set():
@@ -3358,6 +3582,18 @@ class ListenerGuiApp:
                 if not (ipAddress and serialNumber and accessCode):
                     continue
 
+                # Track attempts for this printer
+                if serialNumber not in self.printerInfoUpdateAttempts:
+                    self.printerInfoUpdateAttempts[serialNumber] = 0
+                self.printerInfoUpdateAttempts[serialNumber] += 1
+                
+                nickname = printer.get("nickname", serialNumber)
+                attempt_count = self.printerInfoUpdateAttempts[serialNumber]
+                self._updatePrinterInfoStatus(
+                    f"Oppdaterer {nickname}... (forsøk {attempt_count})",
+                    "blue"
+                )
+
                 try:
                     data = self._fetchBambuExtendedStatus(ipAddress, serialNumber, accessCode)
                     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -3368,12 +3604,31 @@ class ListenerGuiApp:
                     }
 
                     logging.info(f"Printer info updated for {serialNumber}")
+                    # Reset attempts on success
+                    self.printerInfoUpdateAttempts[serialNumber] = 0
                 except Exception as e:
                     logging.error(f"Failed to fetch printer info for {serialNumber}: {e}")
+                    # Keep the attempt count for display
 
             # Update the list UI to show cache indicators
             if hasattr(self, 'root'):
                 self.root.after(0, self._refreshPrinterInfoList)
+
+            # Update status to show completion
+            self.printerInfoIsUpdating = False
+            total_attempts = sum(self.printerInfoUpdateAttempts.values())
+            if total_attempts > 0:
+                failed_printers = [k for k, v in self.printerInfoUpdateAttempts.items() if v > 0]
+                if failed_printers:
+                    self._updatePrinterInfoStatus(
+                        f"Oppdatering fullført. {len(failed_printers)} printer(e) feilet (totalt {total_attempts} forsøk)",
+                        "orange"
+                    )
+                else:
+                    self._updatePrinterInfoStatus("Oppdatering fullført", "green")
+            else:
+                interval_min = self.printerInfoPollingInterval // 60
+                self._updatePrinterInfoStatus(f"Oppdatering aktiv (hver {interval_min} min)", "green")
 
             # Wait for interval or until stop event
             if self.printerInfoStopEvent:
@@ -3386,6 +3641,7 @@ class ListenerGuiApp:
         if self.printerInfoPollingThread:
             self.printerInfoPollingThread.join(timeout=2.0)
         self.log("Automatisk printer info oppdatering stoppet")
+        self._updatePrinterInfoStatus("Oppdatering stoppet", "gray")
 
     def _handleWindowClose(self) -> None:
         try:
