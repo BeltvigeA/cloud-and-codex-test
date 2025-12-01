@@ -315,6 +315,10 @@ class ListenerGuiApp:
         notebook.add(printerInfoFrame, text="Printer Info")
         self._buildPrinterInfoTab(printerInfoFrame)
 
+        printJobFrame = ttk.Frame(notebook)
+        notebook.add(printJobFrame, text="Print Job")
+        self._buildPrintJobTab(printJobFrame)
+
     def _buildListenerTab(self, parent: ttk.Frame, paddingOptions: Dict[str, int]) -> None:
         self.baseUrlVar = tk.StringVar(value=hardcodedBaseUrl)
         api_key = self.config_manager.get_api_key() or ""
@@ -551,6 +555,126 @@ class ListenerGuiApp:
 
         # Start polling automatically
         self.root.after(1000, self._startPrinterInfoPolling)
+
+    def _buildPrintJobTab(self, parent: ttk.Frame) -> None:
+        """Build the Print Job tab showing all printers with print information."""
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(1, weight=1)
+
+        # Header frame with controls
+        headerFrame = ttk.Frame(parent)
+        headerFrame.grid(row=0, column=0, sticky=tk.EW, padx=8, pady=8)
+        headerFrame.columnconfigure(0, weight=1)
+
+        # Info label
+        infoLabel = ttk.Label(
+            headerFrame,
+            text="Oversikt over alle printere med print informasjon. Data hentes automatisk fra detaljer.",
+            font=("TkDefaultFont", 9)
+        )
+        infoLabel.grid(row=0, column=0, sticky=tk.W, padx=6)
+
+        # Control buttons
+        buttonFrame = ttk.Frame(headerFrame)
+        buttonFrame.grid(row=0, column=1, sticky=tk.E, padx=6)
+        
+        ttk.Button(
+            buttonFrame,
+            text="Oppdater alle nå",
+            command=self._refreshPrintJobData
+        ).pack(side=tk.LEFT, padx=6)
+
+        # Main content frame with treeview
+        contentFrame = ttk.Frame(parent)
+        contentFrame.grid(row=1, column=0, sticky=tk.NSEW, padx=8, pady=(0, 8))
+        contentFrame.columnconfigure(0, weight=1)
+        contentFrame.rowconfigure(0, weight=1)
+
+        # Treeview for printers
+        treeFrame = ttk.Frame(contentFrame)
+        treeFrame.grid(row=0, column=0, sticky=tk.NSEW)
+        treeFrame.columnconfigure(0, weight=1)
+        treeFrame.rowconfigure(0, weight=1)
+
+        columns = (
+            "printer",
+            "print_type",
+            "current_state",
+            "file_name",
+            "gcode_state",
+            "gcode_file",
+            "print_error_code",
+            "percentage",
+            "time_remaining",
+            "current_layer",
+            "total_layers",
+            "nozzle",
+            "bed",
+            "chamber",
+            "print_speed",
+            "light_state",
+            "skipped_objects",
+            "chamber_fan_speed",
+            "current_layer_num",
+            "status",
+        )
+
+        self.printJobTree = ttk.Treeview(treeFrame, columns=columns, show="headings", selectmode="browse")
+        
+        # Configure column headings
+        self.printJobTree.heading("printer", text="Printer")
+        self.printJobTree.heading("print_type", text="Print Type")
+        self.printJobTree.heading("current_state", text="State")
+        self.printJobTree.heading("file_name", text="File Name")
+        self.printJobTree.heading("gcode_state", text="Gcode State")
+        self.printJobTree.heading("gcode_file", text="Gcode File")
+        self.printJobTree.heading("print_error_code", text="Error Code")
+        self.printJobTree.heading("percentage", text="Progress %")
+        self.printJobTree.heading("time_remaining", text="Time Remaining")
+        self.printJobTree.heading("current_layer", text="Layer")
+        self.printJobTree.heading("total_layers", text="Total Layers")
+        self.printJobTree.heading("nozzle", text="Nozzle °C")
+        self.printJobTree.heading("bed", text="Bed °C")
+        self.printJobTree.heading("chamber", text="Chamber °C")
+        self.printJobTree.heading("print_speed", text="Speed %")
+        self.printJobTree.heading("light_state", text="Light")
+        self.printJobTree.heading("skipped_objects", text="Skipped")
+        self.printJobTree.heading("chamber_fan_speed", text="Fan Speed")
+        self.printJobTree.heading("current_layer_num", text="Layer #")
+        self.printJobTree.heading("status", text="Status")
+
+        # Configure column widths
+        self.printJobTree.column("printer", width=120)
+        self.printJobTree.column("print_type", width=90)
+        self.printJobTree.column("current_state", width=90)
+        self.printJobTree.column("file_name", width=120)
+        self.printJobTree.column("gcode_state", width=90)
+        self.printJobTree.column("gcode_file", width=120)
+        self.printJobTree.column("print_error_code", width=80)
+        self.printJobTree.column("percentage", width=70)
+        self.printJobTree.column("time_remaining", width=90)
+        self.printJobTree.column("current_layer", width=60)
+        self.printJobTree.column("total_layers", width=70)
+        self.printJobTree.column("nozzle", width=70)
+        self.printJobTree.column("bed", width=70)
+        self.printJobTree.column("chamber", width=70)
+        self.printJobTree.column("print_speed", width=70)
+        self.printJobTree.column("light_state", width=60)
+        self.printJobTree.column("skipped_objects", width=80)
+        self.printJobTree.column("chamber_fan_speed", width=70)
+        self.printJobTree.column("current_layer_num", width=70)
+        self.printJobTree.column("status", width=180)
+
+        scrollbar = ttk.Scrollbar(treeFrame, orient=tk.VERTICAL, command=self.printJobTree.yview)
+        self.printJobTree.configure(yscrollcommand=scrollbar.set)
+        self.printJobTree.grid(row=0, column=0, sticky=tk.NSEW)
+        scrollbar.grid(row=0, column=1, sticky=tk.NS)
+
+        # Populate treeview
+        self._refreshPrintJobTree()
+
+        # Auto-refresh when printer info is updated
+        # This will be called from _refreshAllPrinterInfo and polling
 
     def _registerPrintersConfigListener(self) -> None:
         try:
@@ -1924,10 +2048,25 @@ class ListenerGuiApp:
             try:
                 statusLabel.config(text="Henter data... (dette kan ta opptil 10 sekunder)")
                 data = self._fetchBambuExtendedStatus(ipAddress, serialNumber, accessCode)
+                # Lagre data i printer dictionary for gjenbruk
+                if index is not None and 0 <= index < len(self.printers):
+                    self.printers[index]["extendedStatus"] = data
+                    self.printers[index]["extendedStatusTimestamp"] = time.time()
+                    # Also update cache
+                    serialNumber = str(self.printers[index].get("serialNumber") or "").strip()
+                    if serialNumber:
+                        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        self.printerInfoCache[serialNumber] = {
+                            "timestamp": timestamp,
+                            "data": data
+                        }
                 formattedText = formatDetails(data)
                 updateTextWidget(formattedText)
                 statusLabel.config(text="Data hentet!")
                 refreshButton.config(state=tk.NORMAL)
+                # Refresh Print Job tree if it exists
+                if hasattr(self, 'printJobTree'):
+                    self.root.after(0, self._refreshPrintJobTree)
             except Exception as e:
                 updateTextWidget(f"Feil ved henting av data: {e}")
                 statusLabel.config(text="Feil!")
@@ -3508,6 +3647,13 @@ class ListenerGuiApp:
                         "data": data
                     }
 
+                    # Lagre data også i printer dictionary for gjenbruk
+                    for idx, p in enumerate(self.printers):
+                        if str(p.get("serialNumber") or "").strip() == serialNumber:
+                            self.printers[idx]["extendedStatus"] = data
+                            self.printers[idx]["extendedStatusTimestamp"] = timestamp
+                            break
+
                     self.log(f"✓ Info hentet for {nickname}")
                     self.printerInfoUpdateAttempts[serialNumber] = 0  # Reset on success
                 except Exception as e:
@@ -3515,6 +3661,8 @@ class ListenerGuiApp:
 
             # Update the list to show cache indicators
             self.root.after(0, self._refreshPrinterInfoList)
+            # Also refresh Print Job tree
+            self.root.after(0, self._refreshPrintJobTree)
             self.log("Printer info oppdatering fullført!")
             
             # Update status
@@ -3603,6 +3751,13 @@ class ListenerGuiApp:
                         "data": data
                     }
 
+                    # Lagre data også i printer dictionary for gjenbruk
+                    for idx, p in enumerate(self.printers):
+                        if str(p.get("serialNumber") or "").strip() == serialNumber:
+                            self.printers[idx]["extendedStatus"] = data
+                            self.printers[idx]["extendedStatusTimestamp"] = timestamp
+                            break
+
                     logging.info(f"Printer info updated for {serialNumber}")
                     # Reset attempts on success
                     self.printerInfoUpdateAttempts[serialNumber] = 0
@@ -3613,6 +3768,8 @@ class ListenerGuiApp:
             # Update the list UI to show cache indicators
             if hasattr(self, 'root'):
                 self.root.after(0, self._refreshPrinterInfoList)
+                # Also refresh Print Job tree
+                self.root.after(0, self._refreshPrintJobTree)
 
             # Update status to show completion
             self.printerInfoIsUpdating = False
@@ -3642,6 +3799,133 @@ class ListenerGuiApp:
             self.printerInfoPollingThread.join(timeout=2.0)
         self.log("Automatisk printer info oppdatering stoppet")
         self._updatePrinterInfoStatus("Oppdatering stoppet", "gray")
+
+    def _refreshPrintJobTree(self) -> None:
+        """Refresh the Print Job treeview with current printer data."""
+        if not hasattr(self, 'printJobTree'):
+            return
+
+        # Clear existing items
+        for item in self.printJobTree.get_children():
+            self.printJobTree.delete(item)
+
+        # Add all printers
+        for printer in self.printers:
+            nickname = str(printer.get("nickname") or "").strip()
+            serialNumber = str(printer.get("serialNumber") or "").strip()
+            ipAddress = str(printer.get("ipAddress") or "").strip()
+            
+            if not nickname and not serialNumber:
+                continue
+
+            printerName = nickname or serialNumber or ipAddress or "Unknown"
+
+            # Get extended status data
+            data = None
+            if "extendedStatus" in printer:
+                data = printer["extendedStatus"]
+            elif serialNumber and serialNumber in self.printerInfoCache:
+                data = self.printerInfoCache[serialNumber].get("data")
+
+            # Extract values with defaults for missing data
+            if data and "error" not in data:
+                print_info = data.get("print_info", {})
+                progress = data.get("progress", {})
+                temperatures = data.get("temperatures", {})
+                misc = data.get("misc", {})
+                mqtt_client = data.get("mqtt_client", {})
+
+                print_type = self._safeValue(print_info.get("print_type"), "unknown")
+                current_state = self._safeValue(print_info.get("current_state"), "unknown")
+                file_name = self._safeValue(print_info.get("file_name"), "")
+                gcode_state = self._safeValue(print_info.get("gcode_state"), "unknown")
+                gcode_file = self._safeValue(print_info.get("gcode_file"), "")
+                print_error_code = self._safeValue(print_info.get("print_error_code"), 0)
+                percentage = self._safeValue(progress.get("percentage"), 0)
+                time_remaining = self._safeValue(progress.get("time_remaining"), 0)
+                current_layer = self._safeValue(progress.get("current_layer"), 0)
+                total_layers = self._safeValue(progress.get("total_layers"), 0)
+                nozzle = self._safeValue(temperatures.get("nozzle"), 0)
+                bed = self._safeValue(temperatures.get("bed"), 0)
+                chamber = self._safeValue(temperatures.get("chamber"), 0)
+                print_speed = self._safeValue(misc.get("print_speed"), 0)
+                light_state = self._safeValue(misc.get("light_state"), "unknown")
+                skipped_objects = self._safeValue(misc.get("skipped_objects"), [])
+                # Format skipped_objects as string if it's a list
+                if isinstance(skipped_objects, list):
+                    skipped_objects = ", ".join(str(x) for x in skipped_objects) if skipped_objects else ""
+                chamber_fan_speed = self._safeValue(mqtt_client.get("chamber_fan_speed"), 0)
+                current_layer_num = self._safeValue(mqtt_client.get("current_layer_num"), 0)
+                status = "OK"
+            else:
+                # No data available - show error state
+                print_type = "unknown"
+                current_state = "unknown"
+                file_name = ""
+                gcode_state = "unknown"
+                gcode_file = ""
+                print_error_code = 0
+                percentage = 0
+                time_remaining = 0
+                current_layer = 0
+                total_layers = 0
+                nozzle = 0
+                bed = 0
+                chamber = 0
+                print_speed = 0
+                light_state = "unknown"
+                skipped_objects = ""
+                chamber_fan_speed = 0
+                current_layer_num = 0
+                if data and "error" in data:
+                    status = f"FEIL: {data['error']}"
+                else:
+                    status = "Får ikke kontakt med printer"
+
+            # Insert row
+            self.printJobTree.insert(
+                "",
+                tk.END,
+                values=(
+                    printerName,
+                    print_type,
+                    current_state,
+                    file_name,
+                    gcode_state,
+                    gcode_file,
+                    print_error_code,
+                    percentage,
+                    time_remaining,
+                    current_layer,
+                    total_layers,
+                    nozzle,
+                    bed,
+                    chamber,
+                    print_speed,
+                    light_state,
+                    skipped_objects,
+                    chamber_fan_speed,
+                    current_layer_num,
+                    status,
+                )
+            )
+
+    def _safeValue(self, value: Any, default: Any) -> Any:
+        """Safely extract a value, returning default if value is None, error string, or invalid."""
+        if value is None:
+            return default
+        if isinstance(value, str) and value.startswith("<feil:"):
+            return default
+        if isinstance(value, (dict, list)) and not value:
+            return default
+        return value
+
+    def _refreshPrintJobData(self) -> None:
+        """Manually refresh print job data for all printers."""
+        # Trigger a refresh of all printer info, which will update the Print Job tree
+        self._refreshAllPrinterInfo()
+        # Also refresh the tree after a short delay to ensure data is updated
+        self.root.after(2000, self._refreshPrintJobTree)
 
     def _handleWindowClose(self) -> None:
         try:
