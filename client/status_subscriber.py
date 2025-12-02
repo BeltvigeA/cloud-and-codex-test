@@ -144,13 +144,16 @@ class BambuStatusSubscriber:
         # Initialize status reporter if enabled and credentials available
         self.status_reporter: Optional[StatusReporter] = None
 
-        if enableStatusReporting and _status_reporter_available and self.base_url and self.api_key and self.defaultRecipientId:
+        # Hardcoded base URL for status reporting
+        status_reporter_base_url = "https://printpro3d-api-931368217793.europe-west1.run.app"
+
+        if enableStatusReporting and _status_reporter_available and config_api_key and config_recipient_id:
             try:
                 self.log.info("🔧 Initializing StatusReporter in status_subscriber...")
                 self.status_reporter = StatusReporter(
-                    base_url=self.base_url,
-                    api_key=self.api_key,
-                    recipient_id=self.defaultRecipientId,
+                    base_url=status_reporter_base_url,
+                    api_key=config_api_key,
+                    recipient_id=config_recipient_id,
                     report_interval=statusReportInterval,
                     logger=self.log,
                 )
@@ -163,9 +166,8 @@ class BambuStatusSubscriber:
             self.log.debug("Status reporter module not available")
         else:
             self.log.warning("⚠️  StatusReporter NOT initialized (missing credentials)")
-            self.log.warning(f"   base_url: {'✅' if self.base_url else '❌'}")
-            self.log.warning(f"   api_key: {'✅' if self.api_key else '❌'}")
-            self.log.warning(f"   recipient_id: {'✅' if self.defaultRecipientId else '❌'}")
+            self.log.warning(f"   api_key: {'✅' if config_api_key else '❌'}")
+            self.log.warning(f"   recipient_id: {'✅' if config_recipient_id else '❌'}")
 
         # Track reported HMS errors to avoid duplicates
         self.reported_hms_errors: Dict[str, Set[str]] = {}
