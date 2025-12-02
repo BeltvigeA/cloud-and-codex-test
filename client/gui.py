@@ -2341,10 +2341,13 @@ class ListenerGuiApp:
     def _collectPrinterTelemetry(self, printer: Dict[str, Any]) -> Dict[str, Any]:
         ipAddress = str(printer.get("ipAddress", "")).strip()
         availabilityStatus = self._probePrinterAvailability(ipAddress) if ipAddress else "Offline"
-        
+
         # Check ping status - quick check
         pingStatus = self._checkPingStatus(ipAddress) if ipAddress else "N/A"
-        
+
+        # Parse serialNumber early since it's needed for cache lookup
+        serialNumber = self._parseOptionalString(printer.get("serialNumber"))
+
         # Check MQTT status from cached extendedStatus data instead of connecting
         mqttStatus = "N/A"
         extendedStatus = printer.get("extendedStatus")
@@ -2382,7 +2385,6 @@ class ListenerGuiApp:
         if availabilityStatus == "Offline":
             return telemetry
 
-        serialNumber = self._parseOptionalString(printer.get("serialNumber"))
         accessCode = self._parseOptionalString(printer.get("accessCode"))
         brand = self._parseOptionalString(printer.get("brand"))
 
