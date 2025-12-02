@@ -525,30 +525,52 @@ class ListenerGuiApp:
         leftFrame = ttk.LabelFrame(contentFrame, text="Printere")
         leftFrame.grid(row=0, column=0, sticky=tk.NSEW, padx=(0, 4))
         leftFrame.columnconfigure(0, weight=1)
-        leftFrame.rowconfigure(0, weight=1)
+        leftFrame.rowconfigure(1, weight=1)
+
+        # Search frame for printer list
+        printerSearchFrame = ttk.Frame(leftFrame)
+        printerSearchFrame.grid(row=0, column=0, columnspan=2, sticky=tk.EW, padx=4, pady=(4, 2))
+        printerSearchFrame.columnconfigure(0, weight=1)
+
+        self.printerInfoSearchVar = tk.StringVar()
+        printerSearchEntry = ttk.Entry(printerSearchFrame, textvariable=self.printerInfoSearchVar, width=20)
+        printerSearchEntry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(printerSearchFrame, text="Clear", command=self._clearPrinterInfoSearch).pack(side=tk.LEFT, padx=(4, 0))
+        self.printerInfoSearchVar.trace_add("write", lambda *_: self._refreshPrinterInfoList())
 
         # Printer listbox
         self.printerInfoListbox = tk.Listbox(leftFrame, selectmode=tk.SINGLE)
-        self.printerInfoListbox.grid(row=0, column=0, sticky=tk.NSEW, padx=4, pady=4)
+        self.printerInfoListbox.grid(row=1, column=0, sticky=tk.NSEW, padx=4, pady=4)
         self.printerInfoListbox.bind("<<ListboxSelect>>", self._onPrinterInfoSelection)
 
         listScrollbar = ttk.Scrollbar(leftFrame, orient=tk.VERTICAL, command=self.printerInfoListbox.yview)
         self.printerInfoListbox.configure(yscrollcommand=listScrollbar.set)
-        listScrollbar.grid(row=0, column=1, sticky=tk.NS, pady=4)
+        listScrollbar.grid(row=1, column=1, sticky=tk.NS, pady=4)
 
         # Right pane: Printer details
         rightFrame = ttk.LabelFrame(contentFrame, text="Detaljer")
         rightFrame.grid(row=0, column=1, sticky=tk.NSEW, padx=(4, 0))
         rightFrame.columnconfigure(0, weight=1)
-        rightFrame.rowconfigure(0, weight=1)
+        rightFrame.rowconfigure(1, weight=1)
+
+        # Search frame for details
+        detailsSearchFrame = ttk.Frame(rightFrame)
+        detailsSearchFrame.grid(row=0, column=0, columnspan=2, sticky=tk.EW, padx=4, pady=(4, 2))
+        detailsSearchFrame.columnconfigure(0, weight=1)
+
+        self.printerInfoDetailsSearchVar = tk.StringVar()
+        detailsSearchEntry = ttk.Entry(detailsSearchFrame, textvariable=self.printerInfoDetailsSearchVar, width=20)
+        detailsSearchEntry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(detailsSearchFrame, text="Clear", command=self._clearPrinterInfoDetailsSearch).pack(side=tk.LEFT, padx=(4, 0))
+        self.printerInfoDetailsSearchVar.trace_add("write", lambda *_: self._highlightDetailsSearch())
 
         # Text widget for details
         self.printerInfoText = tk.Text(rightFrame, wrap=tk.WORD, state=tk.DISABLED)
-        self.printerInfoText.grid(row=0, column=0, sticky=tk.NSEW, padx=4, pady=4)
+        self.printerInfoText.grid(row=1, column=0, sticky=tk.NSEW, padx=4, pady=4)
 
         detailsScrollbar = ttk.Scrollbar(rightFrame, orient=tk.VERTICAL, command=self.printerInfoText.yview)
         self.printerInfoText.configure(yscrollcommand=detailsScrollbar.set)
-        detailsScrollbar.grid(row=0, column=1, sticky=tk.NS, pady=4)
+        detailsScrollbar.grid(row=1, column=1, sticky=tk.NS, pady=4)
 
         # Populate printer list
         self._refreshPrinterInfoList()
@@ -559,7 +581,7 @@ class ListenerGuiApp:
     def _buildPrintJobTab(self, parent: ttk.Frame) -> None:
         """Build the Print Job tab showing all printers with print information."""
         parent.columnconfigure(0, weight=1)
-        parent.rowconfigure(1, weight=1)
+        parent.rowconfigure(2, weight=1)
 
         # Header frame with controls
         headerFrame = ttk.Frame(parent)
@@ -577,16 +599,27 @@ class ListenerGuiApp:
         # Control buttons
         buttonFrame = ttk.Frame(headerFrame)
         buttonFrame.grid(row=0, column=1, sticky=tk.E, padx=6)
-        
+
         ttk.Button(
             buttonFrame,
             text="Oppdater alle nå",
             command=self._refreshPrintJobData
         ).pack(side=tk.LEFT, padx=6)
 
+        # Search frame
+        searchFrame = ttk.Frame(parent)
+        searchFrame.grid(row=1, column=0, sticky=tk.EW, padx=8, pady=(0, 4))
+        ttk.Label(searchFrame, text="Search by Printer Name or Serial Number:").pack(side=tk.LEFT)
+
+        self.printJobSearchVar = tk.StringVar()
+        searchEntry = ttk.Entry(searchFrame, textvariable=self.printJobSearchVar, width=30)
+        searchEntry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6)
+        ttk.Button(searchFrame, text="Clear", command=self._clearPrintJobSearch).pack(side=tk.LEFT)
+        self.printJobSearchVar.trace_add("write", lambda *_: self._refreshPrintJobTree())
+
         # Main content frame with treeview
         contentFrame = ttk.Frame(parent)
-        contentFrame.grid(row=1, column=0, sticky=tk.NSEW, padx=8, pady=(0, 8))
+        contentFrame.grid(row=2, column=0, sticky=tk.NSEW, padx=8, pady=(0, 8))
         contentFrame.columnconfigure(0, weight=1)
         contentFrame.rowconfigure(0, weight=1)
 
@@ -598,6 +631,7 @@ class ListenerGuiApp:
 
         columns = (
             "printer",
+            "serial_number",
             "print_type",
             "current_state",
             "file_name",
@@ -624,6 +658,7 @@ class ListenerGuiApp:
         
         # Configure column headings
         self.printJobTree.heading("printer", text="Printer")
+        self.printJobTree.heading("serial_number", text="Serial Number")
         self.printJobTree.heading("print_type", text="Print Type")
         self.printJobTree.heading("current_state", text="State")
         self.printJobTree.heading("file_name", text="File Name")
@@ -647,6 +682,7 @@ class ListenerGuiApp:
 
         # Configure column widths
         self.printJobTree.column("printer", width=120)
+        self.printJobTree.column("serial_number", width=120)
         self.printJobTree.column("print_type", width=90)
         self.printJobTree.column("current_state", width=90)
         self.printJobTree.column("file_name", width=120)
@@ -1250,6 +1286,46 @@ class ListenerGuiApp:
 
     def _clearPrinterSearch(self) -> None:
         self.printerSearchVar.set("")
+
+    def _clearPrinterInfoSearch(self) -> None:
+        """Clear the printer info list search field."""
+        if hasattr(self, 'printerInfoSearchVar'):
+            self.printerInfoSearchVar.set("")
+
+    def _clearPrinterInfoDetailsSearch(self) -> None:
+        """Clear the printer info details search field."""
+        if hasattr(self, 'printerInfoDetailsSearchVar'):
+            self.printerInfoDetailsSearchVar.set("")
+
+    def _clearPrintJobSearch(self) -> None:
+        """Clear the print job search field."""
+        if hasattr(self, 'printJobSearchVar'):
+            self.printJobSearchVar.set("")
+
+    def _highlightDetailsSearch(self) -> None:
+        """Highlight search term in the details text widget."""
+        if not hasattr(self, 'printerInfoText') or not hasattr(self, 'printerInfoDetailsSearchVar'):
+            return
+
+        # Remove existing highlight tag
+        self.printerInfoText.tag_remove("search_highlight", "1.0", tk.END)
+
+        searchTerm = self.printerInfoDetailsSearchVar.get().strip()
+        if not searchTerm:
+            return
+
+        # Configure highlight tag
+        self.printerInfoText.tag_config("search_highlight", background="yellow", foreground="black")
+
+        # Search and highlight all occurrences
+        start = "1.0"
+        while True:
+            pos = self.printerInfoText.search(searchTerm, start, stopindex=tk.END, nocase=True)
+            if not pos:
+                break
+            end = f"{pos}+{len(searchTerm)}c"
+            self.printerInfoText.tag_add("search_highlight", pos, end)
+            start = end
 
     def _openAddPrinterDialog(self) -> None:
         self._showPrinterDialog(
@@ -3541,6 +3617,11 @@ class ListenerGuiApp:
 
         self.printerInfoListbox.delete(0, tk.END)
 
+        # Get search term if the search var exists
+        searchTerm = ""
+        if hasattr(self, 'printerInfoSearchVar'):
+            searchTerm = self.printerInfoSearchVar.get().strip().lower()
+
         for printer in self.printers:
             ipAddress = str(printer.get("ipAddress") or "").strip()
             serialNumber = str(printer.get("serialNumber") or "").strip()
@@ -3549,6 +3630,12 @@ class ListenerGuiApp:
             # Only show printers with complete Bambu configuration
             if ipAddress and serialNumber and accessCode:
                 nickname = printer.get("nickname", serialNumber)
+
+                # Apply search filter
+                if searchTerm:
+                    if searchTerm not in nickname.lower() and searchTerm not in serialNumber.lower():
+                        continue
+
                 # Show if data exists in cache
                 hasCachedData = serialNumber in self.printerInfoCache
                 cacheIndicator = "✓" if hasCachedData else "○"
@@ -3616,6 +3703,9 @@ class ListenerGuiApp:
             self.printerInfoText.insert(tk.END, formatted)
 
         self.printerInfoText.config(state=tk.DISABLED)
+
+        # Apply search highlighting if active
+        self._highlightDetailsSearch()
 
     def _formatPrinterInfoData(self, data: Dict[str, Any]) -> str:
         """Format printer info data as readable text."""
@@ -3997,16 +4087,26 @@ class ListenerGuiApp:
         for item in self.printJobTree.get_children():
             self.printJobTree.delete(item)
 
+        # Get search term if the search var exists
+        searchTerm = ""
+        if hasattr(self, 'printJobSearchVar'):
+            searchTerm = self.printJobSearchVar.get().strip().lower()
+
         # Add all printers
         for printer in self.printers:
             nickname = str(printer.get("nickname") or "").strip()
             serialNumber = str(printer.get("serialNumber") or "").strip()
             ipAddress = str(printer.get("ipAddress") or "").strip()
-            
+
             if not nickname and not serialNumber:
                 continue
 
             printerName = nickname or serialNumber or ipAddress or "Unknown"
+
+            # Apply search filter
+            if searchTerm:
+                if searchTerm not in nickname.lower() and searchTerm not in serialNumber.lower():
+                    continue
 
             # Get extended status data
             data = None
@@ -4078,6 +4178,7 @@ class ListenerGuiApp:
                 tk.END,
                 values=(
                     printerName,
+                    serialNumber,
                     print_type,
                     current_state,
                     file_name,
