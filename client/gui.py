@@ -616,6 +616,7 @@ class ListenerGuiApp:
             "skipped_objects",
             "chamber_fan_speed",
             "current_layer_num",
+            "ping",
             "status",
         )
 
@@ -641,6 +642,7 @@ class ListenerGuiApp:
         self.printJobTree.heading("skipped_objects", text="Skipped")
         self.printJobTree.heading("chamber_fan_speed", text="Fan Speed")
         self.printJobTree.heading("current_layer_num", text="Layer #")
+        self.printJobTree.heading("ping", text="Ping")
         self.printJobTree.heading("status", text="Status")
 
         # Configure column widths
@@ -663,6 +665,7 @@ class ListenerGuiApp:
         self.printJobTree.column("skipped_objects", width=80)
         self.printJobTree.column("chamber_fan_speed", width=70)
         self.printJobTree.column("current_layer_num", width=70)
+        self.printJobTree.column("ping", width=60)
         self.printJobTree.column("status", width=180)
 
         scrollbar = ttk.Scrollbar(treeFrame, orient=tk.VERTICAL, command=self.printJobTree.yview)
@@ -4041,6 +4044,7 @@ class ListenerGuiApp:
                     skipped_objects = ", ".join(str(x) for x in skipped_objects) if skipped_objects else ""
                 chamber_fan_speed = self._safeValue(mqtt_client.get("chamber_fan_speed"), 0)
                 current_layer_num = self._safeValue(mqtt_client.get("current_layer_num"), 0)
+                ping = printer.get("pingStatus", "N/A")
                 status = "OK"
             else:
                 # No data available - show error state
@@ -4062,6 +4066,7 @@ class ListenerGuiApp:
                 skipped_objects = ""
                 chamber_fan_speed = 0
                 current_layer_num = 0
+                ping = printer.get("pingStatus", "N/A")
                 if data and "error" in data:
                     status = f"FEIL: {data['error']}"
                 else:
@@ -4091,6 +4096,7 @@ class ListenerGuiApp:
                     skipped_objects,
                     chamber_fan_speed,
                     current_layer_num,
+                    ping,
                     status,
                 )
             )
