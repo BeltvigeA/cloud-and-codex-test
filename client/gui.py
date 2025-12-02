@@ -440,11 +440,6 @@ class ListenerGuiApp:
             "status",
         )
         self.printerTree = ttk.Treeview(treeFrame, columns=columns, show="headings", selectmode="browse")
-
-        # Configure alternating row colors for better readability
-        self.printerTree.tag_configure("oddrow", background="#f0f0f0")
-        self.printerTree.tag_configure("evenrow", background="#ffffff")
-
         self.printerTree.heading("nickname", text="Nickname")
         self.printerTree.heading("ipAddress", text="IP Address")
         self.printerTree.heading("accessCode", text="Access Code")
@@ -660,11 +655,7 @@ class ListenerGuiApp:
         )
 
         self.printJobTree = ttk.Treeview(treeFrame, columns=columns, show="headings", selectmode="browse")
-
-        # Configure alternating row colors for better readability
-        self.printJobTree.tag_configure("oddrow", background="#f0f0f0")
-        self.printJobTree.tag_configure("evenrow", background="#ffffff")
-
+        
         # Configure column headings
         self.printJobTree.heading("printer", text="Printer")
         self.printJobTree.heading("serial_number", text="Serial Number")
@@ -1044,7 +1035,6 @@ class ListenerGuiApp:
             self.printerTree.delete(itemId)
         searchTerm = self.printerSearchVar.get().strip().lower()
         defaultTransport = getattr(self, "defaultConnectionMethod", "octoprint")
-        rowIndex = 0
         for index, printer in enumerate(self.printers):
             nickname = printer.get("nickname", "")
             ipAddress = printer.get("ipAddress", "")
@@ -1078,8 +1068,6 @@ class ListenerGuiApp:
                 # Fallback to cached value from telemetry
                 mqttStatus = printer.get("mqttStatus", "Unknown")
 
-            # Insert with alternating row color
-            rowTag = "evenrow" if rowIndex % 2 == 0 else "oddrow"
             self.printerTree.insert(
                 "",
                 tk.END,
@@ -1095,9 +1083,7 @@ class ListenerGuiApp:
                     pingStatus,
                     mqttStatus,
                 ),
-                tags=(rowTag,)
             )
-            rowIndex += 1
         self._onPrinterSelection(None)
 
     def _applyBase44Environment(self) -> None:
@@ -4106,8 +4092,7 @@ class ListenerGuiApp:
         if hasattr(self, 'printJobSearchVar'):
             searchTerm = self.printJobSearchVar.get().strip().lower()
 
-        # Add all printers with alternating row colors
-        rowIndex = 0
+        # Add all printers
         for printer in self.printers:
             nickname = str(printer.get("nickname") or "").strip()
             serialNumber = str(printer.get("serialNumber") or "").strip()
@@ -4187,8 +4172,7 @@ class ListenerGuiApp:
                 else:
                     status = "Får ikke kontakt med printer"
 
-            # Insert row with alternating color
-            rowTag = "evenrow" if rowIndex % 2 == 0 else "oddrow"
+            # Insert row
             self.printJobTree.insert(
                 "",
                 tk.END,
@@ -4215,10 +4199,8 @@ class ListenerGuiApp:
                     current_layer_num,
                     ping,
                     status,
-                ),
-                tags=(rowTag,)
+                )
             )
-            rowIndex += 1
 
     def _safeValue(self, value: Any, default: Any) -> Any:
         """Safely extract a value, returning default if value is None, error string, or invalid."""
