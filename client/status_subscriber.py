@@ -27,6 +27,14 @@ except ImportError:
     _event_reporting_available = False
     EventReporter = None
 
+# Import status reporter
+try:
+    from .status_reporter import StatusReporter
+    _status_reporter_available = True
+except ImportError:
+    _status_reporter_available = False
+    StatusReporter = None
+
 # Import config manager
 try:
     from .config_manager import get_config_manager
@@ -70,6 +78,8 @@ class BambuStatusSubscriber:
         reconnectDelay: float = 3.0,
         baseUrl: Optional[str] = None,
         apiKey: Optional[str] = None,
+        enableStatusReporting: bool = True,
+        statusReportInterval: int = 10,
     ) -> None:
         self.onUpdate = onUpdate
         self.onError = onError
@@ -127,6 +137,32 @@ class BambuStatusSubscriber:
             self.log.debug("Event reporting not configured (config manager not available)")
         else:
             self.log.warning("⚠️  EventReporter NOT initialized (missing credentials)")
+            self.log.warning(f"   base_url: {'✅' if self.base_url else '❌'}")
+            self.log.warning(f"   api_key: {'✅' if self.api_key else '❌'}")
+            self.log.warning(f"   recipient_id: {'✅' if self.defaultRecipientId else '❌'}")
+
+        # Initialize status reporter if enabled and credentials available
+        self.status_reporter: Optional[StatusReporter] = None
+
+        if enableStatusReporting and _status_reporter_available and self.base_url and self.api_key and self.defaultRecipientId:
+            try:
+                self.log.info("🔧 Initializing StatusReporter in status_subscriber...")
+                self.status_reporter = StatusReporter(
+                    base_url=self.base_url,
+                    api_key=self.api_key,
+                    recipient_id=self.defaultRecipientId,
+                    report_interval=statusReportInterval,
+                    logger=self.log,
+                )
+                self.log.info("✅ StatusReporter initialized successfully")
+            except Exception as e:
+                self.log.warning(f"Failed to initialize status reporter: {e}")
+        elif not enableStatusReporting:
+            self.log.debug("Status reporting disabled by configuration")
+        elif not _status_reporter_available:
+            self.log.debug("Status reporter module not available")
+        else:
+            self.log.warning("⚠️  StatusReporter NOT initialized (missing credentials)")
             self.log.warning(f"   base_url: {'✅' if self.base_url else '❌'}")
             self.log.warning(f"   api_key: {'✅' if self.api_key else '❌'}")
             self.log.warning(f"   recipient_id: {'✅' if self.defaultRecipientId else '❌'}")
@@ -438,6 +474,13 @@ class BambuStatusSubscriber:
                             import traceback
                             self.log.warning(f"   Traceback:\n{traceback.format_exc()}")
                             # Don't fail status update if camera fails
+
+                    # ============================================
+                    # STATUS REPORTER - SEND STATUS TO BACKEND
+                    # ============================================
+                    # Report status to backend API if StatusReporter is initialized
+                    if statusPayload:
+                        self._reportPrinterStatus(serial, ipAddress, statusPayload)
 
                     base44Package = self._buildBase44Payloads(statusPayload, printerConfig, resolvedApiKey)
                     if base44Package is not None:
@@ -1455,6 +1498,38 @@ class BambuStatusSubscriber:
 
         except Exception as e:
             self.log.debug(f"Error reporting status update: {e}")
+
+    def _reportPrinterStatus(
+        self,
+        printer_serial: str,
+        printer_ip: str,
+        status_data: Dict[str, Any],
+    ) -> None:
+        """
+        Report printer status to backend API using StatusReporter.
+
+        Args:
+            printer_serial: Printer serial number
+            printer_ip: Printer IP address
+            status_data: Raw status data from MQTT
+        """
+        if not self.status_reporter:
+            return
+
+        try:
+            result = self.status_reporter.report_status(
+                printer_serial=printer_serial,
+                printer_ip=printer_ip,
+                status_data=status_data,
+            )
+
+            if result:
+                self.log.debug(
+                    f"Status reported for {printer_serial}: {result.get('ok', False)}"
+                )
+
+        except Exception as e:
+            self.log.error(f"Failed to report status for {printer_serial}: {e}")
 
     def _check_pause_reason(
         self,
