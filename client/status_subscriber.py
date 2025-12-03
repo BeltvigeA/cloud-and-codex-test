@@ -147,17 +147,23 @@ class BambuStatusSubscriber:
         # Hardcoded base URL for status reporting
         status_reporter_base_url = "https://printpro3d-api-931368217793.europe-west1.run.app"
 
-        if enableStatusReporting and _status_reporter_available and config_api_key and config_recipient_id:
+        # Prefer config values, fall back to parameters, fall back to env
+        final_api_key = config_api_key or apiKey or self.api_key
+        final_recipient_id = config_recipient_id or self.defaultRecipientId
+
+        if enableStatusReporting and _status_reporter_available and final_api_key and final_recipient_id:
             try:
                 self.log.info("🔧 Initializing StatusReporter in status_subscriber...")
                 self.status_reporter = StatusReporter(
                     base_url=status_reporter_base_url,
-                    api_key=config_api_key,
-                    recipient_id=config_recipient_id,
+                    api_key=final_api_key,
+                    recipient_id=final_recipient_id,
                     report_interval=statusReportInterval,
                     logger=self.log,
                 )
                 self.log.info("✅ StatusReporter initialized successfully")
+                self.log.info(f"   Recipient ID: {final_recipient_id[:8]}...")
+                self.log.info(f"   Report interval: {statusReportInterval}s")
             except Exception as e:
                 self.log.warning(f"Failed to initialize status reporter: {e}")
         elif not enableStatusReporting:
@@ -166,8 +172,8 @@ class BambuStatusSubscriber:
             self.log.debug("Status reporter module not available")
         else:
             self.log.warning("⚠️  StatusReporter NOT initialized (missing credentials)")
-            self.log.warning(f"   api_key: {'✅' if config_api_key else '❌'}")
-            self.log.warning(f"   recipient_id: {'✅' if config_recipient_id else '❌'}")
+            self.log.warning(f"   api_key: {'✅' if final_api_key else '❌'}")
+            self.log.warning(f"   recipient_id: {'✅' if final_recipient_id else '❌'}")
 
         # Track reported HMS errors to avoid duplicates
         self.reported_hms_errors: Dict[str, Set[str]] = {}

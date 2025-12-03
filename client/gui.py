@@ -193,6 +193,9 @@ class ListenerGuiApp:
             self.config_manager.save()
             logging.info(f"Saved backend URL to config: {backend_url}")
 
+        # Load settings from config FIRST (sets env vars needed by statusSubscriber)
+        self._loadSettingsFromConfig()
+
         # Now create statusSubscriber (it will read backend_url from config)
         self.liveStatusEnabledVar = tk.BooleanVar(value=True)
         self.statusSubscriber = BambuStatusSubscriber(
@@ -213,9 +216,6 @@ class ListenerGuiApp:
         self.printerInfoStopEvent: Optional[threading.Event] = None
         self.printerInfoUpdateAttempts: Dict[str, int] = {}  # serial -> attempt count
         self.printerInfoIsUpdating: bool = False
-
-        # Load settings from config if available
-        self._loadSettingsFromConfig()
 
         # Build menu bar
         self._buildMenuBar()
