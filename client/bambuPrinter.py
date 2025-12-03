@@ -878,16 +878,70 @@ def postStatus(status: Dict[str, Any], printerConfig: Dict[str, Any]) -> None:
         "Content-Type": "application/json"
     }
 
+    # VERBOSE LOGGING - Before sending
+    logger.info("─" * 80)
+    logger.info("📤 SENDING PRINTER STATUS (postStatus - Legacy) to backend")
+    logger.info(f"   Printer Serial: {printerConfig.get('serialNumber')}")
+    logger.info(f"   Printer IP: {printerConfig.get('ipAddress')}")
+    logger.info(f"   Target URL: {url}")
+    logger.info(f"   API Key: {'✅ Present (' + str(len(apiKey)) + ' chars)' if apiKey else '❌ MISSING'}")
+    logger.info(f"   Recipient ID: {recipientId}")
+    if organizationId:
+        logger.info(f"   Organization ID: {organizationId}")
+    logger.info("   ─── PAYLOAD DATA ───")
+    logger.info(f"   Status: {payload.get('status')}")
+    logger.info(f"   GCode State: {payload.get('gcodeState')}")
+    logger.info(f"   Progress: {payload.get('progressPercent')}%")
+    logger.info(f"   Nozzle Temp: {payload.get('nozzleTemp')}°C")
+    logger.info(f"   Bed Temp: {payload.get('bedTemp')}°C")
+    logger.info(f"   Remaining Time: {payload.get('remainingTimeSeconds')}s")
+    logger.info("   ─── FULL JSON PAYLOAD ───")
+    import json
+    logger.info(f"{json.dumps(payload, indent=2)}")
+    logger.info("─" * 80)
+
     try:
+        logger.info("🌐 Making HTTP POST request...")
         response = requests.post(url, json=payload, headers=headers, timeout=5)
+
+        logger.info(f"📥 Got response: HTTP {response.status_code}")
+
         response.raise_for_status()
-        logger.debug(
-            "Status update sent successfully for printer %s at %s",
-            printerConfig.get("serialNumber"),
-            printerConfig.get("ipAddress")
-        )
-    except Exception:  # pragma: no cover - logging optional
-        logger.debug("Failed to post status update", exc_info=True)
+
+        logger.info("✅ PRINTER STATUS SENT SUCCESSFULLY (Legacy postStatus)")
+        logger.info(f"   Printer Serial: {printerConfig.get('serialNumber')}")
+        logger.info(f"   Printer IP: {printerConfig.get('ipAddress')}")
+        logger.info(f"   Status: {payload.get('status')}")
+        logger.info(f"   Response: {response.text[:500]}")
+        logger.info("─" * 80)
+
+    except requests.exceptions.Timeout as e:
+        logger.error("❌ REQUEST TIMEOUT (Legacy postStatus)")
+        logger.error(f"   Printer Serial: {printerConfig.get('serialNumber')}")
+        logger.error(f"   Target: {url}")
+        logger.error(f"   Error: {e}")
+        logger.error("─" * 80)
+
+    except requests.exceptions.HTTPError as e:
+        logger.error("❌ HTTP ERROR (Legacy postStatus)")
+        logger.error(f"   Printer Serial: {printerConfig.get('serialNumber')}")
+        logger.error(f"   Status Code: {response.status_code}")
+        logger.error(f"   Response: {response.text[:500]}")
+        logger.error(f"   Error: {e}")
+        logger.error("─" * 80)
+
+    except requests.exceptions.RequestException as e:
+        logger.error("❌ REQUEST ERROR (Legacy postStatus)")
+        logger.error(f"   Printer Serial: {printerConfig.get('serialNumber')}")
+        logger.error(f"   Error: {e}")
+        logger.error("─" * 80)
+
+    except Exception as e:
+        logger.error("❌ UNEXPECTED ERROR (Legacy postStatus)")
+        logger.error(f"   Printer Serial: {printerConfig.get('serialNumber')}")
+        logger.error(f"   Error Type: {type(e).__name__}")
+        logger.error(f"   Error: {e}", exc_info=True)
+        logger.error("─" * 80)
 
 
 def _resolveTimeLapseDirectory(

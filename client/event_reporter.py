@@ -3,6 +3,7 @@ Event Reporter - Sends events to backend
 Mirrors command_controller pattern for consistency
 """
 
+import json
 import logging
 import requests
 from typing import Dict, Optional, Any
@@ -102,6 +103,8 @@ class EventReporter:
         log.info(f"   Target URL: {self.report_url}")
         log.info(f"   API Key: {'✅ Present' if self.api_key else '❌ MISSING'}")
         log.info(f"   Recipient ID: {self.recipient_id}")
+        log.info("   ─── FULL JSON PAYLOAD ───")
+        log.info(f"{json.dumps(payload, indent=2)}")
         log.info("─" * 80)
 
         try:
@@ -186,16 +189,61 @@ class EventReporter:
         files = {"image": (filename, image_data, "image/jpeg")}
         headers = {"X-API-Key": self.api_key}
 
+        # VERBOSE LOGGING - Before uploading
+        log.info("─" * 80)
+        log.info(f"📤 UPLOADING EVENT IMAGE to backend")
+        log.info(f"   Event ID: {event_id}")
+        log.info(f"   Filename: {filename}")
+        log.info(f"   Image Size: {len(image_data)} bytes ({len(image_data)/1024:.2f} KB)")
+        log.info(f"   Target URL: {url}")
+        log.info(f"   API Key: {'✅ Present' if self.api_key else '❌ MISSING'}")
+        log.info("─" * 80)
+
         try:
+            log.info(f"🌐 Making HTTP POST request (multipart/form-data)...")
             response = requests.post(url, files=files, headers=headers, timeout=30)
+
+            log.info(f"📥 Got response: HTTP {response.status_code}")
+
             response.raise_for_status()
-            log.info(f"Image uploaded for event {event_id}")
+
+            log.info("✅ IMAGE UPLOADED SUCCESSFULLY")
+            log.info(f"   Event ID: {event_id}")
+            log.info(f"   Filename: {filename}")
+            log.info(f"   Size: {len(image_data)/1024:.2f} KB")
+            log.info("─" * 80)
             return True
-        except requests.exceptions.RequestException as error:
-            log.error(f"Failed to upload image for event {event_id}: {error}")
+
+        except requests.exceptions.Timeout as error:
+            log.error("❌ IMAGE UPLOAD TIMEOUT")
+            log.error(f"   Event ID: {event_id}")
+            log.error(f"   Target: {url}")
+            log.error(f"   Error: {error}")
+            log.error("─" * 80)
             return False
+
+        except requests.exceptions.HTTPError as error:
+            log.error("❌ IMAGE UPLOAD HTTP ERROR")
+            log.error(f"   Event ID: {event_id}")
+            log.error(f"   Status Code: {response.status_code}")
+            log.error(f"   Response: {response.text[:500]}")
+            log.error(f"   Error: {error}")
+            log.error("─" * 80)
+            return False
+
+        except requests.exceptions.RequestException as error:
+            log.error("❌ IMAGE UPLOAD REQUEST ERROR")
+            log.error(f"   Event ID: {event_id}")
+            log.error(f"   Error: {error}")
+            log.error("─" * 80)
+            return False
+
         except Exception as error:
-            log.error(f"Unexpected error uploading image for event {event_id}: {error}", exc_info=True)
+            log.error("❌ UNEXPECTED ERROR UPLOADING IMAGE")
+            log.error(f"   Event ID: {event_id}")
+            log.error(f"   Error Type: {type(error).__name__}")
+            log.error(f"   Error: {error}", exc_info=True)
+            log.error("─" * 80)
             return False
 
     def report_job_started(
