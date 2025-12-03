@@ -2539,7 +2539,17 @@ def sendBambuPrintJob(
             logger.info("Forcing bambulabs_api upload because startStrategy=api")
             lanStrategy = "bambuapi"
 
+        # DEBUG: Log transport decision
+        logger.info("=" * 80)
+        logger.info("🔍 TRANSPORT BESLUTNING")
+        logger.info(f"   options.useCloud = {options.useCloud}")
+        logger.info(f"   options.cloudUrl = {options.cloudUrl}")
+        logger.info(f"   Vil bruke cloud? {options.useCloud and options.cloudUrl}")
+        logger.info("=" * 80)
+
         if options.useCloud and options.cloudUrl:
+            logger.info("═" * 80)
+            logger.info("🌐 CLOUD TRANSPORT VALGT")
             logger.info(
                 "[PRINT_JOB] Using Cloud Transport",
                 extra={
@@ -2549,23 +2559,57 @@ def sendBambuPrintJob(
                     "action": "transport_selected"
                 }
             )
+            logger.info(f"   Serial Number: {options.serialNumber}")
+            logger.info(f"   IP Address: {options.ipAddress}")
+            logger.info(f"   Cloud URL: {options.cloudUrl}")
+            logger.info(f"   Cloud Timeout: {options.cloudTimeout}s")
+            logger.info("═" * 80)
+
             useAmsForCloud = resolvedUseAms if resolvedUseAms is not None else True
-            payload = buildCloudJobPayload(
-                ip=options.ipAddress,
-                serial=options.serialNumber,
-                accessCode=options.accessCode,
-                safeName=remoteName,
-                paramPath=paramPath,
-                plateIndex=plateIndex,
-                useAms=useAmsForCloud,
-                bedLeveling=options.bedLeveling,
-                layerInspect=options.layerInspect,
-                flowCalibration=options.flowCalibration,
-                vibrationCalibration=options.vibrationCalibration,
-                secureConnection=options.secureConnection,
-                localPath=workingPath,
-            )
-            response = sendPrintJobViaCloud(options.cloudUrl, payload, timeoutSeconds=options.cloudTimeout)
+
+            logger.info("📦 Bygger cloud job payload...")
+            try:
+                payload = buildCloudJobPayload(
+                    ip=options.ipAddress,
+                    serial=options.serialNumber,
+                    accessCode=options.accessCode,
+                    safeName=remoteName,
+                    paramPath=paramPath,
+                    plateIndex=plateIndex,
+                    useAms=useAmsForCloud,
+                    bedLeveling=options.bedLeveling,
+                    layerInspect=options.layerInspect,
+                    flowCalibration=options.flowCalibration,
+                    vibrationCalibration=options.vibrationCalibration,
+                    secureConnection=options.secureConnection,
+                    localPath=workingPath,
+                )
+                logger.info("✅ Payload bygget vellykket")
+            except Exception as e:
+                logger.error("═" * 80)
+                logger.error("❌ FEIL VED BYGGING AV CLOUD JOB PAYLOAD")
+                logger.error(f"   Error Type: {type(e).__name__}")
+                logger.error(f"   Error: {e}")
+                import traceback
+                logger.error(f"   Traceback:\n{traceback.format_exc()}")
+                logger.error("═" * 80)
+                raise
+
+            logger.info("🚀 Kaller sendPrintJobViaCloud()...")
+            try:
+                response = sendPrintJobViaCloud(options.cloudUrl, payload, timeoutSeconds=options.cloudTimeout)
+                logger.info("✅ sendPrintJobViaCloud() returnerte vellykket")
+                logger.info(f"   Response: {response}")
+            except Exception as e:
+                logger.error("═" * 80)
+                logger.error("❌ EXCEPTION FRA sendPrintJobViaCloud()")
+                logger.error(f"   Error Type: {type(e).__name__}")
+                logger.error(f"   Error: {e}")
+                import traceback
+                logger.error(f"   Traceback:\n{traceback.format_exc()}")
+                logger.error("═" * 80)
+                raise
+
             if statusCallback:
                 statusCallback(_with_plate_options({"status": "cloudAccepted", "response": response}))
             resultPayload = {
@@ -2574,6 +2618,7 @@ def sendBambuPrintJob(
                 "paramPath": paramPath,
                 "response": response,
             }
+            logger.info("✅ Cloud print job fullført, returnerer resultPayload")
             return _with_plate_options(resultPayload)
 
         uploadedName: Optional[str] = None
