@@ -257,9 +257,15 @@ class StatusReporter:
         Returns:
             Response data from backend, or None if failed
         """
+        # DEBUG: Log that method was called
+        self.log.debug(f"🔍 report_status() called for printer {printer_serial}")
+
         # Rate limiting - check if enough time has passed
         if not self.should_report(printer_serial):
+            self.log.debug(f"⏸️  Skipping report for {printer_serial} (rate limited)")
             return None
+
+        self.log.debug(f"✅ Rate limit passed for {printer_serial}, proceeding with report")
 
         # Ping printer first
         ping_result = self.ping_printer(printer_ip)
@@ -350,9 +356,20 @@ class StatusReporter:
                 self.log.warning("─" * 80)
                 return None
 
+        except requests.exceptions.ConnectionError as e:
+            self.log.error("❌ CONNECTION ERROR reporting status")
+            self.log.error(f"   Printer Serial: {printer_serial}")
+            self.log.error(f"   Target URL: {url}")
+            self.log.error(f"   Error: {e}")
+            if "getaddrinfo failed" in str(e):
+                self.log.error("   ⚠️  DNS resolution failed - cannot resolve hostname")
+                self.log.error(f"   ⚠️  Check that the domain '{self.base_url}' is accessible")
+            self.log.error("─" * 80)
+            return None
         except requests.RequestException as e:
             self.log.error("❌ NETWORK ERROR reporting status")
             self.log.error(f"   Printer Serial: {printer_serial}")
+            self.log.error(f"   Error Type: {type(e).__name__}")
             self.log.error(f"   Error: {e}")
             self.log.error("─" * 80)
             return None

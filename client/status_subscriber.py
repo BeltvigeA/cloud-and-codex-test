@@ -1521,8 +1521,13 @@ class BambuStatusSubscriber:
             printer_ip: Printer IP address
             status_data: Raw status data from MQTT
         """
+        self.log.debug(f"🔍 _reportPrinterStatus called for {printer_serial}")
+
         if not self.status_reporter:
+            self.log.warning(f"⚠️  StatusReporter is None - cannot report status for {printer_serial}")
             return
+
+        self.log.debug(f"✅ StatusReporter exists, calling report_status()...")
 
         try:
             result = self.status_reporter.report_status(
@@ -1537,7 +1542,9 @@ class BambuStatusSubscriber:
                 )
 
         except Exception as e:
-            self.log.error(f"Failed to report status for {printer_serial}: {e}")
+            self.log.error(f"❌ Failed to report status for {printer_serial}: {e}")
+            import traceback
+            self.log.error(f"   Traceback:\n{traceback.format_exc()}")
 
     def _check_pause_reason(
         self,
