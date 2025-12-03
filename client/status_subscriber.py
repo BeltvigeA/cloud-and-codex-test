@@ -486,6 +486,14 @@ class BambuStatusSubscriber:
                     # ============================================
                     # STATUS REPORTER - SEND STATUS TO BACKEND
                     # ============================================
+                    # DEBUG: Check if we reach this point
+                    self.log.debug(f"🔍 STATUS REPORTER CHECK: serial={serial}, ipAddress={ipAddress}")
+                    self.log.debug(f"   statusPayload exists: {statusPayload is not None}")
+                    if statusPayload:
+                        self.log.debug(f"   statusPayload has data: {len(statusPayload)} keys")
+                    else:
+                        self.log.warning(f"⚠️  statusPayload is None/False - skipping status report for {serial}")
+
                     # Report status to backend API if StatusReporter is initialized
                     if statusPayload:
                         self._reportPrinterStatus(serial, ipAddress, statusPayload)
