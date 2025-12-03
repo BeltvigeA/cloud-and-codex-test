@@ -301,20 +301,143 @@ def buildCloudJobPayload(
 
 def sendPrintJobViaCloud(baseUrl: str, jobPayload: Dict[str, Any], timeoutSeconds: int = 120) -> Dict[str, Any]:
     """Send a print job to the external cloud API and return the response."""
+    import json
 
     normalizedBaseUrl = baseUrl.rstrip("/") + "/"
     endpoint = urljoin(normalizedBaseUrl, "print")
-    response = requests.post(endpoint, json=jobPayload, timeout=timeoutSeconds)
-    response.raise_for_status()
-    if not response.content:
-        return {}
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # PRINT JOB SUBMISSION - Detaljert logging av cloud API-kall
+    # ═══════════════════════════════════════════════════════════════════════════
+    logger.info("═" * 80)
+    logger.info("📤 SENDER PRINT JOB TIL CLOUD API")
+    logger.info("─" * 80)
+    logger.info(f"   Target URL: {endpoint}")
+    logger.info(f"   Base URL: {baseUrl}")
+    logger.info(f"   Timeout: {timeoutSeconds} sekunder")
+    logger.info("─" * 80)
+    logger.info("   📦 PAYLOAD DATA SOM SENDES:")
+    logger.info("   ─── Printer Info ───")
+    logger.info(f"   Serial Number: {jobPayload.get('serialNumber', 'N/A')}")
+    logger.info(f"   IP Address: {jobPayload.get('ipAddress', 'N/A')}")
+    logger.info(f"   Access Code: {'✅ Present' if jobPayload.get('accessCode') else '❌ Missing'}")
+    logger.info("   ─── File Info ───")
+    logger.info(f"   File Name: {jobPayload.get('fileName', 'N/A')}")
+    logger.info(f"   Remote Name: {jobPayload.get('remoteName', 'N/A')}")
+    logger.info(f"   Param Path: {jobPayload.get('paramPath', 'N/A')}")
+    file_data = jobPayload.get('fileData', '')
+    if file_data:
+        logger.info(f"   File Data Size: {len(file_data)} chars (base64 encoded)")
+        logger.info(f"   File Data Preview: {file_data[:100]}..." if len(file_data) > 100 else f"   File Data: {file_data}")
+    else:
+        logger.info("   File Data: ❌ Missing")
+    logger.info("   ─── Print Settings ───")
+    logger.info(f"   Use AMS: {jobPayload.get('useAms', 'N/A')}")
+    logger.info(f"   Bed Leveling: {jobPayload.get('bedLeveling', 'N/A')}")
+    logger.info(f"   Layer Inspect: {jobPayload.get('layerInspect', 'N/A')}")
+    logger.info(f"   Flow Calibration: {jobPayload.get('flowCalibration', 'N/A')}")
+    logger.info(f"   Vibration Calibration: {jobPayload.get('vibrationCalibration', 'N/A')}")
+    logger.info(f"   Secure Connection: {jobPayload.get('secureConnection', 'N/A')}")
+    logger.info(f"   Plate Index: {jobPayload.get('plateIndex', 'N/A')}")
+    logger.info("─" * 80)
+    logger.info("   📋 FULL JSON PAYLOAD (uten fileData for lesbarhet):")
+    payload_for_log = {k: v for k, v in jobPayload.items() if k != 'fileData'}
+    payload_for_log['fileData'] = f"<{len(file_data)} chars base64>" if file_data else "<missing>"
+    logger.info(f"{json.dumps(payload_for_log, indent=2)}")
+    logger.info("═" * 80)
+
+    logger.info("🌐 Sender HTTP POST request til cloud API...")
+
     try:
-        payload = response.json()
-    except ValueError:
-        return {}
-    if isinstance(payload, dict):
-        return payload
-    return {}
+        response = requests.post(endpoint, json=jobPayload, timeout=timeoutSeconds)
+
+        logger.info(f"📥 Mottok respons: HTTP {response.status_code}")
+        logger.info("─" * 80)
+
+        response.raise_for_status()
+
+        if not response.content:
+            logger.warning("⚠️  Respons har ingen content body")
+            logger.info("═" * 80)
+            return {}
+
+        try:
+            payload = response.json()
+
+            # ═══════════════════════════════════════════════════════════════════════════
+            # RESPONS LOGGING - Detaljert logging av cloud API-respons
+            # ═══════════════════════════════════════════════════════════════════════════
+            logger.info("✅ PRINT JOB SENDT TIL CLOUD API - SUKSESS")
+            logger.info("─" * 80)
+            logger.info("   📥 RESPONS FRA CLOUD API:")
+            logger.info(f"   HTTP Status: {response.status_code}")
+            logger.info(f"   Response Type: {type(payload).__name__}")
+            if isinstance(payload, dict):
+                logger.info("   Response Data:")
+                for key, value in payload.items():
+                    logger.info(f"     • {key}: {value}")
+            logger.info("   ─── FULL JSON RESPONS ───")
+            logger.info(f"{json.dumps(payload, indent=2)}")
+            logger.info("═" * 80)
+
+            if isinstance(payload, dict):
+                return payload
+            else:
+                logger.warning(f"⚠️  Respons er ikke en dict, men {type(payload).__name__}")
+                logger.info("═" * 80)
+                return {}
+
+        except ValueError as e:
+            logger.error("❌ FEIL VED PARSING AV RESPONS")
+            logger.error(f"   Error: {e}")
+            logger.error(f"   Response Content: {response.text[:500]}")
+            logger.error("═" * 80)
+            return {}
+
+    except requests.exceptions.Timeout as e:
+        logger.error("═" * 80)
+        logger.error("❌ TIMEOUT VED SENDING AV PRINT JOB TIL CLOUD API")
+        logger.error("─" * 80)
+        logger.error(f"   Target URL: {endpoint}")
+        logger.error(f"   Timeout: {timeoutSeconds} sekunder")
+        logger.error(f"   Error: {e}")
+        logger.error("═" * 80)
+        raise
+
+    except requests.exceptions.ConnectionError as e:
+        logger.error("═" * 80)
+        logger.error("❌ CONNECTION ERROR VED SENDING AV PRINT JOB TIL CLOUD API")
+        logger.error("─" * 80)
+        logger.error(f"   Target URL: {endpoint}")
+        logger.error(f"   Error: {e}")
+        if "getaddrinfo failed" in str(e):
+            logger.error("   ⚠️  DNS resolution failed - kan ikke finne hostname")
+            logger.error(f"   ⚠️  Sjekk at domenet '{baseUrl}' er tilgjengelig")
+        logger.error("═" * 80)
+        raise
+
+    except requests.exceptions.HTTPError as e:
+        logger.error("═" * 80)
+        logger.error("❌ HTTP ERROR VED SENDING AV PRINT JOB TIL CLOUD API")
+        logger.error("─" * 80)
+        logger.error(f"   Target URL: {endpoint}")
+        logger.error(f"   HTTP Status: {response.status_code}")
+        logger.error(f"   Response Text: {response.text[:500]}")
+        logger.error(f"   Error: {e}")
+        logger.error("═" * 80)
+        raise
+
+    except Exception as e:
+        logger.error("═" * 80)
+        logger.error("❌ UNEXPECTED ERROR VED SENDING AV PRINT JOB TIL CLOUD API")
+        logger.error("─" * 80)
+        logger.error(f"   Target URL: {endpoint}")
+        logger.error(f"   Error Type: {type(e).__name__}")
+        logger.error(f"   Error: {e}")
+        import traceback
+        logger.error(f"   Traceback:\n{traceback.format_exc()}")
+        logger.error("═" * 80)
+        raise
 
 
 def _parseReactivateStorCommands() -> List[str]:
