@@ -79,7 +79,7 @@ class BambuStatusSubscriber:
         baseUrl: Optional[str] = None,
         apiKey: Optional[str] = None,
         enableStatusReporting: bool = True,
-        statusReportInterval: int = 10,
+        statusReportInterval: int = 60,
     ) -> None:
         self.onUpdate = onUpdate
         self.onError = onError

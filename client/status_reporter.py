@@ -32,7 +32,7 @@ class StatusReporter:
         api_key: str,
         recipient_id: str,
         *,
-        report_interval: int = 10,
+        report_interval: int = 60,
         ping_timeout_ms: int = 1000,
         logger: Optional[logging.Logger] = None,
     ) -> None:
@@ -43,7 +43,7 @@ class StatusReporter:
             base_url: Backend API base URL
             api_key: API key for authentication
             recipient_id: Recipient ID for the user
-            report_interval: Seconds between status reports (default: 10)
+            report_interval: Seconds between status reports (default: 60)
             ping_timeout_ms: Ping timeout in milliseconds (default: 1000)
             logger: Optional logger instance
         """
@@ -298,33 +298,15 @@ class StatusReporter:
                 "X-API-Key": self.api_key,
             }
 
-            # VERBOSE LOGGING - Before sending
-            self.log.info("─" * 80)
-            self.log.info(f"📤 SENDING STATUS UPDATE to backend")
-            self.log.info(f"   Printer Serial: {printer_serial}")
-            self.log.info(f"   Printer IP: {printer_ip}")
-            self.log.info(f"   Target URL: {url}")
-            self.log.info(f"   API Key: {'✅ Present (' + str(len(self.api_key)) + ' chars)' if self.api_key else '❌ MISSING'}")
-            self.log.info(f"   Recipient ID: {self.recipient_id}")
-            self.log.info("   ─── PAYLOAD DATA ───")
-            self.log.info(f"   Status: {parsed_status.get('status', 'UNKNOWN')}")
-            self.log.info(f"   GCode State: {parsed_status.get('gcodeState', 'N/A')}")
-            self.log.info(f"   Job Progress: {parsed_status.get('jobProgress', 'N/A')}%")
-            self.log.info(f"   File Name: {parsed_status.get('fileName', 'N/A')}")
-            self.log.info(f"   Nozzle Temp: {parsed_status.get('nozzleTemp', 'N/A')}°C (Target: {parsed_status.get('nozzleTargetTemp', 'N/A')}°C)")
-            self.log.info(f"   Bed Temp: {parsed_status.get('bedTemp', 'N/A')}°C (Target: {parsed_status.get('bedTargetTemp', 'N/A')}°C)")
-            self.log.info(f"   Chamber Temp: {parsed_status.get('chamberTemp', 'N/A')}°C")
-            self.log.info(f"   Current Layer: {parsed_status.get('currentLayer', 'N/A')}/{parsed_status.get('totalLayers', 'N/A')}")
-            self.log.info(f"   Time Remaining: {parsed_status.get('timeRemaining', 'N/A')}s")
-            self.log.info(f"   Fan Speed: {parsed_status.get('fanSpeed', 'N/A')}%")
-            self.log.info(f"   Speed Percentage: {parsed_status.get('speedPercentage', 'N/A')}%")
-            self.log.info(f"   Light On: {parsed_status.get('lightOn', 'N/A')}")
-            self.log.info(f"   Ping Status: {ping_result.get('status', 'unknown')}")
-            self.log.info("   ─── FULL JSON PAYLOAD ───")
-            self.log.info(f"{json.dumps(payload, indent=2)}")
-            self.log.info("─" * 80)
+            # Simplified logging - only IP, status, and progress
+            status_str = parsed_status.get('status', 'UNKNOWN')
+            progress = parsed_status.get('jobProgress')
+            
+            if progress is not None:
+                self.log.info(f"Status update: {printer_ip} | {status_str} | {progress}%")
+            else:
+                self.log.info(f"Status update: {printer_ip} | {status_str}")
 
-            self.log.info(f"🌐 Making HTTP POST request...")
             response = requests.post(
                 url,
                 json=payload,
@@ -332,55 +314,22 @@ class StatusReporter:
                 timeout=10,
             )
 
-            self.log.info(f"📥 Got response: HTTP {response.status_code}")
-
             if response.status_code == 200:
                 result = response.json()
 
-                # VERBOSE LOGGING - Success response
-                self.log.info("✅ STATUS UPDATE SENT SUCCESSFULLY")
-                self.log.info(f"   Printer Serial: {printer_serial}")
-                self.log.info(f"   Status: {parsed_status.get('status', 'UNKNOWN')}")
-                progress = parsed_status.get("jobProgress")
-                if progress is not None:
-                    self.log.info(f"   Progress: {progress}%")
-                self.log.info(f"   Response Data: {result}")
-                self.log.info("─" * 80)
-
                 return result
             else:
-                self.log.warning("❌ STATUS UPDATE FAILED")
-                self.log.warning(
-                    f"   HTTP {response.status_code} - {response.text[:500]}"
-                )
-                self.log.warning("─" * 80)
+                self.log.warning(f"Status update failed: {printer_ip} | HTTP {response.status_code}")
                 return None
 
         except requests.exceptions.ConnectionError as e:
-            self.log.error("❌ CONNECTION ERROR reporting status")
-            self.log.error(f"   Printer Serial: {printer_serial}")
-            self.log.error(f"   Target URL: {url}")
-            self.log.error(f"   Error: {e}")
-            if "getaddrinfo failed" in str(e):
-                self.log.error("   ⚠️  DNS resolution failed - cannot resolve hostname")
-                self.log.error(f"   ⚠️  Check that the domain '{self.base_url}' is accessible")
-            self.log.error("─" * 80)
+            self.log.error(f"Connection error: {printer_ip} | {e}")
             return None
         except requests.RequestException as e:
-            self.log.error("❌ NETWORK ERROR reporting status")
-            self.log.error(f"   Printer Serial: {printer_serial}")
-            self.log.error(f"   Error Type: {type(e).__name__}")
-            self.log.error(f"   Error: {e}")
-            self.log.error("─" * 80)
+            self.log.error(f"Network error: {printer_ip} | {type(e).__name__}: {e}")
             return None
         except Exception as e:
-            self.log.error("❌ UNEXPECTED ERROR reporting status")
-            self.log.error(f"   Printer Serial: {printer_serial}")
-            self.log.error(f"   Error Type: {type(e).__name__}")
-            self.log.error(f"   Error: {e}")
-            import traceback
-            self.log.error(f"   Traceback:\n{traceback.format_exc()}")
-            self.log.error("─" * 80)
+            self.log.error(f"Unexpected error: {printer_ip} | {type(e).__name__}: {e}")
             return None
 
     def report_offline(
@@ -417,15 +366,7 @@ class StatusReporter:
                 "X-API-Key": self.api_key,
             }
 
-            # VERBOSE LOGGING - Before sending offline status
-            self.log.info("─" * 80)
-            self.log.info(f"📤 SENDING OFFLINE STATUS to backend")
-            self.log.info(f"   Printer Serial: {printer_serial}")
-            self.log.info(f"   Printer IP: {printer_ip}")
-            self.log.info(f"   Target URL: {url}")
-            self.log.info(f"   Status: OFFLINE")
-            self.log.info(f"   Ping Status: failed")
-            self.log.info("─" * 80)
+            self.log.info(f"Status update: {printer_ip} | OFFLINE")
 
             response = requests.post(
                 url,
@@ -436,28 +377,14 @@ class StatusReporter:
 
             if response.status_code == 200:
                 result = response.json()
-                self.log.info("✅ OFFLINE STATUS SENT SUCCESSFULLY")
-                self.log.info(f"   Printer Serial: {printer_serial}")
-                self.log.info(f"   Response: {result}")
-                self.log.info("─" * 80)
                 return result
             else:
-                self.log.warning("❌ OFFLINE STATUS UPDATE FAILED")
-                self.log.warning(
-                    f"   HTTP {response.status_code} - {response.text[:200]}"
-                )
-                self.log.warning("─" * 80)
+                self.log.warning(f"Offline status failed: {printer_ip} | HTTP {response.status_code}")
                 return None
 
         except requests.RequestException as e:
-            self.log.error("❌ NETWORK ERROR reporting offline status")
-            self.log.error(f"   Printer Serial: {printer_serial}")
-            self.log.error(f"   Error: {e}")
-            self.log.error("─" * 80)
+            self.log.error(f"Network error (offline): {printer_ip} | {e}")
             return None
         except Exception as e:
-            self.log.error("❌ ERROR reporting offline status")
-            self.log.error(f"   Printer Serial: {printer_serial}")
-            self.log.error(f"   Error: {e}")
-            self.log.error("─" * 80)
+            self.log.error(f"Error (offline): {printer_ip} | {e}")
             return None
