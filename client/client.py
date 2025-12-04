@@ -786,8 +786,12 @@ def upsertPrinterFromJob(entryData: Dict[str, Any]) -> Optional[Path]:
     else:
         updatedEntry = dict(printerEntries[matchedIndex])
 
+    # Only update IP address if the existing printer doesn't already have one
+    # This preserves user-configured IP addresses
     if ipAddress:
-        updatedEntry["ipAddress"] = ipAddress
+        existingIp = str(updatedEntry.get("ipAddress", "")).strip()
+        if not existingIp:
+            updatedEntry["ipAddress"] = ipAddress
     for key, value in connectionUpdates.items():
         updatedEntry[key] = value
     if transportNormalized == "bambu_connect":

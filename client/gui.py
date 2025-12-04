@@ -2029,6 +2029,7 @@ class ListenerGuiApp:
         self._savePrinters()
         self._refreshPrinterList()
         self._scheduleStatusRefresh(0)
+        self._notifyPrintersConfigChanged()
 
     def _onPrinterSelection(self, event: object) -> None:  # noqa: ARG002 - required by Tk callback
         state = tk.NORMAL if self._getSelectedPrinterIndex() is not None else tk.DISABLED
