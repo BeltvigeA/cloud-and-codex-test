@@ -962,7 +962,7 @@ def postStatus(status: Dict[str, Any], printerConfig: Dict[str, Any]) -> None:
     postgresBackend = "https://printpro3d-api-931368217793.europe-west1.run.app"
 
     # Build endpoint URL (recipientId is sent in payload)
-    url = f"{postgresBackend}/printer-status"
+    url = f"{postgresBackend}/api/printer-status/update"
 
     # Get organizationId from environment variable or printer config
     organizationId = printerConfig.get("organizationId") or os.getenv("BASE44_ORGANIZATION_ID", "").strip()

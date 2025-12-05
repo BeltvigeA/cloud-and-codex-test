@@ -76,8 +76,8 @@ def getPrinterStatusEndpointUrl(baseUrl: Optional[str] = None, recipientId: Opti
     postgresBackend = "https://printpro3d-api-931368217793.europe-west1.run.app"
     sanitizedBaseUrl = buildBaseUrl(postgresBackend if not baseUrl else baseUrl)
 
-    # Always use the /printer-status endpoint (recipientId is sent in payload)
-    return f"{sanitizedBaseUrl}/printer-status"
+    # Always use the updated /api/printer-status/update endpoint (recipientId is sent in payload)
+    return f"{sanitizedBaseUrl}/api/printer-status/update"
 
 
 def getPrinterControlEndpointUrl(baseUrl: Optional[str] = None) -> str:
