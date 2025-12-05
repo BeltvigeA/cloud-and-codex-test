@@ -45,6 +45,8 @@ except ImportError:
 
 import requests
 
+from .status_reporter import StatusReporter
+
 
 _bambulabsApiModule = importlib.util.find_spec("bambulabs_api")
 if _bambulabsApiModule is not None:
@@ -967,20 +969,20 @@ def postStatus(status: Dict[str, Any], printerConfig: Dict[str, Any]) -> None:
     # Get organizationId from environment variable or printer config
     organizationId = printerConfig.get("organizationId") or os.getenv("BASE44_ORGANIZATION_ID", "").strip()
 
+    parsedStatus = StatusReporter.parse_print_job_data(status)
+
+    # Add compatibility fields expected by the web frontend
+    if "jobProgress" in parsedStatus:
+        parsedStatus.setdefault("progressPercent", parsedStatus.get("jobProgress"))
+    if "timeRemaining" in parsedStatus:
+        parsedStatus.setdefault("remainingTimeSeconds", parsedStatus.get("timeRemaining"))
+
     # Build payload with all required fields for PostgreSQL backend
     payload = {
         "recipientId": recipientId,
         "printerIpAddress": printerConfig.get("ipAddress"),  # CRITICAL: Required for matching
         "printerSerial": printerConfig.get("serialNumber"),
-        "status": status.get("status") or status.get("state"),
-        "nozzleTemp": status.get("nozzle_temper") or status.get("nozzleTemp"),
-        "bedTemp": status.get("bed_temper") or status.get("bedTemp"),
-        "progressPercent": status.get("mc_percent")
-        or status.get("progress")
-        or status.get("progressPercent"),
-        "remainingTimeSeconds": status.get("mc_remaining_time")
-        or status.get("remainingTimeSeconds"),
-        "gcodeState": status.get("gcode_state") or status.get("gcodeState"),
+        "status": parsedStatus,
     }
 
     # Add organizationId if available
@@ -1012,12 +1014,12 @@ def postStatus(status: Dict[str, Any], printerConfig: Dict[str, Any]) -> None:
     if organizationId:
         logger.info(f"   Organization ID: {organizationId}")
     logger.info("   ─── PAYLOAD DATA ───")
-    logger.info(f"   Status: {payload.get('status')}")
-    logger.info(f"   GCode State: {payload.get('gcodeState')}")
-    logger.info(f"   Progress: {payload.get('progressPercent')}%")
-    logger.info(f"   Nozzle Temp: {payload.get('nozzleTemp')}°C")
-    logger.info(f"   Bed Temp: {payload.get('bedTemp')}°C")
-    logger.info(f"   Remaining Time: {payload.get('remainingTimeSeconds')}s")
+    logger.info(f"   Status: {parsedStatus.get('status')}")
+    logger.info(f"   GCode State: {parsedStatus.get('gcodeState')}")
+    logger.info(f"   Progress: {parsedStatus.get('jobProgress')}%")
+    logger.info(f"   Nozzle Temp: {parsedStatus.get('nozzleTemp')}°C")
+    logger.info(f"   Bed Temp: {parsedStatus.get('bedTemp')}°C")
+    logger.info(f"   Remaining Time: {parsedStatus.get('timeRemaining')}s")
     logger.info("   ─── FULL JSON PAYLOAD ───")
     import json
     logger.info(f"{json.dumps(payload, indent=2)}")
