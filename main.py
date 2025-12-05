@@ -2752,19 +2752,19 @@ def _handlePrinterStatusUpdate(appId: Optional[str]):
             logging.warning('Missing required field in printer status update: %s', field)
             return makeErrorResponse(400, 'ValidationError', f'Missing required field: {field}')
 
-    # Ensure jobProgress is properly stored
-    if 'jobProgress' in payload:
-        job_progress_value = payload['jobProgress']
-        # Store with consistent naming for database compatibility
-        sanitizedStatusData['job_progress'] = job_progress_value
-        sanitizedStatusData['jobProgress'] = job_progress_value  # Keep both for compatibility
- 
-
     sanitizedStatusData = {
         key: value
         for key, value in payload.items()
         if key not in {'accessCode', 'printerSerial'}
     }
+
+    # Ensure jobProgress is properly stored
+    jobProgressValue = sanitizedStatusData.get('jobProgress')
+    if jobProgressValue is not None:
+        # Store with consistent naming for database compatibility
+        sanitizedStatusData['job_progress'] = jobProgressValue
+        sanitizedStatusData['jobProgress'] = jobProgressValue  # Keep both for compatibility
+
     sanitizedStatusData['timestamp'] = firestore.SERVER_TIMESTAMP
     if appId:
         sanitizedStatusData['appId'] = appId
