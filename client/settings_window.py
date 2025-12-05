@@ -397,7 +397,7 @@ class SettingsWindow:
         test_url = "https://printpro3d-api-931368217793.europe-west1.run.app"
 
         # Build status endpoint
-        status_endpoint = f"{test_url}/printer-status"
+        status_endpoint = f"{test_url}/api/printer-status/update"
 
         self.status_label.config(text="Testing connection...", foreground="blue")
         self.test_btn.config(state=tk.DISABLED)

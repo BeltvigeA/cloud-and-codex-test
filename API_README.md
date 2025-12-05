@@ -548,7 +548,7 @@ Receives status updates from printers for a specific app context.
 ---
 
 #### 13. Printer Status Update (Default)
-**POST** `/printer-status`
+**POST** `/api/printer-status/update`
 
 Generic printer status update endpoint without app context.
 

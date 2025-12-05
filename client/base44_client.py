@@ -114,7 +114,7 @@ def postUpdateStatus(payload: Dict[str, object]) -> Dict[str, object]:
     """
     POST to printer status update endpoint.
 
-    Endpoint: POST /printer-status
+    Endpoint: POST /api/printer-status/update
 
     Payload format:
     {
@@ -163,7 +163,7 @@ def postUpdateStatus(payload: Dict[str, object]) -> Dict[str, object]:
     preparedPayload.setdefault("lastUpdateTimestamp", _isoNow())
 
     # Bygg dynamisk URL (bruker hardkodet backend URL)
-    statusUrl = f"{PRINTPRO3D_BASE}/printer-status"
+    statusUrl = f"{PRINTPRO3D_BASE}/api/printer-status/update"
 
     # Bruk control headers (ikke functions headers)
     headers = _buildControlHeaders()
