@@ -140,7 +140,8 @@ class StatusReporter:
         except Exception as e:
             return {"status": "failed", "success": False, "error": str(e)}
 
-    def parse_print_job_data(self, status_data: Dict[str, Any]) -> Dict[str, Any]:
+    @staticmethod
+    def parse_print_job_data(status_data: Dict[str, Any]) -> Dict[str, Any]:
         """
         Parse MQTT status data into structured print job data.
 
