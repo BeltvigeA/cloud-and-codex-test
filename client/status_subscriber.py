@@ -179,14 +179,9 @@ class BambuStatusSubscriber:
         self.reported_hms_errors: Dict[str, Set[str]] = {}
         self.hms_errors_lock = threading.Lock()
 
-        # Track last status update time per printer for periodic reporting
-        self.last_status_report_time: Dict[str, float] = {}
-        self.status_report_lock = threading.Lock()
-        self.status_report_interval = 300.0  # 5 minutes
-
-        # Track previous printer states for pause detection
-        self.previous_states: Dict[str, Optional[str]] = {}
-        self.previous_states_lock = threading.Lock()
+        # Track completed job ids to avoid duplicate completion reports
+        self.completedJobIds: Dict[str, Set[str]] = {}
+        self.completedJobsLock = threading.Lock()
 
         # Camera capture tracking
         self.last_camera_capture: Dict[str, float] = {}  # {printer_serial: timestamp}
@@ -398,48 +393,10 @@ class BambuStatusSubscriber:
                         else:
                             self.log.debug(f"✅ No HMS errors detected for {serial}")
 
-                        # Periodic status updates (every 5 minutes by default)
-                        current_time = time.monotonic()
-                        with self.status_report_lock:
-                            last_report_time = self.last_status_report_time.get(serial, 0)
-                            if current_time - last_report_time >= self.status_report_interval:
-                                try:
-                                    self._report_status_update(statusPayload, serial, ipAddress)
-                                    self.last_status_report_time[serial] = current_time
-                                except Exception as e:
-                                    self.log.debug(f"Status update reporting failed: {e}")
-
                         # ============================================
-                        # UNEXPECTED PAUSE DETECTION FOR HMS ERRORS
+                        # JOB COMPLETION DETECTION
                         # ============================================
-                        if self.event_reporter:
-                            try:
-                                gcode_state = statusPayload.get('gcodeState')
-
-                                # Get previous state (thread-safe)
-                                with self.previous_states_lock:
-                                    previous_state = self.previous_states.get(serial)
-
-                                # Detect unexpected pause (state transition to PAUSE)
-                                if gcode_state == 'PAUSE':
-                                    self.log.info(f"🔍 Printer {serial} is PAUSED")
-
-                                    # Check if this is a NEW pause (state changed from non-paused to paused)
-                                    if previous_state and previous_state != 'PAUSE':
-                                        self.log.warning("⚠️  UNEXPECTED PAUSE DETECTED!")
-                                        self.log.warning(f"   Printer: {serial}")
-                                        self.log.warning(f"   Previous state: {previous_state}")
-                                        self.log.warning(f"   Current state: PAUSE")
-
-                                        # Check if pause was user-initiated or error-caused
-                                        self._check_pause_reason(serial, ipAddress, printerInstance, statusPayload)
-
-                                # Update previous state (thread-safe)
-                                with self.previous_states_lock:
-                                    self.previous_states[serial] = gcode_state
-
-                            except Exception as e:
-                                self.log.debug(f"Pause detection failed: {e}")
+                        self._maybeReportJobCompletion(statusPayload, serial, ipAddress)
 
                     # ============================================
                     # CAMERA IMAGE CAPTURE AND UPLOAD
@@ -1465,56 +1422,6 @@ class BambuStatusSubscriber:
 
         self.log.info("=" * 80)
 
-    def _report_status_update(
-        self,
-        status_data: Dict[str, Any],
-        printer_serial: str,
-        printer_ip: str
-    ) -> None:
-        """
-        Report periodic status update to backend
-
-        Args:
-            status_data: Raw status data from printer
-            printer_serial: Printer serial number
-            printer_ip: Printer IP address
-        """
-        if not self.event_reporter:
-            return
-
-        try:
-            # Extract relevant status fields from normalized snapshot
-            extracted_status = {
-                "progress": status_data.get("progressPercent"),
-                "bedTemp": status_data.get("bedTemp"),
-                "nozzleTemp": status_data.get("nozzleTemp"),
-                "remainingTimeSeconds": status_data.get("remainingTimeSeconds"),
-                "gcodeState": status_data.get("gcodeState"),
-                "currentLayer": status_data.get("currentLayer"),
-                "totalLayers": status_data.get("totalLayers"),
-                "state": status_data.get("state"),
-                "fanSpeedPercent": status_data.get("fanSpeedPercent"),
-                "printSpeed": status_data.get("printSpeed"),
-                "filamentUsed": status_data.get("filamentUsed"),
-                "currentJobId": status_data.get("currentJobId"),
-            }
-
-            # Remove None values
-            extracted_status = {k: v for k, v in extracted_status.items() if v is not None}
-
-            # Only report if we have meaningful status data
-            if extracted_status:
-                self.event_reporter.report_event(
-                    event_type="status_update",
-                    printer_serial=printer_serial,
-                    printer_ip=printer_ip,
-                    event_status="info",
-                    status_data=extracted_status
-                )
-
-        except Exception as e:
-            self.log.debug(f"Error reporting status update: {e}")
-
     def _reportPrinterStatus(
         self,
         printer_serial: str,
@@ -1554,75 +1461,77 @@ class BambuStatusSubscriber:
             import traceback
             self.log.error(f"   Traceback:\n{traceback.format_exc()}")
 
-    def _check_pause_reason(
+    def _completedStateDetected(self, status_data: Dict[str, Any]) -> bool:
+        completionStates = {"finish", "finished", "completed", "complete", "idle"}
+
+        for key in ("gcodeState", "state"):
+            stateValue = self._coerceString(status_data.get(key))
+            if stateValue:
+                normalizedState = stateValue.strip().lower()
+                if normalizedState in completionStates:
+                    return True
+
+        progressValue = status_data.get("progressPercent")
+        progressPercent = self._coerceFloat(progressValue)
+        if progressPercent is not None and progressPercent >= 100.0:
+            return True
+
+        return False
+
+    def _extractCompletedFileName(self, status_data: Dict[str, Any]) -> str:
+        raw_state = status_data.get("rawStatePayload") or {}
+        candidates = [
+            status_data.get("fileName"),
+            status_data.get("projectName"),
+            self._findValue([raw_state], {"jobName", "taskName", "subtaskName", "file", "fileName"}),
+        ]
+
+        for candidate in candidates:
+            nameValue = self._coerceString(candidate)
+            if nameValue:
+                return nameValue
+
+        return "unknown"
+
+    def _maybeReportJobCompletion(
         self,
+        status_data: Dict[str, Any],
         printer_serial: str,
-        printer_ip: str,
-        printer_instance: Optional[Any],
-        status_data: Dict[str, Any]
+        printer_ip: str
     ) -> None:
-        """
-        Check if pause was caused by HMS error or user action
+        if not self.event_reporter:
+            return
 
-        Uses Bambu API print_error_code() to detect errors
+        jobId = self._coerceString(status_data.get("currentJobId"))
+        if not jobId:
+            return
 
-        Args:
-            printer_serial: Printer serial number
-            printer_ip: Printer IP address
-            printer_instance: Connected printer instance
-            status_data: Current status payload
-        """
-        self.log.info("=" * 80)
-        self.log.info("🔍 CHECKING PAUSE REASON")
-        self.log.info(f"   Printer: {printer_serial}")
-        self.log.info(f"   IP: {printer_ip}")
+        if not self._completedStateDetected(status_data):
+            return
+
+        with self.completedJobsLock:
+            reportedJobs = self.completedJobIds.setdefault(printer_serial, set())
+            if jobId in reportedJobs:
+                return
+            reportedJobs.add(jobId)
+
+        fileName = self._extractCompletedFileName(status_data)
 
         try:
-            # Check if we have a printer instance
-            if not printer_instance:
-                self.log.warning("⚠️  No printer instance available, cannot check error code")
-                return
+            eventId = self.event_reporter.report_job_completed(
+                printer_serial=printer_serial,
+                printer_ip=printer_ip,
+                print_job_id=jobId,
+                file_name=fileName,
+            )
 
-            # Check error code via API
-            self.log.info("🔍 Calling printer.print_error_code()...")
-            error_code_method = getattr(printer_instance, "print_error_code", None)
-
-            if not callable(error_code_method):
-                self.log.warning("⚠️  print_error_code() method not available on printer instance")
-                return
-
-            error_code = error_code_method()
-            self.log.info(f"📊 Error code: {error_code}")
-
-            if error_code and error_code > 0:
-                # Error detected!
-                self.log.error("❌ HMS ERROR DETECTED via error code!")
-                self.log.error(f"   Printer: {printer_serial}")
-                self.log.error(f"   Error code: {error_code}")
-
-                # Try to get HMS error codes from status data
-                hms_errors = self._extract_hms_from_status(status_data)
-
-                if hms_errors:
-                    self.log.error(f"   HMS errors found: {hms_errors}")
-
-                    # Report each HMS error
-                    for hms_code in hms_errors:
-                        self._handle_hms_error(hms_code, printer_serial, printer_ip, printer_instance)
-                else:
-                    # Error code present but no specific HMS codes
-                    # Report generic error
-                    self.log.warning("⚠️  Error code present but no specific HMS codes found")
-                    self._report_generic_pause_error(printer_serial, printer_ip, error_code)
+            if eventId:
+                self.log.info(f"✅ Job completion reported: {eventId}")
             else:
-                # No error - this was a user-initiated pause
-                self.log.info("✅ Pause was USER-INITIATED (error_code = 0)")
-                self.log.info("   No HMS error to report")
+                self.log.warning("⚠️  Job completion report returned no event_id")
 
-        except Exception as e:
-            self.log.error(f"❌ Failed to check pause reason: {e}")
-            import traceback
-            self.log.error(traceback.format_exc())
+        except Exception as error:
+            self.log.error(f"❌ Failed to report job completion: {error}")
 
         self.log.info("=" * 80)
 
@@ -1796,49 +1705,6 @@ class BambuStatusSubscriber:
                 return True
 
         return False
-
-    def _report_generic_pause_error(
-        self,
-        printer_serial: str,
-        printer_ip: str,
-        error_code: int
-    ) -> None:
-        """
-        Report a generic pause error when error_code > 0 but no specific HMS codes
-
-        Args:
-            printer_serial: Printer serial number
-            printer_ip: Printer IP address
-            error_code: Error code from printer
-        """
-        self.log.warning("📤 Reporting generic pause error to backend...")
-
-        if not self.event_reporter:
-            self.log.error("❌ EventReporter not initialized, cannot report error")
-            return
-
-        try:
-            event_id = self.event_reporter.report_event(
-                event_type="printer_error",
-                printer_serial=printer_serial,
-                printer_ip=printer_ip,
-                event_status="warning",
-                error_data={
-                    "errorCode": error_code,
-                    "description": f"Printer paused unexpectedly with error code {error_code}"
-                },
-                message=f"Unexpected pause detected (error code: {error_code})"
-            )
-
-            if event_id:
-                self.log.info(f"✅ Generic pause error reported: {event_id}")
-            else:
-                self.log.warning("⚠️  Failed to report generic pause error")
-
-        except Exception as e:
-            self.log.error(f"❌ Failed to report generic pause error: {e}")
-            import traceback
-            self.log.error(traceback.format_exc())
 
     def _capture_camera_image_to_file(
         self,
