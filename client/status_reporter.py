@@ -9,6 +9,7 @@ import platform
 import shutil
 import subprocess
 import time
+from collections.abc import Mapping
 from typing import Any, Dict, Optional
 
 import requests
@@ -140,7 +141,8 @@ class StatusReporter:
         except Exception as e:
             return {"status": "failed", "success": False, "error": str(e)}
 
-    def parse_print_job_data(self, status_data: Dict[str, Any]) -> Dict[str, Any]:
+    @staticmethod
+    def parse_print_job_data(status_data: Dict[str, Any]) -> Dict[str, Any]:
         """
         Parse MQTT status data into structured print job data.
 
@@ -180,6 +182,16 @@ class StatusReporter:
 
         # Get raw state payload for additional fields
         raw_state = status_data.get("rawStatePayload", {})
+        if raw_state is None:
+            raw_state = {}
+        elif not isinstance(raw_state, Mapping):
+            if hasattr(raw_state, "__dict__"):
+                raw_state = vars(raw_state)
+            else:
+                try:
+                    raw_state = dict(raw_state)  # type: ignore[arg-type]
+                except Exception:
+                    raw_state = {}
 
         # Try to extract layer info
         current_layer = raw_state.get("layer_num") or raw_state.get("current_layer")
