@@ -83,17 +83,21 @@ class PrintCompletionMonitor:
         """
         self._log = logger or log
         self._debounce_count = max(1, debounce_count)
-        
+
         # Track completed jobs per printer: serial -> set of job IDs
         self._completed_jobs: Dict[str, Set[str]] = {}
         self._lock = threading.Lock()
-        
+
         # Track consecutive completion counts for debouncing
         # Key: (serial, job_id), Value: consecutive count
         self._pending_completions: Dict[Tuple[str, str], int] = {}
-        
+
         # Track previous printing state per printer for transition detection
         self._was_printing: Dict[str, bool] = {}
+
+        # Track if printer has reported completion without job_id
+        # This prevents duplicate notifications when job_id is not available
+        self._printer_reported_complete: Dict[str, bool] = {}
 
     def is_print_completed(
         self,
@@ -167,7 +171,19 @@ class PrintCompletionMonitor:
         is_printing = self._is_currently_printing(status_data)
         was_printing = self._was_printing.get(printer_serial, False)
         self._was_printing[printer_serial] = is_printing
-        
+
+        # Reset completion tracking when printer starts printing again
+        if is_printing and not was_printing:
+            # Printer has started a new print, clear completion status
+            with self._lock:
+                self._printer_reported_complete.pop(printer_serial, None)
+                # Also clear completed jobs for this printer to allow new completion reports
+                self._completed_jobs.pop(printer_serial, None)
+            self._log.debug(
+                "[completion] Printer %s started printing, cleared completion status",
+                printer_serial,
+            )
+
         # If not completed, reset any pending debounce counter
         if not completed:
             if job_id:
@@ -189,6 +205,17 @@ class PrintCompletionMonitor:
                 return CompletionResult(
                     completed=True,
                     reason=f"{reason} (already reported)",
+                    job_id=job_id,
+                    file_name=file_name,
+                    printer_serial=printer_serial,
+                )
+
+            # If no job_id, check if printer has already reported completion
+            if not job_id and self._printer_reported_complete.get(printer_serial, False):
+                # Already reported completion for this printer without job_id
+                return CompletionResult(
+                    completed=True,
+                    reason=f"{reason} (already reported - no job_id)",
                     job_id=job_id,
                     file_name=file_name,
                     printer_serial=printer_serial,
@@ -218,7 +245,7 @@ class PrintCompletionMonitor:
         
         # Completion confirmed - record and notify
         timestamp = datetime.now(timezone.utc).isoformat()
-        
+
         with self._lock:
             if printer_serial not in self._completed_jobs:
                 self._completed_jobs[printer_serial] = set()
@@ -227,6 +254,9 @@ class PrintCompletionMonitor:
                 # Clean up pending counter
                 key = (printer_serial, job_id)
                 self._pending_completions.pop(key, None)
+            else:
+                # No job_id available, mark printer as having reported completion
+                self._printer_reported_complete[printer_serial] = True
         
         result = CompletionResult(
             completed=True,
@@ -262,7 +292,7 @@ class PrintCompletionMonitor:
     def clear_completed_jobs(self, printer_serial: Optional[str] = None) -> None:
         """
         Clear the record of completed jobs.
-        
+
         Args:
             printer_serial: If provided, clear only for this printer.
                            If None, clear all.
@@ -270,6 +300,7 @@ class PrintCompletionMonitor:
         with self._lock:
             if printer_serial:
                 self._completed_jobs.pop(printer_serial, None)
+                self._printer_reported_complete.pop(printer_serial, None)
                 # Also clear pending completions for this printer
                 keys_to_remove = [
                     key for key in self._pending_completions
@@ -279,8 +310,9 @@ class PrintCompletionMonitor:
                     self._pending_completions.pop(key, None)
             else:
                 self._completed_jobs.clear()
+                self._printer_reported_complete.clear()
                 self._pending_completions.clear()
-        
+
         self._log.debug(
             "[completion] Cleared completed jobs for %s",
             printer_serial or "all printers",
