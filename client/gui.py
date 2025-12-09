@@ -626,11 +626,18 @@ class ListenerGuiApp:
         # Treeview for printers
         treeFrame = ttk.Frame(contentFrame)
         treeFrame.grid(row=0, column=0, sticky=tk.NSEW)
-        treeFrame.columnconfigure(0, weight=1)
+        treeFrame.columnconfigure(0, weight=0) # Locked tree (fixed width)
+        treeFrame.columnconfigure(1, weight=1) # Main tree (expands)
         treeFrame.rowconfigure(0, weight=1)
 
-        columns = (
-            "printer",
+        # Shared configuration for striped rows
+        self.stripedRowTags = ("even_row", "odd_row")
+
+        # columns for the locked tree (left side)
+        columnsLocked = ("printer",)
+
+        # columns for the main tree (right side, scrollable)
+        columnsMain = (
             "serial_number",
             "print_type",
             "current_state",
@@ -652,12 +659,23 @@ class ListenerGuiApp:
             "current_layer_num",
             "ping",
             "status",
+            "bed_image",
         )
 
-        self.printJobTree = ttk.Treeview(treeFrame, columns=columns, show="headings", selectmode="browse")
+        # Frame for the two trees to sit side-by-side
+        # We use a panedwindow or just grid. Grid is simpler for fixed lock.
+        # But to ensure they scroll together, we need a shared scrollbar.
         
-        # Configure column headings
-        self.printJobTree.heading("printer", text="Printer")
+        # Locked Tree (Left)
+        self.lockedTree = ttk.Treeview(treeFrame, columns=columnsLocked, show="headings", selectmode="browse")
+        self.lockedTree.heading("printer", text="Printer")
+        self.lockedTree.column("printer", width=150, minwidth=150, stretch=False)
+        self.lockedTree.grid(row=0, column=0, sticky=tk.NS)
+
+        # Main Tree (Right)
+        self.printJobTree = ttk.Treeview(treeFrame, columns=columnsMain, show="headings", selectmode="browse")
+        
+        # Configure headings
         self.printJobTree.heading("serial_number", text="Serial Number")
         self.printJobTree.heading("print_type", text="Print Type")
         self.printJobTree.heading("current_state", text="State")
@@ -679,35 +697,74 @@ class ListenerGuiApp:
         self.printJobTree.heading("current_layer_num", text="Layer #")
         self.printJobTree.heading("ping", text="Ping")
         self.printJobTree.heading("status", text="Status")
+        self.printJobTree.heading("bed_image", text="Bed Image")
 
         # Configure column widths
-        self.printJobTree.column("printer", width=120)
-        self.printJobTree.column("serial_number", width=120)
-        self.printJobTree.column("print_type", width=90)
-        self.printJobTree.column("current_state", width=90)
-        self.printJobTree.column("file_name", width=120)
-        self.printJobTree.column("gcode_state", width=90)
-        self.printJobTree.column("gcode_file", width=120)
+        self.printJobTree.column("serial_number", width=140)
+        self.printJobTree.column("print_type", width=100)
+        self.printJobTree.column("current_state", width=100)
+        self.printJobTree.column("file_name", width=180)
+        self.printJobTree.column("gcode_state", width=100)
+        self.printJobTree.column("gcode_file", width=180)
         self.printJobTree.column("print_error_code", width=80)
-        self.printJobTree.column("percentage", width=70)
-        self.printJobTree.column("time_remaining", width=90)
-        self.printJobTree.column("current_layer", width=60)
-        self.printJobTree.column("total_layers", width=70)
+        self.printJobTree.column("percentage", width=80)
+        self.printJobTree.column("time_remaining", width=100)
+        self.printJobTree.column("current_layer", width=70)
+        self.printJobTree.column("total_layers", width=80)
         self.printJobTree.column("nozzle", width=70)
         self.printJobTree.column("bed", width=70)
         self.printJobTree.column("chamber", width=70)
         self.printJobTree.column("print_speed", width=70)
-        self.printJobTree.column("light_state", width=60)
-        self.printJobTree.column("skipped_objects", width=80)
-        self.printJobTree.column("chamber_fan_speed", width=70)
-        self.printJobTree.column("current_layer_num", width=70)
-        self.printJobTree.column("ping", width=60)
-        self.printJobTree.column("status", width=180)
+        self.printJobTree.column("light_state", width=70)
+        self.printJobTree.column("skipped_objects", width=100)
+        self.printJobTree.column("chamber_fan_speed", width=80)
+        self.printJobTree.column("current_layer_num", width=80)
+        self.printJobTree.column("ping", width=70)
+        self.printJobTree.column("status", width=200)
+        self.printJobTree.column("bed_image", width=100)
 
-        scrollbar = ttk.Scrollbar(treeFrame, orient=tk.VERTICAL, command=self.printJobTree.yview)
-        self.printJobTree.configure(yscrollcommand=scrollbar.set)
-        self.printJobTree.grid(row=0, column=0, sticky=tk.NSEW)
-        scrollbar.grid(row=0, column=1, sticky=tk.NS)
+        self.printJobTree.grid(row=0, column=1, sticky=tk.NSEW)
+        treeFrame.columnconfigure(1, weight=1) # Main tree expands
+
+        # Shared Vertical Scrollbar
+        def multiple_yview(*args):
+            self.lockedTree.yview(*args)
+            self.printJobTree.yview(*args)
+
+        scrollbar = ttk.Scrollbar(treeFrame, orient=tk.VERTICAL, command=multiple_yview)
+        scrollbar.grid(row=0, column=2, sticky=tk.NS)
+
+        # Horizontal Scrollbar (only for main tree)
+        hScrollbar = ttk.Scrollbar(treeFrame, orient=tk.HORIZONTAL, command=self.printJobTree.xview)
+        hScrollbar.grid(row=1, column=1, sticky=tk.EW)
+
+        # Configure trees to use scrollbars
+        self.lockedTree.configure(yscrollcommand=scrollbar.set)
+        self.printJobTree.configure(yscrollcommand=scrollbar.set, xscrollcommand=hScrollbar.set)
+
+        # Bind scroll events for mousewheel to ensure sync
+        def _on_mousewheel(event):
+            # Windows: event.delta is usually 120 or -120
+            # Linux: Button-4 / Button-5 events are used instead usually, but let's try standard bind
+            self.lockedTree.yview_scroll(int(-1*(event.delta/120)), "units")
+            self.printJobTree.yview_scroll(int(-1*(event.delta/120)), "units")
+            return "break" # prevent default handling
+
+        self.lockedTree.bind("<MouseWheel>", _on_mousewheel)
+        self.printJobTree.bind("<MouseWheel>", _on_mousewheel)
+
+        # Configure striped rows visual
+        self.lockedTree.tag_configure("even_row", background="#f2f2f2")
+        self.lockedTree.tag_configure("odd_row", background="white")
+        self.printJobTree.tag_configure("even_row", background="#f2f2f2")
+        self.printJobTree.tag_configure("odd_row", background="white")
+
+        # Bind double-click to open bed image
+        self.printJobTree.bind("<Double-1>", self._onPrintJobBedImageClick)
+
+        # Bind selection events to sync trees
+        self.lockedTree.bind("<<TreeviewSelect>>", self._syncSelection)
+        self.printJobTree.bind("<<TreeviewSelect>>", self._syncSelection)
 
         # Populate treeview
         self._refreshPrintJobTree()
@@ -4082,12 +4139,12 @@ class ListenerGuiApp:
 
     def _refreshPrintJobTree(self) -> None:
         """Refresh the Print Job treeview with current printer data."""
-        if not hasattr(self, 'printJobTree'):
+        if not hasattr(self, 'printJobTree') or not hasattr(self, 'lockedTree'):
             return
 
         # Clear existing items
-        for item in self.printJobTree.get_children():
-            self.printJobTree.delete(item)
+        self.lockedTree.delete(*self.lockedTree.get_children())
+        self.printJobTree.delete(*self.printJobTree.get_children())
 
         # Get search term if the search var exists
         searchTerm = ""
@@ -4095,7 +4152,7 @@ class ListenerGuiApp:
             searchTerm = self.printJobSearchVar.get().strip().lower()
 
         # Add all printers
-        for printer in self.printers:
+        for i, printer in enumerate(self.printers):
             nickname = str(printer.get("nickname") or "").strip()
             serialNumber = str(printer.get("serialNumber") or "").strip()
             ipAddress = str(printer.get("ipAddress") or "").strip()
@@ -4174,12 +4231,31 @@ class ListenerGuiApp:
                 else:
                     status = "Får ikke kontakt med printer"
 
-            # Insert row
+            # Check if bed image exists for this printer
+            bed_image_path = self._getLatestBedImagePath(serialNumber)
+            bed_image_text = "Vis bilde" if bed_image_path else ""
+
+            # Determine row tag
+            tag = "even_row" if i % 2 == 0 else "odd_row"
+
+            # Use serial number as ID if available, otherwise index
+            iid = serialNumber if serialNumber else str(i)
+
+            # Insert into Locked Tree
+            self.lockedTree.insert(
+                "",
+                tk.END,
+                iid=iid,
+                values=(printerName,),
+                tags=(tag,)
+            )
+
+            # Insert into Main Tree
             self.printJobTree.insert(
                 "",
                 tk.END,
+                iid=iid,
                 values=(
-                    printerName,
                     serialNumber,
                     print_type,
                     current_state,
@@ -4201,8 +4277,34 @@ class ListenerGuiApp:
                     current_layer_num,
                     ping,
                     status,
-                )
+                    bed_image_text,
+                ),
+                tags=(tag,)
             )
+
+    def _syncSelection(self, event: object) -> None:
+        """Synchronize selection between locked and main trees."""
+        # Determine which tree fired the event
+        widget = event.widget # type: ignore
+        selection = widget.selection()
+        
+        if not selection:
+            return
+
+        # Apply selection to the other tree
+        if widget == self.lockedTree:
+            other = self.printJobTree
+        else:
+            other = self.lockedTree
+            
+        current_other = other.selection()
+        if current_other != selection:
+            try:
+                other.selection_set(selection)
+                # Also ensure we see it
+                other.see(selection[0])
+            except Exception:
+                pass # ID might not exist if update pending
 
     def _safeValue(self, value: Any, default: Any) -> Any:
         """Safely extract a value, returning default if value is None, error string, or invalid."""
@@ -4220,6 +4322,80 @@ class ListenerGuiApp:
         self._refreshAllPrinterInfo()
         # Also refresh the tree after a short delay to ensure data is updated
         self.root.after(2000, self._refreshPrintJobTree)
+
+    def _getLatestBedImagePath(self, serialNumber: str) -> Optional[Path]:
+        """Get the path to the latest bed reference image for a printer.
+        
+        Args:
+            serialNumber: The printer's serial number
+            
+        Returns:
+            Path to the most recent bed reference image, or None if no images exist
+        """
+        if not serialNumber:
+            return None
+        
+        bedRefDir = Path.home() / ".printmaster" / "bed-reference" / serialNumber.strip()
+        if not bedRefDir.exists():
+            return None
+        
+        # Find all jpg files and get the most recently modified one
+        jpgFiles = list(bedRefDir.glob("*.jpg"))
+        if not jpgFiles:
+            return None
+        
+        # Sort by modification time, newest first
+        jpgFiles.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        return jpgFiles[0]
+
+    def _onPrintJobBedImageClick(self, event: object) -> None:
+        """Handle double-click on the Print Job tree to open bed image.
+        
+        Opens the bed reference image in the system's default image viewer
+        when the user double-clicks on the "Bed Image" column.
+        """
+        tree = self.printJobTree
+        
+        # Get the clicked region
+        region = tree.identify("region", event.x, event.y)  # type: ignore
+        if region != "cell":
+            return
+        
+        # Get the column that was clicked
+        column = tree.identify_column(event.x)  # type: ignore
+        columnIndex = int(column.replace("#", "")) - 1
+        
+        # Check if it's the bed_image column (last column, index 22)
+        columns = tree["columns"]
+        if columnIndex >= len(columns) or columns[columnIndex] != "bed_image":
+            return
+        
+        # Get the selected item
+        item = tree.identify_row(event.y)  # type: ignore
+        if not item:
+            return
+        
+        # Get the serial number from the row (column index 0 now)
+        values = tree.item(item, "values")
+        if not values:
+            return
+        
+        serialNumber = str(values[0]).strip()
+        if not serialNumber:
+            return
+        
+        # Get the bed image path
+        imagePath = self._getLatestBedImagePath(serialNumber)
+        if not imagePath or not imagePath.exists():
+            return
+        
+        # Open the image in the default viewer
+        try:
+            os.startfile(str(imagePath))  # type: ignore - Windows only
+            self.log(f"Åpnet bed referansebilde: {imagePath}")
+        except Exception as error:
+            logging.exception("Failed to open bed image: %s", error)
+            self.log(f"Kunne ikke åpne bilde: {error}")
 
     def _handleWindowClose(self) -> None:
         try:
