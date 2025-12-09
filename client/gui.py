@@ -83,6 +83,7 @@ from .autoprint.brake_flow import BrakeFlowContext
 from .bambuPrinter import BambuPrintOptions, postStatus, sendBambuPrintJob
 from .status_subscriber import BambuStatusSubscriber
 from .command_controller import CommandWorker
+from .printflow import PrintCompletionMonitor, CompletionResult
 from .client import (
     appendJsonLogEntry,
     buildBaseUrl,
@@ -206,6 +207,12 @@ class ListenerGuiApp:
         self.lastLiveStatusAlerts: Dict[str, str] = {}
         self.commandWorkers: Dict[str, CommandWorker] = {}
         self.heartbeatWorker: Optional[HeartbeatWorker] = None
+
+        # Print completion monitor for detecting finished prints
+        self.completionMonitor = PrintCompletionMonitor(
+            logger=logging.getLogger(__name__),
+            debounce_count=2,
+        )
 
         # Printer Info cache and polling
         self.printerInfoCache: Dict[str, Dict[str, Any]] = {}  # serial -> {timestamp, data}
@@ -3190,10 +3197,48 @@ class ListenerGuiApp:
         except Exception:
             logging.debug("Failed to post status from subscriber", exc_info=True)
 
+        # Check for print completion
+        try:
+            serial = str(printerConfigCopy.get("serialNumber") or "")
+            result = self.completionMonitor.check_and_notify(
+                status_data=statusCopy,
+                printer_serial=serial,
+                on_completion=self._onPrintCompleted,
+            )
+        except Exception:
+            logging.debug("Print completion check failed", exc_info=True)
+
         try:
             self.root.after(0, lambda: self._applyLiveStatusUpdate(statusCopy, printerConfigCopy))
         except Exception:
             logging.exception("Unable to schedule GUI update for printer status")
+
+    def _onPrintCompleted(self, result: CompletionResult) -> None:
+        """Handle print completion event - log and notify user."""
+        printer_serial = result.printer_serial or "unknown"
+        file_name = result.file_name or "unknown"
+        job_id = result.job_id[:8] if result.job_id else "N/A"
+        
+        # Log to console
+        log_message = f"✅ PRINT FERDIG: {printer_serial} - {file_name} (job: {job_id})"
+        self.logQueue.put(log_message)
+        logging.info(log_message)
+        
+        # Show notification in GUI (using after to ensure thread-safety)
+        def show_notification() -> None:
+            try:
+                messagebox.showinfo(
+                    "Print Ferdig!",
+                    f"Printer: {printer_serial}\nFil: {file_name}\nJob ID: {job_id}",
+                    parent=self.root
+                )
+            except Exception:
+                logging.debug("Failed to show completion notification", exc_info=True)
+        
+        try:
+            self.root.after(0, show_notification)
+        except Exception:
+            logging.debug("Unable to schedule completion notification", exc_info=True)
 
     def _onPrinterStatusError(self, message: str, printerConfig: Dict[str, Any]) -> None:
         printerCopy = dict(printerConfig)
