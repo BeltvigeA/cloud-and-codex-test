@@ -1675,14 +1675,6 @@ def startPrintViaApi(
         startKeywordArgs["use_ams"] = resolvedUseAms
     startKeywordArgs["flow_calibration"] = bool(options.flowCalibration)
 
-    # --- NYTT: trekk ut AMS/skip fra metadata og logg det ---
-    amsMapping, skipObjects = _extract_ams_and_skips_from_metadata(job_metadata)
-    if skipObjects:
-        startKeywordArgs["skip_objects"] = skipObjects
-        logger.info("[start] skip_objects preselected in job: %s", skipObjects)
-    if amsMapping:
-        startKeywordArgs["ams_mapping"] = amsMapping
-        logger.info("[start] ams_mapping requested: %s", amsMapping)
 
     sendControlFlags: Dict[str, Any] = {
         "use_ams": resolvedUseAms,
@@ -1742,9 +1734,13 @@ def startPrintViaApi(
     if skipObjects:
         startKeywordArgs["skip_objects"] = skipObjects
         logger.info("[start] skip_objects preselected in job: %s", skipObjects)
-    if amsMapping:
+    # Only include ams_mapping when use_ams is True or None (auto-detect)
+    # When use_ams=False (external spool), ams_mapping causes HMS validation errors
+    if amsMapping and resolvedUseAms is not False:
         startKeywordArgs["ams_mapping"] = amsMapping
         logger.info("[start] ams_mapping requested: %s", amsMapping)
+    elif amsMapping and resolvedUseAms is False:
+        logger.info("[start] ams_mapping SKIPPED (use_ams=False, external spool mode): %s", amsMapping)
 
 
     if START_DEBUG:
@@ -1895,8 +1891,9 @@ def startPrintViaApi(
                     if startParam:
                         payload["print"]["param"] = startParam
                     payload["print"].update({key: value for key, value in sendControlFlags.items() if value is not None})
-                    # speil verdiene også i send_control payload for fallback-sti
-                    if amsMapping:
+                    # Only include ams_mapping in fallback path when use_ams is True or None
+                    # When use_ams=False (external spool), ams_mapping causes HMS validation errors
+                    if amsMapping and resolvedUseAms is not False:
                         payload["print"]["ams_mapping"] = amsMapping
                     if skipObjects:
                         payload["print"]["skip_objects"] = skipObjects

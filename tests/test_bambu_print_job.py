@@ -474,3 +474,99 @@ def test_sendBambuPrintJob_raises_when_api_start_fails(
 
     assert "API print start failed and MQTT fallback is disabled by policy" in str(errorInfo.value)
 
+
+def test_startPrintViaApi_excludes_ams_mapping_when_use_ams_false(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Test that ams_mapping is NOT sent when use_ams=False (external spool mode)."""
+    fakePrinter = FakeApiPrinter()
+    monkeypatch.setattr(bambuPrinter, "bambulabsApi", ApiModuleStub(lambda *_args, **_kwargs: fakePrinter))
+    monkeypatch.setattr(bambuPrinter.time, "sleep", lambda _seconds: None)
+
+    options = bambuPrinter.BambuPrintOptions(
+        ipAddress="1.2.3.4",
+        serialNumber="SERIAL",
+        accessCode="CODE",
+        waitSeconds=1,
+        useAms=False,  # External spool mode
+    )
+
+    # Job metadata with ams_configuration that should be IGNORED when use_ams=False
+    job_metadata = {
+        "unencryptedData": {
+            "ams_configuration": {
+                "slots": [
+                    {"colorIndex": 0, "slot": 0},
+                    {"colorIndex": 1, "slot": 1},
+                ]
+            }
+        }
+    }
+
+    result = bambuPrinter.startPrintViaApi(
+        ip="1.2.3.4",
+        serial="SERIAL",
+        accessCode="CODE",
+        uploaded_name="job.3mf",
+        plate_index=1,
+        param_path="Metadata/plate_1.gcode",
+        options=options,
+        job_metadata=job_metadata,
+        ack_timeout_sec=0.2,
+    )
+
+    assert result["acknowledged"] is True
+    # Verify that use_ams is False
+    assert fakePrinter.startRequests == [False]
+    # Verify that ams_mapping was NOT included in startKeywordArgs
+    for payload in fakePrinter.startPayloads:
+        assert "ams_mapping" not in payload, (
+            f"ams_mapping should NOT be sent when use_ams=False, but got: {payload}"
+        )
+
+
+def test_startPrintViaApi_includes_ams_mapping_when_use_ams_true(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Test that ams_mapping IS sent when use_ams=True."""
+    fakePrinter = FakeApiPrinter()
+    monkeypatch.setattr(bambuPrinter, "bambulabsApi", ApiModuleStub(lambda *_args, **_kwargs: fakePrinter))
+    monkeypatch.setattr(bambuPrinter.time, "sleep", lambda _seconds: None)
+
+    options = bambuPrinter.BambuPrintOptions(
+        ipAddress="1.2.3.4",
+        serialNumber="SERIAL",
+        accessCode="CODE",
+        waitSeconds=1,
+        useAms=True,  # AMS mode
+    )
+
+    # Job metadata with ams_configuration that SHOULD be included when use_ams=True
+    job_metadata = {
+        "unencryptedData": {
+            "ams_configuration": {
+                "slots": [
+                    {"colorIndex": 0, "slot": 0},
+                    {"colorIndex": 1, "slot": 1},
+                ]
+            }
+        }
+    }
+
+    result = bambuPrinter.startPrintViaApi(
+        ip="1.2.3.4",
+        serial="SERIAL",
+        accessCode="CODE",
+        uploaded_name="job.3mf",
+        plate_index=1,
+        param_path="Metadata/plate_1.gcode",
+        options=options,
+        job_metadata=job_metadata,
+        ack_timeout_sec=0.2,
+    )
+
+    assert result["acknowledged"] is True
+    # Verify that use_ams is True
+    assert fakePrinter.startRequests == [True]
+    # Verify that ams_mapping WAS included in startKeywordArgs
+    assert len(fakePrinter.startPayloads) == 1
+    assert "ams_mapping" in fakePrinter.startPayloads[0], (
+        f"ams_mapping should be sent when use_ams=True, but got: {fakePrinter.startPayloads[0]}"
+    )
+    assert fakePrinter.startPayloads[0]["ams_mapping"] == [0, 1]
