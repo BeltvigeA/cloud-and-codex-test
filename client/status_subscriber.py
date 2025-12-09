@@ -868,6 +868,16 @@ class BambuStatusSubscriber:
         )
         bedTemp = self._coerceFloat(bedCandidate)
 
+        # DEBUG: Log raw values
+        if self.statusDebugEnabled:
+            self.log.info(
+                "[status] Raw MQTT data: nozzleCandidate=%s (coerced=%s), bedCandidate=%s (coerced=%s)",
+                nozzleCandidate,
+                nozzleTemp,
+                bedCandidate,
+                bedTemp
+            )
+
         fanCandidate = self._findValue(
             sources,
             {
@@ -1091,17 +1101,20 @@ class BambuStatusSubscriber:
         if jobId:
             optionalFields["currentJobId"] = jobId
 
+        # ALWAYS send temperature fields - even when 0 (idle printer)
+        # Frontend needs these fields to display the telemetry section
         bedTemp = self._coerceFloat(snapshot.get("bedTemp"))
-        if bedTemp is not None:
-            optionalFields["bedTemp"] = bedTemp
+        optionalFields["bedTemp"] = bedTemp if bedTemp is not None else 0.0
 
         nozzleTemp = self._coerceFloat(snapshot.get("nozzleTemp"))
-        if nozzleTemp is not None:
-            optionalFields["nozzleTemp"] = nozzleTemp
+        optionalFields["nozzleTemp"] = nozzleTemp if nozzleTemp is not None else 0.0
 
+        # ALWAYS send fan speed for consistency
         fanSpeed = self._coerceFloat(snapshot.get("fanSpeedPercent"))
-        if fanSpeed is not None:
+        if fanSpeed is not None and fanSpeed > 0:
             optionalFields["fanSpeed"] = max(0, min(100, int(round(fanSpeed))))
+        else:
+            optionalFields["fanSpeed"] = 0
 
         printSpeed = self._coerceFloat(snapshot.get("printSpeed"))
         if printSpeed is not None:
@@ -1111,9 +1124,12 @@ class BambuStatusSubscriber:
         if filamentUsed is not None:
             optionalFields["filamentUsed"] = filamentUsed
 
+        # ALWAYS send time remaining, even if 0 (idle)
         remainingSeconds = self._coerceInt(snapshot.get("remainingTimeSeconds"))
         if remainingSeconds is not None:
             optionalFields["timeRemaining"] = max(0, remainingSeconds)
+        else:
+            optionalFields["timeRemaining"] = 0
 
         firmwareVersion = self._coerceString(snapshot.get("firmwareVersion"))
         if firmwareVersion:
@@ -1142,6 +1158,20 @@ class BambuStatusSubscriber:
         if combinedErrorMessage:
             updatePayload["errorMessage"] = combinedErrorMessage
         updatePayload.update(optionalFields)
+
+        # Log what we're about to send (only if debug is enabled)
+        if self.statusDebugEnabled:
+            self.log.info(
+                "[status] Sending payload for %s: status=%s, bedTemp=%s, nozzleTemp=%s, fanSpeed=%s, timeRemaining=%s, progress=%s",
+                ipAddress,
+                status,
+                optionalFields.get("bedTemp"),
+                optionalFields.get("nozzleTemp"),
+                optionalFields.get("fanSpeed"),
+                optionalFields.get("timeRemaining"),
+                optionalFields.get("jobProgress")
+            )
+
         # Exclude camera image and timestamp from comparison (don't trigger updates just because image changed)
         updateComparable = {
             key: value
