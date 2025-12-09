@@ -980,16 +980,19 @@ class BambuStatusSubscriber:
             if not errorMessage:
                 errorMessage = "Possible AMS filament conflict"
 
+        # CRITICAL FIX: Always use 0.0 for temperatures instead of None
+        # This ensures the entire pipeline (GUI, JSON storage, backend API) gets consistent data
+        # Frontend/GUI checks "is not None" before updating - None values cause fields to be skipped
         normalized: Dict[str, Any] = {
             "status": "update",
             "state": stateText,
             "gcodeState": gcodeState,
             "progressPercent": progressPercent,
-            "nozzleTemp": nozzleTemp,
-            "bedTemp": bedTemp,
-            "chamberTemp": chamberTemp,
-            "remainingTimeSeconds": remainingTimeSeconds,
-            "fanSpeedPercent": fanSpeedPercent,
+            "nozzleTemp": nozzleTemp if nozzleTemp is not None else 0.0,
+            "bedTemp": bedTemp if bedTemp is not None else 0.0,
+            "chamberTemp": chamberTemp if chamberTemp is not None else 0.0,
+            "remainingTimeSeconds": remainingTimeSeconds if remainingTimeSeconds is not None else 0,
+            "fanSpeedPercent": fanSpeedPercent if fanSpeedPercent is not None else 0.0,
             "printSpeed": printSpeed,
             "filamentUsed": filamentUsed,
             "currentLayer": currentLayer,

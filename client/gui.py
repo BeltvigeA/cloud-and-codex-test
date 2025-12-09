@@ -3500,13 +3500,14 @@ class ListenerGuiApp:
             if status.get("remainingTimeSeconds") is not None:
                 printer["remainingTimeSeconds"] = status.get("remainingTimeSeconds")
 
-            # Temperature fields
-            if status.get("nozzleTemp") is not None:
-                printer["nozzleTemp"] = status.get("nozzleTemp")
-            if status.get("bedTemp") is not None:
-                printer["bedTemp"] = status.get("bedTemp")
-            if status.get("chamberTemp") is not None:
-                printer["chamberTemp"] = status.get("chamberTemp")
+            # Temperature fields - ALWAYS update (status_subscriber now guarantees 0.0 instead of None)
+            # This ensures printers.json and backend always receive temperature data
+            printer["nozzleTemp"] = status.get("nozzleTemp", 0.0)
+            printer["bedTemp"] = status.get("bedTemp", 0.0)
+            printer["chamberTemp"] = status.get("chamberTemp", 0.0)
+
+            # Fan speed - ALWAYS update
+            printer["fanSpeedPercent"] = status.get("fanSpeedPercent", 0.0)
 
             # Layer information
             if status.get("currentLayer") is not None:
@@ -3521,8 +3522,6 @@ class ListenerGuiApp:
                 printer["printSpeed"] = status.get("printSpeed")
             if status.get("lightState") is not None:
                 printer["lightState"] = status.get("lightState")
-            if status.get("fanSpeedPercent") is not None:
-                printer["fanSpeedPercent"] = status.get("fanSpeedPercent")
 
             # Update MQTT status
             printer["mqttStatus"] = "OK"
