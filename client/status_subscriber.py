@@ -207,6 +207,11 @@ class BambuStatusSubscriber:
         self.liveStatusCache: Dict[str, Dict[str, Any]] = {}  # {serial: status_data}
         self.liveStatusCacheLock = threading.Lock()
 
+        # MQTT reconnect tracking - for retry logic when ping succeeds but MQTT fails
+        self.mqttReconnectAttempts: Dict[str, int] = {}  # {serial: attempt_count}
+        self.mqttReconnectLock = threading.Lock()
+        self.mqttMaxReconnectAttempts = 0  # 0 = infinite retries
+
     def startAll(self, printers: Iterable[Dict[str, Any]]) -> None:
         """Start worker threads for each printer configuration."""
 
@@ -624,9 +629,36 @@ class BambuStatusSubscriber:
                 if stopEvent.is_set():
                     break
                 sanitizedMessage = self._sanitizeErrorMessage(str(error), accessCode)
-                if self._shouldLogConnectionFailure(serial):
-                    self.onError(sanitizedMessage, dict(printerConfig))
-                stopEvent.wait(self.reconnectDelay * 2)
+                
+                # Track reconnect attempts
+                with self.mqttReconnectLock:
+                    attemptCount = self.mqttReconnectAttempts.get(serial, 0) + 1
+                    self.mqttReconnectAttempts[serial] = attemptCount
+                
+                # Check if printer is still pingable (network is up)
+                printerStillReachable = self._pingHost(ipAddress, 1000)
+                
+                if printerStillReachable:
+                    # Printer is reachable but MQTT failed - send reconnecting status to GUI
+                    self._sendReconnectingStatus(
+                        serial=serial,
+                        ipAddress=ipAddress,
+                        nickname=nickname,
+                        printerConfig=printerConfig,
+                        attemptCount=attemptCount,
+                        errorMessage=sanitizedMessage,
+                    )
+                    self.log.info(
+                        f"🔄 MQTT reconnect attempt {attemptCount} for {serial} - "
+                        f"printer pingable, retrying in {self.reconnectDelay}s..."
+                    )
+                    # Wait before retry (shorter delay since we know printer is reachable)
+                    stopEvent.wait(self.reconnectDelay)
+                else:
+                    # Printer not reachable - normal error handling
+                    if self._shouldLogConnectionFailure(serial):
+                        self.onError(sanitizedMessage, dict(printerConfig))
+                    stopEvent.wait(self.reconnectDelay * 2)
             finally:
                 if printerInstance is not None:
                     safeDisconnectPrinter(printerInstance)
@@ -643,6 +675,56 @@ class BambuStatusSubscriber:
         with self.errorCountLock:
             if key in self.errorCountBySerial:
                 self.errorCountBySerial.pop(key, None)
+        # Also reset MQTT reconnect attempts counter
+        with self.mqttReconnectLock:
+            if key in self.mqttReconnectAttempts:
+                self.mqttReconnectAttempts.pop(key, None)
+
+    def _sendReconnectingStatus(
+        self,
+        serial: str,
+        ipAddress: str,
+        nickname: Optional[str],
+        printerConfig: Dict[str, Any],
+        attemptCount: int,
+        errorMessage: str,
+    ) -> None:
+        """Send a status update showing that MQTT reconnection is in progress.
+        
+        This ensures the GUI shows accurate status when ping succeeds but MQTT fails,
+        rather than showing stale/outdated information.
+        """
+        from datetime import datetime
+        
+        statusPayload = {
+            "printerSerial": serial,
+            "printerIp": ipAddress,
+            "nickname": nickname,
+            "status": "reconnecting",
+            "mqttConnected": False,
+            "mqttReconnecting": True,
+            "mqttReconnectAttempt": attemptCount,
+            "gcodeState": f"Reconnecting (attempt {attemptCount})...",
+            "lastError": errorMessage,
+            "lastUpdate": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "percentage": None,
+            "nozzleTemp": None,
+            "bedTemp": None,
+        }
+        
+        # Update live status cache with reconnecting state
+        with self.liveStatusCacheLock:
+            self.liveStatusCache[serial] = {
+                "timestamp": time.time(),
+                "data": dict(statusPayload),
+            }
+        
+        # Send to GUI via the onUpdate callback
+        try:
+            self.onUpdate(statusPayload, dict(printerConfig))
+            self.log.debug(f"Sent reconnecting status for {serial} (attempt {attemptCount})")
+        except Exception as e:
+            self.log.debug(f"Failed to send reconnecting status: {e}")
 
     def _pingHost(self, ipAddress: str, timeoutMillis: int) -> bool:
         if not ipAddress:
@@ -786,6 +868,45 @@ class BambuStatusSubscriber:
                 gcodePayload = gcodeGetter()
             except Exception as error:  # pragma: no cover - depends on SDK behaviour
                 self.log.debug("get_gcode_state failed", exc_info=error)
+
+        # CRITICAL: Fetch temperatures directly from printer methods
+        # These are NOT included in get_state() for Bambu Lab printers!
+        directTemperatures: Dict[str, Any] = {}
+        
+        # Get nozzle temperature
+        nozzleTempGetter = getattr(printer, "get_nozzle_temperature", None)
+        if callable(nozzleTempGetter):
+            try:
+                nozzleTemp = nozzleTempGetter()
+                if nozzleTemp is not None:
+                    directTemperatures["nozzleTemp"] = float(nozzleTemp)
+            except Exception:
+                pass
+        
+        # Get bed temperature
+        bedTempGetter = getattr(printer, "get_bed_temperature", None)
+        if callable(bedTempGetter):
+            try:
+                bedTemp = bedTempGetter()
+                if bedTemp is not None:
+                    directTemperatures["bedTemp"] = float(bedTemp)
+            except Exception:
+                pass
+        
+        # Get chamber temperature
+        chamberTempGetter = getattr(printer, "get_chamber_temperature", None)
+        if callable(chamberTempGetter):
+            try:
+                chamberTemp = chamberTempGetter()
+                if chamberTemp is not None:
+                    directTemperatures["chamberTemp"] = float(chamberTemp)
+            except Exception:
+                pass
+        
+        # Merge direct temperatures into printerMetadata for _normalizeSnapshot
+        if printerMetadata is None:
+            printerMetadata = {}
+        printerMetadata.update(directTemperatures)
 
         snapshot = self._normalizeSnapshot(
             statePayload,

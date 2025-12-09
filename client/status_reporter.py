@@ -224,17 +224,16 @@ class StatusReporter:
         if gcode_state:
             parsed_status["gcodeState"] = gcode_state
         if progress is not None:
-            parsed_status["jobProgress"] = max(0, min(100, progress))
-        if bed_temp is not None:
-            parsed_status["bedTemp"] = bed_temp
+            parsed_status["progressPercent"] = max(0, min(100, progress))
+        # Always include temperature fields (use 0.0 fallback if missing)
+        # The API expects these fields to always be present
+        parsed_status["bedTemp"] = bed_temp if bed_temp is not None else 0.0
         if bed_target_temp is not None:
             parsed_status["bedTargetTemp"] = bed_target_temp
-        if nozzle_temp is not None:
-            parsed_status["nozzleTemp"] = nozzle_temp
+        parsed_status["nozzleTemp"] = nozzle_temp if nozzle_temp is not None else 0.0
         if nozzle_target_temp is not None:
             parsed_status["nozzleTargetTemp"] = nozzle_target_temp
-        if chamber_temp is not None:
-            parsed_status["chamberTemp"] = chamber_temp
+        parsed_status["chamberTemp"] = chamber_temp if chamber_temp is not None else 0.0
         if fan_speed is not None:
             parsed_status["fanSpeed"] = max(0, min(100, int(fan_speed)))
         if print_speed is not None:
@@ -248,7 +247,7 @@ class StatusReporter:
         if total_layers is not None:
             parsed_status["totalLayers"] = int(total_layers)
         if remaining_time is not None:
-            parsed_status["timeRemaining"] = int(remaining_time)
+            parsed_status["remainingTimeSeconds"] = int(remaining_time)
 
         return parsed_status
 
@@ -293,14 +292,17 @@ class StatusReporter:
         # Add ping status to parsed data
         parsed_status["pingStatus"] = ping_result.get("status", "unknown")
 
-        # Build payload
+        # Build payload - flatten parsed_status to top level (API expects flat structure)
         payload = {
             "recipientId": self.recipient_id,
             "printerSerial": printer_serial,
             "printerIpAddress": printer_ip,
             "pingStatus": ping_result.get("status", "unknown"),
-            "status": parsed_status,
         }
+        
+        # Merge parsed status fields into top-level payload (not nested)
+        # The API expects: nozzleTemp, bedTemp, etc. at the root level
+        payload.update(parsed_status)
 
         # Send to backend
         try:
@@ -312,7 +314,7 @@ class StatusReporter:
 
             # Simplified logging - only IP, status, and progress
             status_str = parsed_status.get('status', 'UNKNOWN')
-            progress = parsed_status.get('jobProgress')
+            progress = parsed_status.get('progressPercent')
             
             if progress is not None:
                 self.log.info(f"Status update: {printer_ip} | {status_str} | {progress}%")

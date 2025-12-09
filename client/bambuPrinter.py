@@ -978,12 +978,16 @@ def postStatus(status: Dict[str, Any], printerConfig: Dict[str, Any]) -> None:
         parsedStatus.setdefault("remainingTimeSeconds", parsedStatus.get("timeRemaining"))
 
     # Build payload with all required fields for PostgreSQL backend
+    # CRITICAL: API expects FLAT structure, not nested "status" object
     payload = {
         "recipientId": recipientId,
         "printerIpAddress": printerConfig.get("ipAddress"),  # CRITICAL: Required for matching
         "printerSerial": printerConfig.get("serialNumber"),
-        "status": parsedStatus,
     }
+
+    # Merge parsedStatus fields into top-level payload (not nested)
+    # The API expects: nozzleTemp, bedTemp, progressPercent, etc. at the root level
+    payload.update(parsedStatus)
 
     # Add organizationId if available
     if organizationId:

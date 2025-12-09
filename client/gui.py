@@ -1295,7 +1295,7 @@ class ListenerGuiApp:
         try:
             self.printerStoragePath.parent.mkdir(parents=True, exist_ok=True)
             with self.printerStoragePath.open("w", encoding="utf-8") as printerFile:
-                json.dump(self.printers, printerFile, ensure_ascii=False, indent=2)
+                json.dump(self.printers, printerFile, ensure_ascii=False, indent=2, default=str)
         except OSError as error:
             logging.exception("Failed to save printers: %s", error)
             messagebox.showerror("Printer Storage", f"Unable to save printers: {error}")
