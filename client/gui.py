@@ -606,6 +606,12 @@ class ListenerGuiApp:
             command=self._refreshPrintJobData
         ).pack(side=tk.LEFT, padx=6)
 
+        ttk.Button(
+            buttonFrame,
+            text="Force send status oppdatering",
+            command=self._forceStatusUpdate
+        ).pack(side=tk.LEFT, padx=6)
+
         # Search frame
         searchFrame = ttk.Frame(parent)
         searchFrame.grid(row=1, column=0, sticky=tk.EW, padx=8, pady=(0, 4))
@@ -4322,6 +4328,234 @@ class ListenerGuiApp:
         self._refreshAllPrinterInfo()
         # Also refresh the tree after a short delay to ensure data is updated
         self.root.after(2000, self._refreshPrintJobTree)
+
+    def _forceStatusUpdate(self) -> None:
+        """Force send status update for all printers displayed in the Print Job tab.
+        
+        This sends all status data shown in the Print Job table except bed image.
+        Uses the StatusReporter to send updates, bypassing rate limiting.
+        """
+        import requests
+        from datetime import datetime
+        
+        # Get API key and backend URL from config
+        api_key = self.config_manager.get_api_key()
+        recipient_id = self.config_manager.get_recipient_id()
+        backend_url = self.config_manager.get_backend_url()
+        
+        if not api_key or not recipient_id or not backend_url:
+            messagebox.showerror(
+                "Konfigurasjonsfeil",
+                "API-nøkkel, mottaker-ID eller backend-URL mangler. Sjekk innstillingene."
+            )
+            return
+        
+        # Count the number of printers to update
+        printers_to_update = []
+        
+        for printer in self.printers:
+            serialNumber = str(printer.get("serialNumber") or "").strip()
+            ipAddress = str(printer.get("ipAddress") or "").strip()
+            
+            if not serialNumber or not ipAddress:
+                continue
+            
+            # Get extended status data from cache
+            data = None
+            if "extendedStatus" in printer:
+                data = printer["extendedStatus"]
+            elif serialNumber in self.printerInfoCache:
+                data = self.printerInfoCache[serialNumber].get("data")
+            
+            printers_to_update.append((printer, serialNumber, ipAddress, data))
+        
+        if not printers_to_update:
+            messagebox.showinfo(
+                "Ingen printere",
+                "Ingen printere med tilstrekkelig data funnet for statusoppdatering."
+            )
+            return
+        
+        # Ask user for confirmation
+        confirm = messagebox.askyesno(
+            "Force Status Oppdatering",
+            f"Vil du sende statusoppdatering for {len(printers_to_update)} printer(e)?\n\n"
+            "Dette sender all dataen som vises i Print Job tabellen (unntatt bed image) til backend."
+        )
+        
+        if not confirm:
+            return
+        
+        # Send status updates
+        success_count = 0
+        failed_count = 0
+        
+        for printer, serialNumber, ipAddress, data in printers_to_update:
+            try:
+                # Build status payload from cached data (excluding bed image)
+                status_payload = self._buildStatusPayloadFromPrintJobData(printer, data)
+                
+                # Build full request payload
+                payload = {
+                    "recipientId": recipient_id,
+                    "printerSerial": serialNumber,
+                    "printerIpAddress": ipAddress,
+                    "pingStatus": printer.get("pingStatus", "unknown"),
+                    "status": status_payload,
+                    "forcedUpdate": True,  # Mark as forced update
+                }
+                
+                # Send to backend
+                url = f"{backend_url.rstrip('/')}/api/printer-status/update"
+                headers = {
+                    "Content-Type": "application/json",
+                    "X-API-Key": api_key,
+                }
+                
+                response = requests.post(url, json=payload, headers=headers, timeout=10)
+                
+                if response.status_code == 200:
+                    success_count += 1
+                    logging.info(f"Force status update sent for {serialNumber}: HTTP 200")
+                else:
+                    failed_count += 1
+                    logging.warning(f"Force status update failed for {serialNumber}: HTTP {response.status_code}")
+                    
+            except requests.RequestException as error:
+                failed_count += 1
+                logging.error(f"Failed to send force status update for {serialNumber}: {error}")
+            except Exception as error:
+                failed_count += 1
+                logging.exception(f"Unexpected error sending force status update for {serialNumber}: {error}")
+        
+        # Show result
+        if failed_count == 0:
+            messagebox.showinfo(
+                "Force Status Oppdatering",
+                f"Statusoppdatering sendt for {success_count} printer(e)."
+            )
+        else:
+            messagebox.showwarning(
+                "Force Status Oppdatering",
+                f"Statusoppdatering sendt for {success_count} printer(e).\n"
+                f"{failed_count} mislyktes."
+            )
+        
+        self.log(f"Force status update: {success_count} ok, {failed_count} failed")
+
+    def _buildStatusPayloadFromPrintJobData(
+        self,
+        printer: Dict[str, Any],
+        data: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Build status payload from Print Job data for force update.
+        
+        Extracts all relevant fields shown in Print Job treeview except bed image.
+        
+        Args:
+            printer: Printer configuration dict
+            data: Extended status data from cache (or None if not available)
+            
+        Returns:
+            Status payload ready for backend API
+        """
+        from datetime import datetime, timezone
+        
+        # Build status dictionary
+        status: Dict[str, Any] = {}
+        
+        if data and "error" not in data:
+            print_info = data.get("print_info", {})
+            progress = data.get("progress", {})
+            temperatures = data.get("temperatures", {})
+            misc = data.get("misc", {})
+            mqtt_client = data.get("mqtt_client", {})
+            
+            # Map print job data to status fields
+            status["state"] = self._safeValue(print_info.get("current_state"), "UNKNOWN")
+            status["status"] = status["state"]
+            status["gcodeState"] = self._safeValue(print_info.get("gcode_state"), "")
+            
+            # Progress
+            percentage = self._safeValue(progress.get("percentage"), 0)
+            if percentage is not None:
+                status["jobProgress"] = max(0, min(100, float(percentage)))
+            
+            time_remaining = self._safeValue(progress.get("time_remaining"), 0)
+            if time_remaining is not None:
+                status["timeRemaining"] = int(time_remaining)
+            
+            current_layer = self._safeValue(progress.get("current_layer"), None)
+            if current_layer is not None:
+                status["currentLayer"] = int(current_layer)
+            
+            total_layers = self._safeValue(progress.get("total_layers"), None)
+            if total_layers is not None:
+                status["totalLayers"] = int(total_layers)
+            
+            # Temperatures
+            nozzle_temp = self._safeValue(temperatures.get("nozzle"), None)
+            if nozzle_temp is not None:
+                status["nozzleTemp"] = float(nozzle_temp)
+            
+            bed_temp = self._safeValue(temperatures.get("bed"), None)
+            if bed_temp is not None:
+                status["bedTemp"] = float(bed_temp)
+            
+            chamber_temp = self._safeValue(temperatures.get("chamber"), None)
+            if chamber_temp is not None:
+                status["chamberTemp"] = float(chamber_temp)
+            
+            # Misc
+            print_speed = self._safeValue(misc.get("print_speed"), None)
+            if print_speed is not None:
+                status["speedPercentage"] = int(print_speed)
+            
+            light_state = self._safeValue(misc.get("light_state"), None)
+            if light_state is not None:
+                status["lightOn"] = light_state.lower() == "on" if isinstance(light_state, str) else bool(light_state)
+            
+            skipped_objects = self._safeValue(misc.get("skipped_objects"), [])
+            if skipped_objects:
+                status["skippedObjects"] = skipped_objects
+            
+            # Fan speed
+            chamber_fan_speed = self._safeValue(mqtt_client.get("chamber_fan_speed"), None)
+            if chamber_fan_speed is not None:
+                status["fanSpeed"] = int(chamber_fan_speed)
+            
+            # File info
+            file_name = self._safeValue(print_info.get("file_name"), "")
+            if file_name:
+                status["fileName"] = str(file_name)
+            
+            gcode_file = self._safeValue(print_info.get("gcode_file"), "")
+            if gcode_file:
+                status["gcodeFile"] = str(gcode_file)
+            
+            # Print type and error code
+            print_type = self._safeValue(print_info.get("print_type"), "")
+            if print_type:
+                status["printType"] = str(print_type)
+            
+            print_error_code = self._safeValue(print_info.get("print_error_code"), 0)
+            if print_error_code:
+                status["errorCode"] = str(print_error_code)
+        else:
+            # No data available or has error
+            status["state"] = "UNKNOWN"
+            status["status"] = "UNKNOWN"
+            if data and "error" in data:
+                status["errorMessage"] = str(data["error"])
+        
+        # Add timestamp
+        status["lastUpdateTimestamp"] = datetime.now(timezone.utc).isoformat()
+        
+        # Add ping status from printer config
+        ping_status = printer.get("pingStatus", "unknown")
+        status["pingStatus"] = ping_status
+        
+        return status
 
     def _getLatestBedImagePath(self, serialNumber: str) -> Optional[Path]:
         """Get the path to the latest bed reference image for a printer.
