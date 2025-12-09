@@ -193,7 +193,12 @@ class BambuStatusSubscriber:
         self.mqttDumpCache: Dict[str, Dict[str, Any]] = {}  # {serial: {timestamp, data}}
         self.mqttDumpCacheLock = threading.Lock()
         self.mqttDumpInterval = 60.0  # 60 seconds between full mqtt_dump calls
+        self.mqttDumpRetryInterval = 5.0  # 5 seconds retry on failure
         self.lastMqttDumpTime: Dict[str, float] = {}  # {serial: timestamp}
+
+        # Stale connection detection
+        self.connectionStaleTimeout = 60.0  # Force reconnect if no data for 60s
+
 
         # Optional callback for mqtt_dump updates
         self.onMqttDump: Optional[Callable[[Dict[str, Any], Dict[str, Any]], None]] = None
@@ -302,8 +307,7 @@ class BambuStatusSubscriber:
                 printerMetadata = self._fetchPrinterMetadata(printerInstance)
                 lastBase44Comparable: Optional[Dict[str, Any]] = None
                 lastBase44Emit = 0.0
-                lastErrorComparable: Optional[Dict[str, Any]] = None
-                lastErrorEmit = 0.0
+                lastSuccessfulStateTime = time.monotonic()
 
                 while not stopEvent.is_set():
                     resolvedApiKey = self._resolveBase44ApiKey(printerConfig)
@@ -317,6 +321,18 @@ class BambuStatusSubscriber:
                     statusPayload["nickname"] = nickname
                     statusPayload["status"] = statusPayload.get("status") or "update"
 
+                    # Check for valid data to reset stale timer
+                    current_monotonic = time.monotonic()
+                    # We consider it valid if we have non-empty gcode state or temperatures
+                    if statusPayload.get("gcodeState") or statusPayload.get("nozzleTemp"):
+                        lastSuccessfulStateTime = current_monotonic
+                    
+                    # STALE CONNECTION CHECK
+                    if current_monotonic - lastSuccessfulStateTime > self.connectionStaleTimeout:
+                        self.log.warning(f"⚠️  No valid data from {serial} for {self.connectionStaleTimeout}s - forcing reconnect")
+                        # Break inner loop to trigger reconnection in outer loop
+                        break
+
                     # ============================================
                     # UPDATE LIVE STATUS CACHE
                     # ============================================
@@ -327,12 +343,24 @@ class BambuStatusSubscriber:
                         }
 
                     # ============================================
-                    # PERIODIC MQTT DUMP (every 60 seconds)
+                    # PERIODIC MQTT DUMP (Smart Retry: 60s normal, 5s retry)
                     # ============================================
-                    currentTime = time.monotonic()
                     lastDumpTime = self.lastMqttDumpTime.get(serial, 0.0)
                     
-                    if currentTime - lastDumpTime >= self.mqttDumpInterval:
+                    # Determine interval based on whether last attempt was successful (we can infer this if needed, 
+                    # but simpler is to check if we have cached data recently)
+                    # For now, we utilize the loop variable logic:
+                    # If we failed last time, we want to retry sooner.
+                    
+                    # We use a localized variable for next check interval if not tracked in class
+                    # But better: Check if cache has recent data
+                    
+                    currentInterval = self.mqttDumpInterval
+                    
+                    # logic: If time since last dump > interval, try again.
+                    # But if we failed, we want 'lastDumpTime' to be set so that next check is in 5 seconds.
+                    
+                    if current_monotonic - lastDumpTime >= self.mqttDumpInterval:
                         try:
                             mqttDumpGetter = getattr(printerInstance, "mqtt_dump", None)
                             if callable(mqttDumpGetter):
@@ -349,28 +377,37 @@ class BambuStatusSubscriber:
                                             "data": mqttDumpData,
                                         }
                                     
-                                    # Add mqtt_dump to status payload for this cycle
                                     statusPayload["mqttDump"] = mqttDumpData
                                     statusPayload["mqttDumpTimestamp"] = dumpTimestamp
                                     
                                     self.log.info(f"✅ mqtt_dump cached for {serial}")
                                     
-                                    # Call optional callback if registered
                                     if self.onMqttDump:
                                         try:
                                             self.onMqttDump(
                                                 {"serial": serial, "timestamp": dumpTimestamp, "data": mqttDumpData},
                                                 printerConfig,
                                             )
-                                        except Exception as callbackErr:
-                                            self.log.debug(f"mqtt_dump callback failed: {callbackErr}")
+                                        except Exception as calbackErr:
+                                            self.log.debug(f"mqtt_dump callback failed: {calbackErr}")
+                                    
+                                    # Success: Wait full interval
+                                    self.lastMqttDumpTime[serial] = current_monotonic
                                 else:
                                     self.log.debug(f"mqtt_dump returned empty for {serial}")
-                                    
-                            self.lastMqttDumpTime[serial] = currentTime
+                                    # Empty result: Retry sooner
+                                    # Set last time so that (now - last) approx equals (interval - retry_interval)
+                                    # resulting in waiting 'retry_interval' seconds from now
+                                    self.lastMqttDumpTime[serial] = current_monotonic - (self.mqttDumpInterval - self.mqttDumpRetryInterval)
+                                    self.log.info(f"   Empty dump. Retrying in {self.mqttDumpRetryInterval}s...")
+                            else:
+                                self.lastMqttDumpTime[serial] = current_monotonic
+                                
                         except Exception as dumpErr:
                             self.log.warning(f"mqtt_dump failed for {serial}: {dumpErr}")
-                            self.lastMqttDumpTime[serial] = currentTime  # Don't retry immediately
+                            # Failure: Retry sooner
+                            self.lastMqttDumpTime[serial] = current_monotonic - (self.mqttDumpInterval - self.mqttDumpRetryInterval)
+                            self.log.info(f"   Dump failed. Retrying in {self.mqttDumpRetryInterval}s...")
 
                     # ============================================
                     # ENHANCED HMS ERROR DETECTION AND REPORTING
