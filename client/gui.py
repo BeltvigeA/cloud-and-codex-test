@@ -83,7 +83,13 @@ from .autoprint.brake_flow import BrakeFlowContext
 from .bambuPrinter import BambuPrintOptions, postStatus, sendBambuPrintJob
 from .status_subscriber import BambuStatusSubscriber
 from .command_controller import CommandWorker
-from .printflow import PrintCompletionMonitor, CompletionResult
+from .printflow import PrintCompletionMonitor, CompletionResult, PrintJobTracker, TrackedJob, JobStatus
+try:
+    from .event_reporter import EventReporter
+    _event_reporter_available = True
+except ImportError:
+    _event_reporter_available = False
+    EventReporter = None
 from .client import (
     appendJsonLogEntry,
     buildBaseUrl,
@@ -101,6 +107,7 @@ from .client import (
 from .config_manager import get_config_manager
 from .settings_window import show_settings_dialog
 from .heartbeat import HeartbeatWorker
+
 
 
 def loadPrinters() -> list[Dict[str, Any]]:
@@ -214,6 +221,29 @@ class ListenerGuiApp:
             debounce_count=2,
         )
 
+        # Print job tracker for logging all jobs
+        self.jobTracker = PrintJobTracker(
+            logger=logging.getLogger(__name__),
+            on_job_ended=self._onJobEnded,
+        )
+
+        # Event reporter for sending events to backend
+        self._eventReporter: Optional[Any] = None
+        if _event_reporter_available:
+            try:
+                api_key = self.config_manager.get_api_key() or ""
+                recipient_id = self.config_manager.get_recipient_id() or ""
+                backend_url = self.config_manager.get_backend_url() or "https://printpro3d-api-931368217793.europe-west1.run.app"
+                if api_key and recipient_id:
+                    self._eventReporter = EventReporter(
+                        base_url=backend_url,
+                        api_key=api_key,
+                        recipient_id=recipient_id,
+                    )
+                    logging.info("EventReporter initialized for Print Log")
+            except Exception as e:
+                logging.warning(f"Failed to initialize EventReporter: {e}")
+
         # Printer Info cache and polling
         self.printerInfoCache: Dict[str, Dict[str, Any]] = {}  # serial -> {timestamp, data}
         self.printerInfoPollingThread: Optional[threading.Thread] = None
@@ -325,6 +355,10 @@ class ListenerGuiApp:
         printJobFrame = ttk.Frame(notebook)
         notebook.add(printJobFrame, text="Print Job")
         self._buildPrintJobTab(printJobFrame)
+
+        printLogFrame = ttk.Frame(notebook)
+        notebook.add(printLogFrame, text="Print Log")
+        self._buildPrintLogTab(printLogFrame)
 
     def _buildListenerTab(self, parent: ttk.Frame, paddingOptions: Dict[str, int]) -> None:
         self.baseUrlVar = tk.StringVar(value=hardcodedBaseUrl)
@@ -784,6 +818,174 @@ class ListenerGuiApp:
 
         # Auto-refresh when printer info is updated
         # This will be called from _refreshAllPrinterInfo and polling
+
+    def _buildPrintLogTab(self, parent: ttk.Frame) -> None:
+        """Build the Print Log tab showing all print jobs with status and sent indicators."""
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(1, weight=1)
+
+        # Header frame
+        headerFrame = ttk.Frame(parent)
+        headerFrame.grid(row=0, column=0, sticky=tk.EW, padx=8, pady=8)
+        headerFrame.columnconfigure(0, weight=1)
+
+        infoLabel = ttk.Label(
+            headerFrame,
+            text="Logg over alle print-jobber med status. Ferdige jobber sendes automatisk til backend.",
+            font=("TkDefaultFont", 9)
+        )
+        infoLabel.grid(row=0, column=0, sticky=tk.W, padx=6)
+
+        # Control buttons
+        buttonFrame = ttk.Frame(headerFrame)
+        buttonFrame.grid(row=0, column=1, sticky=tk.E, padx=6)
+
+        ttk.Button(
+            buttonFrame,
+            text="Oppdater",
+            command=self._refreshPrintLogTree
+        ).pack(side=tk.LEFT, padx=6)
+
+        ttk.Button(
+            buttonFrame,
+            text="Tøm logg",
+            command=self._clearPrintLog
+        ).pack(side=tk.LEFT, padx=6)
+
+        # Treeview frame
+        treeFrame = ttk.Frame(parent)
+        treeFrame.grid(row=1, column=0, sticky=tk.NSEW, padx=8, pady=(0, 8))
+        treeFrame.columnconfigure(0, weight=1)
+        treeFrame.rowconfigure(0, weight=1)
+
+        # Create treeview with columns
+        columns = (
+            "printer",
+            "file_name",
+            "status",
+            "started_at",
+            "finished_at",
+            "sent",
+        )
+
+        self.printLogTree = ttk.Treeview(
+            treeFrame,
+            columns=columns,
+            show="headings",
+            selectmode="browse"
+        )
+
+        # Configure headings
+        self.printLogTree.heading("printer", text="Printer")
+        self.printLogTree.heading("file_name", text="Fil")
+        self.printLogTree.heading("status", text="Status")
+        self.printLogTree.heading("started_at", text="Startet")
+        self.printLogTree.heading("finished_at", text="Avsluttet")
+        self.printLogTree.heading("sent", text="Sendt")
+
+        # Configure column widths
+        self.printLogTree.column("printer", width=150)
+        self.printLogTree.column("file_name", width=250)
+        self.printLogTree.column("status", width=100)
+        self.printLogTree.column("started_at", width=100)
+        self.printLogTree.column("finished_at", width=100)
+        self.printLogTree.column("sent", width=60)
+
+        # Scrollbar
+        scrollbar = ttk.Scrollbar(treeFrame, orient=tk.VERTICAL, command=self.printLogTree.yview)
+        self.printLogTree.configure(yscrollcommand=scrollbar.set)
+        self.printLogTree.grid(row=0, column=0, sticky=tk.NSEW)
+        scrollbar.grid(row=0, column=1, sticky=tk.NS)
+
+        # Configure row colors for status
+        self.printLogTree.tag_configure("printing", background="#e3f2fd")  # Light blue
+        self.printLogTree.tag_configure("finished", background="#e8f5e9")  # Light green
+        self.printLogTree.tag_configure("cancelled", background="#ffebee")  # Light red
+
+        # Initial populate
+        self._refreshPrintLogTree()
+
+    def _refreshPrintLogTree(self) -> None:
+        """Refresh the print log treeview with current job data."""
+        # Clear existing items
+        for item in self.printLogTree.get_children():
+            self.printLogTree.delete(item)
+
+        # Get all jobs from tracker
+        jobs = self.jobTracker.get_all_jobs()
+
+        # Insert jobs
+        for job in jobs:
+            # Find printer nickname
+            printer_name = job.printer_serial
+            for printer in self.printers:
+                if printer.get("serialNumber") == job.printer_serial:
+                    printer_name = printer.get("nickname") or job.printer_serial
+                    break
+
+            # Format status for display
+            status_display = {
+                JobStatus.PRINTING: "Printer...",
+                JobStatus.FINISHED: "Ferdig",
+                JobStatus.CANCELLED: "Avbrutt",
+            }.get(job.status, job.status.value)
+
+            values = (
+                printer_name,
+                job.file_name,
+                status_display,
+                job.started_at.strftime("%H:%M:%S") if job.started_at else "",
+                job.finished_at.strftime("%H:%M:%S") if job.finished_at else "",
+                "✓" if job.sent_to_backend else "",
+            )
+
+            self.printLogTree.insert(
+                "",
+                0,  # Insert at top (newest first)
+                values=values,
+                tags=(job.status.value,)
+            )
+
+    def _clearPrintLog(self) -> None:
+        """Clear the print log (only in memory, keeps tracker for new events)."""
+        # Just refresh the tree - the tracker maintains its own state
+        self._refreshPrintLogTree()
+
+    def _onJobEnded(self, job: TrackedJob) -> None:
+        """Callback when a job ends - send event to backend and update GUI."""
+        # Send to backend
+        if self._eventReporter and job.status in (JobStatus.FINISHED, JobStatus.CANCELLED):
+            try:
+                if job.status == JobStatus.FINISHED:
+                    event_id = self._eventReporter.report_job_completed(
+                        printer_serial=job.printer_serial,
+                        printer_ip=job.printer_ip,
+                        print_job_id=job.job_id,
+                        file_name=job.file_name,
+                    )
+                else:  # CANCELLED
+                    event_id = self._eventReporter.report_job_failed(
+                        printer_serial=job.printer_serial,
+                        printer_ip=job.printer_ip,
+                        print_job_id=job.job_id,
+                        file_name=job.file_name,
+                        error_message="Job cancelled",
+                    )
+
+                if event_id:
+                    self.jobTracker.mark_as_sent(job.printer_serial, job.job_id, event_id)
+                    logging.info(f"[print-log] Event sent to backend: {event_id[:8] if event_id else 'N/A'}")
+                else:
+                    logging.warning("[print-log] Backend returned no event_id")
+
+            except Exception as error:
+                logging.error(f"[print-log] Failed to send event to backend: {error}")
+
+        # Schedule GUI refresh on main thread
+        try:
+            self.root.after(0, self._refreshPrintLogTree)
+        except Exception:
+            pass
 
     def _registerPrintersConfigListener(self) -> None:
         try:
@@ -2057,6 +2259,7 @@ class ListenerGuiApp:
         connectionMethod = connectionMethodVar.get().strip().lower()
         accessCode = accessCodeVar.get().strip()
 
+
         if not nickname or not ipAddress:
             messagebox.showerror(
                 "Printer Details",
@@ -2248,11 +2451,12 @@ class ListenerGuiApp:
             """Refresh-knapp callback"""
             refreshButton.config(state=tk.DISABLED)
             threading.Thread(target=fetchData, daemon=True).start()
-
+        
+        # Start henting automatisk
+        onRefresh()
+        # Bind knapp
         refreshButton.config(command=onRefresh)
 
-        # Start data-henting i bakgrunnen
-        threading.Thread(target=fetchData, daemon=True).start()
 
     def _captureSelectedBedReference(self) -> None:
         """
@@ -3197,6 +3401,14 @@ class ListenerGuiApp:
         except Exception:
             logging.debug("Failed to post status from subscriber", exc_info=True)
 
+        # Track job in job tracker
+        try:
+            serial = str(printerConfigCopy.get("serialNumber") or "")
+            ip = str(printerConfigCopy.get("ipAddress") or "")
+            self.jobTracker.update_from_status(serial, ip, statusCopy)
+        except Exception:
+            logging.debug("Job tracking update failed", exc_info=True)
+
         # Check for print completion
         try:
             serial = str(printerConfigCopy.get("serialNumber") or "")
@@ -3208,19 +3420,35 @@ class ListenerGuiApp:
         except Exception:
             logging.debug("Print completion check failed", exc_info=True)
 
+        # Check for cancelled/failed state
+        try:
+            gcode_state = statusCopy.get("gcodeState") or statusCopy.get("gcode_state") or ""
+            if PrintJobTracker.is_cancelled_state(gcode_state):
+                job_id = statusCopy.get("currentJobId") or statusCopy.get("job_id")
+                if job_id:
+                    serial = str(printerConfigCopy.get("serialNumber") or "")
+                    self.jobTracker.cancel_job(serial, job_id)
+        except Exception:
+            logging.debug("Cancel detection failed", exc_info=True)
+
         try:
             self.root.after(0, lambda: self._applyLiveStatusUpdate(statusCopy, printerConfigCopy))
         except Exception:
             logging.exception("Unable to schedule GUI update for printer status")
 
     def _onPrintCompleted(self, result: CompletionResult) -> None:
-        """Handle print completion event - log and notify user."""
+        """Handle print completion event - log, notify user, and update job tracker."""
         printer_serial = result.printer_serial or "unknown"
         file_name = result.file_name or "unknown"
-        job_id = result.job_id[:8] if result.job_id else "N/A"
+        job_id = result.job_id or ""
+        job_id_display = job_id[:8] if job_id else "N/A"
+        
+        # Mark job as finished in tracker (this triggers backend report via _onJobEnded)
+        if job_id:
+            self.jobTracker.finish_job(printer_serial, job_id)
         
         # Log to console
-        log_message = f"✅ PRINT FERDIG: {printer_serial} - {file_name} (job: {job_id})"
+        log_message = f"PRINT FERDIG: {printer_serial} - {file_name} (job: {job_id_display})"
         self.logQueue.put(log_message)
         logging.info(log_message)
         
@@ -3229,7 +3457,7 @@ class ListenerGuiApp:
             try:
                 messagebox.showinfo(
                     "Print Ferdig!",
-                    f"Printer: {printer_serial}\nFil: {file_name}\nJob ID: {job_id}",
+                    f"Printer: {printer_serial}\nFil: {file_name}\nJob ID: {job_id_display}",
                     parent=self.root
                 )
             except Exception:
