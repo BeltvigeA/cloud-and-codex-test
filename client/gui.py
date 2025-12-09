@@ -3233,21 +3233,92 @@ class ListenerGuiApp:
             if str(printer.get("serialNumber") or "").strip() != serial:
                 continue
             printer["status"] = mappedStatus
+            printer["pingStatus"] = "OK"  # If we receive live status, printer is reachable
+
+            # Basic status fields
             if "gcodeState" in status:
                 printer["gcodeState"] = status.get("gcodeState")
             if status.get("progressPercent") is not None:
                 printer["progressPercent"] = status.get("progressPercent")
             if status.get("remainingTimeSeconds") is not None:
                 printer["remainingTimeSeconds"] = status.get("remainingTimeSeconds")
+
+            # Temperature fields
             if status.get("nozzleTemp") is not None:
                 printer["nozzleTemp"] = status.get("nozzleTemp")
             if status.get("bedTemp") is not None:
                 printer["bedTemp"] = status.get("bedTemp")
+            if status.get("chamberTemp") is not None:
+                printer["chamberTemp"] = status.get("chamberTemp")
+
+            # Layer information
+            if status.get("currentLayer") is not None:
+                printer["currentLayer"] = status.get("currentLayer")
+            if status.get("totalLayers") is not None:
+                printer["totalLayers"] = status.get("totalLayers")
+
+            # Print details
+            if status.get("fileName") is not None:
+                printer["fileName"] = status.get("fileName")
+            if status.get("printSpeed") is not None:
+                printer["printSpeed"] = status.get("printSpeed")
+            if status.get("lightState") is not None:
+                printer["lightState"] = status.get("lightState")
+            if status.get("fanSpeedPercent") is not None:
+                printer["fanSpeedPercent"] = status.get("fanSpeedPercent")
+
+            # Update MQTT status
+            printer["mqttStatus"] = "OK"
+
+            # Store raw live status for Print Job tab
+            printer["liveStatus"] = status
+            printer["liveStatusTimestamp"] = time.time()
+
+            # If mqtt_dump is included, update extendedStatus
+            if status.get("mqttDump"):
+                printer["extendedStatus"] = {
+                    "mqtt_status": {"connected": True, "ready": True},
+                    "mqtt_dump": status.get("mqttDump"),
+                }
+                printer["extendedStatusTimestamp"] = status.get("mqttDumpTimestamp")
+
+                # Also update printerInfoCache
+                self.printerInfoCache[serial] = {
+                    "timestamp": status.get("mqttDumpTimestamp"),
+                    "data": {
+                        "mqtt_status": {"connected": True, "ready": True},
+                        "mqtt_dump": status.get("mqttDump"),
+                        "print_info": {
+                            "current_state": status.get("gcodeState"),
+                            "file_name": status.get("fileName"),
+                            "gcode_state": status.get("gcodeState"),
+                        },
+                        "progress": {
+                            "percentage": status.get("progressPercent"),
+                            "time_remaining": status.get("remainingTimeSeconds"),
+                            "current_layer": status.get("currentLayer"),
+                            "total_layers": status.get("totalLayers"),
+                        },
+                        "temperatures": {
+                            "nozzle": status.get("nozzleTemp"),
+                            "bed": status.get("bedTemp"),
+                            "chamber": status.get("chamberTemp"),
+                        },
+                        "misc": {
+                            "print_speed": status.get("printSpeed"),
+                            "light_state": status.get("lightState"),
+                        },
+                    },
+                }
+
             updated = True
             break
 
         if updated:
             self._refreshPrinterList()
+            # Also refresh Print Job tree if it exists
+            if hasattr(self, 'printJobTree'):
+                self.root.after(100, self._refreshPrintJobTree)
 
         alertCode = str(status.get("hmsCode") or "").strip()
         alertMessage = str(status.get("errorMessage") or "").strip()
@@ -3969,6 +4040,18 @@ class ListenerGuiApp:
                     "blue"
                 )
 
+                # Check ping first - skip MQTT if printer is not reachable
+                pingStatus = self._checkPingStatus(ipAddress)
+                if pingStatus != "OK":
+                    self.log(f"⚠ Hopper over {nickname} - ping feilet (IP ikke nåbar)")
+                    # Update printer status to indicate ping failure
+                    for idx, p in enumerate(self.printers):
+                        if str(p.get("serialNumber") or "").strip() == serialNumber:
+                            self.printers[idx]["pingStatus"] = pingStatus
+                            self.printers[idx]["mqttStatus"] = "Ikke tilgjengelig (ping feilet)"
+                            break
+                    continue
+
                 try:
                     data = self._fetchBambuExtendedStatus(ipAddress, serialNumber, accessCode)
                     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -3983,6 +4066,7 @@ class ListenerGuiApp:
                         if str(p.get("serialNumber") or "").strip() == serialNumber:
                             self.printers[idx]["extendedStatus"] = data
                             self.printers[idx]["extendedStatusTimestamp"] = timestamp
+                            self.printers[idx]["pingStatus"] = "OK"  # Update ping status on success
                             # Update MQTT status from extendedStatus
                             if isinstance(data, dict) and "error" not in data:
                                 mqtt_status = data.get("mqtt_status", {})
@@ -4079,6 +4163,18 @@ class ListenerGuiApp:
                     "blue"
                 )
 
+                # Check ping first - skip MQTT if printer is not reachable
+                pingStatus = self._checkPingStatus(ipAddress)
+                if pingStatus != "OK":
+                    logging.info(f"Skipping {nickname} - ping failed (IP not reachable)")
+                    # Update printer status to indicate ping failure
+                    for idx, p in enumerate(self.printers):
+                        if str(p.get("serialNumber") or "").strip() == serialNumber:
+                            self.printers[idx]["pingStatus"] = pingStatus
+                            self.printers[idx]["mqttStatus"] = "Ikke tilgjengelig (ping feilet)"
+                            break
+                    continue
+
                 try:
                     data = self._fetchBambuExtendedStatus(ipAddress, serialNumber, accessCode)
                     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -4093,6 +4189,7 @@ class ListenerGuiApp:
                         if str(p.get("serialNumber") or "").strip() == serialNumber:
                             self.printers[idx]["extendedStatus"] = data
                             self.printers[idx]["extendedStatusTimestamp"] = timestamp
+                            self.printers[idx]["pingStatus"] = "OK"  # Update ping status on success
                             # Update MQTT status from extendedStatus
                             if isinstance(data, dict) and "error" not in data:
                                 mqtt_status = data.get("mqtt_status", {})
@@ -4180,7 +4277,11 @@ class ListenerGuiApp:
             elif serialNumber and serialNumber in self.printerInfoCache:
                 data = self.printerInfoCache[serialNumber].get("data")
 
-            # Extract values with defaults for missing data
+            # Get live status data for real-time fields (preferred source for temps, progress, speed)
+            liveStatus = printer.get("liveStatus", {})
+            hasLiveData = bool(liveStatus)
+
+            # Extract values - use live data for real-time fields, cached for details
             if data and "error" not in data:
                 print_info = data.get("print_info", {})
                 progress = data.get("progress", {})
@@ -4194,23 +4295,40 @@ class ListenerGuiApp:
                 gcode_state = self._safeValue(print_info.get("gcode_state"), "unknown")
                 gcode_file = self._safeValue(print_info.get("gcode_file"), "")
                 print_error_code = self._safeValue(print_info.get("print_error_code"), 0)
-                percentage = self._safeValue(progress.get("percentage"), 0)
-                time_remaining = self._safeValue(progress.get("time_remaining"), 0)
-                current_layer = self._safeValue(progress.get("current_layer"), 0)
-                total_layers = self._safeValue(progress.get("total_layers"), 0)
-                nozzle = self._safeValue(temperatures.get("nozzle"), 0)
-                bed = self._safeValue(temperatures.get("bed"), 0)
-                chamber = self._safeValue(temperatures.get("chamber"), 0)
-                print_speed = self._safeValue(misc.get("print_speed"), 0)
-                light_state = self._safeValue(misc.get("light_state"), "unknown")
                 skipped_objects = self._safeValue(misc.get("skipped_objects"), [])
                 # Format skipped_objects as string if it's a list
                 if isinstance(skipped_objects, list):
                     skipped_objects = ", ".join(str(x) for x in skipped_objects) if skipped_objects else ""
                 chamber_fan_speed = self._safeValue(mqtt_client.get("chamber_fan_speed"), 0)
-                current_layer_num = self._safeValue(mqtt_client.get("current_layer_num"), 0)
+
+                # Use LIVE data for real-time fields if available
+                if hasLiveData:
+                    percentage = liveStatus.get("progressPercent") or self._safeValue(progress.get("percentage"), 0)
+                    time_remaining = liveStatus.get("remainingTimeSeconds") or self._safeValue(progress.get("time_remaining"), 0)
+                    current_layer = liveStatus.get("currentLayer") or self._safeValue(progress.get("current_layer"), 0)
+                    total_layers = liveStatus.get("totalLayers") or self._safeValue(progress.get("total_layers"), 0)
+                    nozzle = liveStatus.get("nozzleTemp") or self._safeValue(temperatures.get("nozzle"), 0)
+                    bed = liveStatus.get("bedTemp") or self._safeValue(temperatures.get("bed"), 0)
+                    chamber = liveStatus.get("chamberTemp") or self._safeValue(temperatures.get("chamber"), 0)
+                    print_speed = liveStatus.get("printSpeed") or self._safeValue(misc.get("print_speed"), 0)
+                    light_state = liveStatus.get("lightState") or self._safeValue(misc.get("light_state"), "unknown")
+                    current_layer_num = liveStatus.get("currentLayer") or self._safeValue(mqtt_client.get("current_layer_num"), 0)
+                    gcode_state = liveStatus.get("gcodeState") or gcode_state
+                    file_name = liveStatus.get("fileName") or file_name
+                else:
+                    percentage = self._safeValue(progress.get("percentage"), 0)
+                    time_remaining = self._safeValue(progress.get("time_remaining"), 0)
+                    current_layer = self._safeValue(progress.get("current_layer"), 0)
+                    total_layers = self._safeValue(progress.get("total_layers"), 0)
+                    nozzle = self._safeValue(temperatures.get("nozzle"), 0)
+                    bed = self._safeValue(temperatures.get("bed"), 0)
+                    chamber = self._safeValue(temperatures.get("chamber"), 0)
+                    print_speed = self._safeValue(misc.get("print_speed"), 0)
+                    light_state = self._safeValue(misc.get("light_state"), "unknown")
+                    current_layer_num = self._safeValue(mqtt_client.get("current_layer_num"), 0)
+
                 ping = printer.get("pingStatus", "N/A")
-                status = "OK"
+                status = "OK (Live)" if hasLiveData else "OK"
             else:
                 # No data available - show error state
                 print_type = "unknown"

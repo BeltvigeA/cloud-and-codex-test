@@ -189,6 +189,19 @@ class BambuStatusSubscriber:
         self.camera_capture_interval_active = 30.0   # 30 seconds during print
         self.camera_capture_interval_idle = 300.0    # 5 minutes when idle
 
+        # MQTT dump cache for full printer data (refreshed every 60 seconds)
+        self.mqttDumpCache: Dict[str, Dict[str, Any]] = {}  # {serial: {timestamp, data}}
+        self.mqttDumpCacheLock = threading.Lock()
+        self.mqttDumpInterval = 60.0  # 60 seconds between full mqtt_dump calls
+        self.lastMqttDumpTime: Dict[str, float] = {}  # {serial: timestamp}
+
+        # Optional callback for mqtt_dump updates
+        self.onMqttDump: Optional[Callable[[Dict[str, Any], Dict[str, Any]], None]] = None
+
+        # Live status cache (updated every poll cycle)
+        self.liveStatusCache: Dict[str, Dict[str, Any]] = {}  # {serial: status_data}
+        self.liveStatusCacheLock = threading.Lock()
+
     def startAll(self, printers: Iterable[Dict[str, Any]]) -> None:
         """Start worker threads for each printer configuration."""
 
@@ -303,6 +316,61 @@ class BambuStatusSubscriber:
                     statusPayload["printerIp"] = ipAddress
                     statusPayload["nickname"] = nickname
                     statusPayload["status"] = statusPayload.get("status") or "update"
+
+                    # ============================================
+                    # UPDATE LIVE STATUS CACHE
+                    # ============================================
+                    with self.liveStatusCacheLock:
+                        self.liveStatusCache[serial] = {
+                            "timestamp": time.time(),
+                            "data": dict(statusPayload),
+                        }
+
+                    # ============================================
+                    # PERIODIC MQTT DUMP (every 60 seconds)
+                    # ============================================
+                    currentTime = time.monotonic()
+                    lastDumpTime = self.lastMqttDumpTime.get(serial, 0.0)
+                    
+                    if currentTime - lastDumpTime >= self.mqttDumpInterval:
+                        try:
+                            mqttDumpGetter = getattr(printerInstance, "mqtt_dump", None)
+                            if callable(mqttDumpGetter):
+                                self.log.info(f"📦 Fetching mqtt_dump for {serial}...")
+                                mqttDumpData = mqttDumpGetter()
+                                
+                                if mqttDumpData:
+                                    from datetime import datetime
+                                    dumpTimestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                                    
+                                    with self.mqttDumpCacheLock:
+                                        self.mqttDumpCache[serial] = {
+                                            "timestamp": dumpTimestamp,
+                                            "data": mqttDumpData,
+                                        }
+                                    
+                                    # Add mqtt_dump to status payload for this cycle
+                                    statusPayload["mqttDump"] = mqttDumpData
+                                    statusPayload["mqttDumpTimestamp"] = dumpTimestamp
+                                    
+                                    self.log.info(f"✅ mqtt_dump cached for {serial}")
+                                    
+                                    # Call optional callback if registered
+                                    if self.onMqttDump:
+                                        try:
+                                            self.onMqttDump(
+                                                {"serial": serial, "timestamp": dumpTimestamp, "data": mqttDumpData},
+                                                printerConfig,
+                                            )
+                                        except Exception as callbackErr:
+                                            self.log.debug(f"mqtt_dump callback failed: {callbackErr}")
+                                else:
+                                    self.log.debug(f"mqtt_dump returned empty for {serial}")
+                                    
+                            self.lastMqttDumpTime[serial] = currentTime
+                        except Exception as dumpErr:
+                            self.log.warning(f"mqtt_dump failed for {serial}: {dumpErr}")
+                            self.lastMqttDumpTime[serial] = currentTime  # Don't retry immediately
 
                     # ============================================
                     # ENHANCED HMS ERROR DETECTION AND REPORTING
@@ -794,6 +862,46 @@ class BambuStatusSubscriber:
         )
         filamentUsed = self._coerceFloat(filamentCandidate)
 
+        # Chamber temperature
+        chamberCandidate = self._findValue(
+            sources,
+            {
+                "chamber_temper",
+                "chamber_temp",
+                "chamberTemp",
+                "chamber_temperature",
+                "chamber",
+            },
+        )
+        chamberTemp = self._coerceFloat(chamberCandidate)
+
+        # Layer information
+        currentLayerCandidate = self._findValue(
+            sources,
+            {"layer_num", "current_layer", "currentLayer", "layer", "current_layer_num"},
+        )
+        currentLayer = self._coerceInt(currentLayerCandidate)
+
+        totalLayersCandidate = self._findValue(
+            sources,
+            {"total_layer_num", "total_layers", "totalLayers", "layer_count"},
+        )
+        totalLayers = self._coerceInt(totalLayersCandidate)
+
+        # File name
+        fileNameCandidate = self._findValue(
+            sources,
+            {"subtask_name", "gcode_file", "file_name", "fileName", "print_file", "task_name"},
+        )
+        fileName = self._coerceString(fileNameCandidate)
+
+        # Light state
+        lightStateCandidate = self._findValue(
+            sources,
+            {"lights_report", "light_state", "lightState", "led_state", "chamber_light"},
+        )
+        lightState = self._coerceString(lightStateCandidate)
+
         jobCandidate = self._findValue(
             sources,
             {"job_id", "task_id", "current_job_id", "print_id", "jobId"},
@@ -802,12 +910,15 @@ class BambuStatusSubscriber:
 
         if self.statusDebugEnabled:
             self.log.info(
-                "[status] parsed progress=%s remaining=%s nozzle=%s bed=%s gcode=%s",
+                "[status] parsed progress=%s remaining=%s nozzle=%s bed=%s chamber=%s gcode=%s layer=%s/%s",
                 progressPercent,
                 remainingTimeSeconds,
                 nozzleTemp,
                 bedTemp,
+                chamberTemp,
                 gcodeState,
+                currentLayer,
+                totalLayers,
             )
 
         firmwareVersion = self._extractFirmwareVersion(sources)
@@ -829,10 +940,15 @@ class BambuStatusSubscriber:
             "progressPercent": progressPercent,
             "nozzleTemp": nozzleTemp,
             "bedTemp": bedTemp,
+            "chamberTemp": chamberTemp,
             "remainingTimeSeconds": remainingTimeSeconds,
             "fanSpeedPercent": fanSpeedPercent,
             "printSpeed": printSpeed,
             "filamentUsed": filamentUsed,
+            "currentLayer": currentLayer,
+            "totalLayers": totalLayers,
+            "fileName": fileName,
+            "lightState": lightState,
             "currentJobId": currentJobId,
             "firmwareVersion": firmwareVersion,
             "hmsCode": hmsCode,
