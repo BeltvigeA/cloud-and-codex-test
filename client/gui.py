@@ -3451,22 +3451,6 @@ class ListenerGuiApp:
         log_message = f"PRINT FERDIG: {printer_serial} - {file_name} (job: {job_id_display})"
         self.logQueue.put(log_message)
         logging.info(log_message)
-        
-        # Show notification in GUI (using after to ensure thread-safety)
-        def show_notification() -> None:
-            try:
-                messagebox.showinfo(
-                    "Print Ferdig!",
-                    f"Printer: {printer_serial}\nFil: {file_name}\nJob ID: {job_id_display}",
-                    parent=self.root
-                )
-            except Exception:
-                logging.debug("Failed to show completion notification", exc_info=True)
-        
-        try:
-            self.root.after(0, show_notification)
-        except Exception:
-            logging.debug("Unable to schedule completion notification", exc_info=True)
 
     def _onPrinterStatusError(self, message: str, printerConfig: Dict[str, Any]) -> None:
         printerCopy = dict(printerConfig)
