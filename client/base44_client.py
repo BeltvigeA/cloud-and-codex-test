@@ -162,11 +162,6 @@ def postUpdateStatus(payload: Dict[str, object]) -> Dict[str, object]:
     preparedPayload["recipientId"] = recipientId
     preparedPayload.setdefault("lastUpdateTimestamp", _isoNow())
 
-    # DEBUG: Log the exact payload being sent
-    if os.getenv("PRINTMASTER_STATUS_DEBUG", "").lower() in ("1", "true", "yes"):
-        import json
-        log.info("[base44] Sending to backend: %s", json.dumps(preparedPayload, indent=2))
-
     # Bygg dynamisk URL (bruker hardkodet backend URL)
     statusUrl = f"{PRINTPRO3D_BASE}/api/printer-status/update"
 
