@@ -4544,13 +4544,42 @@ class ListenerGuiApp:
                 temperatures = data.get("temperatures", {})
                 misc = data.get("misc", {})
                 mqtt_client = data.get("mqtt_client", {})
+                
+                # FALLBACK: Extract from mqtt_dump raw data when wrapper methods return None
+                mqtt_dump = data.get("mqtt_dump", {})
+                mqtt_print = {}
+                if isinstance(mqtt_dump, dict):
+                    mqtt_print = mqtt_dump.get("print", {}) if isinstance(mqtt_dump.get("print"), dict) else mqtt_dump
 
-                print_type = self._safeValue(print_info.get("print_type"), "unknown")
-                current_state = self._safeValue(print_info.get("current_state"), "unknown")
-                file_name = self._safeValue(print_info.get("file_name"), "")
-                gcode_state = self._safeValue(print_info.get("gcode_state"), "unknown")
-                gcode_file = self._safeValue(print_info.get("gcode_file"), "")
-                print_error_code = self._safeValue(print_info.get("print_error_code"), 0)
+                # Extract print_type with mqtt_dump fallback
+                print_type = self._safeValue(print_info.get("print_type"), None)
+                if print_type is None or print_type == "unknown":
+                    print_type = mqtt_print.get("print_type") or "unknown"
+
+                # Extract gcode_state with mqtt_dump fallback
+                current_state_raw = self._safeValue(print_info.get("current_state"), None)
+                gcode_state_raw = self._safeValue(print_info.get("gcode_state"), None)
+                if (not current_state_raw or current_state_raw == "unknown") and (not gcode_state_raw or gcode_state_raw == "unknown"):
+                    gcode_state = mqtt_print.get("gcode_state") or mqtt_print.get("print_state") or "unknown"
+                    current_state = gcode_state
+                else:
+                    gcode_state = gcode_state_raw if gcode_state_raw and gcode_state_raw != "unknown" else (current_state_raw or "unknown")
+                    current_state = current_state_raw if current_state_raw and current_state_raw != "unknown" else gcode_state
+
+                # Extract file_name with mqtt_dump fallback
+                file_name = self._safeValue(print_info.get("file_name"), None)
+                if not file_name:
+                    file_name = mqtt_print.get("gcode_file") or mqtt_print.get("subtask_name") or ""
+
+                # Extract gcode_file with mqtt_dump fallback
+                gcode_file = self._safeValue(print_info.get("gcode_file"), None)
+                if not gcode_file:
+                    gcode_file = mqtt_print.get("gcode_file") or ""
+
+                # Extract print_error_code with mqtt_dump fallback
+                print_error_code = self._safeValue(print_info.get("print_error_code"), None)
+                if print_error_code is None:
+                    print_error_code = mqtt_print.get("print_error") or mqtt_print.get("print_error_code") or 0
                 skipped_objects = self._safeValue(misc.get("skipped_objects"), [])
                 # Format skipped_objects as string if it's a list
                 if isinstance(skipped_objects, list):
@@ -4572,16 +4601,47 @@ class ListenerGuiApp:
                     gcode_state = liveStatus.get("gcodeState") or gcode_state
                     file_name = liveStatus.get("fileName") or file_name
                 else:
-                    percentage = self._safeValue(progress.get("percentage"), 0)
-                    time_remaining = self._safeValue(progress.get("time_remaining"), 0)
-                    current_layer = self._safeValue(progress.get("current_layer"), 0)
-                    total_layers = self._safeValue(progress.get("total_layers"), 0)
-                    nozzle = self._safeValue(temperatures.get("nozzle"), 0)
-                    bed = self._safeValue(temperatures.get("bed"), 0)
-                    chamber = self._safeValue(temperatures.get("chamber"), 0)
-                    print_speed = self._safeValue(misc.get("print_speed"), 0)
-                    light_state = self._safeValue(misc.get("light_state"), "unknown")
-                    current_layer_num = self._safeValue(mqtt_client.get("current_layer_num"), 0)
+                    # Use mqtt_dump fallback for progress data
+                    percentage = self._safeValue(progress.get("percentage"), None)
+                    if percentage is None or percentage == 0:
+                        percentage = mqtt_print.get("mc_percent") or 0
+                    
+                    time_remaining = self._safeValue(progress.get("time_remaining"), None)
+                    if time_remaining is None or time_remaining == 0:
+                        time_remaining = mqtt_print.get("mc_remaining_time") or 0
+                    
+                    current_layer = self._safeValue(progress.get("current_layer"), None)
+                    if current_layer is None or current_layer == 0:
+                        current_layer = mqtt_print.get("layer_num") or 0
+                    
+                    total_layers = self._safeValue(progress.get("total_layers"), None)
+                    if total_layers is None or total_layers == 0:
+                        total_layers = mqtt_print.get("total_layer_num") or 0
+                    
+                    # Use mqtt_dump fallback for temperature data
+                    nozzle = self._safeValue(temperatures.get("nozzle"), None)
+                    if nozzle is None or nozzle == 0:
+                        nozzle = mqtt_print.get("nozzle_temper") or mqtt_print.get("nozzle_temp") or 0
+                    
+                    bed = self._safeValue(temperatures.get("bed"), None)
+                    if bed is None or bed == 0:
+                        bed = mqtt_print.get("bed_temper") or mqtt_print.get("bed_temp") or 0
+                    
+                    chamber = self._safeValue(temperatures.get("chamber"), None)
+                    if chamber is None or chamber == 0:
+                        chamber = mqtt_print.get("chamber_temper") or 0
+                    
+                    print_speed = self._safeValue(misc.get("print_speed"), None)
+                    if print_speed is None or print_speed == 0:
+                        print_speed = mqtt_print.get("spd_lvl") or mqtt_print.get("spd_mag") or 0
+                    
+                    light_state = self._safeValue(misc.get("light_state"), None)
+                    if light_state is None or light_state == "unknown":
+                        light_state = mqtt_print.get("lights_report") or "unknown"
+                    
+                    current_layer_num = self._safeValue(mqtt_client.get("current_layer_num"), None)
+                    if current_layer_num is None or current_layer_num == 0:
+                        current_layer_num = mqtt_print.get("layer_num") or 0
 
                 ping = printer.get("pingStatus", "N/A")
                 status = "OK (Live)" if hasLiveData else "OK"
@@ -4845,76 +4905,143 @@ class ListenerGuiApp:
             misc = data.get("misc", {})
             mqtt_client = data.get("mqtt_client", {})
             
-            # Map print job data to status fields
-            status["state"] = self._safeValue(print_info.get("current_state"), "UNKNOWN")
-            status["status"] = status["state"]
-            status["gcodeState"] = self._safeValue(print_info.get("gcode_state"), "")
+            # FALLBACK: Extract from mqtt_dump raw data when wrapper methods return None
+            mqtt_dump = data.get("mqtt_dump", {})
+            mqtt_print = {}
+            if isinstance(mqtt_dump, dict):
+                mqtt_print = mqtt_dump.get("print", {}) if isinstance(mqtt_dump.get("print"), dict) else mqtt_dump
             
-            # Progress
-            percentage = self._safeValue(progress.get("percentage"), 0)
+            # Map print job data to status fields with mqtt_dump fallback
+            state = self._safeValue(print_info.get("current_state"), None)
+            gcode_state = self._safeValue(print_info.get("gcode_state"), None)
+            if not state or state == "unknown" or state == "UNKNOWN":
+                state = mqtt_print.get("gcode_state") or mqtt_print.get("print_state") or "UNKNOWN"
+            if not gcode_state or gcode_state == "unknown":
+                gcode_state = mqtt_print.get("gcode_state") or mqtt_print.get("print_state") or ""
+            
+            status["state"] = state
+            status["status"] = state
+            status["gcodeState"] = gcode_state
+            
+            # Progress with mqtt_dump fallback
+            percentage = self._safeValue(progress.get("percentage"), None)
+            if percentage is None or percentage == 0:
+                percentage = mqtt_print.get("mc_percent") or 0
             if percentage is not None:
-                status["jobProgress"] = max(0, min(100, float(percentage)))
+                try:
+                    status["jobProgress"] = max(0, min(100, float(percentage)))
+                    status["progressPercent"] = max(0, min(100, float(percentage)))
+                except (ValueError, TypeError):
+                    pass
             
-            time_remaining = self._safeValue(progress.get("time_remaining"), 0)
+            time_remaining = self._safeValue(progress.get("time_remaining"), None)
+            if time_remaining is None or time_remaining == 0:
+                time_remaining = mqtt_print.get("mc_remaining_time") or 0
             if time_remaining is not None:
-                status["timeRemaining"] = int(time_remaining)
+                try:
+                    status["timeRemaining"] = int(time_remaining)
+                    status["remainingTimeSeconds"] = int(time_remaining)
+                except (ValueError, TypeError):
+                    pass
             
             current_layer = self._safeValue(progress.get("current_layer"), None)
+            if current_layer is None or current_layer == 0:
+                current_layer = mqtt_print.get("layer_num") or 0
             if current_layer is not None:
-                status["currentLayer"] = int(current_layer)
+                try:
+                    status["currentLayer"] = int(current_layer)
+                except (ValueError, TypeError):
+                    pass
             
             total_layers = self._safeValue(progress.get("total_layers"), None)
+            if total_layers is None or total_layers == 0:
+                total_layers = mqtt_print.get("total_layer_num") or 0
             if total_layers is not None:
-                status["totalLayers"] = int(total_layers)
+                try:
+                    status["totalLayers"] = int(total_layers)
+                except (ValueError, TypeError):
+                    pass
             
-            # Temperatures
+            # Temperatures with mqtt_dump fallback
             nozzle_temp = self._safeValue(temperatures.get("nozzle"), None)
-            if nozzle_temp is not None:
-                status["nozzleTemp"] = float(nozzle_temp)
+            if nozzle_temp is None or nozzle_temp == 0:
+                nozzle_temp = mqtt_print.get("nozzle_temper") or mqtt_print.get("nozzle_temp") or 0
+            status["nozzleTemp"] = float(nozzle_temp) if nozzle_temp else 0.0
             
             bed_temp = self._safeValue(temperatures.get("bed"), None)
-            if bed_temp is not None:
-                status["bedTemp"] = float(bed_temp)
+            if bed_temp is None or bed_temp == 0:
+                bed_temp = mqtt_print.get("bed_temper") or mqtt_print.get("bed_temp") or 0
+            status["bedTemp"] = float(bed_temp) if bed_temp else 0.0
             
             chamber_temp = self._safeValue(temperatures.get("chamber"), None)
-            if chamber_temp is not None:
-                status["chamberTemp"] = float(chamber_temp)
+            if chamber_temp is None or chamber_temp == 0:
+                chamber_temp = mqtt_print.get("chamber_temper") or 0
+            status["chamberTemp"] = float(chamber_temp) if chamber_temp else 0.0
             
-            # Misc
+            # Misc with mqtt_dump fallback
             print_speed = self._safeValue(misc.get("print_speed"), None)
+            if print_speed is None or print_speed == 0:
+                print_speed = mqtt_print.get("spd_lvl") or mqtt_print.get("spd_mag") or 0
             if print_speed is not None:
-                status["speedPercentage"] = int(print_speed)
+                try:
+                    status["speedPercentage"] = int(print_speed)
+                    status["printSpeed"] = int(print_speed)
+                except (ValueError, TypeError):
+                    pass
             
             light_state = self._safeValue(misc.get("light_state"), None)
+            if light_state is None:
+                lights_report = mqtt_print.get("lights_report")
+                if lights_report and isinstance(lights_report, list) and len(lights_report) > 0:
+                    light_state = lights_report[0].get("mode")
             if light_state is not None:
-                status["lightOn"] = light_state.lower() == "on" if isinstance(light_state, str) else bool(light_state)
+                if isinstance(light_state, str):
+                    status["lightOn"] = light_state.lower() == "on"
+                    status["lightState"] = light_state
+                else:
+                    status["lightOn"] = bool(light_state)
             
             skipped_objects = self._safeValue(misc.get("skipped_objects"), [])
             if skipped_objects:
                 status["skippedObjects"] = skipped_objects
             
-            # Fan speed
+            # Fan speed with mqtt_dump fallback
             chamber_fan_speed = self._safeValue(mqtt_client.get("chamber_fan_speed"), None)
+            if chamber_fan_speed is None:
+                chamber_fan_speed = mqtt_print.get("cooling_fan_speed") or mqtt_print.get("big_fan1_speed") or 0
             if chamber_fan_speed is not None:
-                status["fanSpeed"] = int(chamber_fan_speed)
+                try:
+                    status["fanSpeed"] = int(chamber_fan_speed)
+                    status["chamberFanSpeed"] = int(chamber_fan_speed)
+                except (ValueError, TypeError):
+                    pass
             
-            # File info
-            file_name = self._safeValue(print_info.get("file_name"), "")
+            # File info with mqtt_dump fallback
+            file_name = self._safeValue(print_info.get("file_name"), None)
+            if not file_name:
+                file_name = mqtt_print.get("gcode_file") or mqtt_print.get("subtask_name") or ""
             if file_name:
                 status["fileName"] = str(file_name)
             
-            gcode_file = self._safeValue(print_info.get("gcode_file"), "")
+            gcode_file = self._safeValue(print_info.get("gcode_file"), None)
+            if not gcode_file:
+                gcode_file = mqtt_print.get("gcode_file") or ""
             if gcode_file:
                 status["gcodeFile"] = str(gcode_file)
             
-            # Print type and error code
-            print_type = self._safeValue(print_info.get("print_type"), "")
+            # Print type and error code with mqtt_dump fallback
+            print_type = self._safeValue(print_info.get("print_type"), None)
+            if not print_type:
+                print_type = mqtt_print.get("print_type") or ""
             if print_type:
                 status["printType"] = str(print_type)
             
-            print_error_code = self._safeValue(print_info.get("print_error_code"), 0)
+            print_error_code = self._safeValue(print_info.get("print_error_code"), None)
+            if print_error_code is None:
+                print_error_code = mqtt_print.get("print_error") or mqtt_print.get("print_error_code") or 0
             if print_error_code:
                 status["errorCode"] = str(print_error_code)
+                status["printErrorCode"] = int(print_error_code) if isinstance(print_error_code, (int, float)) else print_error_code
         else:
             # No data available or has error
             status["state"] = "UNKNOWN"

@@ -969,13 +969,34 @@ def postStatus(status: Dict[str, Any], printerConfig: Dict[str, Any]) -> None:
     # Get organizationId from environment variable or printer config
     organizationId = printerConfig.get("organizationId") or os.getenv("BASE44_ORGANIZATION_ID", "").strip()
 
-    parsedStatus = StatusReporter.parse_print_job_data(status)
-
-    # Add compatibility fields expected by the web frontend
-    if "jobProgress" in parsedStatus:
-        parsedStatus.setdefault("progressPercent", parsedStatus.get("jobProgress"))
-    if "timeRemaining" in parsedStatus:
-        parsedStatus.setdefault("remainingTimeSeconds", parsedStatus.get("timeRemaining"))
+    # SIMPLIFIED: Get fields directly from status dict - they are already set by _normalizeSnapshot
+    # No need for parse_print_job_data - the fields are at top level of status
+    parsedStatus = {
+        "status": status.get("status") or status.get("state") or "UNKNOWN",
+        "state": status.get("state") or status.get("status") or "UNKNOWN",
+        "gcodeState": status.get("gcodeState"),
+        "progressPercent": status.get("progressPercent"),
+        "jobProgress": status.get("progressPercent"),  # Alias
+        "bedTemp": status.get("bedTemp"),
+        "nozzleTemp": status.get("nozzleTemp"),
+        "chamberTemp": status.get("chamberTemp"),
+        "fanSpeed": status.get("fanSpeedPercent"),
+        "remainingTimeSeconds": status.get("remainingTimeSeconds"),
+        "timeRemaining": status.get("remainingTimeSeconds"),  # Alias
+        # Print Job Fields - these come directly from _normalizeSnapshot
+        "fileName": status.get("fileName"),
+        "gcodeFile": status.get("gcodeFile"),
+        "printType": status.get("printType"),
+        "currentLayer": status.get("currentLayer"),
+        "totalLayers": status.get("totalLayers"),
+        "lightState": status.get("lightState"),
+        "printErrorCode": status.get("printErrorCode"),
+        "skippedObjects": status.get("skippedObjects"),
+        "printSpeed": status.get("printSpeed"),
+    }
+    
+    # Remove None values to keep payload clean
+    parsedStatus = {k: v for k, v in parsedStatus.items() if v is not None}
 
     # Build payload with all required fields for PostgreSQL backend
     # CRITICAL: API expects FLAT structure, not nested "status" object
@@ -1020,10 +1041,21 @@ def postStatus(status: Dict[str, Any], printerConfig: Dict[str, Any]) -> None:
     logger.info("   ─── PAYLOAD DATA ───")
     logger.info(f"   Status: {parsedStatus.get('status')}")
     logger.info(f"   GCode State: {parsedStatus.get('gcodeState')}")
-    logger.info(f"   Progress: {parsedStatus.get('jobProgress')}%")
+    logger.info(f"   Progress: {parsedStatus.get('progressPercent') or parsedStatus.get('jobProgress')}%")
     logger.info(f"   Nozzle Temp: {parsedStatus.get('nozzleTemp')}°C")
     logger.info(f"   Bed Temp: {parsedStatus.get('bedTemp')}°C")
-    logger.info(f"   Remaining Time: {parsedStatus.get('timeRemaining')}s")
+    logger.info(f"   Chamber Temp: {parsedStatus.get('chamberTemp')}°C")
+    logger.info(f"   Remaining Time: {parsedStatus.get('remainingTimeSeconds') or parsedStatus.get('timeRemaining')}s")
+    logger.info("   ─── NEW PRINT JOB FIELDS ───")
+    logger.info(f"   File Name: {parsedStatus.get('fileName')}")
+    logger.info(f"   Gcode File: {parsedStatus.get('gcodeFile')}")
+    logger.info(f"   Print Type: {parsedStatus.get('printType')}")
+    logger.info(f"   Current Layer: {parsedStatus.get('currentLayer')}")
+    logger.info(f"   Total Layers: {parsedStatus.get('totalLayers')}")
+    logger.info(f"   Light State: {parsedStatus.get('lightState')}")
+    logger.info(f"   Print Error Code: {parsedStatus.get('printErrorCode')}")
+    logger.info(f"   Skipped Objects: {parsedStatus.get('skippedObjects')}")
+    logger.info(f"   Fan Speed: {parsedStatus.get('fanSpeed')}")
     logger.info("   ─── FULL JSON PAYLOAD ───")
     import json
     logger.info(f"{json.dumps(payload, indent=2)}")

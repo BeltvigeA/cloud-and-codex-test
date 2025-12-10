@@ -907,6 +907,38 @@ class BambuStatusSubscriber:
         if printerMetadata is None:
             printerMetadata = {}
         printerMetadata.update(directTemperatures)
+        
+        # CRITICAL: Get print job fields from mqtt_dump cache
+        # mqtt_dump contains the raw 'print' object with all the detailed print job info
+        # This is the same approach the GUI uses to display correct data
+        serial = printerConfig.get("serialNumber", "")
+        if serial:
+            with self.mqttDumpCacheLock:
+                cached_dump = self.mqttDumpCache.get(serial, {})
+            dump_data = cached_dump.get("data", {}) if isinstance(cached_dump, dict) else {}
+            if isinstance(dump_data, dict):
+                # Get the nested 'print' object - this is where Bambu stores all the good stuff
+                mqtt_print = dump_data.get("print", {}) if isinstance(dump_data.get("print"), dict) else {}
+                if mqtt_print:
+                    # Add these directly to printerMetadata so they get picked up by _normalizeSnapshot
+                    if mqtt_print.get("print_type"):
+                        printerMetadata["printType"] = mqtt_print.get("print_type")
+                    if mqtt_print.get("subtask_name"):
+                        printerMetadata["fileName"] = mqtt_print.get("subtask_name")
+                    if mqtt_print.get("gcode_file"):
+                        printerMetadata["gcodeFile"] = mqtt_print.get("gcode_file")
+                    if mqtt_print.get("layer_num") is not None:
+                        printerMetadata["currentLayer"] = mqtt_print.get("layer_num")
+                    if mqtt_print.get("total_layer_num") is not None:
+                        printerMetadata["totalLayers"] = mqtt_print.get("total_layer_num")
+                    if mqtt_print.get("print_error") is not None:
+                        printerMetadata["printErrorCode"] = mqtt_print.get("print_error")
+                    # Light state from lights_report array
+                    lights_report = mqtt_print.get("lights_report")
+                    if lights_report and isinstance(lights_report, list) and len(lights_report) > 0:
+                        printerMetadata["lightState"] = lights_report[0].get("mode")
+                    if mqtt_print.get("skipped_objects") is not None:
+                        printerMetadata["skippedObjects"] = mqtt_print.get("skipped_objects")
 
         snapshot = self._normalizeSnapshot(
             statePayload,
@@ -925,11 +957,20 @@ class BambuStatusSubscriber:
         printerConfig: Dict[str, Any],
         printerMetadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
+        # Build sources list including nested 'print' object from statePayload
+        # Bambu MQTT data has most fields nested under the 'print' key
         sources = [
             payload
             for payload in (statePayload, percentagePayload, gcodePayload, printerMetadata)
             if payload is not None
         ]
+        
+        # CRITICAL: Add the nested 'print' object as a source
+        # This is where Bambu printers store most of the status data
+        if isinstance(statePayload, dict):
+            print_data = statePayload.get("print", {})
+            if isinstance(print_data, dict) and print_data:
+                sources.insert(0, print_data)  # Insert at beginning for priority
 
         gcodeState = self._coerceString(gcodePayload)
         if not gcodeState:
@@ -1060,6 +1101,43 @@ class BambuStatusSubscriber:
         )
         lightState = self._coerceString(lightStateCandidate)
 
+        # ========== NEW PRINT JOB FIELDS ==========
+        
+        # Print type (e.g., "local", "cloud", "sd_card")
+        printTypeCandidate = self._findValue(
+            sources,
+            {"print_type", "printType", "task_type", "job_type"},
+        )
+        printType = self._coerceString(printTypeCandidate)
+
+        # Gcode file (separate from file name - full path)
+        gcodeFileCandidate = self._findValue(
+            sources,
+            {"gcode_file", "gcodeFile", "file_path", "gcode_path"},
+        )
+        gcodeFile = self._coerceString(gcodeFileCandidate)
+
+        # Print error code
+        printErrorCodeCandidate = self._findValue(
+            sources,
+            {"print_error", "print_error_code", "printErrorCode", "error_code", "mc_print_error_code"},
+        )
+        printErrorCode = self._coerceInt(printErrorCodeCandidate)
+
+        # Skipped objects
+        skippedObjectsCandidate = self._findValue(
+            sources,
+            {"skipped_objects", "skippedObjects", "skip_objects"},
+        )
+        skippedObjects = None
+        if skippedObjectsCandidate is not None:
+            if isinstance(skippedObjectsCandidate, list):
+                skippedObjects = skippedObjectsCandidate
+            else:
+                skippedObjects = self._coerceString(skippedObjectsCandidate)
+
+        # ========== END NEW FIELDS ==========
+
         jobCandidate = self._findValue(
             sources,
             {"job_id", "task_id", "current_job_id", "print_id", "jobId"},
@@ -1115,6 +1193,12 @@ class BambuStatusSubscriber:
             "hmsCode": hmsCode,
             "errorMessage": errorMessage,
             "hasAmsConflict": hasAmsConflict,
+            # NEW PRINT JOB FIELDS
+            "printType": printType,
+            "gcodeFile": gcodeFile,
+            "printErrorCode": printErrorCode,
+            "skippedObjects": skippedObjects,
+            # END NEW FIELDS
             "rawStatePayload": statePayload,
             "rawPercentagePayload": percentagePayload,
             "rawGcodePayload": gcodePayload,
@@ -1242,6 +1326,49 @@ class BambuStatusSubscriber:
         firmwareVersion = self._coerceString(snapshot.get("firmwareVersion"))
         if firmwareVersion:
             optionalFields["firmwareVersion"] = firmwareVersion
+
+        # NEW PRINT JOB FIELDS - Add all fields shown in Print Job tab
+        fileName = self._coerceString(snapshot.get("fileName"))
+        if fileName:
+            optionalFields["fileName"] = fileName
+
+        currentLayer = self._coerceInt(snapshot.get("currentLayer"))
+        if currentLayer is not None:
+            optionalFields["currentLayer"] = currentLayer
+
+        totalLayers = self._coerceInt(snapshot.get("totalLayers"))
+        if totalLayers is not None:
+            optionalFields["totalLayers"] = totalLayers
+
+        lightState = self._coerceString(snapshot.get("lightState"))
+        if lightState:
+            optionalFields["lightState"] = lightState
+
+        printType = self._coerceString(snapshot.get("printType"))
+        if printType:
+            optionalFields["printType"] = printType
+
+        gcodeFile = self._coerceString(snapshot.get("gcodeFile"))
+        if gcodeFile:
+            optionalFields["gcodeFile"] = gcodeFile
+
+        printErrorCode = self._coerceInt(snapshot.get("printErrorCode"))
+        if printErrorCode is not None and printErrorCode != 0:
+            optionalFields["printErrorCode"] = printErrorCode
+
+        skippedObjects = snapshot.get("skippedObjects")
+        if skippedObjects:
+            optionalFields["skippedObjects"] = skippedObjects
+
+        gcodeState = self._coerceString(snapshot.get("gcodeState"))
+        if gcodeState:
+            optionalFields["gcodeState"] = gcodeState
+
+        chamberTemp = self._coerceFloat(snapshot.get("chamberTemp"))
+        if chamberTemp is not None:
+            optionalFields["chamberTemp"] = chamberTemp
+
+        # END NEW PRINT JOB FIELDS
 
         # Add camera image data if available
         cameraImage = snapshot.get("cameraImage")

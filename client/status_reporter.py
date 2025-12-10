@@ -146,11 +146,17 @@ class StatusReporter:
         """
         Parse MQTT status data into structured print job data.
 
+        Extracts ALL fields from Print Job tab (except bed image) including:
+        - print_type, gcode_state, file_name, gcode_file, print_error_code
+        - progress, time_remaining, current_layer, total_layers
+        - temperatures (nozzle, bed, chamber)
+        - print_speed, light_state, skipped_objects, chamber_fan_speed
+
         Args:
             status_data: Raw MQTT status data from printer
 
         Returns:
-            Parsed status data ready for backend
+            Parsed status data ready for backend with ALL Print Job fields
         """
         # Extract state and gcode_state
         state = status_data.get("state", "UNKNOWN")
@@ -193,28 +199,112 @@ class StatusReporter:
                 except Exception:
                     raw_state = {}
 
-        # Try to extract layer info
-        current_layer = raw_state.get("layer_num") or raw_state.get("current_layer")
-        total_layers = raw_state.get("total_layer_num") or raw_state.get("total_layers")
+        # CRITICAL: Bambu printers store most MQTT data under the nested 'print' key
+        # This is the primary source for print job fields - extract it as mqtt_print
+        mqtt_print = {}
+        if isinstance(raw_state, dict):
+            mqtt_print = raw_state.get("print", {}) if isinstance(raw_state.get("print"), dict) else {}
 
-        # Try to extract file name
-        file_name = (
-            raw_state.get("gcode_file") or
-            raw_state.get("subtask_name") or
-            raw_state.get("print_file")
+        # Try to extract layer info (with mqtt_print fallback)
+        current_layer = (
+            status_data.get("currentLayer") or
+            raw_state.get("layer_num") or
+            raw_state.get("current_layer") or
+            mqtt_print.get("layer_num")
+        )
+        total_layers = (
+            status_data.get("totalLayers") or
+            raw_state.get("total_layer_num") or
+            raw_state.get("total_layers") or
+            mqtt_print.get("total_layer_num")
         )
 
-        # Try to extract target temperatures
-        bed_target_temp = raw_state.get("bed_target_temper") or raw_state.get("target_bed_temp")
-        nozzle_target_temp = raw_state.get("nozzle_target_temper") or raw_state.get("target_nozzle_temp")
+        # ========== NEW FIELDS FROM PRINT JOB TAB ==========
+        
+        # Extract print_type (with mqtt_print fallback)
+        print_type = (
+            status_data.get("printType") or
+            status_data.get("print_type") or
+            raw_state.get("print_type") or
+            mqtt_print.get("print_type")
+        )
 
-        # Try to extract chamber temp
-        chamber_temp = raw_state.get("chamber_temper") or raw_state.get("chamber_temp")
+        # Try to extract file name (enhanced with mqtt_print fallback)
+        file_name = (
+            status_data.get("fileName") or
+            status_data.get("file_name") or
+            raw_state.get("gcode_file") or
+            raw_state.get("subtask_name") or
+            raw_state.get("print_file") or
+            mqtt_print.get("subtask_name") or
+            mqtt_print.get("gcode_file")
+        )
 
-        # Try to extract light status
-        light_on = raw_state.get("lights_report", [{}])[0].get("mode") if raw_state.get("lights_report") else None
+        # Extract gcode_file (with mqtt_print fallback)
+        gcode_file = (
+            status_data.get("gcodeFile") or
+            status_data.get("gcode_file") or
+            raw_state.get("gcode_file") or
+            mqtt_print.get("gcode_file")
+        )
 
-        # Build structured status
+        # Extract print_error_code (with mqtt_print fallback)
+        print_error_code = (
+            status_data.get("printErrorCode") or
+            status_data.get("print_error_code") or
+            raw_state.get("print_error") or
+            raw_state.get("print_error_code") or
+            mqtt_print.get("print_error") or
+            mqtt_print.get("mc_print_error_code")
+        )
+
+        # Extract skipped_objects (with mqtt_print fallback)
+        skipped_objects = (
+            status_data.get("skippedObjects") or
+            status_data.get("skipped_objects") or
+            raw_state.get("skipped_objects") or
+            mqtt_print.get("skipped_objects")
+        )
+
+        # Extract chamber_fan_speed (with mqtt_print fallback)
+        chamber_fan_speed = (
+            status_data.get("chamberFanSpeed") or
+            status_data.get("chamber_fan_speed") or
+            raw_state.get("cooling_fan_speed") or
+            raw_state.get("big_fan1_speed") or
+            raw_state.get("big_fan2_speed") or
+            mqtt_print.get("cooling_fan_speed") or
+            mqtt_print.get("big_fan1_speed")
+        )
+
+        # Try to extract target temperatures (with mqtt_print fallback)
+        bed_target_temp = (
+            raw_state.get("bed_target_temper") or
+            raw_state.get("target_bed_temp") or
+            mqtt_print.get("bed_target_temper")
+        )
+        nozzle_target_temp = (
+            raw_state.get("nozzle_target_temper") or
+            raw_state.get("target_nozzle_temp") or
+            mqtt_print.get("nozzle_target_temper")
+        )
+
+        # Try to extract chamber temp (with mqtt_print fallback)
+        chamber_temp = (
+            status_data.get("chamberTemp") or
+            raw_state.get("chamber_temper") or
+            raw_state.get("chamber_temp") or
+            mqtt_print.get("chamber_temper")
+        )
+
+        # Try to extract light status (with mqtt_print fallback)
+        light_state = status_data.get("lightState") or status_data.get("light_state")
+        if not light_state:
+            lights_report = raw_state.get("lights_report") or mqtt_print.get("lights_report")
+            if lights_report and isinstance(lights_report, list) and len(lights_report) > 0:
+                light_state = lights_report[0].get("mode")
+
+        # Build structured status with ALL Print Job fields
         parsed_status: Dict[str, Any] = {
             "status": state,
             "state": state,
@@ -225,8 +315,9 @@ class StatusReporter:
             parsed_status["gcodeState"] = gcode_state
         if progress is not None:
             parsed_status["progressPercent"] = max(0, min(100, progress))
+            parsed_status["jobProgress"] = max(0, min(100, progress))  # Alias
+        
         # Always include temperature fields (use 0.0 fallback if missing)
-        # The API expects these fields to always be present
         parsed_status["bedTemp"] = bed_temp if bed_temp is not None else 0.0
         if bed_target_temp is not None:
             parsed_status["bedTargetTemp"] = bed_target_temp
@@ -234,20 +325,64 @@ class StatusReporter:
         if nozzle_target_temp is not None:
             parsed_status["nozzleTargetTemp"] = nozzle_target_temp
         parsed_status["chamberTemp"] = chamber_temp if chamber_temp is not None else 0.0
+        
         if fan_speed is not None:
             parsed_status["fanSpeed"] = max(0, min(100, int(fan_speed)))
         if print_speed is not None:
             parsed_status["speedPercentage"] = int(print_speed)
-        if light_on is not None:
-            parsed_status["lightOn"] = light_on == "on"
+            parsed_status["printSpeed"] = int(print_speed)  # Alias
+        
+        # Light state
+        if light_state is not None:
+            if isinstance(light_state, str):
+                parsed_status["lightOn"] = light_state.lower() == "on"
+                parsed_status["lightState"] = light_state
+            else:
+                parsed_status["lightOn"] = bool(light_state)
+        
         if file_name:
             parsed_status["fileName"] = str(file_name)
         if current_layer is not None:
-            parsed_status["currentLayer"] = int(current_layer)
+            try:
+                parsed_status["currentLayer"] = int(current_layer)
+            except (ValueError, TypeError):
+                pass
         if total_layers is not None:
-            parsed_status["totalLayers"] = int(total_layers)
+            try:
+                parsed_status["totalLayers"] = int(total_layers)
+            except (ValueError, TypeError):
+                pass
         if remaining_time is not None:
-            parsed_status["remainingTimeSeconds"] = int(remaining_time)
+            try:
+                parsed_status["remainingTimeSeconds"] = int(remaining_time)
+                parsed_status["timeRemaining"] = int(remaining_time)  # Alias
+            except (ValueError, TypeError):
+                pass
+
+        # ========== ADD NEW PRINT JOB FIELDS ==========
+        if print_type:
+            parsed_status["printType"] = str(print_type)
+        
+        if gcode_file:
+            parsed_status["gcodeFile"] = str(gcode_file)
+        
+        if print_error_code:
+            try:
+                parsed_status["printErrorCode"] = int(print_error_code)
+            except (ValueError, TypeError):
+                parsed_status["printErrorCode"] = str(print_error_code)
+        
+        if skipped_objects:
+            if isinstance(skipped_objects, list):
+                parsed_status["skippedObjects"] = skipped_objects
+            else:
+                parsed_status["skippedObjects"] = str(skipped_objects)
+        
+        if chamber_fan_speed is not None:
+            try:
+                parsed_status["chamberFanSpeed"] = int(chamber_fan_speed)
+            except (ValueError, TypeError):
+                pass
 
         return parsed_status
 
