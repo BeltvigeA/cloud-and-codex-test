@@ -75,10 +75,10 @@ def test_functions_requests_use_dedicated_api_key(monkeypatch: pytest.MonkeyPatc
     assert recorded_headers[1].get("X-API-Key") == "functions-key"  # postReportError (functions)
     assert recorded_headers[2].get("X-API-Key") == "functions-key"  # postReportPrinterImage (functions)
 
-    # Verify image upload uses multipart/form-data to the new endpoint
+    # Verify image upload uses multipart/form-data to the new backend endpoint
     assert len(recorded_multipart_requests) == 1
     upload_url, upload_data, upload_headers = recorded_multipart_requests[0]
-    assert upload_url.endswith("/api/printer-events/upload-image")
+    assert upload_url.endswith("/api/printer-images/upload")
     assert upload_data["recipientId"] == "recipient-xyz"
     assert upload_data["printerIpAddress"] == "192.168.1.100"
     assert upload_data["imageType"] == "webcam"
