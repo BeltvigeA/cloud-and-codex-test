@@ -30,12 +30,15 @@ def _resolveFunctionsBaseUrl() -> str:
 # Hardkodet PrintPro3D backend URL for status updates
 PRINTPRO3D_BASE = "https://printpro3d-api-931368217793.europe-west1.run.app"
 
+# Printer backend URL for image uploads (configurable)
+PRINTER_BACKEND_BASE = os.getenv("PRINTER_BACKEND_BASE_URL", "https://printer-backend-934564650450.europe-west1.run.app")
+
 # Base44 functions base - now configurable via environment variable (legacy)
 BASE44_FUNCTIONS_BASE = _resolveFunctionsBaseUrl()
 
 # PrintPro3D backend API endpoints
 REPORT_ERROR_URL = f"{PRINTPRO3D_BASE}/api/printer-events/error"
-REPORT_IMAGE_URL = f"{PRINTPRO3D_BASE}/api/printer-events/upload-image"
+REPORT_IMAGE_URL = f"{PRINTER_BACKEND_BASE}/api/printer-images/upload"
 
 # Note: UPDATE_STATUS_URL er nå dynamisk og bygges i postUpdateStatus()
 
@@ -225,7 +228,10 @@ def postReportError(payload: Dict[str, object]) -> Dict[str, object]:
 
 def postReportPrinterImage(payload: Dict[str, object]) -> Dict[str, object]:
     """
-    POST to upload printer image endpoint.
+    POST camera snapshot to printer backend for permanent storage.
+
+    Saves images to Google Cloud Storage via the printer backend API.
+    The old Base44 endpoint only stored images temporarily.
 
     Expected payload format:
     {
@@ -236,7 +242,7 @@ def postReportPrinterImage(payload: Dict[str, object]) -> Dict[str, object]:
         "imageData": "data:image/jpeg;base64,/9j/4AAQ..."  # Base64 data URI
     }
 
-    Converts to multipart/form-data upload for new backend.
+    Converts to multipart/form-data upload for backend API.
     """
     import base64
     from io import BytesIO
