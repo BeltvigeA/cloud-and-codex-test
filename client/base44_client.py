@@ -237,68 +237,60 @@ def postReportPrinterImage(payload: Dict[str, object]) -> Dict[str, object]:
     {
         "recipientId": "RID123",  # Optional - will be auto-filled if missing
         "printerSerial": "01P00A381200434",
-        "printerIpAddress": "192.168.1.100",  # Optional
+        "printerIpAddress": "192.168.1.100",  # Optional - one of serial/IP required
         "imageType": "webcam",  # Optional - default is "webcam"
-        "imageData": "data:image/jpeg;base64,/9j/4AAQ..."  # Base64 data URI
+        "imageData": "data:image/jpeg;base64,/9j/4AAQ...",  # Base64 data URI
+        "timestamp": "2025-12-11T12:00:00.000Z"  # Optional - defaults to now
     }
 
-    Converts to multipart/form-data upload for backend API.
+    Sends as JSON to the backend API (not multipart/form-data).
     """
-    import base64
-    from io import BytesIO
-
     preparedPayload = dict(payload)
     if not _ensureRecipient(preparedPayload):
         return {}
 
-    # Extract and decode image data
+    # Validate imageData is present
     imageDataUri = preparedPayload.get("imageData", "")
     if not imageDataUri:
         log.warning("postReportPrinterImage: missing imageData")
         return {}
 
-    # Strip data URI prefix if present (e.g., "data:image/jpeg;base64,...")
-    if imageDataUri.startswith("data:"):
-        imageDataUri = imageDataUri.split(",", 1)[1] if "," in imageDataUri else imageDataUri
+    # Ensure imageData has data URI prefix
+    if not imageDataUri.startswith("data:"):
+        # If raw base64, add prefix (assume JPEG)
+        imageDataUri = f"data:image/jpeg;base64,{imageDataUri}"
+        preparedPayload["imageData"] = imageDataUri
 
-    try:
-        # Decode base64 image data
-        imageBytes = base64.b64decode(imageDataUri)
-    except Exception as e:
-        log.error(f"Failed to decode image data: {e}")
+    # Add timestamp if not provided
+    if "timestamp" not in preparedPayload:
+        preparedPayload["timestamp"] = _isoNow()
+
+    # Ensure either printerSerial or printerIpAddress is present
+    if not preparedPayload.get("printerSerial") and not preparedPayload.get("printerIpAddress"):
+        log.warning("postReportPrinterImage: missing both printerSerial and printerIpAddress")
         return {}
 
-    # Prepare multipart form data
-    files = {"image": ("snapshot.jpg", BytesIO(imageBytes), "image/jpeg")}
-    data = {
-        "recipientId": preparedPayload.get("recipientId"),
-        "printerSerial": preparedPayload.get("printerSerial", ""),
-        "imageType": preparedPayload.get("imageType", "webcam")
-    }
+    # Set default imageType
+    preparedPayload.setdefault("imageType", "webcam")
 
-    # Include printerIpAddress if provided
-    if "printerIpAddress" in preparedPayload and preparedPayload["printerIpAddress"]:
-        data["printerIpAddress"] = preparedPayload["printerIpAddress"]
+    # Build headers with Content-Type for JSON
+    headers = _buildFunctionsHeaders()
 
-    # Build headers (without Content-Type - requests will set it for multipart)
-    apiKey = _resolveApiKey("PRINTER_BACKEND_API_KEY", "BASE44_FUNCTIONS_API_KEY", "BASE44_API_KEY")
-    headers = {"X-API-Key": apiKey}
+    printer_id = preparedPayload.get("printerSerial") or preparedPayload.get("printerIpAddress") or "unknown"
 
     try:
+        log.info(f"Posting printer image to {REPORT_IMAGE_URL} for printer {printer_id}")
         response = requests.post(
             REPORT_IMAGE_URL,
-            files=files,
-            data=data,
+            json=preparedPayload,
             headers=headers,
             timeout=30,  # Longer timeout for image upload
         )
         response.raise_for_status()
-        printer_serial = data.get("printerSerial", "unknown")
-        log.info(f"Image uploaded successfully for printer {printer_serial}")
+        log.info(f"Image uploaded successfully for printer {printer_id}")
         return response.json() if response.content else {}
     except requests.RequestException as error:
-        printer_serial = data.get("printerSerial", "unknown")
-        log.error(f"Failed to upload image for printer {printer_serial}: {error}")
+        log.error(f"Failed to upload image for printer {printer_id}: {error}")
         return {}
 
 

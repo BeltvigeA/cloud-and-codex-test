@@ -37,18 +37,13 @@ def test_functions_requests_use_dedicated_api_key(monkeypatch: pytest.MonkeyPatc
 
     recorded_headers: List[Dict[str, str]] = []
     recorded_requests: List[Tuple[str, Dict[str, Any]]] = []
-    recorded_multipart_requests: List[Tuple[str, Dict[str, str], Dict[str, str]]] = []
 
     def fake_post(url: str, json: Dict[str, Any] | None = None, headers: Dict[str, str] | None = None, files: Any = None, data: Dict[str, str] | None = None, timeout: float = 0.0) -> _DummyResponse:
         if headers is not None:
             recorded_headers.append(dict(headers))
 
-        # Handle multipart/form-data requests (for image upload)
-        if files is not None and data is not None:
-            recorded_multipart_requests.append((url, dict(data or {}), dict(headers or {})))
-        else:
-            # Handle JSON requests
-            recorded_requests.append((url, dict(json or {})))
+        # All requests now use JSON
+        recorded_requests.append((url, dict(json or {})))
 
         return _DummyResponse({})
 
@@ -67,6 +62,7 @@ def test_functions_requests_use_dedicated_api_key(monkeypatch: pytest.MonkeyPatc
 
     # Verify all three calls were made
     assert len(recorded_headers) == 3
+    assert len(recorded_requests) == 3
 
     # postUpdateStatus uses control headers (BASE44_API_KEY → "legacy-key")
     # postReportError uses functions headers (BASE44_FUNCTIONS_API_KEY → "functions-key")
@@ -75,14 +71,14 @@ def test_functions_requests_use_dedicated_api_key(monkeypatch: pytest.MonkeyPatc
     assert recorded_headers[1].get("X-API-Key") == "functions-key"  # postReportError (functions)
     assert recorded_headers[2].get("X-API-Key") == "functions-key"  # postReportPrinterImage (functions)
 
-    # Verify image upload uses multipart/form-data to the new backend endpoint
-    assert len(recorded_multipart_requests) == 1
-    upload_url, upload_data, upload_headers = recorded_multipart_requests[0]
+    # Verify image upload uses JSON to the new backend endpoint
+    upload_url, upload_payload = recorded_requests[2]
     assert upload_url.endswith("/api/printer-images/upload")
-    assert upload_data["recipientId"] == "recipient-xyz"
-    assert upload_data["printerIpAddress"] == "192.168.1.100"
-    assert upload_data["imageType"] == "webcam"
-    assert upload_headers.get("X-API-Key") == "functions-key"
+    assert upload_payload["recipientId"] == "recipient-xyz"
+    assert upload_payload["printerIpAddress"] == "192.168.1.100"
+    assert upload_payload["imageType"] == "webcam"
+    assert upload_payload["imageData"] == "data:image/jpeg;base64,/9j/4AAQSkZJRg=="
+    assert "timestamp" in upload_payload  # Should auto-add timestamp
 
 
 def test_control_requests_use_control_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
