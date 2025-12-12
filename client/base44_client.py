@@ -326,21 +326,27 @@ def listPendingCommandsForRecipient(recipientId: str, limit: Optional[int] = Non
         log.info("Pending commands fetched for %s: %d", recipientId, commandCount)
     if not commandsPayload:
         return []
-    return [entry for entry in commandsPayload if isinstance(entry, dict)]
+    # Normalize 'id' to 'commandId' for API compatibility
+    normalized: List[Dict[str, Any]] = []
+    for entry in commandsPayload:
+        if not isinstance(entry, dict):
+            continue
+        # New API returns 'id', normalize to 'commandId' for internal use
+        if "id" in entry and "commandId" not in entry:
+            entry["commandId"] = entry["id"]
+        normalized.append(entry)
+    return normalized
 
 
 def acknowledgeCommand(commandId: str) -> None:
-    baseUrl = _resolveControlBaseUrl()
-    url = f"{baseUrl}/control/ack"
-    payload = {"commandId": commandId}
-    response = requests.post(
-        url,
-        json=payload,
-        headers=_buildControlHeaders(),
-        timeout=10,
-    )
-    response.raise_for_status()
-    log.debug("ACK sent for %s", commandId)
+    """
+    Acknowledge receipt of a command.
+    
+    NOTE: The new API automatically transitions command status from 'pending' 
+    to 'sent' when polled, so explicit ACK is no longer required.
+    This function is kept for backward compatibility but is now a no-op.
+    """
+    log.debug("ACK for %s (no-op, handled automatically by API)", commandId)
 
 
 def postCommandResult(
@@ -348,26 +354,56 @@ def postCommandResult(
     status: str,
     message: Optional[str] = None,
     errorMessage: Optional[str] = None,
+    recipientId: Optional[str] = None,
 ) -> None:
+    """
+    Report command result to the backend.
+    
+    New API format: POST /api/control/:commandId/result?recipientId=xxx
+    Body: { "success": bool, "result": str|null, "error": str|null }
+    """
     baseUrl = _resolveControlBaseUrl()
-    url = f"{baseUrl}/control/result"
-    body: Dict[str, Any] = {"commandId": commandId, "status": str(status or "").strip() or "completed"}
-    if message is not None:
-        messageValue = str(message).strip()
-        if messageValue:
-            body["message"] = messageValue
-    if errorMessage is not None:
-        errorValue = str(errorMessage).strip()
-        if errorValue:
-            body["errorMessage"] = errorValue
+    url = f"{baseUrl}/api/control/{commandId}/result"
+    
+    # Resolve recipientId from config or environment if not provided
+    resolvedRecipientId = recipientId
+    if not resolvedRecipientId:
+        if _config_manager_available:
+            try:
+                config = get_config_manager()
+                resolvedRecipientId = config.get_recipient_id()
+            except Exception:
+                pass
+        if not resolvedRecipientId:
+            resolvedRecipientId = os.getenv("BASE44_RECIPIENT_ID", "").strip()
+    
+    # Determine success based on status
+    normalizedStatus = str(status or "").strip().lower()
+    successStatusSet = {"completed", "success", "ok", "done"}
+    isSuccess = normalizedStatus in successStatusSet or (normalizedStatus and normalizedStatus not in {"failed", "error", "errored", "ko"})
+    
+    # Build body with new format
+    body: Dict[str, Any] = {
+        "success": isSuccess,
+        "result": str(message).strip() if message else ("Command executed successfully" if isSuccess else None),
+        "error": str(errorMessage).strip() if errorMessage else None,
+    }
+    
+    # Build query params
+    params: Dict[str, str] = {}
+    if resolvedRecipientId:
+        params["recipientId"] = resolvedRecipientId
+    
     response = requests.post(
         url,
         json=body,
         headers=_buildControlHeaders(),
+        params=params if params else None,
         timeout=10,
     )
     response.raise_for_status()
-    log.debug("RESULT sent for %s (status=%s)", commandId, body["status"])
+    log.debug("RESULT sent for %s (success=%s)", commandId, body["success"])
+
 _pendingCommandLogLock = threading.Lock()
 _pendingCommandLogCounters: Dict[str, int] = {}
 

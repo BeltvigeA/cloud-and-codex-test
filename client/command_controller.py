@@ -777,8 +777,8 @@ class CommandWorker:
             log.debug("Invalid control base URL %s – falling back to default", baseCandidate, exc_info=True)
             self.controlBaseUrl = buildBaseUrl(defaultBaseUrl)
         self.controlEndpointUrl = getPrinterControlEndpointUrl(self.controlBaseUrl)
-        self.controlAckUrl = f"{self.controlBaseUrl}/control/ack"
-        self.controlResultUrl = f"{self.controlBaseUrl}/control/result"
+        self.controlAckUrl = f"{self.controlBaseUrl}/api/control/ack"  # No longer used by new API
+        self.controlResultUrl = f"{self.controlBaseUrl}/api/control"  # Base URL for result endpoint
         self.pollErrorCount = 0
         self.pollLogEvery = 50
         self.pollIntervalSeconds = max(
@@ -1081,24 +1081,29 @@ class CommandWorker:
                 normalizedLower,
                 message=messageValue,
                 errorMessage=errorValue,
+                recipientId=self.recipientIdValue,
             )
             return
         if not self.apiKeyValue or not self.recipientIdValue:
             raise RuntimeError("Missing API key or recipientId for CommandWorker")
+        
+        # New API format: POST /api/control/:commandId/result?recipientId=xxx
+        # Body: { "success": bool, "result": str|null, "error": str|null }
+        normalizedStatus = str(status or "").strip().lower()
+        successStatusSet = {"completed", "success", "ok", "done"}
+        isSuccess = normalizedStatus in successStatusSet or (
+            normalizedStatus and normalizedStatus not in {"failed", "error", "errored", "ko"}
+        )
+        
+        resultUrl = f"{self.controlResultUrl}/{commandId}/result"
         payload: Dict[str, Any] = {
-            "recipientId": self.recipientIdValue,
-            "printerSerial": self.serial,
-            "printerIpAddress": self.ipAddress,
-            "commandId": commandId,
-            "status": status,
-            "finishedAt": _isoTimestamp(),
+            "success": isSuccess,
+            "result": str(message).strip() if message else ("Command executed successfully" if isSuccess else None),
+            "error": str(errorMessage).strip() if errorMessage else None,
         }
-        if message:
-            payload["message"] = str(message)
-        if errorMessage:
-            payload["errorMessage"] = str(errorMessage)
-        log.debug("Sending RESULT for %s via %s", commandId, self.controlResultUrl)
-        self._postControlPayload(self.controlResultUrl, payload, "result")
+        params = {"recipientId": self.recipientIdValue}
+        log.debug("Sending RESULT for %s via %s", commandId, resultUrl)
+        self._postControlPayloadWithParams(resultUrl, payload, params, "result")
 
     def _postControlPayload(self, url: str, payload: Dict[str, Any], action: str) -> bool:
         headers = {"Content-Type": "application/json", "X-API-Key": self.apiKeyValue}
@@ -1106,6 +1111,23 @@ class CommandWorker:
             response = requests.post(url, json=payload, headers=headers, timeout=CONNECT_TIMEOUT_SECONDS)
             response.raise_for_status()
         except requests.HTTPError as error:  # pragma: no cover - HTTP path validated via tests
+            statusCode = getattr(error.response, "status_code", None)
+            if statusCode in {404, 405}:
+                raise UnsupportedControlEndpointError(f"/{action}") from error
+            raise
+        return True
+
+    def _postControlPayloadWithParams(
+        self, url: str, payload: Dict[str, Any], params: Dict[str, str], action: str
+    ) -> bool:
+        """Post control payload with query parameters for new API format."""
+        headers = {"Content-Type": "application/json", "X-API-Key": self.apiKeyValue}
+        try:
+            response = requests.post(
+                url, json=payload, headers=headers, params=params, timeout=CONNECT_TIMEOUT_SECONDS
+            )
+            response.raise_for_status()
+        except requests.HTTPError as error:
             statusCode = getattr(error.response, "status_code", None)
             if statusCode in {404, 405}:
                 raise UnsupportedControlEndpointError(f"/{action}") from error
