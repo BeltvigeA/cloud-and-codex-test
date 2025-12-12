@@ -42,8 +42,24 @@ try:
 except ImportError:
     _config_manager_available = False
 
-# Reduce noise from third-party SDK logger
-logging.getLogger("bambulabs_api").setLevel(logging.WARNING)
+# Reduce noise from third-party SDK logger - set to CRITICAL to suppress
+# "Printer Values Not Available Yet" ERROR messages that spam during initialization
+logging.getLogger("bambulabs_api").setLevel(logging.CRITICAL)
+
+
+class _PrinterValuesNotAvailableFilter(logging.Filter):
+    """Filter to suppress noisy 'Printer Values Not Available Yet' messages."""
+    
+    def filter(self, record: logging.LogRecord) -> bool:
+        # Return False to suppress the message, True to allow it
+        message = record.getMessage() if hasattr(record, 'getMessage') else str(record.msg)
+        if "Printer Values Not Available Yet" in message:
+            return False
+        return True
+
+
+# Apply filter to root logger to catch messages from any source
+logging.getLogger().addFilter(_PrinterValuesNotAvailableFilter())
 
 
 try:  # pragma: no cover - dependency handled dynamically in tests
@@ -306,6 +322,23 @@ class BambuStatusSubscriber:
         while not stopEvent.is_set():
             printerInstance = None
             try:
+                # ============================================
+                # PING CHECK BEFORE MQTT CONNECTION
+                # ============================================
+                # Verify printer is reachable before attempting MQTT connection
+                # This prevents spam of "Printer Values Not Available Yet" errors
+                if not self._pingHost(ipAddress, 1000):
+                    self.log.debug(f"⏳ Printer {serial} at {ipAddress} is not reachable, skipping MQTT connection")
+                    # Report offline status if StatusReporter is available
+                    if self.status_reporter:
+                        try:
+                            self.status_reporter.report_offline(serial, ipAddress)
+                        except Exception as offline_err:
+                            self.log.debug(f"Failed to report offline status: {offline_err}")
+                    # Wait before next ping attempt
+                    stopEvent.wait(10.0)
+                    continue
+
                 printerInstance = _printerClass(ipAddress, accessCode, serial)
                 self._connectPrinter(printerInstance)
                 self._resetConnectionFailures(serial)

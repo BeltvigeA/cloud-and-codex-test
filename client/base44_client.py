@@ -295,7 +295,13 @@ def postReportPrinterImage(payload: Dict[str, object]) -> Dict[str, object]:
 
 
 def listPendingCommandsForRecipient(recipientId: str, limit: Optional[int] = None) -> List[Dict[str, Any]]:
-    params: Dict[str, Any] = {"recipientId": recipientId}
+    # Resolve API key for query parameter
+    apiKey = _resolveApiKey("PRINTER_BACKEND_API_KEY", "BASE44_API_KEY")
+    
+    params: Dict[str, Any] = {
+        "recipientId": recipientId,
+        "apiKey": apiKey,
+    }
     if limit is not None:
         params["limit"] = int(limit)
     baseUrl = _resolveControlBaseUrl()
@@ -304,7 +310,7 @@ def listPendingCommandsForRecipient(recipientId: str, limit: Optional[int] = Non
     controlEndpointUrl = getPrinterControlEndpointUrl(baseUrl)
     response = requests.get(
         controlEndpointUrl,
-        headers=_buildControlHeaders(),
+        headers={"Content-Type": "application/json"},  # No X-API-Key, using query param instead
         params=params or None,
         timeout=10,
     )
@@ -359,11 +365,14 @@ def postCommandResult(
     """
     Report command result to the backend.
     
-    New API format: POST /api/control/:commandId/result?recipientId=xxx
+    API format: POST /control/:commandId/result?recipientId=xxx&apiKey=xxx
     Body: { "success": bool, "result": str|null, "error": str|null }
     """
     baseUrl = _resolveControlBaseUrl()
-    url = f"{baseUrl}/api/control/{commandId}/result"
+    url = f"{baseUrl}/control/{commandId}/result"
+    
+    # Resolve API key for query parameter
+    apiKey = _resolveApiKey("PRINTER_BACKEND_API_KEY", "BASE44_API_KEY")
     
     # Resolve recipientId from config or environment if not provided
     resolvedRecipientId = recipientId
@@ -389,16 +398,16 @@ def postCommandResult(
         "error": str(errorMessage).strip() if errorMessage else None,
     }
     
-    # Build query params
-    params: Dict[str, str] = {}
+    # Build query params with apiKey
+    params: Dict[str, str] = {"apiKey": apiKey}
     if resolvedRecipientId:
         params["recipientId"] = resolvedRecipientId
     
     response = requests.post(
         url,
         json=body,
-        headers=_buildControlHeaders(),
-        params=params if params else None,
+        headers={"Content-Type": "application/json"},  # No X-API-Key, using query param
+        params=params,
         timeout=10,
     )
     response.raise_for_status()

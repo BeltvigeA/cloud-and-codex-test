@@ -83,7 +83,7 @@ def getPrinterStatusEndpointUrl(baseUrl: Optional[str] = None, recipientId: Opti
 def getPrinterControlEndpointUrl(baseUrl: Optional[str] = None) -> str:
     """Resolve the control endpoint for printer commands."""
     sanitizedBaseUrl = buildBaseUrl(baseUrl or defaultBaseUrl)
-    return f"{sanitizedBaseUrl}/api/control"
+    return f"{sanitizedBaseUrl}/control"
 
 
 def configureLogging() -> None:

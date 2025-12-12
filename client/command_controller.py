@@ -777,8 +777,8 @@ class CommandWorker:
             log.debug("Invalid control base URL %s – falling back to default", baseCandidate, exc_info=True)
             self.controlBaseUrl = buildBaseUrl(defaultBaseUrl)
         self.controlEndpointUrl = getPrinterControlEndpointUrl(self.controlBaseUrl)
-        self.controlAckUrl = f"{self.controlBaseUrl}/api/control/ack"  # No longer used by new API
-        self.controlResultUrl = f"{self.controlBaseUrl}/api/control"  # Base URL for result endpoint
+        self.controlAckUrl = f"{self.controlBaseUrl}/control/ack"  # No longer used by new API
+        self.controlResultUrl = f"{self.controlBaseUrl}/control"  # Base URL for result endpoint
         self.pollErrorCount = 0
         self.pollLogEvery = 50
         self.pollIntervalSeconds = max(
@@ -1087,7 +1087,7 @@ class CommandWorker:
         if not self.apiKeyValue or not self.recipientIdValue:
             raise RuntimeError("Missing API key or recipientId for CommandWorker")
         
-        # New API format: POST /api/control/:commandId/result?recipientId=xxx
+        # API format: POST /control/:commandId/result?recipientId=xxx&apiKey=xxx
         # Body: { "success": bool, "result": str|null, "error": str|null }
         normalizedStatus = str(status or "").strip().lower()
         successStatusSet = {"completed", "success", "ok", "done"}
@@ -1101,7 +1101,7 @@ class CommandWorker:
             "result": str(message).strip() if message else ("Command executed successfully" if isSuccess else None),
             "error": str(errorMessage).strip() if errorMessage else None,
         }
-        params = {"recipientId": self.recipientIdValue}
+        params = {"recipientId": self.recipientIdValue, "apiKey": self.apiKeyValue}
         log.debug("Sending RESULT for %s via %s", commandId, resultUrl)
         self._postControlPayloadWithParams(resultUrl, payload, params, "result")
 
@@ -1120,8 +1120,8 @@ class CommandWorker:
     def _postControlPayloadWithParams(
         self, url: str, payload: Dict[str, Any], params: Dict[str, str], action: str
     ) -> bool:
-        """Post control payload with query parameters for new API format."""
-        headers = {"Content-Type": "application/json", "X-API-Key": self.apiKeyValue}
+        """Post control payload with query parameters (apiKey is in params)."""
+        headers = {"Content-Type": "application/json"}  # apiKey is in query params, not header
         try:
             response = requests.post(
                 url, json=payload, headers=headers, params=params, timeout=CONNECT_TIMEOUT_SECONDS
