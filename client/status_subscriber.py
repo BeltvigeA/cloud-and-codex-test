@@ -1202,6 +1202,20 @@ class BambuStatusSubscriber:
             if not errorMessage:
                 errorMessage = "Possible AMS filament conflict"
 
+        # Handle "Cannot send print job" error (0x05004004 / 83902468)
+        # This occurs when trying to upload/print while printer is busy
+        if printErrorCode == 83902468:
+            busyMessage = "Printer Busy (Job in progress)"
+            if not errorMessage:
+                errorMessage = busyMessage
+            elif busyMessage not in errorMessage:
+                errorMessage = f"{errorMessage} - {busyMessage}"
+            
+            # Use a more descriptive state than "FAILED"
+            if gcodeState == "FAILED":
+                gcodeState = "BUSY"
+
+
         # CRITICAL FIX: Always use 0.0 for temperatures instead of None
         # This ensures the entire pipeline (GUI, JSON storage, backend API) gets consistent data
         # Frontend/GUI checks "is not None" before updating - None values cause fields to be skipped

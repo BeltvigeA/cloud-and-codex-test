@@ -1,0 +1,14 @@
+--- STARTING PRINTER DIAGNOSIS ---
+
+Scanning Printer: 01P00A381200434 (192.168.86.26)
+  Connecting (MQTT)...
+  Waiting for data (15s)...
+  Checking state...
+  RAW get_state(): "FAILED"
+  get_gcode_state() method NOT FOUND on printer object
+  mqtt_dump['print']['gcode_state']: FAILED
+  mqtt_dump['print']['print_error']: 83902468
+  mqtt_dump['print']['mc_print_error_code']: None
+  RAW mqtt_dump keys: ['print', 'upgrade', 'info']
+
+--- DIAGNOSIS COMPLETE ---

@@ -349,20 +349,13 @@ def extractPreferredTransport(*sources: Any) -> Optional[str]:
 def extractEnableTimeLapse(*sources: Any) -> Optional[bool]:
     targetKeys = {"enabletimelapse", "timelapseenabled"}
 
-    logging.info("[timelapse] extractEnableTimeLapse kalles med %d sources", len(sources))
-    for i, src in enumerate(sources):
-        logging.info("[timelapse] source[%d] type=%s: %s", i, type(src).__name__, src)
-
     def search(value: Any, depth: int = 0) -> Optional[bool]:
         indent = "  " * depth
         if isinstance(value, dict):
             for rawKey, rawValue in value.items():
                 normalizedKey = rawKey.replace("-", "").replace("_", "").lower()
-                logging.debug("[timelapse] %ssøker i nøkkel '%s' -> normalized '%s'", indent, rawKey, normalizedKey)
                 if normalizedKey in targetKeys:
                     interpreted = interpretBoolean(rawValue)
-                    logging.info("[timelapse] %sFUNNET! nøkkel='%s', verdi=%s, interpreted=%s",
-                                indent, rawKey, rawValue, interpreted)
                     if interpreted is not None:
                         return interpreted
                     if rawValue is None:
@@ -381,10 +374,8 @@ def extractEnableTimeLapse(*sources: Any) -> Optional[bool]:
     for source in sources:
         result = search(source, depth=0)
         if result is not None:
-            logging.info("[timelapse] extractEnableTimeLapse returnerer: %s", result)
             return result
 
-    logging.warning("[timelapse] extractEnableTimeLapse fant INGEN enableTimeLapse - returnerer None")
     return None
 
 
@@ -1365,32 +1356,19 @@ def dispatchBambuPrintIfPossible(
 
     resolvedAccessCode = "" if accessCode in {None, ""} else str(accessCode)
 
-    logging.info("[timelapse] ===== ENABLE TIMELAPSE RESOLUTION START =====")
-    logging.info("[timelapse] entryData keys: %s", list(entryData.keys()) if isinstance(entryData, dict) else "NOT A DICT")
-    logging.info("[timelapse] statusPayload keys: %s", list(statusPayload.keys()) if isinstance(statusPayload, dict) else "NOT A DICT")
-
     enableTimeLapseOverride = extractEnableTimeLapse(entryData, statusPayload)
-    logging.info("[timelapse] extractEnableTimeLapse returnerte: %s", enableTimeLapseOverride)
 
     configEnableTimeLapse = resolvedDetails.get("enableTimeLapse")
-    logging.info("[timelapse] configEnableTimeLapse fra resolvedDetails: %s", configEnableTimeLapse)
 
     if enableTimeLapseOverride is not None:
         enableTimeLapse = enableTimeLapseOverride
-        logging.info("[timelapse] Bruker enableTimeLapseOverride: %s", enableTimeLapse)
     elif isinstance(configEnableTimeLapse, bool):
         enableTimeLapse = configEnableTimeLapse
-        logging.info("[timelapse] Bruker configEnableTimeLapse (bool): %s", enableTimeLapse)
     elif configEnableTimeLapse is not None:
         interpretedConfig = interpretBoolean(configEnableTimeLapse)
         enableTimeLapse = bool(interpretedConfig) if interpretedConfig is not None else False
-        logging.info("[timelapse] Bruker interpretedConfig: %s", enableTimeLapse)
     else:
         enableTimeLapse = False
-        logging.warning("[timelapse] INGEN timelapse config funnet - setter til False")
-
-    logging.info("[timelapse] FINAL enableTimeLapse verdi: %s", enableTimeLapse)
-    logging.info("[timelapse] ===== ENABLE TIMELAPSE RESOLUTION END =====")
 
     rawTimeLapseDirectory = extractTimeLapseDirectory(entryData, statusPayload)
     if not rawTimeLapseDirectory:
@@ -1536,9 +1514,6 @@ def dispatchBambuPrintIfPossible(
                 "action": "invoke_send_job"
             }
         )
-        logging.info("[timelapse] client.py - Kaller sendBambuPrintJob med:")
-        logging.info("[timelapse] client.py - options.enableTimeLapse = %s", getattr(options, "enableTimeLapse", None))
-        logging.info("[timelapse] client.py - combinedJobMetadata = %s", combinedJobMetadata)
 
         result = sendBambuPrintJob(
             filePath=filePath,
