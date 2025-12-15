@@ -2127,11 +2127,11 @@ class BambuStatusSubscriber:
 
         with self.camera_capture_lock:
             # If this is the first time we're checking this printer, 
-            # set initial time so we wait before first capture (let MQTT connect first)
+            # capture immediately (image is already saved to disk, just need to upload)
             if printer_serial not in self.last_camera_capture:
-                self.log.info(f"📷 First camera check for {printer_serial} - waiting 30s before capture")
+                self.log.info(f"📷 First camera check for {printer_serial} - uploading immediately")
                 self.last_camera_capture[printer_serial] = current_time
-                return False
+                return True  # Upload immediately on first check
             
             last_capture = self.last_camera_capture.get(printer_serial, 0)
 
@@ -2164,31 +2164,32 @@ class BambuStatusSubscriber:
         printer_ip: str,
         access_code: Optional[str] = None
     ) -> Optional[str]:
-        """Capture camera image from printer and save to local file
+        """Find the most recent camera image from disk for this printer.
+
+        Images are already captured by captureCameraSnapshot in command_controller.py
+        and saved to ~/.printmaster/camera/<date>/<serial>/
 
         Args:
             printer_serial: Printer serial number
-            printer_ip: Printer IP address
-            access_code: Optional printer access code (if not provided, will look up from config)
+            printer_ip: Printer IP address (unused, kept for API compatibility)
+            access_code: Unused, kept for API compatibility
 
         Returns:
-            Path to saved image file, or None if capture failed
+            Path to the most recent image file, or None if no image found
         """
 
         import os
+        import glob
         from datetime import datetime
 
         try:
             self.log.info("=" * 80)
-            self.log.info("📸 CAMERA CAPTURE STARTED")
+            self.log.info("📸 FINDING LATEST CAMERA IMAGE")
             self.log.info(f"   Printer Serial: {printer_serial}")
-            self.log.info(f"   Printer IP: {printer_ip}")
 
-            # Generate output path
-            timestamp = datetime.utcnow().strftime('%Y-%m-%dT%H-%M-%S')
+            # Look for existing images in today's directory
             date_str = datetime.utcnow().strftime('%Y-%m-%d')
-
-            output_dir = os.path.join(
+            camera_dir = os.path.join(
                 os.path.expanduser('~'),
                 '.printmaster',
                 'camera',
@@ -2196,209 +2197,36 @@ class BambuStatusSubscriber:
                 printer_serial
             )
 
-            self.log.info(f"   Output dir: {output_dir}")
-            os.makedirs(output_dir, exist_ok=True)
-            self.log.info(f"   ✅ Output directory created/verified")
+            self.log.info(f"   Looking in: {camera_dir}")
 
-            output_path = os.path.join(
-                output_dir,
-                f"{printer_serial}-{timestamp}.jpg"
-            )
-
-            self.log.info(f"   Target file: {output_path}")
-
-            # Get printer access code
-            self.log.info(f"   🔑 Getting access code for {printer_serial}...")
-
-            if access_code:
-                self.log.info(f"   ✅ Access code provided directly ({len(access_code)} chars)")
-            else:
-                self.log.info(f"   📋 Looking up access code from config...")
-                access_code = self._get_printer_access_code(printer_serial)
-
-            if not access_code:
-                self.log.error(f"   ❌ No access code found for {printer_serial}")
-                self.log.error(f"   Cannot capture camera image without access code")
+            if not os.path.isdir(camera_dir):
+                self.log.warning(f"   ⚠️  Camera directory does not exist: {camera_dir}")
                 self.log.info("=" * 80)
                 return None
 
-            self.log.info(f"   ✅ Access code found ({len(access_code)} chars)")
+            # Find all jpg files for this printer
+            pattern = os.path.join(camera_dir, f"{printer_serial}-*.jpg")
+            image_files = glob.glob(pattern)
 
-            # Import Bambu API
-            self.log.info(f"   📦 Importing bambulabs_api...")
-            try:
-                from bambulabs_api import Printer
-                self.log.info(f"   ✅ bambulabs_api imported successfully")
-            except ImportError as e:
-                self.log.error(f"   ❌ Failed to import bambulabs_api: {e}")
+            if not image_files:
+                self.log.warning(f"   ⚠️  No images found matching: {pattern}")
                 self.log.info("=" * 80)
                 return None
 
-            # Initialize printer connection
-            self.log.info(f"   🔌 Connecting to printer at {printer_ip}...")
-            try:
-                printer = Printer(
-                    ip_address=printer_ip,
-                    access_code=access_code,
-                    serial=printer_serial
-                )
-                self.log.info(f"   ✅ Printer connection initialized")
-            except Exception as e:
-                self.log.error(f"   ❌ Failed to initialize printer connection: {e}")
-                self.log.info("=" * 80)
-                return None
-
-            # Step 1: Start MQTT connection
-            import time
-            mqttStarter = getattr(printer, "mqtt_start", None)
-            if callable(mqttStarter):
-                try:
-                    self.log.info(f"   📡 Starting MQTT connection...")
-                    mqttStarter()
-                    self.log.info(f"   ✅ MQTT started")
-                except Exception as e:
-                    self.log.warning(f"   ⚠️  mqtt_start() failed: {e}")
-
-            # Step 2: Call connect()
-            connectMethod = getattr(printer, "connect", None)
-            if callable(connectMethod):
-                try:
-                    self.log.info(f"   🔗 Calling connect()...")
-                    connectMethod()
-                    self.log.info(f"   ✅ connect() completed")
-                except Exception as e:
-                    self.log.warning(f"   ⚠️  connect() failed: {e}")
-
-            # Step 3: Wait for printer to be ready (get_state succeeds)
-            getStateMethod = getattr(printer, "get_state", None)
-            if callable(getStateMethod):
-                self.log.info(f"   ⏳ Waiting for printer readiness (get_state)...")
-                readinessDeadline = time.monotonic() + 8.0
-                printerReady = False
-                while time.monotonic() < readinessDeadline:
-                    try:
-                        getStateMethod()
-                        printerReady = True
-                        self.log.info(f"   ✅ Printer is ready (get_state succeeded)")
-                        break
-                    except Exception:
-                        time.sleep(0.25)
-                if not printerReady:
-                    self.log.warning(f"   ⚠️  Printer readiness not confirmed, continuing anyway...")
-
-            # Step 4: Start camera and wait for it to be alive
-            self.log.info(f"   📷 Initializing camera...")
-            image_data = None
-            cameraAliveMethod = getattr(printer, "camera_client_alive", None)
-            cameraStartMethod = getattr(printer, "camera_start", None)
-
-            # Check if camera is already alive
-            cameraIsAlive = False
-            if callable(cameraAliveMethod):
-                try:
-                    cameraIsAlive = bool(cameraAliveMethod())
-                    self.log.info(f"   📷 camera_client_alive: {cameraIsAlive}")
-                except Exception as e:
-                    self.log.debug(f"   camera_client_alive() error: {e}")
-
-            # Start camera if not already running
-            if not cameraIsAlive and callable(cameraStartMethod):
-                try:
-                    self.log.info(f"   🎬 Starting camera stream...")
-                    cameraStartMethod()
-                    self.log.info(f"   ✅ camera_start() called")
-                except Exception as e:
-                    self.log.warning(f"   ⚠️  camera_start() failed: {e}")
-
-            # Wait for camera to become alive (up to 6 seconds)
-            if callable(cameraAliveMethod):
-                cameraDeadline = time.monotonic() + 6.0
-                self.log.info(f"   ⏳ Waiting for camera to be ready...")
-                while time.monotonic() < cameraDeadline:
-                    try:
-                        if cameraAliveMethod():
-                            cameraIsAlive = True
-                            self.log.info(f"   ✅ Camera is ready (camera_client_alive=True)")
-                            break
-                    except Exception:
-                        pass
-                    time.sleep(0.25)
-                if not cameraIsAlive:
-                    self.log.warning(f"   ⚠️  Camera readiness not confirmed after 6s")
-
-            # Step 5: Try to get camera image
-            self.log.info(f"   📸 Capturing camera image...")
-            methods_tried = []
-
-            # Method 1: get_camera_frame() - more reliable than get_camera_image
-            if hasattr(printer, 'get_camera_frame'):
-                methods_tried.append('get_camera_frame()')
-                try:
-                    self.log.info(f"   Trying: printer.get_camera_frame()...")
-                    image_data = printer.get_camera_frame()
-                    if image_data:
-                        self.log.info(f"   ✅ Success with get_camera_frame()")
-                except Exception as e:
-                    self.log.warning(f"   ⚠️  get_camera_frame() failed: {e}")
-
-            # Method 2: get_camera_image()
-            if not image_data and hasattr(printer, 'get_camera_image'):
-                methods_tried.append('get_camera_image()')
-                try:
-                    self.log.info(f"   Trying: printer.get_camera_image()...")
-                    image_data = printer.get_camera_image()
-                    if image_data:
-                        self.log.info(f"   ✅ Success with get_camera_image()")
-                except Exception as e:
-                    self.log.warning(f"   ⚠️  get_camera_image() failed: {e}")
-
-            # Method 2: get_latest_jpg()
-            if not image_data and hasattr(printer, 'get_latest_jpg'):
-                methods_tried.append('get_latest_jpg()')
-                try:
-                    self.log.info(f"   Trying: printer.get_latest_jpg()...")
-                    image_data = printer.get_latest_jpg()
-                    if image_data:
-                        self.log.info(f"   ✅ Success with get_latest_jpg()")
-                except Exception as e:
-                    self.log.warning(f"   ⚠️  get_latest_jpg() failed: {e}")
-
-            # Method 3: camera.get_image()
-            if not image_data and hasattr(printer, 'camera'):
-                if hasattr(printer.camera, 'get_image'):
-                    methods_tried.append('camera.get_image()')
-                    try:
-                        self.log.info(f"   Trying: printer.camera.get_image()...")
-                        image_data = printer.camera.get_image()
-                        if image_data:
-                            self.log.info(f"   ✅ Success with camera.get_image()")
-                    except Exception as e:
-                        self.log.warning(f"   ⚠️  camera.get_image() failed: {e}")
-
-            if not image_data:
-                self.log.error(f"   ❌ No image data received from printer")
-                self.log.error(f"   Methods tried: {methods_tried}")
-                self.log.error(f"   Available methods: {[m for m in dir(printer) if 'camera' in m.lower() or 'image' in m.lower() or 'jpg' in m.lower()]}")
-                self.log.info("=" * 80)
-                return None
-
-            # Save to file
-            self.log.info(f"   💾 Saving image to file...")
-            with open(output_path, 'wb') as f:
-                f.write(image_data)
-
-            file_size = len(image_data)
+            # Get the most recent file (by modification time)
+            latest_image = max(image_files, key=os.path.getmtime)
+            file_size = os.path.getsize(latest_image)
             file_size_kb = file_size / 1024
 
-            self.log.info(f"   ✅ Camera image saved successfully!")
-            self.log.info(f"   File: {output_path}")
+            self.log.info(f"   ✅ Found {len(image_files)} image(s)")
+            self.log.info(f"   📸 Using latest: {os.path.basename(latest_image)}")
             self.log.info(f"   Size: {file_size_kb:.2f} KB ({file_size} bytes)")
             self.log.info("=" * 80)
 
-            return output_path
+            return latest_image
 
         except Exception as e:
-            self.log.error(f"❌ CAMERA CAPTURE FAILED")
+            self.log.error(f"❌ FINDING CAMERA IMAGE FAILED")
             self.log.error(f"   Error: {e}")
             import traceback
             self.log.error(f"   Traceback:\n{traceback.format_exc()}")
