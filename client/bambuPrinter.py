@@ -2241,6 +2241,62 @@ def _updateSkippedContainer(
         existingElement.set("plate_id", plateId)
 
 
+def extractOrderedObjectsFromArchive(archivePath: Path) -> List[Dict[str, Any]]:
+    """
+    Extract ordered objects from a 3MF archive's slice_info.config.
+    
+    This function reads object information from the Metadata/slice_info.config
+    file, which contains the correct identify_id values used in G-code
+    and during printing.
+    
+    Args:
+        archivePath: Path to the 3MF archive file
+        
+    Returns:
+        List of objects, each containing:
+        - identify_id: The object's unique identifier used in G-code
+        - name: Object name (e.g., "Model.stl 7")
+        - plate_id: Which plate the object belongs to (1-indexed)
+        - order: Sequential print order (1-indexed)
+        - skipped: Whether the object is marked as skipped
+        
+    Raises:
+        ValueError: If the archive is invalid or missing slice_info.config
+    """
+    try:
+        with zipfile.ZipFile(archivePath, "r") as archive:
+            try:
+                sliceInfo = archive.read("Metadata/slice_info.config")
+            except KeyError as error:
+                raise ValueError("3MF archive is missing slicer metadata (Metadata/slice_info.config)") from error
+    except zipfile.BadZipFile as error:
+        raise ValueError(f"{archivePath} is not a valid 3MF archive") from error
+
+    root = ET.fromstring(sliceInfo)
+    orderedObjects: List[Dict[str, Any]] = []
+    objectOrder = 1
+
+    for plateElement in root.findall("plate"):
+        plateIndex = _extractPlateIndex(plateElement)
+        
+        for objectElement in plateElement.findall("object"):
+            identifyId = objectElement.get("identify_id") or objectElement.get("object_id") or objectElement.get("id")
+            objectName = objectElement.get("name")
+            skipped = objectElement.get("skipped", "false").lower() == "true"
+            
+            objectData: Dict[str, Any] = {
+                "order": objectOrder,
+                "identify_id": identifyId,
+                "name": objectName,
+                "plate_id": plateIndex,
+                "skipped": skipped,
+            }
+            orderedObjects.append(objectData)
+            objectOrder += 1
+
+    return orderedObjects
+
+
 def applySkippedObjectsToArchive(archivePath: Path, skipTargets: Sequence[Dict[str, Any]]) -> None:
     if not skipTargets:
         return

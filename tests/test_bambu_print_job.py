@@ -570,3 +570,38 @@ def test_startPrintViaApi_includes_ams_mapping_when_use_ams_true(monkeypatch: py
         f"ams_mapping should be sent when use_ams=True, but got: {fakePrinter.startPayloads[0]}"
     )
     assert fakePrinter.startPayloads[0]["ams_mapping"] == [0, 1]
+
+
+def test_extractOrderedObjectsFromArchive_returns_identify_id(tmp_path: Path) -> None:
+    """Test that extractOrderedObjectsFromArchive returns identify_id from slice_info.config."""
+    samplePath = tmp_path / "model.3mf"
+    
+    sliceInfoXml = """<?xml version="1.0" encoding="UTF-8"?>
+<config>
+  <plate>
+    <metadata key="index" value="1"/>
+    <object identify_id="482" name="Model.stl 1" skipped="false" />
+    <object identify_id="493" name="Model.stl 2" skipped="false" />
+    <object identify_id="515" name="Model.stl 3" skipped="true" />
+  </plate>
+</config>
+"""
+    
+    with zipfile.ZipFile(samplePath, "w") as archive:
+        archive.writestr("Metadata/slice_info.config", sliceInfoXml)
+        archive.writestr("Metadata/plate_1.gcode", "G1 X0 Y0\n")
+    
+    objects = bambuPrinter.extractOrderedObjectsFromArchive(samplePath)
+    
+    assert len(objects) == 3
+    assert objects[0]["identify_id"] == "482"
+    assert objects[0]["name"] == "Model.stl 1"
+    assert objects[0]["plate_id"] == "1"
+    assert objects[0]["order"] == 1
+    assert objects[0]["skipped"] is False
+    
+    assert objects[1]["identify_id"] == "493"
+    assert objects[1]["order"] == 2
+    
+    assert objects[2]["identify_id"] == "515"
+    assert objects[2]["skipped"] is True
