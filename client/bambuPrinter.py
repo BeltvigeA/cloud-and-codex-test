@@ -1029,53 +1029,9 @@ def postStatus(status: Dict[str, Any], printerConfig: Dict[str, Any]) -> None:
         "Content-Type": "application/json"
     }
 
-    # VERBOSE LOGGING - Before sending
-    logger.info("─" * 80)
-    logger.info("📤 SENDING PRINTER STATUS (postStatus - Legacy) to backend")
-    logger.info(f"   Printer Serial: {printerConfig.get('serialNumber')}")
-    logger.info(f"   Printer IP: {printerConfig.get('ipAddress')}")
-    logger.info(f"   Target URL: {url}")
-    logger.info(f"   API Key: {'✅ Present (' + str(len(apiKey)) + ' chars)' if apiKey else '❌ MISSING'}")
-    logger.info(f"   Recipient ID: {recipientId}")
-    if organizationId:
-        logger.info(f"   Organization ID: {organizationId}")
-    logger.info("   ─── PAYLOAD DATA ───")
-    logger.info(f"   Status: {parsedStatus.get('status')}")
-    logger.info(f"   GCode State: {parsedStatus.get('gcodeState')}")
-    logger.info(f"   Progress: {parsedStatus.get('progressPercent') or parsedStatus.get('jobProgress')}%")
-    logger.info(f"   Nozzle Temp: {parsedStatus.get('nozzleTemp')}°C")
-    logger.info(f"   Bed Temp: {parsedStatus.get('bedTemp')}°C")
-    logger.info(f"   Chamber Temp: {parsedStatus.get('chamberTemp')}°C")
-    logger.info(f"   Remaining Time: {parsedStatus.get('remainingTimeSeconds') or parsedStatus.get('timeRemaining')}s")
-    logger.info("   ─── NEW PRINT JOB FIELDS ───")
-    logger.info(f"   File Name: {parsedStatus.get('fileName')}")
-    logger.info(f"   Gcode File: {parsedStatus.get('gcodeFile')}")
-    logger.info(f"   Print Type: {parsedStatus.get('printType')}")
-    logger.info(f"   Current Layer: {parsedStatus.get('currentLayer')}")
-    logger.info(f"   Total Layers: {parsedStatus.get('totalLayers')}")
-    logger.info(f"   Light State: {parsedStatus.get('lightState')}")
-    logger.info(f"   Print Error Code: {parsedStatus.get('printErrorCode')}")
-    logger.info(f"   Skipped Objects: {parsedStatus.get('skippedObjects')}")
-    logger.info(f"   Fan Speed: {parsedStatus.get('fanSpeed')}")
-    logger.info("   ─── FULL JSON PAYLOAD ───")
-    import json
-    logger.info(f"{json.dumps(payload, indent=2)}")
-    logger.info("─" * 80)
-
     try:
-        logger.info("🌐 Making HTTP POST request...")
         response = requests.post(url, json=payload, headers=headers, timeout=5)
-
-        logger.info(f"📥 Got response: HTTP {response.status_code}")
-
         response.raise_for_status()
-
-        logger.info("✅ PRINTER STATUS SENT SUCCESSFULLY (Legacy postStatus)")
-        logger.info(f"   Printer Serial: {printerConfig.get('serialNumber')}")
-        logger.info(f"   Printer IP: {printerConfig.get('ipAddress')}")
-        logger.info(f"   Status: {payload.get('status')}")
-        logger.info(f"   Response: {response.text[:500]}")
-        logger.info("─" * 80)
 
     except requests.exceptions.Timeout as e:
         logger.error("❌ REQUEST TIMEOUT (Legacy postStatus)")

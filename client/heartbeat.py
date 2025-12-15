@@ -108,18 +108,7 @@ class HeartbeatWorker:
             "clientVersion": self.client_version,
         }
 
-        # Log detailed request information
-        masked_key = self._mask_api_key(self.api_key)
-        log.info(
-            "Sending heartbeat request:\n"
-            "  URL: %s\n"
-            "  Method: POST\n"
-            "  Headers: {X-API-Key: %s, Content-Type: application/json}\n"
-            "  Payload: %s",
-            endpoint,
-            masked_key,
-            payload,
-        )
+
 
         try:
             response = requests.post(endpoint, json=payload, headers=headers, timeout=10)
@@ -129,13 +118,7 @@ class HeartbeatWorker:
             self._last_success = time.time()
             self._consecutive_failures = 0
 
-            data = response.json()
-            log.info(
-                "Heartbeat sent successfully (status: %d, recipient: %s, last: %s)",
-                response.status_code,
-                self.recipient_id,
-                data.get("lastHeartbeat", "unknown"),
-            )
+            response.json()  # Consume response but don't log
 
         except requests.Timeout:
             self._consecutive_failures += 1
