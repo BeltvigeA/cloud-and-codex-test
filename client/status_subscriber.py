@@ -226,7 +226,14 @@ class BambuStatusSubscriber:
         # MQTT reconnect tracking - for retry logic when ping succeeds but MQTT fails
         self.mqttReconnectAttempts: Dict[str, int] = {}  # {serial: attempt_count}
         self.mqttReconnectLock = threading.Lock()
+        self.mqttReconnectAttempts: Dict[str, int] = {}  # {serial: attempt_count}
+        self.mqttReconnectLock = threading.Lock()
         self.mqttMaxReconnectAttempts = 0  # 0 = infinite retries
+
+        # Active printer instances for reuse
+        self.active_printers: Dict[str, Any] = {}
+        self.active_printers_lock = threading.Lock()
+
 
     def startAll(self, printers: Iterable[Dict[str, Any]]) -> None:
         """Start worker threads for each printer configuration."""
@@ -306,6 +313,12 @@ class BambuStatusSubscriber:
     def stop_all(self) -> None:
         self.stopAll()
 
+    def get_active_printer(self, serial: str) -> Optional[Any]:
+        """Get the active printer instance for a given serial, if connected."""
+        with self.active_printers_lock:
+            return self.active_printers.get(serial)
+
+
     def _worker(self, printerConfig: Dict[str, Any], stopEvent: threading.Event) -> None:
         serial = str(printerConfig.get("serialNumber") or "").strip()
         ipAddress = str(printerConfig.get("ipAddress") or "").strip()
@@ -340,6 +353,9 @@ class BambuStatusSubscriber:
                     continue
 
                 printerInstance = _printerClass(ipAddress, accessCode, serial)
+                with self.active_printers_lock:
+                    self.active_printers[serial] = printerInstance
+
                 self._connectPrinter(printerInstance)
                 self._resetConnectionFailures(serial)
                 printerMetadata = self._fetchPrinterMetadata(printerInstance)
@@ -694,6 +710,9 @@ class BambuStatusSubscriber:
                     stopEvent.wait(self.reconnectDelay * 2)
             finally:
                 if printerInstance is not None:
+                    with self.active_printers_lock:
+                        if serial in self.active_printers and self.active_printers[serial] is printerInstance:
+                            del self.active_printers[serial]
                     safeDisconnectPrinter(printerInstance)
 
     def _shouldLogConnectionFailure(self, serial: str) -> bool:

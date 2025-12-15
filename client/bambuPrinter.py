@@ -1552,49 +1552,53 @@ def startPrintViaApi(
     job_metadata: Optional[Dict[str, Any]] = None,
     ack_timeout_sec: float = 15.0,
     timelapse_directory: Optional[Path] = None,
+    printer: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Start a print using bambulabs_api.Printer with acknowledgement handling."""
 
-    if bambulabsApi is None:
-        raise RuntimeError("bambulabs_api is required for API start strategy")
+    if printer is None:
+        if bambulabsApi is None:
+            raise RuntimeError("bambulabs_api is required for API start strategy")
 
-    printerClass = getattr(bambulabsApi, "Printer", None)
-    if printerClass is None:
-        raise RuntimeError("bambulabs_api.Printer class is unavailable")
+        printerClass = getattr(bambulabsApi, "Printer", None)
+        if printerClass is None:
+            raise RuntimeError("bambulabs_api.Printer class is unavailable")
 
-    printer = printerClass(ip, accessCode, serial)
+        printer = printerClass(ip, accessCode, serial)
 
-    # Connect to printer via MQTT
-    connectionMethod = getattr(printer, "mqtt_start", None) or getattr(printer, "connect", None)
-    if connectionMethod:
-        connectionMethod()
-        logger.info(
-            "[PRINTER_COMM] Bambu API Start Print Connection",
-            extra={
-                "method": "BAMBU_API",
-                "protocol": "MQTT",
-                "port": 8883,
-                "destination": ip,
-                "serial": serial,
-                "action": "mqtt_connect",
-                "comm_direction": "client_to_printer"
-            }
-        )
-        # Wait for MQTT connection to establish and receive printer state
-        max_wait = 5.0  # Maximum 5 seconds
-        wait_interval = 0.5
-        elapsed = 0.0
-        while elapsed < max_wait:
-            time.sleep(wait_interval)
-            elapsed += wait_interval
-            # Try to get printer state to verify connection is ready
-            state = _safe_get_state(printer)
-            if state is not None:
-                logger.info("[PRINTER_COMM] MQTT connection established and printer state received (waited %.1fs)", elapsed)
-                break
-        else:
-            # Timed out waiting for state, but continue anyway
-            logger.warning("[PRINTER_COMM] MQTT connection timeout - proceeding anyway (waited %.1fs)", elapsed)
+        # Connect to printer via MQTT
+        connectionMethod = getattr(printer, "mqtt_start", None) or getattr(printer, "connect", None)
+        if connectionMethod:
+            connectionMethod()
+            logger.info(
+                "[PRINTER_COMM] Bambu API Start Print Connection",
+                extra={
+                    "method": "BAMBU_API",
+                    "protocol": "MQTT",
+                    "port": 8883,
+                    "destination": ip,
+                    "serial": serial,
+                    "action": "mqtt_connect",
+                    "comm_direction": "client_to_printer"
+                }
+            )
+            # Wait for MQTT connection to establish and receive printer state
+            max_wait = 5.0  # Maximum 5 seconds
+            wait_interval = 0.5
+            elapsed = 0.0
+            while elapsed < max_wait:
+                time.sleep(wait_interval)
+                elapsed += wait_interval
+                # Try to get printer state to verify connection is ready
+                state = _safe_get_state(printer)
+                if state is not None:
+                    logger.info("[PRINTER_COMM] MQTT connection established and printer state received (waited %.1fs)", elapsed)
+                    break
+            else:
+                # Timed out waiting for state, but continue anyway
+                logger.warning("[PRINTER_COMM] MQTT connection timeout - proceeding anyway (waited %.1fs)", elapsed)
+    else:
+        logger.info("[PRINTER_COMM] Using provided printer instance for startPrintViaApi")
 
     resolvedUseAms = resolveUseAmsAuto(options, job_metadata, None)
 
@@ -2378,6 +2382,7 @@ def sendBambuPrintJob(
     statusCallback: Optional[Callable[[Dict[str, Any]], None]] = None,
     skippedObjects: Optional[Sequence[Dict[str, Any]]] = None,
     jobMetadata: Optional[Dict[str, Any]] = None,
+    printer: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Upload a file and start a Bambu print job."""
 
@@ -2754,6 +2759,7 @@ def sendBambuPrintJob(
                 job_metadata=jobMetadata,
                 ack_timeout_sec=max(float(options.waitSeconds), 1.0),
                 timelapse_directory=timelapsePath,
+                printer=printer,
             )
             if statusCallback:
                 statusCallback(

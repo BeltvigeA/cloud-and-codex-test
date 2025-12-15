@@ -2468,6 +2468,7 @@ class CommandWorker:
                 param_path=paramPath,
                 options=options,
                 job_metadata=metadata if isinstance(metadata, dict) else None,
+                printer=printer,
             )
             acknowledged = result.get("acknowledged")
             message = (

@@ -1071,6 +1071,8 @@ def dispatchBambuPrintIfPossible(
     entryData: Dict[str, Any],
     statusPayload: Dict[str, Any],
     configuredPrinters: Optional[List[Dict[str, Any]]] = None,
+    context: Optional[Dict[str, Any]] = None,
+    on_dispatch_start: Optional[Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]] = None,
 ) -> Optional[Dict[str, Any]]:
     savedFile = entryData.get("savedFile")
     if not savedFile:
@@ -1389,6 +1391,27 @@ def dispatchBambuPrintIfPossible(
         statusPayload,
     )
 
+    printerInstance = None
+    if context and isinstance(context, dict):
+        printerInstance = context.get("printer")
+
+    # If we have a callback and resolved details, try to get the active printer now
+    if not printerInstance and on_dispatch_start:
+        # Enrich entryData with resolved info so the callback can find the printer
+        enrichedEntry = dict(entryData)
+        if serialNumber:
+            enrichedEntry["serialNumber"] = str(serialNumber)
+        if ipAddress:
+            enrichedEntry["ipAddress"] = str(ipAddress)
+        
+        try:
+            dispatchContext = on_dispatch_start(enrichedEntry)
+            if dispatchContext and isinstance(dispatchContext, dict):
+                printerInstance = dispatchContext.get("printer")
+        except Exception as e:
+            logging.warning("Failed to invoke on_dispatch_start callback: %s", e)
+
+
     options = BambuPrintOptions(
         ipAddress=str(ipAddress),
         serialNumber=str(serialNumber),
@@ -1521,6 +1544,7 @@ def dispatchBambuPrintIfPossible(
             statusCallback=capture,
             skippedObjects=skippedTargets,
             jobMetadata=combinedJobMetadata,
+            printer=printerInstance,
         )
         capture(
             {
@@ -2214,6 +2238,8 @@ def listenForFiles(
     pollInterval: int,
     maxIterations: int,
     onFileFetched: Optional[Callable[[Dict[str, Any]], None]] = None,
+    onDispatchStart: Optional[Callable[[Dict[str, Any]], None]] = None,
+    onDispatchEnd: Optional[Callable[[Dict[str, Any], Optional[Dict[str, Any]]], None]] = None,
     stopEvent: Optional[Event] = None,
     *,
     logFilePath: Optional[Union[str, Path]] = None,
@@ -2436,13 +2462,18 @@ def listenForFiles(
                             upsertPrinterFromJob(fetchResult)
                         except Exception as error:
                             logging.warning("Failed to update printer defaults from job: %s", error)
+
                         dispatchResult = dispatchBambuPrintIfPossible(
                             baseUrl=baseUrl,
                             productId=productId,
                             recipientId=handshakeRecipientId,
                             entryData=entryData,
                             statusPayload=statusPayload,
+                            on_dispatch_start=onDispatchStart,
                         )
+
+                        if onDispatchEnd:
+                            onDispatchEnd(entryData, dispatchResult)
                         if dispatchResult is not None:
                             entryData["printerDispatch"] = dispatchResult
 

@@ -3693,6 +3693,33 @@ class ListenerGuiApp:
         self.stopButton.config(state=tk.DISABLED)
         self._appendLogLine("Stopped listening.")
 
+    def _extractSerialFromJob(self, entryData: Dict[str, Any]) -> Optional[str]:
+        unencrypted = entryData.get("unencryptedData") or {}
+        decrypted = entryData.get("decryptedData") or {}
+        serial = (
+            decrypted.get("printer_serial") 
+            or entryData.get("serialNumber")
+            or unencrypted.get("serial_number")
+            or unencrypted.get("serialNumber")
+        )
+        return str(serial).strip() if serial else None
+
+    def _handleDispatchStart(self, entryData: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        serial = self._extractSerialFromJob(entryData)
+        if serial:
+            # Check if we have an active connection to this printer
+            printer = self.statusSubscriber.get_active_printer(serial)
+            if printer:
+                self.log(f"Reusing active printer connection for {serial}...")
+                return {"printer": printer}
+        return None
+
+    def _handleDispatchEnd(self, entryData: Dict[str, Any], result: Optional[Dict[str, Any]]) -> None:
+        serial = self._extractSerialFromJob(entryData)
+        if serial:
+            # Reload printers to ensure we have the latest IP/AccessCode from upsertPrinterFromJob
+            self.printers = loadPrinters()
+
     def _runListener(
         self,
         baseUrl: str,
@@ -3708,6 +3735,8 @@ class ListenerGuiApp:
                 pollInterval,
                 maxIterations=0,
                 onFileFetched=self._handleFetchedData,
+                onDispatchStart=self._handleDispatchStart,
+                onDispatchEnd=self._handleDispatchEnd,
                 stopEvent=self.stopEvent,
                 logFilePath=str(self.logFilePath) if self.logFilePath else None,
             )
