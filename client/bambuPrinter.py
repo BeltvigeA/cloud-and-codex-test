@@ -532,6 +532,7 @@ def uploadViaFtps(
             safeBase = baseName or "upload"
             timestampPart = str(int(time.time()))
             uniquePart = uuid.uuid4().hex[:8]
+            # Put timestamp and unique suffix at the END so original name stays recognizable
             return f"{safeBase}_{timestampPart}_{uniquePart}{extension}"
 
         savedDirectory: Optional[str] = None

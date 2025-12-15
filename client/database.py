@@ -521,12 +521,31 @@ class LocalDatabase:
         elif isinstance(lastRequestedAt, str):
             latestPrintedAt = lastRequestedAt
 
+        # Extract product name from fileName by removing UUID prefix and file extension
+        productName = None
+        fileLocation = record.get("fileName")
+        if fileLocation:
+            # Remove directory path and file extension
+            baseName = Path(fileLocation).stem  # Gets filename without extension
+            # Check if filename has UUID prefix (format: uuid_productname)
+            if "_" in baseName:
+                # Find the first underscore after the UUID pattern (36 chars: 8-4-4-4-12)
+                parts = baseName.split("_", 1)
+                if len(parts) > 1 and len(parts[0]) == 36:
+                    # UUID is exactly 36 chars (with dashes), so keep everything after first underscore
+                    productName = parts[1]
+                else:
+                    productName = baseName
+            else:
+                productName = baseName
+
         productEntry.update(
             {
                 "productId": productId,
+                "productName": productName,
                 "createdAt": createdAt,
                 "lastRequestedAt": lastRequestedAt,
-                "fileLocation": record.get("fileName"),
+                "fileLocation": fileLocation,
                 "filePath": record.get("downloadedFilePath"),
                 "downloaded": bool(record.get("downloaded")),
                 "requestHistory": requestHistory,
