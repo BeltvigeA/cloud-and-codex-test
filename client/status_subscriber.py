@@ -2126,6 +2126,13 @@ class BambuStatusSubscriber:
         current_time = time.monotonic()
 
         with self.camera_capture_lock:
+            # If this is the first time we're checking this printer, 
+            # set initial time so we wait before first capture (let MQTT connect first)
+            if printer_serial not in self.last_camera_capture:
+                self.log.info(f"📷 First camera check for {printer_serial} - waiting 30s before capture")
+                self.last_camera_capture[printer_serial] = current_time
+                return False
+            
             last_capture = self.last_camera_capture.get(printer_serial, 0)
 
             # Get printer state
@@ -2233,7 +2240,7 @@ class BambuStatusSubscriber:
                 printer = Printer(
                     ip_address=printer_ip,
                     access_code=access_code,
-                    serial_number=printer_serial
+                    serial=printer_serial
                 )
                 self.log.info(f"   ✅ Printer connection initialized")
             except Exception as e:
@@ -2241,15 +2248,101 @@ class BambuStatusSubscriber:
                 self.log.info("=" * 80)
                 return None
 
-            # Try to get camera image
-            self.log.info(f"   📷 Requesting camera image from printer...")
-            image_data = None
+            # Step 1: Start MQTT connection
+            import time
+            mqttStarter = getattr(printer, "mqtt_start", None)
+            if callable(mqttStarter):
+                try:
+                    self.log.info(f"   📡 Starting MQTT connection...")
+                    mqttStarter()
+                    self.log.info(f"   ✅ MQTT started")
+                except Exception as e:
+                    self.log.warning(f"   ⚠️  mqtt_start() failed: {e}")
 
-            # Try multiple methods
+            # Step 2: Call connect()
+            connectMethod = getattr(printer, "connect", None)
+            if callable(connectMethod):
+                try:
+                    self.log.info(f"   🔗 Calling connect()...")
+                    connectMethod()
+                    self.log.info(f"   ✅ connect() completed")
+                except Exception as e:
+                    self.log.warning(f"   ⚠️  connect() failed: {e}")
+
+            # Step 3: Wait for printer to be ready (get_state succeeds)
+            getStateMethod = getattr(printer, "get_state", None)
+            if callable(getStateMethod):
+                self.log.info(f"   ⏳ Waiting for printer readiness (get_state)...")
+                readinessDeadline = time.monotonic() + 8.0
+                printerReady = False
+                while time.monotonic() < readinessDeadline:
+                    try:
+                        getStateMethod()
+                        printerReady = True
+                        self.log.info(f"   ✅ Printer is ready (get_state succeeded)")
+                        break
+                    except Exception:
+                        time.sleep(0.25)
+                if not printerReady:
+                    self.log.warning(f"   ⚠️  Printer readiness not confirmed, continuing anyway...")
+
+            # Step 4: Start camera and wait for it to be alive
+            self.log.info(f"   📷 Initializing camera...")
+            image_data = None
+            cameraAliveMethod = getattr(printer, "camera_client_alive", None)
+            cameraStartMethod = getattr(printer, "camera_start", None)
+
+            # Check if camera is already alive
+            cameraIsAlive = False
+            if callable(cameraAliveMethod):
+                try:
+                    cameraIsAlive = bool(cameraAliveMethod())
+                    self.log.info(f"   📷 camera_client_alive: {cameraIsAlive}")
+                except Exception as e:
+                    self.log.debug(f"   camera_client_alive() error: {e}")
+
+            # Start camera if not already running
+            if not cameraIsAlive and callable(cameraStartMethod):
+                try:
+                    self.log.info(f"   🎬 Starting camera stream...")
+                    cameraStartMethod()
+                    self.log.info(f"   ✅ camera_start() called")
+                except Exception as e:
+                    self.log.warning(f"   ⚠️  camera_start() failed: {e}")
+
+            # Wait for camera to become alive (up to 6 seconds)
+            if callable(cameraAliveMethod):
+                cameraDeadline = time.monotonic() + 6.0
+                self.log.info(f"   ⏳ Waiting for camera to be ready...")
+                while time.monotonic() < cameraDeadline:
+                    try:
+                        if cameraAliveMethod():
+                            cameraIsAlive = True
+                            self.log.info(f"   ✅ Camera is ready (camera_client_alive=True)")
+                            break
+                    except Exception:
+                        pass
+                    time.sleep(0.25)
+                if not cameraIsAlive:
+                    self.log.warning(f"   ⚠️  Camera readiness not confirmed after 6s")
+
+            # Step 5: Try to get camera image
+            self.log.info(f"   📸 Capturing camera image...")
             methods_tried = []
 
-            # Method 1: get_camera_image()
-            if hasattr(printer, 'get_camera_image'):
+            # Method 1: get_camera_frame() - more reliable than get_camera_image
+            if hasattr(printer, 'get_camera_frame'):
+                methods_tried.append('get_camera_frame()')
+                try:
+                    self.log.info(f"   Trying: printer.get_camera_frame()...")
+                    image_data = printer.get_camera_frame()
+                    if image_data:
+                        self.log.info(f"   ✅ Success with get_camera_frame()")
+                except Exception as e:
+                    self.log.warning(f"   ⚠️  get_camera_frame() failed: {e}")
+
+            # Method 2: get_camera_image()
+            if not image_data and hasattr(printer, 'get_camera_image'):
                 methods_tried.append('get_camera_image()')
                 try:
                     self.log.info(f"   Trying: printer.get_camera_image()...")
