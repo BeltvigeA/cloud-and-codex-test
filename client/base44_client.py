@@ -38,7 +38,7 @@ BASE44_FUNCTIONS_BASE = _resolveFunctionsBaseUrl()
 
 # PrintPro3D backend API endpoints
 REPORT_ERROR_URL = f"{PRINTPRO3D_BASE}/api/printer-events/error"
-REPORT_IMAGE_URL = f"{PRINTER_BACKEND_BASE}/api/printer-images/upload"
+REPORT_IMAGE_URL = f"{PRINTPRO3D_BASE}/api/printer-images/upload"
 
 # Note: UPDATE_STATUS_URL er nå dynamisk og bygges i postUpdateStatus()
 
