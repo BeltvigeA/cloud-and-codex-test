@@ -1899,7 +1899,7 @@ class BambuStatusSubscriber:
             self.log.error(f"   Traceback:\n{traceback.format_exc()}")
 
     def _completedStateDetected(self, status_data: Dict[str, Any]) -> bool:
-        completionStates = {"finish", "finished", "completed", "complete", "idle"}
+        completionStates = {"finish", "finished", "completed", "complete"}
 
         for key in ("gcodeState", "state"):
             stateValue = self._coerceString(status_data.get(key))
@@ -1940,25 +1940,33 @@ class BambuStatusSubscriber:
             return
 
         jobId = self._coerceString(status_data.get("currentJobId"))
-        if not jobId:
-            return
 
         if not self._completedStateDetected(status_data):
             return
 
+        fileName = self._extractCompletedFileName(status_data)
+
         with self.completedJobsLock:
             reportedJobs = self.completedJobIds.setdefault(printer_serial, set())
-            if jobId in reportedJobs:
+            # Use job ID if available, otherwise use file name as fallback key
+            reportKey = jobId if jobId else fileName
+            if reportKey in reportedJobs:
                 return
-            reportedJobs.add(jobId)
+            reportedJobs.add(reportKey)
 
-        fileName = self._extractCompletedFileName(status_data)
+        self.log.info("═" * 80)
+        self.log.info("🎉 PRINT JOB COMPLETION DETECTED")
+        self.log.info(f"   Printer: {printer_serial}")
+        self.log.info(f"   File: {fileName}")
+        self.log.info(f"   Job ID: {jobId or 'N/A'}")
+        self.log.info(f"   State: {status_data.get('gcodeState')}")
+        self.log.info(f"   Progress: {status_data.get('progressPercent')}%")
 
         try:
             eventId = self.event_reporter.report_job_completed(
                 printer_serial=printer_serial,
                 printer_ip=printer_ip,
-                print_job_id=jobId,
+                print_job_id=jobId or "unknown",
                 file_name=fileName,
             )
 
@@ -1970,7 +1978,7 @@ class BambuStatusSubscriber:
         except Exception as error:
             self.log.error(f"❌ Failed to report job completion: {error}")
 
-        self.log.info("=" * 80)
+        self.log.info("═" * 80)
 
     def _extract_hms_from_status(self, status_data: Dict[str, Any]) -> List[str]:
         """
