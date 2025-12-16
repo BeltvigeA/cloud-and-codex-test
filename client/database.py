@@ -104,6 +104,38 @@ class LocalDatabase:
                 self.connection.execute(
                     "ALTER TABLE products ADD COLUMN downloadedFilePath TEXT"
                 )
+            
+            # Active print jobs table for persistent job tracking
+            self.connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS active_print_jobs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    printer_serial TEXT NOT NULL,
+                    print_job_id TEXT,
+                    product_id TEXT,
+                    product_name TEXT,
+                    file_name TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    status TEXT DEFAULT 'printing',
+                    finished_at TEXT,
+                    sent_to_backend INTEGER DEFAULT 0,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            # Create indexes for efficient lookup
+            self.connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_active_jobs_serial 
+                ON active_print_jobs(printer_serial)
+                """
+            )
+            self.connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_active_jobs_status 
+                ON active_print_jobs(status)
+                """
+            )
 
     def close(self) -> None:
         self.connection.close()
@@ -593,4 +625,191 @@ class LocalDatabase:
                 }
 
         return None
+
+    # ============================================
+    # ACTIVE PRINT JOBS PERSISTENCE METHODS
+    # ============================================
+
+    def save_active_job(
+        self,
+        printer_serial: str,
+        file_name: str,
+        print_job_id: Optional[str] = None,
+        product_id: Optional[str] = None,
+        product_name: Optional[str] = None,
+    ) -> int:
+        """
+        Save an active print job to the database.
+        
+        Returns the row ID of the inserted job.
+        """
+        timestamp = datetime.utcnow().isoformat()
+        with self.connection:
+            cursor = self.connection.execute(
+                """
+                INSERT INTO active_print_jobs (
+                    printer_serial, print_job_id, product_id, product_name,
+                    file_name, started_at, status, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 'printing', ?)
+                """,
+                (
+                    printer_serial,
+                    print_job_id,
+                    product_id,
+                    product_name,
+                    file_name,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            return cursor.lastrowid or 0
+
+    def get_active_job_by_serial(self, printer_serial: str) -> Optional[Dict[str, Any]]:
+        """Get the currently printing job for a printer (status='printing')."""
+        cursor = self.connection.execute(
+            """
+            SELECT id, printer_serial, print_job_id, product_id, product_name,
+                   file_name, started_at, status, finished_at, sent_to_backend
+            FROM active_print_jobs
+            WHERE printer_serial = ? AND status = 'printing'
+            ORDER BY started_at DESC
+            LIMIT 1
+            """,
+            (printer_serial,),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return None
+        return self._row_to_active_job(row)
+
+    def get_active_job_by_file(
+        self, printer_serial: str, file_name: str
+    ) -> Optional[Dict[str, Any]]:
+        """Find an active job by file name (for matching jobs without job ID)."""
+        cursor = self.connection.execute(
+            """
+            SELECT id, printer_serial, print_job_id, product_id, product_name,
+                   file_name, started_at, status, finished_at, sent_to_backend
+            FROM active_print_jobs
+            WHERE printer_serial = ? AND file_name = ? AND status = 'printing'
+            ORDER BY started_at DESC
+            LIMIT 1
+            """,
+            (printer_serial, file_name),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return None
+        return self._row_to_active_job(row)
+
+    def finish_active_job(
+        self,
+        printer_serial: str,
+        print_job_id: Optional[str] = None,
+        status: str = "finished",
+    ) -> bool:
+        """Mark an active job as finished or cancelled."""
+        timestamp = datetime.utcnow().isoformat()
+        with self.connection:
+            if print_job_id:
+                cursor = self.connection.execute(
+                    """
+                    UPDATE active_print_jobs
+                    SET status = ?, finished_at = ?, updated_at = ?
+                    WHERE printer_serial = ? AND print_job_id = ? AND status = 'printing'
+                    """,
+                    (status, timestamp, timestamp, printer_serial, print_job_id),
+                )
+            else:
+                cursor = self.connection.execute(
+                    """
+                    UPDATE active_print_jobs
+                    SET status = ?, finished_at = ?, updated_at = ?
+                    WHERE printer_serial = ? AND status = 'printing'
+                    """,
+                    (status, timestamp, timestamp, printer_serial),
+                )
+            return cursor.rowcount > 0
+
+    def mark_active_job_sent(self, printer_serial: str, print_job_id: Optional[str]) -> bool:
+        """Mark a job as sent to backend."""
+        timestamp = datetime.utcnow().isoformat()
+        with self.connection:
+            if print_job_id:
+                cursor = self.connection.execute(
+                    """
+                    UPDATE active_print_jobs
+                    SET sent_to_backend = 1, updated_at = ?
+                    WHERE printer_serial = ? AND print_job_id = ?
+                    """,
+                    (timestamp, printer_serial, print_job_id),
+                )
+            else:
+                cursor = self.connection.execute(
+                    """
+                    UPDATE active_print_jobs
+                    SET sent_to_backend = 1, updated_at = ?
+                    WHERE printer_serial = ? AND print_job_id IS NULL
+                    ORDER BY started_at DESC
+                    LIMIT 1
+                    """,
+                    (timestamp, printer_serial),
+                )
+            return cursor.rowcount > 0
+
+    def get_printing_jobs(self) -> List[Dict[str, Any]]:
+        """Get all jobs with status='printing' (for recovery after restart)."""
+        cursor = self.connection.execute(
+            """
+            SELECT id, printer_serial, print_job_id, product_id, product_name,
+                   file_name, started_at, status, finished_at, sent_to_backend
+            FROM active_print_jobs
+            WHERE status = 'printing'
+            ORDER BY started_at DESC
+            """
+        )
+        return [self._row_to_active_job(row) for row in cursor.fetchall()]
+
+    def get_unsent_finished_jobs(self) -> List[Dict[str, Any]]:
+        """Get finished jobs that haven't been sent to backend."""
+        cursor = self.connection.execute(
+            """
+            SELECT id, printer_serial, print_job_id, product_id, product_name,
+                   file_name, started_at, status, finished_at, sent_to_backend
+            FROM active_print_jobs
+            WHERE status IN ('finished', 'cancelled') AND sent_to_backend = 0
+            ORDER BY finished_at DESC
+            """
+        )
+        return [self._row_to_active_job(row) for row in cursor.fetchall()]
+
+    def cleanup_old_active_jobs(self, days: int = 7) -> int:
+        """Remove old finished jobs from the database."""
+        from datetime import timedelta
+        cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
+        with self.connection:
+            cursor = self.connection.execute(
+                """
+                DELETE FROM active_print_jobs
+                WHERE status IN ('finished', 'cancelled') AND finished_at < ?
+                """,
+                (cutoff,),
+            )
+            return cursor.rowcount
+
+    def _row_to_active_job(self, row: sqlite3.Row) -> Dict[str, Any]:
+        """Convert a database row to an active job dictionary."""
+        return {
+            "id": row["id"],
+            "printer_serial": row["printer_serial"],
+            "print_job_id": row["print_job_id"],
+            "product_id": row["product_id"],
+            "product_name": row["product_name"],
+            "file_name": row["file_name"],
+            "started_at": row["started_at"],
+            "status": row["status"],
+            "finished_at": row["finished_at"],
+            "sent_to_backend": bool(row["sent_to_backend"]),
+        }
+
 

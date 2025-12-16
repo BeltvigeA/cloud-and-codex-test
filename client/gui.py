@@ -81,6 +81,7 @@ def addPrinterIdentityToPayload(
 
 from .autoprint.brake_flow import BrakeFlowContext
 from .bambuPrinter import BambuPrintOptions, postStatus, sendBambuPrintJob
+from .database import LocalDatabase
 from .status_subscriber import BambuStatusSubscriber
 from .command_controller import CommandWorker
 from .printflow import PrintCompletionMonitor, CompletionResult, PrintJobTracker, TrackedJob, JobStatus
@@ -222,10 +223,17 @@ class ListenerGuiApp:
         )
 
         # Print job tracker for logging all jobs
+        # Initialize database for persistent job tracking
+        self._jobDatabase = LocalDatabase()
         self.jobTracker = PrintJobTracker(
             logger=logging.getLogger(__name__),
             on_job_ended=self._onJobEnded,
+            database=self._jobDatabase,
         )
+        # Load any jobs that were printing before restart
+        loaded_jobs = self.jobTracker.load_from_database()
+        if loaded_jobs > 0:
+            logging.info(f"Loaded {loaded_jobs} printing job(s) from database")
 
         # Event reporter for sending events to backend
         self._eventReporter: Optional[Any] = None
@@ -686,6 +694,8 @@ class ListenerGuiApp:
         # columns for the main tree (right side, scrollable)
         columnsMain = (
             "serial_number",
+            "job_id",
+            "product_name",
             "print_type",
             "current_state",
             "file_name",
@@ -724,6 +734,8 @@ class ListenerGuiApp:
         
         # Configure headings
         self.printJobTree.heading("serial_number", text="Serial Number")
+        self.printJobTree.heading("job_id", text="Job ID")
+        self.printJobTree.heading("product_name", text="Product")
         self.printJobTree.heading("print_type", text="Print Type")
         self.printJobTree.heading("current_state", text="State")
         self.printJobTree.heading("file_name", text="File Name")
@@ -748,6 +760,8 @@ class ListenerGuiApp:
 
         # Configure column widths
         self.printJobTree.column("serial_number", width=140)
+        self.printJobTree.column("job_id", width=80)
+        self.printJobTree.column("product_name", width=150)
         self.printJobTree.column("print_type", width=100)
         self.printJobTree.column("current_state", width=100)
         self.printJobTree.column("file_name", width=180)
@@ -3443,12 +3457,19 @@ class ListenerGuiApp:
         job_id = result.job_id or ""
         job_id_display = job_id[:8] if job_id else "N/A"
         
+        # Get product info from tracker before finishing job
+        product_info = self.jobTracker.get_product_info_for_printer(printer_serial)
+        product_name = product_info.get("product_name") if product_info else None
+        
         # Mark job as finished in tracker (this triggers backend report via _onJobEnded)
         if job_id:
             self.jobTracker.finish_job(printer_serial, job_id)
         
-        # Log to console
-        log_message = f"PRINT FERDIG: {printer_serial} - {file_name} (job: {job_id_display})"
+        # Log to console with job ID and product name
+        if product_name:
+            log_message = f"PRINT FERDIG: {printer_serial} - {file_name} | Job: {job_id_display} | Product: {product_name}"
+        else:
+            log_message = f"PRINT FERDIG: {printer_serial} - {file_name} | Job: {job_id_display}"
         self.logQueue.put(log_message)
         logging.info(log_message)
 
@@ -4703,6 +4724,17 @@ class ListenerGuiApp:
             # Check if bed image exists for this printer
             bed_image_path = self._getLatestBedImagePath(serialNumber)
             bed_image_text = "Vis bilde" if bed_image_path else ""
+            
+            # Get job_id and product_name from job tracker
+            job_id = ""
+            product_name = ""
+            if serialNumber and hasattr(self, 'jobTracker'):
+                product_info = self.jobTracker.get_product_info_for_printer(serialNumber)
+                if product_info:
+                    job_id = product_info.get("job_id") or ""
+                    if job_id:
+                        job_id = job_id[:8] if len(job_id) > 8 else job_id
+                    product_name = product_info.get("product_name") or ""
 
             # Determine row tag
             tag = "even_row" if i % 2 == 0 else "odd_row"
@@ -4726,6 +4758,8 @@ class ListenerGuiApp:
                 iid=iid,
                 values=(
                     serialNumber,
+                    job_id,
+                    product_name,
                     print_type,
                     current_state,
                     file_name,

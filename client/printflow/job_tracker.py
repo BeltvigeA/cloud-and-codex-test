@@ -32,11 +32,14 @@ class TrackedJob:
     finished_at: Optional[datetime] = None
     sent_to_backend: bool = False
     backend_event_id: Optional[str] = None
+    product_id: Optional[str] = None
+    product_name: Optional[str] = None
     
     def to_display_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for GUI display."""
+        job_id_display = self.job_id[:8] if self.job_id and len(self.job_id) > 8 else (self.job_id or "-")
         return {
-            "job_id": self.job_id,
+            "job_id": job_id_display,
             "printer_serial": self.printer_serial,
             "printer_ip": self.printer_ip,
             "file_name": self.file_name,
@@ -44,6 +47,8 @@ class TrackedJob:
             "started_at": self.started_at.strftime("%H:%M:%S") if self.started_at else "",
             "finished_at": self.finished_at.strftime("%H:%M:%S") if self.finished_at else "",
             "sent": "✓" if self.sent_to_backend else "",
+            "product_id": self.product_id or "",
+            "product_name": self.product_name or "",
         }
 
 
@@ -64,9 +69,10 @@ class PrintJobTracker:
     
     This class maintains a log of all print jobs and their status transitions.
     It integrates with EventReporter to send events to the backend.
+    Now includes database persistence for job tracking across restarts.
     
     Example usage:
-        tracker = PrintJobTracker()
+        tracker = PrintJobTracker(database=db)
         
         # When a new job starts
         tracker.start_job("SERIAL123", "192.168.1.100", "job-abc", "model.3mf")
@@ -82,6 +88,7 @@ class PrintJobTracker:
         self,
         logger: Optional[logging.Logger] = None,
         on_job_ended: Optional[Callable[[TrackedJob], None]] = None,
+        database: Optional[Any] = None,
     ) -> None:
         """
         Initialize the job tracker.
@@ -89,9 +96,11 @@ class PrintJobTracker:
         Args:
             logger: Optional custom logger
             on_job_ended: Callback invoked when a job ends (finished or cancelled)
+            database: Optional LocalDatabase instance for persistence
         """
         self._log = logger or log
         self._on_job_ended = on_job_ended
+        self._database = database
         
         # All tracked jobs: (printer_serial, job_id) -> TrackedJob
         self._jobs: Dict[tuple[str, str], TrackedJob] = {}
@@ -106,6 +115,8 @@ class PrintJobTracker:
         printer_ip: str,
         job_id: str,
         file_name: str,
+        product_id: Optional[str] = None,
+        product_name: Optional[str] = None,
     ) -> TrackedJob:
         """
         Record a new print job starting.
@@ -115,11 +126,13 @@ class PrintJobTracker:
             printer_ip: Printer IP address
             job_id: Unique job identifier
             file_name: Name of the print file
+            product_id: Optional product ID (auto-lookup if job_id provided)
+            product_name: Optional product name (auto-lookup if job_id provided)
             
         Returns:
             The created TrackedJob
         """
-        key = (printer_serial, job_id)
+        key = (printer_serial, job_id) if job_id else (printer_serial, f"_local_{file_name}")
         
         with self._lock:
             # Check if job already exists
@@ -127,25 +140,61 @@ class PrintJobTracker:
                 existing = self._jobs[key]
                 self._log.debug(
                     "[tracker] Job already exists: %s/%s (status=%s)",
-                    printer_serial, job_id[:8], existing.status.value
+                    printer_serial, (job_id or "local")[:8], existing.status.value
                 )
                 return existing
             
+            # Try to lookup product info from database if not provided
+            resolved_product_id = product_id
+            resolved_product_name = product_name
+            
+            if job_id and self._database and not (product_id and product_name):
+                try:
+                    product_info = self._database.findPrintJobInProductLog(job_id)
+                    if product_info:
+                        resolved_product_id = product_info.get("productId") or product_id
+                        product_entry = product_info.get("productEntry") or {}
+                        resolved_product_name = product_entry.get("productName") or product_name
+                        self._log.info(
+                            "[tracker] Found product info: id=%s, name=%s",
+                            resolved_product_id, resolved_product_name
+                        )
+                except Exception as e:
+                    self._log.debug("[tracker] Product lookup failed: %s", e)
+            
             job = TrackedJob(
-                job_id=job_id,
+                job_id=job_id or "",
                 printer_serial=printer_serial,
                 printer_ip=printer_ip,
                 file_name=file_name,
                 status=JobStatus.PRINTING,
                 started_at=datetime.now(timezone.utc),
+                product_id=resolved_product_id,
+                product_name=resolved_product_name,
             )
             
             self._jobs[key] = job
-            self._current_job_per_printer[printer_serial] = job_id
+            self._current_job_per_printer[printer_serial] = job_id or f"_local_{file_name}"
+            
+            # Persist to database
+            if self._database:
+                try:
+                    self._database.save_active_job(
+                        printer_serial=printer_serial,
+                        file_name=file_name,
+                        print_job_id=job_id,
+                        product_id=resolved_product_id,
+                        product_name=resolved_product_name,
+                    )
+                except Exception as e:
+                    self._log.warning("[tracker] Failed to persist job to database: %s", e)
             
             self._log.info(
-                "[tracker] JOB STARTED: printer=%s, job=%s, file=%s",
-                printer_serial, job_id[:8] if len(job_id) > 8 else job_id, file_name
+                "[tracker] JOB STARTED: printer=%s, job=%s, file=%s, product=%s",
+                printer_serial,
+                (job_id or "local")[:8] if job_id else "local",
+                file_name,
+                resolved_product_name or "unknown"
             )
             
             return job
@@ -225,6 +274,18 @@ class PrintJobTracker:
                 job_id[:8] if len(job_id) > 8 else job_id,
                 job.file_name
             )
+            
+            # Persist to database
+            if self._database:
+                try:
+                    db_status = "finished" if new_status == JobStatus.FINISHED else "cancelled"
+                    self._database.finish_active_job(
+                        printer_serial=printer_serial,
+                        print_job_id=job_id if job_id else None,
+                        status=db_status,
+                    )
+                except Exception as e:
+                    self._log.warning("[tracker] Failed to update job in database: %s", e)
         
         # Invoke callback outside lock
         if self._on_job_ended:
@@ -387,3 +448,106 @@ class PrintJobTracker:
             return False
         normalized = state.strip().lower()
         return normalized in CANCELLED_STATES
+
+    def load_from_database(self) -> int:
+        """
+        Load printing jobs from database for recovery after restart.
+        
+        Returns:
+            Number of jobs loaded
+        """
+        if not self._database:
+            return 0
+        
+        try:
+            printing_jobs = self._database.get_printing_jobs()
+            loaded = 0
+            
+            with self._lock:
+                for job_data in printing_jobs:
+                    job_id = job_data.get("print_job_id") or ""
+                    printer_serial = job_data.get("printer_serial", "")
+                    file_name = job_data.get("file_name", "")
+                    
+                    key = (printer_serial, job_id) if job_id else (printer_serial, f"_local_{file_name}")
+                    
+                    if key in self._jobs:
+                        continue  # Already loaded
+                    
+                    try:
+                        started_at = datetime.fromisoformat(job_data.get("started_at", ""))
+                    except (ValueError, TypeError):
+                        started_at = datetime.now(timezone.utc)
+                    
+                    job = TrackedJob(
+                        job_id=job_id,
+                        printer_serial=printer_serial,
+                        printer_ip="",  # Not stored in database
+                        file_name=file_name,
+                        status=JobStatus.PRINTING,
+                        started_at=started_at,
+                        product_id=job_data.get("product_id"),
+                        product_name=job_data.get("product_name"),
+                    )
+                    
+                    self._jobs[key] = job
+                    self._current_job_per_printer[printer_serial] = job_id or f"_local_{file_name}"
+                    loaded += 1
+                    
+                    self._log.info(
+                        "[tracker] Loaded job from database: printer=%s, job=%s, product=%s",
+                        printer_serial,
+                        (job_id or "local")[:8],
+                        job_data.get("product_name") or "unknown"
+                    )
+            
+            return loaded
+            
+        except Exception as e:
+            self._log.warning("[tracker] Failed to load jobs from database: %s", e)
+            return 0
+
+    def get_current_job_for_printer(self, printer_serial: str) -> Optional[TrackedJob]:
+        """
+        Get the currently printing job for a specific printer.
+        
+        Args:
+            printer_serial: Printer serial number
+            
+        Returns:
+            The current TrackedJob or None
+        """
+        with self._lock:
+            current_job_id = self._current_job_per_printer.get(printer_serial)
+            if not current_job_id:
+                return None
+            
+            key = (printer_serial, current_job_id)
+            job = self._jobs.get(key)
+            
+            if job and job.status == JobStatus.PRINTING:
+                return job
+            
+            return None
+
+    def get_product_info_for_printer(self, printer_serial: str) -> Optional[Dict[str, Any]]:
+        """
+        Get product info for the currently printing job on a printer.
+        
+        Args:
+            printer_serial: Printer serial number
+            
+        Returns:
+            Dict with job_id, product_id, product_name, or None
+        """
+        job = self.get_current_job_for_printer(printer_serial)
+        if not job:
+            return None
+        
+        return {
+            "job_id": job.job_id or None,
+            "product_id": job.product_id,
+            "product_name": job.product_name,
+            "file_name": job.file_name,
+        }
+
