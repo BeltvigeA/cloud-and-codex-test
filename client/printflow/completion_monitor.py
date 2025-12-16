@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Optional, Set, Tuple
@@ -34,6 +35,16 @@ COMPLETION_STATES: Set[str] = frozenset({
     "complete",
 })
 
+# States indicating print job has failed or was cancelled
+FAILED_STATES: Set[str] = frozenset({
+    "failed",
+    "cancelled",
+    "canceled",
+    "stopped",
+    "aborted",
+    "error",
+})
+
 # States indicating printer is actively printing
 PRINTING_STATES: Set[str] = frozenset({
     "running",
@@ -42,6 +53,9 @@ PRINTING_STATES: Set[str] = frozenset({
     "preheating",
     "slicing",
 })
+
+# Timeout for progress=100 fallback detection (seconds)
+PROGRESS_100_TIMEOUT: float = 10.0
 
 
 class PrintCompletionMonitor:
@@ -67,12 +81,13 @@ class PrintCompletionMonitor:
     """
 
     # Number of consecutive completion confirmations before reporting
-    DEBOUNCE_COUNT: int = 2
+    DEBOUNCE_COUNT: int = 1
 
     def __init__(
         self,
         logger: Optional[logging.Logger] = None,
-        debounce_count: int = 2,
+        debounce_count: int = 1,
+        progress_100_timeout: float = 10.0,
     ) -> None:
         """
         Initialize the completion monitor.
@@ -83,6 +98,7 @@ class PrintCompletionMonitor:
         """
         self._log = logger or log
         self._debounce_count = max(1, debounce_count)
+        self._progress_100_timeout = max(1.0, float(progress_100_timeout))
         
         # Track completed jobs per printer: serial -> set of job IDs
         self._completed_jobs: Dict[str, Set[str]] = {}
@@ -94,6 +110,10 @@ class PrintCompletionMonitor:
         
         # Track previous printing state per printer for transition detection
         self._was_printing: Dict[str, bool] = {}
+        
+        # Track when progress reached 100% for timeout-based detection
+        # Key: (serial, job_id), Value: timestamp (monotonic)
+        self._progress_100_since: Dict[Tuple[str, str], float] = {}
 
     def is_print_completed(
         self,
@@ -311,6 +331,35 @@ class PrintCompletionMonitor:
             return True
         
         return False
+
+    def is_print_failed(
+        self,
+        status_data: Dict[str, Any],
+    ) -> Tuple[bool, str]:
+        """
+        Check if a print job has failed or been cancelled.
+        
+        Args:
+            status_data: Status dictionary from printer
+            
+        Returns:
+            Tuple of (failed: bool, reason: str)
+        """
+        # Check gcodeState for failure states
+        gcode_state = self._extract_gcode_state(status_data)
+        if gcode_state:
+            normalized = gcode_state.strip().lower()
+            if normalized in FAILED_STATES:
+                return True, f"gcodeState={gcode_state}"
+        
+        # Check general state field
+        state = self._extract_state(status_data)
+        if state:
+            normalized = state.strip().lower()
+            if normalized in FAILED_STATES:
+                return True, f"state={state}"
+        
+        return False, ""
 
     def _extract_gcode_state(self, status_data: Dict[str, Any]) -> Optional[str]:
         """Extract gcode state from status data."""

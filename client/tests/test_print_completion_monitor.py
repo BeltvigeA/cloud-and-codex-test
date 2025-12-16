@@ -8,6 +8,7 @@ from client.printflow.completion_monitor import (
     PrintCompletionMonitor,
     CompletionResult,
     COMPLETION_STATES,
+    FAILED_STATES,
     PRINTING_STATES,
 )
 
@@ -336,3 +337,54 @@ class TestCompletionResult:
         
         with pytest.raises(AttributeError):
             result.completed = False  # type: ignore
+
+
+class TestIsPrintFailed:
+    """Tests for is_print_failed method."""
+
+    def test_failed_state(self) -> None:
+        """Detect failure via gcodeState=FAILED."""
+        monitor = PrintCompletionMonitor()
+        status = {"gcodeState": "FAILED"}
+        
+        failed, reason = monitor.is_print_failed(status)
+        
+        assert failed is True
+        assert "gcodeState" in reason
+
+    def test_cancelled_state(self) -> None:
+        """Detect cancellation via gcodeState=cancelled."""
+        monitor = PrintCompletionMonitor()
+        status = {"gcodeState": "cancelled"}
+        
+        failed, reason = monitor.is_print_failed(status)
+        
+        assert failed is True
+
+    def test_error_state(self) -> None:
+        """Detect error state."""
+        monitor = PrintCompletionMonitor()
+        status = {"state": "error"}
+        
+        failed, reason = monitor.is_print_failed(status)
+        
+        assert failed is True
+
+    def test_not_failed_when_printing(self) -> None:
+        """Return False when still printing."""
+        monitor = PrintCompletionMonitor()
+        status = {"gcodeState": "RUNNING"}
+        
+        failed, reason = monitor.is_print_failed(status)
+        
+        assert failed is False
+        assert reason == ""
+
+    def test_not_failed_when_finished(self) -> None:
+        """Return False when successfully finished (not failed)."""
+        monitor = PrintCompletionMonitor()
+        status = {"gcodeState": "FINISH"}
+        
+        failed, reason = monitor.is_print_failed(status)
+        
+        assert failed is False
