@@ -1653,7 +1653,7 @@ def extractPrintJobId(*sources: Optional[Dict[str, Any]]) -> Optional[str]:
     for source in sources:
         if not isinstance(source, dict):
             continue
-        for key in ("printJobId", "printJob"):
+        for key in ("printJobId", "printJob", "print_job_id", "job_id"):
             value = source.get(key)
             if value is None:
                 continue

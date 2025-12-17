@@ -226,8 +226,6 @@ class BambuStatusSubscriber:
         # MQTT reconnect tracking - for retry logic when ping succeeds but MQTT fails
         self.mqttReconnectAttempts: Dict[str, int] = {}  # {serial: attempt_count}
         self.mqttReconnectLock = threading.Lock()
-        self.mqttReconnectAttempts: Dict[str, int] = {}  # {serial: attempt_count}
-        self.mqttReconnectLock = threading.Lock()
         self.mqttMaxReconnectAttempts = 0  # 0 = infinite retries
 
         # Active printer instances for reuse
@@ -361,6 +359,8 @@ class BambuStatusSubscriber:
                 printerMetadata = self._fetchPrinterMetadata(printerInstance)
                 lastBase44Comparable: Optional[Dict[str, Any]] = None
                 lastBase44Emit = 0.0
+                lastErrorComparable: Optional[Dict[str, Any]] = None
+                lastErrorEmit = 0.0
                 lastSuccessfulStateTime = time.monotonic()
 
                 while not stopEvent.is_set():
@@ -1192,7 +1192,7 @@ class BambuStatusSubscriber:
 
         jobCandidate = self._findValue(
             sources,
-            {"job_id", "task_id", "current_job_id", "print_id", "jobId"},
+            {"job_id", "task_id", "current_job_id", "print_id", "jobId", "print_job_id", "printJobId"},
         )
         currentJobId = self._coerceString(jobCandidate)
 
