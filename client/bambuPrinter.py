@@ -1701,13 +1701,14 @@ def startPrintViaApi(
     if skipObjects:
         startKeywordArgs["skip_objects"] = skipObjects
         logger.info("[start] skip_objects preselected in job: %s", skipObjects)
-    # Only include ams_mapping when use_ams is True or None (auto-detect)
-    # When use_ams=False (external spool), ams_mapping causes HMS validation errors
-    if amsMapping and resolvedUseAms is not False:
+    # Only include ams_mapping when use_ams is explicitly True
+    # When use_ams=None (auto-detect) or False, ams_mapping should NOT be sent
+    # to avoid HMS validation errors on printers without AMS
+    if amsMapping and resolvedUseAms is True:
         startKeywordArgs["ams_mapping"] = amsMapping
-        logger.info("[start] ams_mapping requested: %s", amsMapping)
-    elif amsMapping and resolvedUseAms is False:
-        logger.info("[start] ams_mapping SKIPPED (use_ams=False, external spool mode): %s", amsMapping)
+        logger.info("[start] ams_mapping requested (use_ams=True): %s", amsMapping)
+    elif amsMapping:
+        logger.info("[start] ams_mapping SKIPPED (use_ams=%s, not explicitly True): %s", resolvedUseAms, amsMapping)
 
 
     if START_DEBUG:
@@ -1858,9 +1859,9 @@ def startPrintViaApi(
                     if startParam:
                         payload["print"]["param"] = startParam
                     payload["print"].update({key: value for key, value in sendControlFlags.items() if value is not None})
-                    # Only include ams_mapping in fallback path when use_ams is True or None
-                    # When use_ams=False (external spool), ams_mapping causes HMS validation errors
-                    if amsMapping and resolvedUseAms is not False:
+                    # Only include ams_mapping in fallback path when use_ams is explicitly True
+                    # When use_ams=None (auto-detect) or False, ams_mapping should NOT be sent
+                    if amsMapping and resolvedUseAms is True:
                         payload["print"]["ams_mapping"] = amsMapping
                     if skipObjects:
                         payload["print"]["skip_objects"] = skipObjects

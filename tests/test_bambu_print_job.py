@@ -572,6 +572,61 @@ def test_startPrintViaApi_includes_ams_mapping_when_use_ams_true(monkeypatch: py
     assert fakePrinter.startPayloads[0]["ams_mapping"] == [0, 1]
 
 
+def test_startPrintViaApi_excludes_ams_mapping_when_use_ams_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Test that ams_mapping is NOT sent when use_ams=None (auto-detect mode).
+    
+    This is the fix for the AMS mapping error when no AMS config is specified -
+    ams_mapping should only be sent when use_ams is explicitly True.
+    
+    Note: When ams_configuration is present in metadata, resolveUseAmsAuto()
+    will return True (not None). So to test the None case, we must NOT include
+    ams_configuration in the metadata.
+    """
+    fakePrinter = FakeApiPrinter()
+    monkeypatch.setattr(bambuPrinter, "bambulabsApi", ApiModuleStub(lambda *_args, **_kwargs: fakePrinter))
+    monkeypatch.setattr(bambuPrinter.time, "sleep", lambda _seconds: None)
+
+    # No useAms specified - should default to None (auto-detect)
+    options = bambuPrinter.BambuPrintOptions(
+        ipAddress="1.2.3.4",
+        serialNumber="SERIAL",
+        accessCode="CODE",
+        waitSeconds=1,
+        # useAms not specified - defaults to None
+    )
+
+    # Job metadata WITHOUT ams_configuration - this will keep use_ams as None
+    # This simulates the user's case: no AMS config specified in payload
+    job_metadata = {
+        "unencryptedData": {
+            "printJobId": "test-job-123",
+            # No ams_configuration here!
+        }
+    }
+
+    result = bambuPrinter.startPrintViaApi(
+        ip="1.2.3.4",
+        serial="SERIAL",
+        accessCode="CODE",
+        uploaded_name="job.3mf",
+        plate_index=1,
+        param_path="Metadata/plate_1.gcode",
+        options=options,
+        job_metadata=job_metadata,
+        ack_timeout_sec=0.2,
+    )
+
+    assert result["acknowledged"] is True
+    # Verify that use_ams is None (auto-detect) initially
+    # Note: The first request will have None, but may retry with False on conflict
+    assert fakePrinter.startRequests[0] is None or fakePrinter.startRequests[0] is False
+    # Verify that ams_mapping was NOT included in any startKeywordArgs
+    for payload in fakePrinter.startPayloads:
+        assert "ams_mapping" not in payload, (
+            f"ams_mapping should NOT be sent when use_ams=None (auto-detect), but got: {payload}"
+        )
+
+
 def test_extractOrderedObjectsFromArchive_returns_identify_id(tmp_path: Path) -> None:
     """Test that extractOrderedObjectsFromArchive returns identify_id from slice_info.config."""
     samplePath = tmp_path / "model.3mf"
