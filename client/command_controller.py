@@ -754,6 +754,7 @@ class CommandWorker:
         recipientId: Optional[str] = None,
         baseUrl: Optional[str] = None,
         pollInterval: Optional[float] = None,
+        statusSubscriber: Optional[Any] = None,
     ) -> None:
         self.serial = serial
         self.ipAddress = ipAddress
@@ -813,6 +814,7 @@ class CommandWorker:
         self._cameraLoopStopEvent = threading.Event()
         self._idleConnectErrorCount = 0
         self._sequence_id: int = 0
+        self._statusSubscriber = statusSubscriber  # For registering job metadata
         log.debug(
             "CommandWorker configured for %s using control endpoint %s", self.serial, self.controlEndpointUrl
         )
@@ -2482,6 +2484,44 @@ class CommandWorker:
             except Exception:
                 self._lastRemoteFile = None
             self._sawActivityDuringJob = False
+            
+            # Register job metadata with status subscriber for display in GUI
+            # This fixes job_id not showing when dispatch happens via command polling
+            if self._statusSubscriber is not None:
+                try:
+                    # Extract job metadata for registration
+                    unencrypted = metadata.get("unencryptedData") or {}
+                    job_id = (
+                        unencrypted.get("printJobId")
+                        or unencrypted.get("print_job_id")
+                        or metadata.get("printJobId")
+                        or metadata.get("print_job_id")
+                    )
+                    product_name = (
+                        unencrypted.get("productName")
+                        or unencrypted.get("product_name")
+                        or metadata.get("productName")
+                    )
+                    product_id = (
+                        unencrypted.get("productId")
+                        or unencrypted.get("product_id")
+                        or metadata.get("productId")
+                    )
+                    self._statusSubscriber.register_active_job(
+                        printer_serial=self.serial,
+                        job_id=str(job_id) if job_id else None,
+                        product_name=str(product_name) if product_name else None,
+                        product_id=str(product_id) if product_id else None,
+                        file_name=str(fileName) if fileName else None,
+                    )
+                    log.info(
+                        "[dispatch] Registered job metadata: serial=%s, job_id=%s, product=%s",
+                        self.serial,
+                        (str(job_id)[:8] if job_id else "N/A"),
+                        product_name or "unknown"
+                    )
+                except Exception as reg_error:
+                    log.warning("[dispatch] Failed to register job metadata: %s", reg_error)
         elif normalizedType in {"home", "light_on", "light_off", "lightoff", "lighton", "move", "jog", "load_filament", "unload_filament", "sendgcode"}:
             if normalizedType == "home":
                 sendGcode("G28")

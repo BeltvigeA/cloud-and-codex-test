@@ -202,10 +202,18 @@ class PrintCompletionMonitor:
             )
         
         # Check if this job was already reported
+        # Use job_id if available, otherwise fall back to file_name for deduplication
+        dedup_key = job_id or file_name or "unknown"
+        
         with self._lock:
             reported_jobs = self._completed_jobs.get(printer_serial, set())
-            if job_id and job_id in reported_jobs:
-                # Already reported, don't report again
+            if dedup_key in reported_jobs:
+                # Already reported, don't report again (debug level to reduce spam)
+                self._log.debug(
+                    "[completion] Already reported for %s: %s",
+                    printer_serial,
+                    dedup_key[:20] if dedup_key else "unknown",
+                )
                 return CompletionResult(
                     completed=True,
                     reason=f"{reason} (already reported)",
@@ -242,9 +250,10 @@ class PrintCompletionMonitor:
         with self._lock:
             if printer_serial not in self._completed_jobs:
                 self._completed_jobs[printer_serial] = set()
+            # Always add dedup_key (job_id or file_name) to prevent repeated logging
+            self._completed_jobs[printer_serial].add(dedup_key)
+            # Clean up pending counter
             if job_id:
-                self._completed_jobs[printer_serial].add(job_id)
-                # Clean up pending counter
                 key = (printer_serial, job_id)
                 self._pending_completions.pop(key, None)
         

@@ -232,6 +232,12 @@ class BambuStatusSubscriber:
         self.active_printers: Dict[str, Any] = {}
         self.active_printers_lock = threading.Lock()
 
+        # Active job metadata tracking
+        # Maps printer_serial -> job metadata (job_id, product_name, product_id, file_name)
+        # This is set when a print job is dispatched and cleared when job completes
+        # Used to inject job_id into status updates since Bambu printers don't populate it via MQTT
+        self._active_job_metadata: Dict[str, Dict[str, Any]] = {}
+        self._active_job_metadata_lock = threading.Lock()
 
     def startAll(self, printers: Iterable[Dict[str, Any]]) -> None:
         """Start worker threads for each printer configuration."""
@@ -315,6 +321,70 @@ class BambuStatusSubscriber:
         """Get the active printer instance for a given serial, if connected."""
         with self.active_printers_lock:
             return self.active_printers.get(serial)
+
+    def register_active_job(
+        self,
+        printer_serial: str,
+        job_id: Optional[str],
+        product_name: Optional[str] = None,
+        product_id: Optional[str] = None,
+        file_name: Optional[str] = None,
+    ) -> None:
+        """
+        Register metadata for an active print job.
+        
+        This is called when a print job is dispatched to a printer.
+        The metadata is used to inject job_id and product info into
+        status updates since Bambu printers don't populate these via MQTT.
+        
+        Args:
+            printer_serial: Printer serial number
+            job_id: The print job ID from the backend
+            product_name: Product name being printed
+            product_id: Product ID being printed
+            file_name: Name of the print file
+        """
+        with self._active_job_metadata_lock:
+            self._active_job_metadata[printer_serial] = {
+                "job_id": job_id,
+                "product_name": product_name,
+                "product_id": product_id,
+                "file_name": file_name,
+                "registered_at": time.time(),
+            }
+            self.log.info(
+                "[job-metadata] Registered job for printer %s: job_id=%s, product=%s",
+                printer_serial,
+                (job_id or "")[:8] if job_id else "N/A",
+                product_name or "unknown"
+            )
+
+    def get_active_job_metadata(self, printer_serial: str) -> Optional[Dict[str, Any]]:
+        """
+        Get metadata for the active job on a printer.
+        
+        Args:
+            printer_serial: Printer serial number
+            
+        Returns:
+            Dict with job_id, product_name, product_id, file_name or None
+        """
+        with self._active_job_metadata_lock:
+            return self._active_job_metadata.get(printer_serial)
+
+    def clear_active_job(self, printer_serial: str) -> None:
+        """
+        Clear the active job metadata for a printer.
+        
+        Called when a print job completes or is cancelled.
+        
+        Args:
+            printer_serial: Printer serial number
+        """
+        with self._active_job_metadata_lock:
+            if printer_serial in self._active_job_metadata:
+                self.log.info("[job-metadata] Cleared job for printer %s", printer_serial)
+                del self._active_job_metadata[printer_serial]
 
 
     def _worker(self, printerConfig: Dict[str, Any], stopEvent: threading.Event) -> None:
@@ -1196,6 +1266,26 @@ class BambuStatusSubscriber:
         )
         currentJobId = self._coerceString(jobCandidate)
 
+        # CRITICAL FIX: Bambu printers don't populate job_id in MQTT data
+        # Fall back to job metadata registered when the print job was dispatched
+        productName: Optional[str] = None
+        productId: Optional[str] = None
+        printerSerial = str(printerConfig.get("serialNumber") or "").strip()
+        if printerSerial:
+            jobMetadata = self.get_active_job_metadata(printerSerial)
+            if jobMetadata:
+                # Use registered job_id if MQTT doesn't provide one
+                if not currentJobId and jobMetadata.get("job_id"):
+                    currentJobId = jobMetadata.get("job_id")
+                    self.log.debug(
+                        "[job-metadata] Using registered job_id for %s: %s",
+                        printerSerial, (currentJobId or "")[:8]
+                    )
+                # Always use product info from registration
+                productName = jobMetadata.get("product_name")
+                productId = jobMetadata.get("product_id")
+
+
         if self.statusDebugEnabled:
             self.log.info(
                 "[status] parsed progress=%s remaining=%s nozzle=%s bed=%s chamber=%s gcode=%s layer=%s/%s",
@@ -1264,6 +1354,9 @@ class BambuStatusSubscriber:
             "gcodeFile": gcodeFile,
             "printErrorCode": printErrorCode,
             "skippedObjects": skippedObjects,
+            # Product info from registered job metadata
+            "productName": productName,
+            "productId": productId,
             # END NEW FIELDS
             "rawStatePayload": statePayload,
             "rawPercentagePayload": percentagePayload,

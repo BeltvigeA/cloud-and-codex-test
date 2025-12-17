@@ -3374,6 +3374,7 @@ class ListenerGuiApp:
                     recipientId=recipient_id,
                     baseUrl=controlBaseUrl,
                     pollInterval=pollIntervalSeconds,
+                    statusSubscriber=self.statusSubscriber,
                 )
                 worker.start()
                 self.commandWorkers[serialNumber] = worker
@@ -3464,6 +3465,10 @@ class ListenerGuiApp:
         # Mark job as finished in tracker (this triggers backend report via _onJobEnded)
         if job_id:
             self.jobTracker.finish_job(printer_serial, job_id)
+        
+        # Clear active job metadata from status subscriber
+        if self.statusSubscriber:
+            self.statusSubscriber.clear_active_job(printer_serial)
         
         # Log to console with job ID and product name
         if product_name:
@@ -3740,6 +3745,67 @@ class ListenerGuiApp:
         if serial:
             # Reload printers to ensure we have the latest IP/AccessCode from upsertPrinterFromJob
             self.printers = loadPrinters()
+
+            # Register job metadata with status subscriber so status updates include job_id and product info
+            # This fixes the bug where Bambu printers don't populate job_id/product in MQTT
+            # NOTE: Register ALWAYS, even if dispatch failed - the print job may have started anyway
+            if self.statusSubscriber:
+                try:
+                    # Extract job metadata from entryData
+                    unencrypted = entryData.get("unencryptedData") or {}
+                    
+                    # Get printJobId - try multiple possible field names
+                    job_id = (
+                        unencrypted.get("printJobId")
+                        or unencrypted.get("print_job_id")
+                        or entryData.get("printJobId")
+                        or entryData.get("print_job_id")
+                    )
+                    
+                    # Get product info
+                    product_name = (
+                        unencrypted.get("productName")
+                        or unencrypted.get("product_name")
+                        or entryData.get("productName")
+                    )
+                    product_id = (
+                        unencrypted.get("productId")
+                        or unencrypted.get("product_id")
+                        or entryData.get("productId")
+                    )
+                    
+                    # Get file name
+                    file_name = (
+                        unencrypted.get("fileName")
+                        or unencrypted.get("file_name")
+                        or unencrypted.get("objectName")
+                        or entryData.get("fileName")
+                    )
+                    
+                    # Register with status subscriber
+                    self.statusSubscriber.register_active_job(
+                        printer_serial=serial,
+                        job_id=str(job_id) if job_id else None,
+                        product_name=str(product_name) if product_name else None,
+                        product_id=str(product_id) if product_id else None,
+                        file_name=str(file_name) if file_name else None,
+                    )
+                    
+                    # Also register with job tracker
+                    if job_id:
+                        ip = str(entryData.get("ipAddress") or "").strip()
+                        self.jobTracker.start_job(
+                            printer_serial=serial,
+                            printer_ip=ip,
+                            job_id=str(job_id),
+                            file_name=str(file_name) if file_name else "unknown",
+                            product_id=str(product_id) if product_id else None,
+                            product_name=str(product_name) if product_name else None,
+                        )
+                        
+                except Exception as error:
+                    logging.warning("Failed to register job metadata: %s", error)
+
 
     def _runListener(
         self,
