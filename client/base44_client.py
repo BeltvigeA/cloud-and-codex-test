@@ -424,3 +424,106 @@ def _shouldLogPendingCount(recipientId: str) -> bool:
         _pendingCommandLogCounters[key] = currentCount
     return currentCount == 1 or currentCount % 50 == 0
 
+
+def postReportCompletedJob(
+    *,
+    product_name: str,
+    printer_serial: str,
+    printer_ip: str,
+    job_id: Optional[str] = None,
+    success: bool = True,
+    print_time_seconds: Optional[int] = None,
+    completed_at: Optional[str] = None,
+    image_base64: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Report completed print job to backend.
+    
+    Endpoint: POST /api/print-jobs/completed?recipientId=xxx
+    
+    This sends completed job data to the Print Analysis system where it
+    will be queued for review with status 'AwaitingReview'.
+    
+    Args:
+        product_name: File name (used for product matching in backend)
+        printer_serial: Printer serial number
+        printer_ip: Printer IP address
+        job_id: Existing job UUID (optional - new one created if not provided)
+        success: True if print was successful, False if failed
+        print_time_seconds: Print duration in seconds
+        completed_at: ISO timestamp for completion (defaults to now)
+        image_base64: Base64-encoded image of finished print
+    
+    Returns:
+        Backend response with jobId and status
+    """
+    # Resolve recipientId
+    recipientId = None
+    if _config_manager_available:
+        try:
+            config = get_config_manager()
+            recipientId = config.get_recipient_id()
+        except Exception:
+            pass
+    if not recipientId:
+        recipientId = os.getenv("BASE44_RECIPIENT_ID", "").strip()
+    
+    if not recipientId:
+        log.warning("postReportCompletedJob: missing recipientId; skipping.")
+        return {}
+    
+    url = f"{PRINTPRO3D_BASE}/api/print-jobs/completed"
+    params = {"recipientId": recipientId}
+    
+    # Build payload according to API spec
+    payload: Dict[str, Any] = {
+        "productName": product_name,
+        "printerSerial": printer_serial,
+        "printerIpAddress": printer_ip,
+        "success": success,
+    }
+    
+    if job_id:
+        payload["jobId"] = job_id
+    if print_time_seconds is not None:
+        payload["printTimeSeconds"] = print_time_seconds
+    if completed_at:
+        payload["completedAt"] = completed_at
+    else:
+        payload["completedAt"] = _isoNow()
+    if image_base64:
+        payload["image"] = image_base64
+    
+    headers = _buildControlHeaders()
+    
+    try:
+        log.info(f"📤 Reporting completed job to {url}")
+        log.info(f"   Product: {product_name}")
+        log.info(f"   Printer: {printer_serial}")
+        log.info(f"   Job ID: {job_id or 'new'}")
+        log.info(f"   Success: {success}")
+        if image_base64:
+            log.info(f"   Image: {len(image_base64)} chars (base64)")
+        
+        # Use longer timeout if image is included
+        timeout = 30 if image_base64 else 15
+        
+        response = requests.post(
+            url,
+            json=payload,
+            headers=headers,
+            params=params,
+            timeout=timeout,
+        )
+        response.raise_for_status()
+        result = response.json() if response.content else {}
+        
+        job_id_result = result.get("jobId") or result.get("job_id")
+        log.info(f"✅ Completed job reported successfully: jobId={job_id_result}")
+        
+        return result
+    except requests.RequestException as error:
+        log.error(f"❌ Failed to report completed job for {product_name}: {error}")
+        return {}
+
+

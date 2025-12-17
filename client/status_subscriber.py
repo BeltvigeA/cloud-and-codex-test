@@ -16,7 +16,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 import requests
 
 from .bambuPrinter import extractStateText, looksLikeAmsFilamentConflict, safeDisconnectPrinter
-from .base44_client import postReportError, postUpdateStatus
+from .base44_client import postReportError, postUpdateStatus, postReportCompletedJob
 
 # Import event reporting modules
 try:
@@ -1969,9 +1969,6 @@ class BambuStatusSubscriber:
         printer_serial: str,
         printer_ip: str
     ) -> None:
-        if not self.event_reporter:
-            return
-
         jobId = self._coerceString(status_data.get("currentJobId"))
 
         if not self._completedStateDetected(status_data):
@@ -1987,6 +1984,12 @@ class BambuStatusSubscriber:
                 return
             reportedJobs.add(reportKey)
 
+        # Extract additional data for the completed job report
+        printTimeSeconds = self._coerceInt(status_data.get("printTimeSeconds"))
+        
+        # Get camera image if available in status payload
+        camera_image = status_data.get("cameraImage")
+
         self.log.info("═" * 80)
         self.log.info("🎉 PRINT JOB COMPLETION DETECTED")
         self.log.info(f"   Printer: {printer_serial}")
@@ -1994,19 +1997,37 @@ class BambuStatusSubscriber:
         self.log.info(f"   Job ID: {jobId or 'N/A'}")
         self.log.info(f"   State: {status_data.get('gcodeState')}")
         self.log.info(f"   Progress: {status_data.get('progressPercent')}%")
+        self.log.info(f"   Print Time: {printTimeSeconds or 'N/A'}s")
+        self.log.info(f"   Has Image: {'Yes' if camera_image else 'No'}")
 
         try:
-            eventId = self.event_reporter.report_job_completed(
+            # Report to new /api/print-jobs/completed endpoint
+            result = postReportCompletedJob(
+                product_name=fileName,
                 printer_serial=printer_serial,
                 printer_ip=printer_ip,
-                print_job_id=jobId or "unknown",
-                file_name=fileName,
+                job_id=jobId,
+                success=True,
+                print_time_seconds=printTimeSeconds,
+                image_base64=camera_image,
             )
-
-            if eventId:
-                self.log.info(f"✅ Job completion reported: {eventId}")
+            
+            resultJobId = result.get("jobId") or result.get("job_id")
+            if resultJobId:
+                self.log.info(f"✅ Completed job reported to Print Analysis: {resultJobId}")
             else:
-                self.log.warning("⚠️  Job completion report returned no event_id")
+                self.log.warning("⚠️  Completed job report returned no jobId")
+
+            # Also report via EventReporter for backwards compatibility
+            if self.event_reporter:
+                eventId = self.event_reporter.report_job_completed(
+                    printer_serial=printer_serial,
+                    printer_ip=printer_ip,
+                    print_job_id=resultJobId or jobId or "unknown",
+                    file_name=fileName,
+                )
+                if eventId:
+                    self.log.info(f"✅ Event also reported: {eventId}")
 
         except Exception as error:
             self.log.error(f"❌ Failed to report job completion: {error}")
