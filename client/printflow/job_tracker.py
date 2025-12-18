@@ -37,7 +37,8 @@ class TrackedJob:
     
     def to_display_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for GUI display."""
-        job_id_display = self.job_id[:8] if self.job_id and len(self.job_id) > 8 else (self.job_id or "-")
+        # Show full Job ID - don't truncate
+        job_id_display = self.job_id or "-"
         return {
             "job_id": job_id_display,
             "printer_serial": self.printer_serial,

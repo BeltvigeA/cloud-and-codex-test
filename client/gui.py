@@ -764,7 +764,7 @@ class ListenerGuiApp:
 
         # Configure column widths
         self.printJobTree.column("serial_number", width=140)
-        self.printJobTree.column("job_id", width=80)
+        self.printJobTree.column("job_id", width=280)
         self.printJobTree.column("product_name", width=150)
         self.printJobTree.column("print_type", width=100)
         self.printJobTree.column("current_state", width=100)
@@ -5326,8 +5326,7 @@ class ListenerGuiApp:
                 product_info = self.jobTracker.get_product_info_for_printer(serialNumber)
                 if product_info:
                     job_id = product_info.get("job_id") or ""
-                    if job_id:
-                        job_id = job_id[:8] if len(job_id) > 8 else job_id
+                    # Show full Job ID - don't truncate for display
                     product_name = product_info.get("product_name") or ""
 
             # Determine row tag

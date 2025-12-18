@@ -384,6 +384,32 @@ class StatusReporter:
             except (ValueError, TypeError):
                 pass
 
+        # ========== ADD JOB ID AND PRODUCT INFO ==========
+        # These are critical for tracking which job is running on each printer
+        current_job_id = (
+            status_data.get("currentJobId") or
+            status_data.get("job_id") or
+            raw_state.get("job_id") or
+            mqtt_print.get("job_id") or
+            mqtt_print.get("task_id")
+        )
+        if current_job_id:
+            parsed_status["currentJobId"] = str(current_job_id)
+        
+        product_name = (
+            status_data.get("productName") or
+            status_data.get("product_name")
+        )
+        if product_name:
+            parsed_status["productName"] = str(product_name)
+        
+        product_id = (
+            status_data.get("productId") or
+            status_data.get("product_id")
+        )
+        if product_id:
+            parsed_status["productId"] = str(product_id)
+
         return parsed_status
 
     def report_status(
