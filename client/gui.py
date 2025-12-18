@@ -1437,7 +1437,7 @@ class ListenerGuiApp:
             messagebox.showerror("Feil", f"Kunne ikke linke jobb: {error}")
 
     def _markSelectedJobAs(self, status: str) -> None:
-        """Mark the selected job with a status (completed, deleted, failed)."""
+        """Mark the selected job with a status (completed, deleted, failed) and report to backend."""
         selection = self.jobQueueTree.selection()
         if not selection:
             return
@@ -1458,7 +1458,38 @@ class ListenerGuiApp:
             if not messagebox.askyesno("Bekreft sletting", "Er du sikker på at du vil slette denne jobben?"):
                 return
 
-        # Update the entry
+        # Extract job data for backend reporting
+        unencrypted = job.get("unencryptedData") or {}
+        job_id = unencrypted.get("print_job_id") or job.get("printJobId")
+        file_name = job.get("fileName") or unencrypted.get("product_name") or "unknown"
+        printer_serial = unencrypted.get("printer_serial_number") or ""
+        printer_ip = unencrypted.get("printer_ip_address") or ""
+
+        # Report to backend for completed and failed (not deleted)
+        if status in ("completed", "failed"):
+            try:
+                from .base44_client import postReportCompletedJob
+                
+                result = postReportCompletedJob(
+                    product_name=file_name,
+                    printer_serial=printer_serial,
+                    printer_ip=printer_ip,
+                    job_id=job_id,
+                    success=(status == "completed"),
+                )
+                
+                result_job_id = result.get("jobId") or result.get("job_id")
+                if result_job_id:
+                    self.log(f"📤 Jobb rapportert til backend: {result_job_id[:12]}...")
+                else:
+                    self.log(f"⚠ Jobb rapport sendt, men ingen jobId mottatt")
+                    
+            except Exception as error:
+                logging.exception("Failed to report job to backend")
+                self.log(f"❌ Kunne ikke rapportere til backend: {error}")
+                # Continue anyway - local update should still happen
+
+        # Update the local entry
         updates = {"manualStatus": status}
         if status in ("completed", "deleted", "failed"):
             updates["success"] = True  # Remove from pending list
