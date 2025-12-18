@@ -35,6 +35,16 @@ except ImportError:
     _status_reporter_available = False
     StatusReporter = None
 
+# Import printflow utilities for consistent job key handling
+try:
+    from .printflow import COMPLETION_STATES, make_job_key
+    _printflow_available = True
+except ImportError:
+    _printflow_available = False
+    COMPLETION_STATES = {"finish", "finished", "completed", "complete"}
+    def make_job_key(job_id, file_name):
+        return job_id if job_id else f"_local_{file_name}"
+
 # Import config manager
 try:
     from .config_manager import get_config_manager
@@ -2025,13 +2035,12 @@ class BambuStatusSubscriber:
             self.log.error(f"   Traceback:\n{traceback.format_exc()}")
 
     def _completedStateDetected(self, status_data: Dict[str, Any]) -> bool:
-        completionStates = {"finish", "finished", "completed", "complete"}
-
+        # Use shared COMPLETION_STATES from printflow for consistency
         for key in ("gcodeState", "state"):
             stateValue = self._coerceString(status_data.get(key))
             if stateValue:
                 normalizedState = stateValue.strip().lower()
-                if normalizedState in completionStates:
+                if normalizedState in COMPLETION_STATES:
                     return True
 
         progressValue = status_data.get("progressPercent")
@@ -2071,8 +2080,8 @@ class BambuStatusSubscriber:
 
         with self.completedJobsLock:
             reportedJobs = self.completedJobIds.setdefault(printer_serial, set())
-            # Use job ID if available, otherwise use file name as fallback key
-            reportKey = jobId if jobId else fileName
+            # Use consistent key format from printflow for deduplication
+            reportKey = make_job_key(jobId, fileName)
             if reportKey in reportedJobs:
                 return
             reportedJobs.add(reportKey)
@@ -2124,6 +2133,10 @@ class BambuStatusSubscriber:
 
         except Exception as error:
             self.log.error(f"❌ Failed to report job completion: {error}")
+
+        # Clear registered job metadata to prevent pollution to next job
+        self.clear_active_job(printer_serial)
+        self.log.debug(f"[job-metadata] Cleared metadata for {printer_serial} after completion")
 
         self.log.info("═" * 80)
 

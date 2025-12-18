@@ -368,6 +368,10 @@ class ListenerGuiApp:
         notebook.add(printLogFrame, text="Print Log")
         self._buildPrintLogTab(printLogFrame)
 
+        jobQueueFrame = ttk.Frame(notebook)
+        notebook.add(jobQueueFrame, text="Job Queue")
+        self._buildJobQueueTab(jobQueueFrame)
+
     def _buildListenerTab(self, parent: ttk.Frame, paddingOptions: Dict[str, int]) -> None:
         self.baseUrlVar = tk.StringVar(value=hardcodedBaseUrl)
         api_key = self.config_manager.get_api_key() or ""
@@ -1000,6 +1004,499 @@ class ListenerGuiApp:
             self.root.after(0, self._refreshPrintLogTree)
         except Exception:
             pass
+
+    # =========================================================================
+    # JOB QUEUE TAB - Pending jobs from listener-log.json
+    # =========================================================================
+
+    def _buildJobQueueTab(self, parent: ttk.Frame) -> None:
+        """Build the Job Queue tab showing pending jobs with send-to-printer functionality."""
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(1, weight=1)
+
+        # Header frame with controls
+        headerFrame = ttk.Frame(parent)
+        headerFrame.grid(row=0, column=0, sticky=tk.EW, padx=8, pady=8)
+        headerFrame.columnconfigure(0, weight=1)
+
+        infoLabel = ttk.Label(
+            headerFrame,
+            text="Ventende print-jobber fra listener. Velg en jobb og send til printer.",
+            font=("TkDefaultFont", 9)
+        )
+        infoLabel.grid(row=0, column=0, sticky=tk.W, padx=6)
+
+        # Control buttons
+        buttonFrame = ttk.Frame(headerFrame)
+        buttonFrame.grid(row=0, column=1, sticky=tk.E, padx=6)
+
+        ttk.Button(
+            buttonFrame,
+            text="Oppdater",
+            command=self._refreshJobQueue
+        ).pack(side=tk.LEFT, padx=6)
+
+        # Main content frame with two panes
+        contentFrame = ttk.Frame(parent)
+        contentFrame.grid(row=1, column=0, sticky=tk.NSEW, padx=8, pady=(0, 8))
+        contentFrame.columnconfigure(0, weight=2)
+        contentFrame.columnconfigure(1, weight=1)
+        contentFrame.rowconfigure(0, weight=1)
+
+        # Left pane: Pending jobs list
+        leftFrame = ttk.LabelFrame(contentFrame, text="Ventende Jobber")
+        leftFrame.grid(row=0, column=0, sticky=tk.NSEW, padx=(0, 4))
+        leftFrame.columnconfigure(0, weight=1)
+        leftFrame.rowconfigure(0, weight=1)
+
+        # Job queue Treeview
+        jobColumns = ("product_name", "file_name", "job_id", "printer", "queued_at")
+        self.jobQueueTree = ttk.Treeview(
+            leftFrame,
+            columns=jobColumns,
+            show="headings",
+            selectmode="browse"
+        )
+        self.jobQueueTree.heading("product_name", text="Produkt")
+        self.jobQueueTree.heading("file_name", text="Fil")
+        self.jobQueueTree.heading("job_id", text="Print Job ID")
+        self.jobQueueTree.heading("printer", text="Tiltenkt Printer")
+        self.jobQueueTree.heading("queued_at", text="Dato/Tid")
+
+        self.jobQueueTree.column("product_name", width=150)
+        self.jobQueueTree.column("file_name", width=200)
+        self.jobQueueTree.column("job_id", width=280)
+        self.jobQueueTree.column("printer", width=120)
+        self.jobQueueTree.column("queued_at", width=140)
+
+        scrollbar = ttk.Scrollbar(leftFrame, orient=tk.VERTICAL, command=self.jobQueueTree.yview)
+        self.jobQueueTree.configure(yscrollcommand=scrollbar.set)
+        self.jobQueueTree.grid(row=0, column=0, sticky=tk.NSEW, padx=4, pady=4)
+        scrollbar.grid(row=0, column=1, sticky=tk.NS, pady=4)
+
+        # Action buttons below job list
+        actionFrame = ttk.Frame(leftFrame)
+        actionFrame.grid(row=1, column=0, columnspan=2, sticky=tk.EW, padx=4, pady=4)
+
+        self.sendToPrinterBtn = ttk.Button(
+            actionFrame,
+            text="📤 Place on Printer",
+            command=self._showSendToPrinterDialog,
+            state=tk.DISABLED
+        )
+        self.sendToPrinterBtn.pack(side=tk.LEFT, padx=2)
+
+        self.markCompletedBtn = ttk.Button(
+            actionFrame,
+            text="✓ Ferdig",
+            command=lambda: self._markSelectedJobAs("completed"),
+            state=tk.DISABLED
+        )
+        self.markCompletedBtn.pack(side=tk.LEFT, padx=2)
+
+        self.markDeletedBtn = ttk.Button(
+            actionFrame,
+            text="✗ Slett",
+            command=lambda: self._markSelectedJobAs("deleted"),
+            state=tk.DISABLED
+        )
+        self.markDeletedBtn.pack(side=tk.LEFT, padx=2)
+
+        self.markFailedBtn = ttk.Button(
+            actionFrame,
+            text="⚠ Feilet",
+            command=lambda: self._markSelectedJobAs("failed"),
+            state=tk.DISABLED
+        )
+        self.markFailedBtn.pack(side=tk.LEFT, padx=2)
+
+        # Bind selection event
+        self.jobQueueTree.bind("<<TreeviewSelect>>", self._onJobQueueSelection)
+
+        # Right pane: Available printers
+        rightFrame = ttk.LabelFrame(contentFrame, text="Tilgjengelige Printere")
+        rightFrame.grid(row=0, column=1, sticky=tk.NSEW, padx=(4, 0))
+        rightFrame.columnconfigure(0, weight=1)
+        rightFrame.rowconfigure(0, weight=1)
+
+        # Printer list for Job Queue - with linked job info
+        printerColumns = ("name", "status", "linked_job_id", "linked_product")
+        self.jobQueuePrinterTree = ttk.Treeview(
+            rightFrame,
+            columns=printerColumns,
+            show="headings",
+            selectmode="browse"
+        )
+        self.jobQueuePrinterTree.heading("name", text="Printer")
+        self.jobQueuePrinterTree.heading("status", text="Status")
+        self.jobQueuePrinterTree.heading("linked_job_id", text="Job ID")
+        self.jobQueuePrinterTree.heading("linked_product", text="Product")
+
+        self.jobQueuePrinterTree.column("name", width=120)
+        self.jobQueuePrinterTree.column("status", width=80)
+        self.jobQueuePrinterTree.column("linked_job_id", width=120)
+        self.jobQueuePrinterTree.column("linked_product", width=120)
+
+        printerScrollbar = ttk.Scrollbar(rightFrame, orient=tk.VERTICAL, command=self.jobQueuePrinterTree.yview)
+        self.jobQueuePrinterTree.configure(yscrollcommand=printerScrollbar.set)
+        self.jobQueuePrinterTree.grid(row=0, column=0, sticky=tk.NSEW, padx=4, pady=4)
+        printerScrollbar.grid(row=0, column=1, sticky=tk.NS, pady=4)
+
+        # Configure row colors for status
+        self.jobQueuePrinterTree.tag_configure("idle", background="#e8f5e9")  # Light green
+        self.jobQueuePrinterTree.tag_configure("printing", background="#fff3e0")  # Light orange
+        self.jobQueuePrinterTree.tag_configure("offline", background="#ffebee")  # Light red
+        self.jobQueuePrinterTree.tag_configure("linked", background="#e3f2fd")  # Light blue - has linked job
+
+        # Store pending jobs data
+        self._pendingJobs: List[Dict[str, Any]] = []
+
+        # Initial load
+        self._refreshJobQueue()
+
+    def _loadPendingJobs(self) -> List[Dict[str, Any]]:
+        """Load jobs from listener-log.json where success is not True."""
+        logPath = Path.home() / ".printmaster" / "listener-log.json"
+        if not logPath.exists():
+            return []
+
+        try:
+            with logPath.open("r", encoding="utf-8") as f:
+                entries = json.load(f)
+            if not isinstance(entries, list):
+                return []
+
+            pending = []
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                # Filter: only show jobs where success is not True
+                if entry.get("success") is True:
+                    continue
+                pending.append(entry)
+
+            return pending
+
+        except (OSError, json.JSONDecodeError) as error:
+            logging.warning("Unable to load listener-log.json: %s", error)
+            return []
+
+    def _refreshJobQueue(self) -> None:
+        """Refresh the pending jobs list and printer list."""
+        # Clear existing items
+        for item in self.jobQueueTree.get_children():
+            self.jobQueueTree.delete(item)
+
+        # Load pending jobs
+        self._pendingJobs = self._loadPendingJobs()
+
+        # Insert jobs
+        for idx, job in enumerate(self._pendingJobs):
+            unencrypted = job.get("unencryptedData") or {}
+            
+            product_name = unencrypted.get("product_name") or job.get("fileName") or "Ukjent"
+            file_name = job.get("fileName") or unencrypted.get("fileName") or ""
+            
+            # Get print job ID
+            job_id = unencrypted.get("print_job_id") or job.get("printJobId") or ""
+            
+            # Get printer info
+            printer_name = unencrypted.get("printer_name") or unencrypted.get("printer_serial_number") or ""
+            
+            # Format timestamp with full date + time
+            timestamp = job.get("timestamp")
+            if isinstance(timestamp, (int, float)):
+                from datetime import datetime
+                queued_at = datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S")
+            else:
+                queued_at = ""
+
+            values = (product_name, file_name, job_id, printer_name, queued_at)
+            
+            self.jobQueueTree.insert(
+                "",
+                tk.END,
+                iid=str(idx),
+                values=values
+            )
+
+        # Refresh printer list
+        self._refreshJobQueuePrinterList()
+
+        # Update button states
+        self._updateJobQueueButtons()
+
+    def _refreshJobQueuePrinterList(self) -> None:
+        """Refresh the printer list in Job Queue tab with linked job info."""
+        for item in self.jobQueuePrinterTree.get_children():
+            self.jobQueuePrinterTree.delete(item)
+
+        for idx, printer in enumerate(self.printers):
+            serial = printer.get("serialNumber") or ""
+            nickname = printer.get("nickname") or serial or "Ukjent"
+            status = printer.get("status") or printer.get("gcodeState") or "Ukjent"
+            
+            # Get linked job info from status subscriber
+            linked_job_id = ""
+            linked_product = ""
+            if self.statusSubscriber and serial:
+                job_metadata = self.statusSubscriber.get_active_job_metadata(serial)
+                if job_metadata:
+                    linked_job_id = (job_metadata.get("job_id") or "")[:12]  # Truncate for display
+                    linked_product = job_metadata.get("product_name") or ""
+            
+            # Determine tag based on status and linked job
+            status_lower = str(status).lower()
+            if linked_job_id:
+                tag = "linked"  # Has a linked job
+            elif "print" in status_lower or "running" in status_lower:
+                tag = "printing"
+            elif "idle" in status_lower or "finish" in status_lower:
+                tag = "idle"
+            elif "offline" in status_lower or "error" in status_lower:
+                tag = "offline"
+            else:
+                tag = ""
+
+            self.jobQueuePrinterTree.insert(
+                "",
+                tk.END,
+                iid=str(idx),
+                values=(nickname, status, linked_job_id, linked_product),
+                tags=(tag,) if tag else ()
+            )
+
+    def _onJobQueueSelection(self, event: tk.Event) -> None:
+        """Handle job selection in queue."""
+        self._updateJobQueueButtons()
+
+    def _updateJobQueueButtons(self) -> None:
+        """Update action button states based on selection."""
+        selection = self.jobQueueTree.selection()
+        state = tk.NORMAL if selection else tk.DISABLED
+        
+        self.sendToPrinterBtn.configure(state=state)
+        self.markCompletedBtn.configure(state=state)
+        self.markDeletedBtn.configure(state=state)
+        self.markFailedBtn.configure(state=state)
+
+    def _showSendToPrinterDialog(self) -> None:
+        """Show dialog to select printer and link job to it (without starting print)."""
+        selection = self.jobQueueTree.selection()
+        if not selection:
+            return
+
+        job_idx = int(selection[0])
+        if job_idx >= len(self._pendingJobs):
+            return
+
+        job = self._pendingJobs[job_idx]
+        unencrypted = job.get("unencryptedData") or {}
+        file_path = job.get("downloadedFilePath") or job.get("savedFile")
+        
+        if not file_path or not Path(file_path).exists():
+            messagebox.showerror(
+                "Fil ikke funnet",
+                f"Filen eksisterer ikke: {file_path}"
+            )
+            return
+
+        # Create printer selection dialog
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Place on Printer")
+        dialog.geometry("450x350")
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        ttk.Label(
+            dialog,
+            text=f"Link jobb til printer (starter IKKE print):",
+            font=("TkDefaultFont", 10, "bold")
+        ).pack(padx=10, pady=5)
+        
+        ttk.Label(
+            dialog,
+            text=f"{job.get('fileName') or 'Ukjent fil'}",
+            font=("TkDefaultFont", 9)
+        ).pack(padx=10, pady=5)
+
+        # Printer listbox
+        listFrame = ttk.Frame(dialog)
+        listFrame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+
+        printerListbox = tk.Listbox(listFrame, selectmode=tk.SINGLE)
+        printerListbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        
+        listScrollbar = ttk.Scrollbar(listFrame, orient=tk.VERTICAL, command=printerListbox.yview)
+        printerListbox.configure(yscrollcommand=listScrollbar.set)
+        listScrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # Sort printers: target printer first, then rest
+        target_serial = unencrypted.get("printer_serial_number")
+        sorted_printers = []
+        target_idx = None
+        
+        for i, printer in enumerate(self.printers):
+            if printer.get("serialNumber") == target_serial:
+                target_idx = i
+                sorted_printers.insert(0, (i, printer))  # Target first
+            else:
+                sorted_printers.append((i, printer))
+
+        # Populate printer list with sorted order
+        for original_idx, printer in sorted_printers:
+            nickname = printer.get("nickname") or printer.get("serialNumber") or "Ukjent"
+            status = printer.get("status") or "Ukjent"
+            # Mark target printer
+            if printer.get("serialNumber") == target_serial:
+                printerListbox.insert(tk.END, f"★ {nickname} ({status}) - Tiltenkt")
+            else:
+                printerListbox.insert(tk.END, f"{nickname} ({status})")
+
+        # Pre-select first item (which is target if exists)
+        if sorted_printers:
+            printerListbox.selection_set(0)
+
+        def on_link():
+            sel = printerListbox.curselection()
+            if not sel:
+                messagebox.showwarning("Ingen printer valgt", "Velg en printer først.")
+                return
+            
+            # Get original printer index from sorted list
+            original_idx, printer = sorted_printers[sel[0]]
+            dialog.destroy()
+            
+            # Link job to printer (NO print start)
+            self._linkJobToPrinter(job, printer)
+
+        buttonFrame = ttk.Frame(dialog)
+        buttonFrame.pack(fill=tk.X, padx=10, pady=10)
+
+        ttk.Button(buttonFrame, text="Link", command=on_link).pack(side=tk.LEFT, padx=5)
+        ttk.Button(buttonFrame, text="Avbryt", command=dialog.destroy).pack(side=tk.LEFT, padx=5)
+
+    def _linkJobToPrinter(self, job: Dict[str, Any], printer: Dict[str, Any]) -> None:
+        """Link a job to a printer (register metadata only, NO print start).
+        
+        This is used as a fallback when the client loses track of which printer
+        is printing which job (e.g., after a restart).
+        """
+        unencrypted = job.get("unencryptedData") or {}
+        printer_serial = printer.get("serialNumber") or ""
+        printer_nickname = printer.get("nickname") or printer_serial
+        
+        try:
+            # Extract job metadata
+            job_id = unencrypted.get("print_job_id") or job.get("printJobId")
+            product_name = unencrypted.get("product_name")
+            product_id = unencrypted.get("product_id")
+            file_name = job.get("fileName")
+            
+            if not job_id:
+                messagebox.showwarning(
+                    "Mangler Job ID",
+                    "Denne jobben har ingen Job ID og kan ikke linkes."
+                )
+                return
+            
+            # Register job metadata with status subscriber (NO print start!)
+            if self.statusSubscriber:
+                self.statusSubscriber.register_active_job(
+                    printer_serial=printer_serial,
+                    job_id=job_id,
+                    product_name=product_name,
+                    product_id=product_id,
+                    file_name=file_name,
+                )
+                
+                self.log(f"🔗 Jobb linket til {printer_nickname}: {file_name}")
+                self.log(f"   Job ID: {job_id[:12]}...")
+                
+                # Mark job as linked in listener-log
+                self._updateListenerLogEntry(job.get("fetchToken"), {
+                    "success": True,
+                    "linkedToPrinter": printer_serial,
+                    "linkedAt": time.time(),
+                })
+                
+                # Refresh UI
+                self._refreshJobQueue()
+                
+                messagebox.showinfo(
+                    "Jobb Linket",
+                    f"Jobb linket til {printer_nickname}.\n\n"
+                    f"Når printeren er ferdig, vil riktig Job ID sendes til backend."
+                )
+            else:
+                messagebox.showerror("Feil", "Status subscriber ikke tilgjengelig.")
+
+        except Exception as error:
+            logging.exception("Failed to link job to printer")
+            self.log(f"❌ Feil ved linking: {error}")
+            messagebox.showerror("Feil", f"Kunne ikke linke jobb: {error}")
+
+    def _markSelectedJobAs(self, status: str) -> None:
+        """Mark the selected job with a status (completed, deleted, failed)."""
+        selection = self.jobQueueTree.selection()
+        if not selection:
+            return
+
+        job_idx = int(selection[0])
+        if job_idx >= len(self._pendingJobs):
+            return
+
+        job = self._pendingJobs[job_idx]
+        fetch_token = job.get("fetchToken")
+
+        if not fetch_token:
+            messagebox.showerror("Feil", "Kunne ikke finne fetchToken for jobben.")
+            return
+
+        # Confirm deletion
+        if status == "deleted":
+            if not messagebox.askyesno("Bekreft sletting", "Er du sikker på at du vil slette denne jobben?"):
+                return
+
+        # Update the entry
+        updates = {"manualStatus": status}
+        if status in ("completed", "deleted", "failed"):
+            updates["success"] = True  # Remove from pending list
+
+        self._updateListenerLogEntry(fetch_token, updates)
+        self._refreshJobQueue()
+        self.log(f"Jobb markert som {status}")
+
+    def _updateListenerLogEntry(self, fetch_token: Optional[str], updates: Dict[str, Any]) -> None:
+        """Update an entry in listener-log.json by fetchToken."""
+        if not fetch_token:
+            return
+
+        logPath = Path.home() / ".printmaster" / "listener-log.json"
+        if not logPath.exists():
+            return
+
+        try:
+            with logPath.open("r", encoding="utf-8") as f:
+                entries = json.load(f)
+
+            if not isinstance(entries, list):
+                return
+
+            # Find and update the entry
+            for entry in entries:
+                if isinstance(entry, dict) and entry.get("fetchToken") == fetch_token:
+                    entry.update(updates)
+                    break
+
+            # Write back
+            with logPath.open("w", encoding="utf-8") as f:
+                json.dump(entries, f, indent=2, ensure_ascii=False)
+
+            logging.info("Updated listener-log entry: %s", fetch_token[:16] if fetch_token else "unknown")
+
+        except (OSError, json.JSONDecodeError) as error:
+            logging.error("Failed to update listener-log.json: %s", error)
 
     def _registerPrintersConfigListener(self) -> None:
         try:

@@ -281,7 +281,7 @@ class PrintJobTracker:
                     db_status = "finished" if new_status == JobStatus.FINISHED else "cancelled"
                     self._database.finish_active_job(
                         printer_serial=printer_serial,
-                        print_job_id=job_id if job_id else None,
+                        print_job_id=job_id or None,
                         status=db_status,
                     )
                 except Exception as e:
