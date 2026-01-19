@@ -14,6 +14,14 @@ import requests
 
 from flask import Flask, jsonify, request
 try:  # pragma: no cover - optional dependency handling
+    from flask_limiter import Limiter
+    from flask_limiter.util import get_remote_address
+    RATE_LIMITER_AVAILABLE = True
+except ImportError:  # pragma: no cover - fallback when flask-limiter is unavailable
+    Limiter = None  # type: ignore[assignment,misc]
+    get_remote_address = None  # type: ignore[assignment]
+    RATE_LIMITER_AVAILABLE = False
+try:  # pragma: no cover - optional dependency handling
     from google.api_core.exceptions import (
         FailedPrecondition,
         Forbidden,
@@ -82,6 +90,70 @@ from werkzeug.utils import secure_filename
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 app = Flask(__name__)
+
+# Rate limiter konfigurasjon
+# Standardgrenser kan overstyres med miljøvariabler
+RATE_LIMIT_DEFAULT = os.environ.get('RATE_LIMIT_DEFAULT', '100 per minute')
+RATE_LIMIT_STRICT = os.environ.get('RATE_LIMIT_STRICT', '10 per minute')
+RATE_LIMIT_UPLOAD = os.environ.get('RATE_LIMIT_UPLOAD', '20 per minute')
+RATE_LIMIT_AUTH = os.environ.get('RATE_LIMIT_AUTH', '30 per minute')
+RATE_LIMIT_FETCH = os.environ.get('RATE_LIMIT_FETCH', '60 per minute')
+
+# Initialiser rate limiter hvis tilgjengelig
+if RATE_LIMITER_AVAILABLE and Limiter is not None:
+    def _get_rate_limit_key():
+        """Hent nøkkel for rate limiting basert på API-nøkkel eller IP-adresse."""
+        api_key = request.headers.get('X-API-Key') or request.args.get('apiKey')
+        if api_key:
+            return f"apikey:{api_key[:16]}"  # Bruk første 16 tegn av API-nøkkel
+        return get_remote_address()
+
+    limiter = Limiter(
+        key_func=_get_rate_limit_key,
+        app=app,
+        default_limits=[RATE_LIMIT_DEFAULT],
+        storage_uri=os.environ.get('RATE_LIMIT_STORAGE_URI', 'memory://'),
+        strategy='fixed-window',
+        headers_enabled=True,  # Legg til X-RateLimit headers i responser
+    )
+
+    @app.errorhandler(429)
+    def ratelimit_handler(e):
+        """Håndter rate limit overskridelser."""
+        logEvent('rate_limit_exceeded', level='WARNING',
+                 remote_addr=get_remote_address(),
+                 endpoint=request.endpoint,
+                 method=request.method)
+        return makeJsonResponse({
+            'ok': False,
+            'error_type': 'RateLimitError',
+            'message': 'Rate limit exceeded. Please slow down your requests.',
+            'retry_after': getattr(e, 'retry_after', 60),
+        }, 429)
+
+    logging.info('Rate limiter initialized with default limit: %s', RATE_LIMIT_DEFAULT)
+else:
+    limiter = None  # type: ignore[assignment]
+    logging.warning('Flask-Limiter not available. Rate limiting is disabled.')
+
+
+def apply_rate_limit(limit_string: str):
+    """Dekorator for å bruke rate limiting på et endepunkt.
+
+    Hvis Flask-Limiter ikke er tilgjengelig, returneres en no-op dekorator.
+
+    Args:
+        limit_string: Rate limit streng, f.eks. "10 per minute"
+
+    Returns:
+        Dekorator funksjon
+    """
+    if limiter is not None:
+        return limiter.limit(limit_string)
+    # No-op dekorator når limiter ikke er tilgjengelig
+    def noop_decorator(func):
+        return func
+    return noop_decorator
 
 
 def logEvent(event: str, level: str = 'INFO', **fields) -> None:
@@ -761,6 +833,7 @@ def parseIso8601Timestamp(rawTimestamp: object) -> Optional[datetime]:
 
 
 @app.route('/upload', methods=['POST'])
+@apply_rate_limit(RATE_LIMIT_UPLOAD)  # Begrens opplastinger for å forhindre ressursutmattelse
 def uploadFile():
     logging.info('Received request to /upload')
     try:
@@ -989,6 +1062,7 @@ def buildHandshakeResponseMetadata(fileMetadata: dict) -> dict:
 
 
 @app.route('/products/<productId>/handshake', methods=['POST'])
+@apply_rate_limit(RATE_LIMIT_STRICT)  # Streng limit - uautentisert endepunkt
 def productHandshake(productId: str):
     logging.info('Received request to /products/%s/handshake', productId)
     try:
@@ -1112,6 +1186,7 @@ def productHandshake(productId: str):
 
 
 @app.route('/products/<productId>/status', methods=['POST'])
+@apply_rate_limit(RATE_LIMIT_AUTH)  # Standard autentisert grense
 def productStatusUpdate(productId: str):
     logging.info('Received request to /products/%s/status', productId)
     try:
@@ -1312,6 +1387,7 @@ def productStatusUpdate(productId: str):
 
 
 @app.route('/fetch/<fetchToken>', methods=['GET'])
+@apply_rate_limit(RATE_LIMIT_FETCH)  # Beskyttelse mot token brute-force
 def fetchFile(fetchToken: str):
     logging.info('Received request to /fetch/%s', fetchToken)
     try:
@@ -1656,6 +1732,7 @@ def _loadClientsOrError():
 
 
 @app.route('/api/apps/<appId>/functions/listPendingJobs', methods=['POST'])
+@apply_rate_limit(RATE_LIMIT_AUTH)  # Liste over ventende jobber
 def listPendingJobs(appId: str):
     logging.info('Received request to listPendingJobs for app %s', appId)
 
@@ -1695,6 +1772,7 @@ def listPendingJobs(appId: str):
 
 
 @app.route('/api/apps/<appId>/functions/listRecipientFiles', methods=['POST'])
+@apply_rate_limit(RATE_LIMIT_AUTH)  # Legacy alias
 def listRecipientFilesAlias(appId: str):
     logging.info(
         'Received legacy request to listRecipientFiles for app %s; redirecting to listPendingJobs.',
@@ -1704,6 +1782,7 @@ def listRecipientFilesAlias(appId: str):
 
 
 @app.route('/api/apps/<appId>/functions/claimJob', methods=['POST'])
+@apply_rate_limit(RATE_LIMIT_AUTH)  # Jobb-claiming
 def claimJob(appId: str):
     logging.info('Received request to claimJob for app %s', appId)
 
@@ -1796,6 +1875,7 @@ def claimJob(appId: str):
 
 
 @app.route('/api/recipients/<recipientId>/status', methods=['GET'])
+@apply_rate_limit(RATE_LIMIT_AUTH)  # Statushistorikk
 def listRecipientPrinterStatusHistory(recipientId: str):
     logging.info('Received request to /api/recipients/%s/status', recipientId)
 
@@ -1832,6 +1912,7 @@ def listRecipientPrinterStatusHistory(recipientId: str):
 
 
 @app.route('/api/recipients/<recipientId>/status/latest', methods=['GET'])
+@apply_rate_limit(RATE_LIMIT_AUTH)  # Siste status
 def listLatestRecipientPrinterStatuses(recipientId: str):
     logging.info('Received request to /api/recipients/%s/status/latest', recipientId)
 
@@ -1868,6 +1949,7 @@ def listLatestRecipientPrinterStatuses(recipientId: str):
 
 
 @app.route('/recipients/<recipientId>/pending', methods=['GET'])
+@apply_rate_limit(RATE_LIMIT_STRICT)  # Streng limit - uautentisert endepunkt med sensitiv data
 def listPendingFiles(recipientId: str):
     logging.info('Received request to /recipients/%s/pending', recipientId)
     try:
@@ -1898,6 +1980,7 @@ def listPendingFiles(recipientId: str):
 
 
 @app.route('/control', methods=['POST', 'GET'])
+@apply_rate_limit(RATE_LIMIT_AUTH)  # Printerkontroll - autentisert grense
 def queuePrinterControlCommand():
     logging.info('Received request to /control')
 
@@ -2517,6 +2600,7 @@ def _validateCommandRouting(
 
 
 @app.route('/control/ack', methods=['POST'])
+@apply_rate_limit(RATE_LIMIT_AUTH)  # Kommando-bekreftelse
 def acknowledgePrinterControlCommand():
     logging.info('Received request to /control/ack')
 
@@ -2582,6 +2666,7 @@ def acknowledgePrinterControlCommand():
 
 
 @app.route('/control/result', methods=['POST'])
+@apply_rate_limit(RATE_LIMIT_AUTH)  # Kommando-resultat
 def submitPrinterControlResult():
     logging.info('Received request to /control/result')
 
@@ -2661,6 +2746,7 @@ def submitPrinterControlResult():
 
 
 @app.route('/debug/listPendingCommands', methods=['POST'])
+@apply_rate_limit(RATE_LIMIT_STRICT)  # Debug-endepunkt - streng limit
 def debugListPendingCommands():
     logging.info('Received request to /debug/listPendingCommands')
 
@@ -2791,16 +2877,19 @@ def _handlePrinterStatusUpdate(appId: Optional[str]):
 
 
 @app.route('/api/apps/<appId>/functions/updatePrinterStatus', methods=['POST'])
+@apply_rate_limit(RATE_LIMIT_AUTH)  # Statusoppdatering via app
 def updatePrinterStatus(appId: str):
     return _handlePrinterStatusUpdate(appId)
 
 
 @app.route('/printer-status', methods=['POST'])
+@apply_rate_limit(RATE_LIMIT_AUTH)  # Printerstatus-oppdatering
 def printerStatusUpdate():
     return _handlePrinterStatusUpdate(None)
 
 
 @app.route('/updatePrinterStatus', methods=['POST'])
+@apply_rate_limit(RATE_LIMIT_AUTH)  # Enkel statusoppdatering
 def simpleUpdatePrinterStatus():
     """Handle simple printer status updates from client."""
     logging.info('Received simple printer status update')
@@ -2854,6 +2943,7 @@ def simpleUpdatePrinterStatus():
 
 
 @app.route('/reportPrinterError', methods=['POST'])
+@apply_rate_limit(RATE_LIMIT_AUTH)  # Feilrapportering
 def reportPrinterError():
     """Handle printer error reports from client."""
     logging.info('Received printer error report')
@@ -2901,6 +2991,7 @@ def reportPrinterError():
 
 
 @app.route('/reportPrinterImage', methods=['POST'])
+@apply_rate_limit(RATE_LIMIT_UPLOAD)  # Bildeopplasting
 def reportPrinterImage():
     """Handle printer image/camera snapshot uploads from client."""
     logging.info('Received printer image report')
@@ -2948,6 +3039,7 @@ def reportPrinterImage():
 
 
 @app.route('/api/printer-events/upload-image', methods=['POST'])
+@apply_rate_limit(RATE_LIMIT_UPLOAD)  # Bildeopplasting via API
 def uploadPrinterImage():
     """
     Handle printer image uploads with multipart/form-data.
@@ -3133,6 +3225,7 @@ def uploadPrinterImage():
 
 
 @app.route('/api/printer-images/latest', methods=['GET'])
+@apply_rate_limit(RATE_LIMIT_AUTH)  # Hent siste bilde
 def getLatestPrinterImage():
     """
     Retrieve the latest camera image for a specific printer.
@@ -3272,6 +3365,7 @@ def getLatestPrinterImage():
 
 
 @app.route('/api/printer-events/error', methods=['POST'])
+@apply_rate_limit(RATE_LIMIT_AUTH)  # Feilrapportering via API
 def reportPrinterEventError():
     """Handle printer error reports via new API endpoint."""
     logging.info('Received printer error report via /api/printer-events/error')
