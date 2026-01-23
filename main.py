@@ -1023,6 +1023,32 @@ def uploadFile():
         return jsonify({'error': 'Internal server error'}), 500
 
 
+def pickLatestDocumentByTimestamp(documentSnapshots: List):
+    latestSnapshot = None
+    latestTimestamp = None
+    for snapshot in documentSnapshots:
+        metadata = snapshot.to_dict() or {}
+        timestamp = metadata.get('timestamp')
+        if isinstance(timestamp, datetime):
+            candidateTimestamp = timestamp
+        else:
+            candidateTimestamp = None
+
+        if latestSnapshot is None:
+            latestSnapshot = snapshot
+            latestTimestamp = candidateTimestamp
+            continue
+
+        if candidateTimestamp is None:
+            continue
+
+        if latestTimestamp is None or candidateTimestamp > latestTimestamp:
+            latestSnapshot = snapshot
+            latestTimestamp = candidateTimestamp
+
+    return latestSnapshot
+
+
 def buildHandshakeResponseMetadata(fileMetadata: dict) -> dict:
     metadataPayload = fileMetadata.get('unencryptedData')
     if isinstance(metadataPayload, dict):
@@ -1064,11 +1090,8 @@ def productHandshake(productId: str):
             logging.warning('Invalid handshake status received: %s', clientStatus)
             return jsonify({'error': 'Invalid status value'}), 400
 
-        fileQuery = (
-            firestoreClient.collection(firestoreCollectionFiles)
-            .where(filter=FieldFilter('productId', '==', productId))
-            .order_by('timestamp', direction=firestore.Query.DESCENDING)
-            .limit(1)
+        fileQuery = firestoreClient.collection(firestoreCollectionFiles).where(
+            filter=FieldFilter('productId', '==', productId)
         )
         documentSnapshots = list(fileQuery.stream())
 
@@ -1076,7 +1099,10 @@ def productHandshake(productId: str):
             logging.info('No files found in handshake for product %s', productId)
             return jsonify({'error': 'File not found for product'}), 404
 
-        documentSnapshot = documentSnapshots[0]
+        documentSnapshot = pickLatestDocumentByTimestamp(documentSnapshots)
+        if documentSnapshot is None:
+            logging.info('No valid document snapshots for product %s', productId)
+            return jsonify({'error': 'File not found for product'}), 404
 
         fileMetadata = documentSnapshot.to_dict() or {}
         fetchToken = fileMetadata.get('fetchToken')
@@ -1088,20 +1114,7 @@ def productHandshake(productId: str):
         )
 
         currentTime = datetime.now(timezone.utc)
-        
-        # Check if the client already has the correct file
-        currentFileId = payload.get('currentFileId')
-        latestFileId = documentSnapshot.id
-        
-        if clientStatus == 'hasFile':
-            # If client provides a file ID, verify it matches the latest
-            if currentFileId and currentFileId != latestFileId:
-                logging.info('Client has stale file %s, forcing update to %s', currentFileId, latestFileId)
-                fetchMode = 'full'
-            else:
-                fetchMode = 'metadata'
-        else:
-            fetchMode = 'full'
+        fetchMode = 'metadata' if clientStatus == 'hasFile' else 'full'
 
         if fetchMode == 'full':
             if fetchTokenConsumed:
@@ -1241,11 +1254,8 @@ def productStatusUpdate(productId: str):
 
         recipientId = payload.get('recipientId')
 
-        fileQuery = (
-            firestoreClient.collection(firestoreCollectionFiles)
-            .where(filter=FieldFilter('productId', '==', productId))
-            .order_by('timestamp', direction=firestore.Query.DESCENDING)
-            .limit(1)
+        fileQuery = firestoreClient.collection(firestoreCollectionFiles).where(
+            filter=FieldFilter('productId', '==', productId)
         )
         documentSnapshots = list(fileQuery.stream())
 
@@ -1253,7 +1263,11 @@ def productStatusUpdate(productId: str):
             logging.info('No files found when recording status for product %s', productId)
             return jsonify({'error': 'File not found for product'}), 404
 
-        documentSnapshot = documentSnapshots[0]
+        documentSnapshot = pickLatestDocumentByTimestamp(documentSnapshots)
+        if documentSnapshot is None:
+            logging.info('No valid file snapshots found when recording status for product %s', productId)
+            return jsonify({'error': 'File not found for product'}), 404
+
         fileMetadata = documentSnapshot.to_dict() or {}
 
         fetchTokenData: Dict[str, object] = {

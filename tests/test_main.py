@@ -70,7 +70,6 @@ googleModule = ModuleType('google')
 cloudModule = ModuleType('google.cloud')
 firestoreModule = ModuleType('google.cloud.firestore')
 firestoreModule.SERVER_TIMESTAMP = object()
-firestoreModule.Query = SimpleNamespace(DESCENDING='DESCENDING', ASCENDING='ASCENDING')
 
 
 class DummyFirestoreClient:
@@ -344,37 +343,11 @@ class MockQuery:
         return MockQuery(filteredSnapshots, self.filters + [(field, operator, value)])
 
     def order_by(self, field, direction=None):
-        sortedSnapshots = list(self.documentSnapshots)
-        # direction is typically firestore.Query.DESCENDING or ASCENDING
-        # We need to mock these constants if used, or just handle the standard usage
-        reverse = False
-        if direction == 'DESCENDING' or (hasattr(direction, 'value') and direction.value == 'DESCENDING'):
-            reverse = True
-        # In the real code, direction might be passed as firestore.Query.DESCENDING which is an object/enum.
-        # We need to ensure we can handle it.
-        # Check if the field exists in the metadata for sorting.
-        # If timestamp is None or missing, handling might be tricky, but basic sort should work.
-        
-        def sort_key(snapshot):
-            val = (snapshot.to_dict() or {}).get(field)
-            # Handle None values for sort stability if needed, but python sorts None poorly against other types usually
-            # Assuming timestamps are always present in these tests for sorted fields
-            return val
+        # Mock sorting if needed, or just return self
+        return self
 
-        # Filter out snapshots that don't have the field if that's Firestore behavior? 
-        # Actually Firestore requires the field to exist for it to be in the index usually.
-        # For our mock, let's just sort.
-        # Note: In our current tests, timestamps are datetime objects.
-        try:
-            sortedSnapshots.sort(key=sort_key, reverse=reverse)
-        except TypeError:
-            # Handle cases where some are None and some are not, if that happens
-            pass
-            
-        return MockQuery(sortedSnapshots, self.filters)
-
-    def limit(self, count):
-        return MockQuery(self.documentSnapshots[:count], self.filters)
+    def limit(self, _count):
+        return self
 
     def stream(self):
         return self.documentSnapshots
@@ -626,83 +599,6 @@ def testProductHandshakeMetadataFlow(monkeypatch):
     assert updatePayload['fetchTokenExpiry'] is main.DELETE_FIELD
     assert updatePayload['fetchTokenConsumed'] is True
     assert isinstance(updatePayload['fetchTokenConsumedTimestamp'], datetime)
-
-
-def testProductHandshakeWithStaleFileIdForcesDownload(monkeypatch):
-    metadata = {
-        'productId': 'prod-stale',
-        'fetchToken': 'token-new',
-        'fetchTokenConsumed': False,
-        'fetchTokenExpiry': datetime.now(timezone.utc) + timedelta(minutes=5),
-        'originalFilename': 'new_version.gcode',
-        'timestamp': datetime.now(timezone.utc),
-        'unencryptedData': {'info': 'new'},
-    }
-    documentSnapshot = MockDocumentSnapshot('doc-new-version', metadata)
-    updateRecorder = {'set': None, 'update': []}
-    mockClients = main.ClientBundle(
-        storageClient=MockStorageClient(),
-        firestoreClient=MockFirestoreClient(
-            documentSnapshot=documentSnapshot, updateRecorder=updateRecorder
-        ),
-        kmsClient=MockEncryptClient({'sensitive': 'value'}),
-        kmsKeyPath='projects/test/locations/test/keyRings/test/cryptoKeys/test',
-        gcsBucketName='test-bucket',
-    )
-    monkeypatch.setattr(main, 'getClients', lambda: mockClients)
-
-    fakeRequest.clear_json()
-    fakeRequest.args = {}
-    fakeRequest.set_json({
-        'status': 'hasFile',
-        'currentFileId': 'doc-old-version'
-    })
-
-    responseBody, statusCode = main.productHandshake('prod-stale')
-
-    assert statusCode == 200
-    assert responseBody['decision'] == 'full'
-    assert responseBody['downloadRequired'] is True
-    assert responseBody['fetchMode'] == 'full'
-    assert responseBody['fileId'] == 'doc-new-version'
-
-
-def testProductHandshakeWithCorrectFileIdReturnsMetadata(monkeypatch):
-    metadata = {
-        'productId': 'prod-correct',
-        'fetchToken': 'token-same',
-        'fetchTokenConsumed': False,
-        'fetchTokenExpiry': datetime.now(timezone.utc) + timedelta(minutes=5),
-        'originalFilename': 'same_version.gcode',
-        'timestamp': datetime.now(timezone.utc),
-        'unencryptedData': {'info': 'same'},
-    }
-    documentSnapshot = MockDocumentSnapshot('doc-same-version', metadata)
-    updateRecorder = {'set': None, 'update': []}
-    mockClients = main.ClientBundle(
-        storageClient=MockStorageClient(),
-        firestoreClient=MockFirestoreClient(
-            documentSnapshot=documentSnapshot, updateRecorder=updateRecorder
-        ),
-        kmsClient=MockEncryptClient({'sensitive': 'value'}),
-        kmsKeyPath='projects/test/locations/test/keyRings/test/cryptoKeys/test',
-        gcsBucketName='test-bucket',
-    )
-    monkeypatch.setattr(main, 'getClients', lambda: mockClients)
-
-    fakeRequest.clear_json()
-    fakeRequest.args = {}
-    fakeRequest.set_json({
-        'status': 'hasFile',
-        'currentFileId': 'doc-same-version'
-    })
-
-    responseBody, statusCode = main.productHandshake('prod-correct')
-
-    assert statusCode == 200
-    assert responseBody['decision'] == 'metadata'
-    assert responseBody['downloadRequired'] is False
-    assert responseBody['fetchMode'] == 'metadata'
 
 
 def testProductStatusUpdateSuccess(monkeypatch):
