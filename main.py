@@ -1953,6 +1953,10 @@ def listLatestRecipientPrinterStatuses(recipientId: str):
 def listPendingFiles(recipientId: str):
     logging.info('Received request to /recipients/%s/pending', recipientId)
     try:
+        apiKeyError = ensureValidApiKey()
+        if apiKeyError:
+            return apiKeyError
+
         clients, errorResponse = fetchClientsOrResponse()
         if errorResponse:
             return jsonify(errorResponse[0]), errorResponse[1]
